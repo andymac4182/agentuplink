@@ -360,7 +360,27 @@ fn sign_record_signed_now(
     key_id: &str,
     spki: &str,
 ) -> SignedMembershipRecord {
-    let now = Utc::now();
+    sign_record_signed_ahead(
+        issuer,
+        node_id,
+        version,
+        key_id,
+        spki,
+        chrono::Duration::zero(),
+    )
+}
+
+/// As [`sign_record_signed_now`], by a signer whose clock leads this
+/// relay's by `lead`: every signed instant is `now + lead`.
+fn sign_record_signed_ahead(
+    issuer: &MembershipIssuer,
+    node_id: &str,
+    version: u64,
+    key_id: &str,
+    spki: &str,
+    lead: chrono::Duration,
+) -> SignedMembershipRecord {
+    let now = Utc::now() + lead;
     let host = if node_id == NODE_ID {
         "10.0.0.1"
     } else {
@@ -896,5 +916,50 @@ async fn racing_same_key_resigns_never_reject_the_local_key() {
         (0, 0),
         "M7-C170: {rejected} of {PASSES} reconcile passes rejected the local key \
          ({other} other failures) while same-key re-signs raced them"
+    );
+}
+
+/// **M7-C171, current behaviour.** A same-key re-sign from a signer whose
+/// clock leads this relay's by 500 ms -- inside the one-second skew the
+/// verifier accepts -- is still judged strictly at the record-read instant:
+/// the local key is not yet active, so the reconcile reports `PeerRejected`
+/// (`MissingLocalKey`) and revokes the admission. This pins that the M7-C170
+/// fix did not widen key activation by the skew allowance; changing it is
+/// M7-C171's open owner decision, and must change this test with it.
+#[tokio::test]
+async fn a_resign_from_a_signer_ahead_inside_the_skew_is_still_rejected() {
+    let fixture = Fixture::ready().await;
+    let admission = fixture
+        .runtime
+        .admit_peer(Fixture::identity())
+        .expect("an active admission");
+    let stream = admission.cancellation();
+    fixture
+        .publish(sign_record_signed_ahead(
+            &fixture.issuer,
+            NODE_ID,
+            2,
+            "key-1",
+            SPKI_SHA256,
+            chrono::Duration::milliseconds(500),
+        ))
+        .await;
+    let result = fixture.runtime.reconcile_once().await;
+    assert!(
+        matches!(
+            result,
+            Err(tunnel_relay::MembershipRuntimeError::PeerRejected)
+        ),
+        "M7-C171: a local key not yet active at the read instant must be rejected, got {:?}",
+        result.as_ref().map(|_| ())
+    );
+    assert_eq!(
+        fixture.runtime.readiness(),
+        MembershipReadiness::Unready(MembershipUnreadyReason::MissingLocalKey)
+    );
+    assert!(stream.is_cancelled(), "the admission must be revoked");
+    assert_eq!(
+        stream.reason(),
+        Some(PeerInvalidationReason::MembershipRevoked)
     );
 }
