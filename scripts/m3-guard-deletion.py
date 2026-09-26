@@ -1992,6 +1992,27 @@ M7_CONNECTOR_CLIENT_CASES: list[Case] = [
         ),
     ),
     Case(
+        # M6-C196, review of PR #219: a full retained stream table arms the
+        # clock even at the live limit.
+        "a full retained stream table arms the give-up clock even at the live limit",
+        [
+            (
+                CLIENT / "src" / "m2_runtime.rs",
+                "            if self.streams.len() >= "
+                "retained_stream_limit(self.config.limits.max_streams) {\n"
+                "                self.note_open_retention_exhausted();\n",
+                "            if self.active_stream_count() < self.config.limits.max_streams {\n"
+                "                self.note_open_retention_exhausted();\n",
+            )
+        ],
+        frozenset(
+            {
+                "m2_runtime::tests::"
+                "m6c196_a_full_stream_table_at_the_live_limit_gives_up_once_the_live_streams_drain",
+            }
+        ),
+    ),
+    Case(
         # M6-C196: a full journal arms the clock even at the live limit.
         "a full OPEN journal arms the give-up clock even at the live limit",
         [

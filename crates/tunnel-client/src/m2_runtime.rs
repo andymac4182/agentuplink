@@ -17730,6 +17730,66 @@ mod tests {
         ));
     }
 
+    /// Task row M6-C196, review of PR #219: the retained-stream-table refusal
+    /// arms the give-up clock when the table is full, even at the live limit.
+    /// 64 live and 64 terminal streams fill the 128-entry table with the
+    /// journal still empty, so the OPEN that follows is refused for the table
+    /// rather than the journal.  The session stays busy past the grace, the
+    /// live streams then end unreclaimed with no further OPEN, and it must
+    /// give up.  Before the fix that refusal armed nothing at the live limit.
+    #[tokio::test]
+    async fn m6c196_a_full_stream_table_at_the_live_limit_gives_up_once_the_live_streams_drain() {
+        let (mut actor, _key, _receiver, mut control_receiver) =
+            test_actor_with_control_capacity(M2_CARRIER_QUEUE_FRAMES, 16);
+        let max = actor.config.limits.max_streams as u64;
+        let table = retained_stream_limit(actor.config.limits.max_streams) as u64;
+        for stream_id in 1..=table {
+            let mut stream = test_stream();
+            // The first `max` stay live; the rest are terminal, unforgotten.
+            stream.output_fin = stream_id > max;
+            actor.streams.insert(stream_id, stream);
+        }
+        assert_eq!(actor.active_stream_count() as u64, max);
+        actor
+            .handle_control(ControlMessage::Open(test_open(table + 1)))
+            .await
+            .expect("a full stream table refuses the OPEN");
+        assert!(
+            drain_control_messages(&mut control_receiver).iter().any(
+                |message| matches!(message, ControlMessage::Rejected(rejected)
+                    if rejected.stream_id == table + 1)
+            ),
+            "the OPEN is refused"
+        );
+        assert!(
+            actor.open_retention_exhausted_since.is_some(),
+            "a full stream table arms the give-up clock at the live limit"
+        );
+        let refused_at = Instant::now();
+        let grace = actor.open_retention_exhaustion_grace();
+        let busy_until = refused_at + grace + Duration::from_secs(1);
+        assert!(
+            actor.check_open_retention_exhaustion_at(busy_until).is_ok(),
+            "a session at its live limit is busy"
+        );
+        for stream in actor.streams.values_mut() {
+            stream.output_fin = true;
+        }
+        assert!(
+            actor
+                .check_open_retention_exhaustion_at(busy_until + Duration::from_secs(1))
+                .is_ok(),
+            "the grace counts from the last busy check"
+        );
+        assert!(
+            matches!(
+                actor.check_open_retention_exhaustion_at(busy_until + grace),
+                Err(ClientError::OpenRetentionFull)
+            ),
+            "a full stream table at the live limit must give up once the live streams drain"
+        );
+    }
+
     /// Task row M6-C196 (hosted run 36270434775): OPEN retention that fills
     /// while the session is at its live limit must still give the session up
     /// once those live streams finish and the owner never forgets them.  The
