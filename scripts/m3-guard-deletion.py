@@ -1949,8 +1949,10 @@ M7_CONNECTOR_CLIENT_CASES: list[Case] = [
         [
             (
                 CLIENT / "src" / "m2_runtime.rs",
-                "        if self.active_stream_count() >= self.config.limits.max_streams {\n"
-                "            self.open_retention_exhausted_since = None;\n"
+                "        if self.active_stream_count() >= self.config.limits.max_streams\n"
+                "            && self.open_retention_exhausted_since.is_some()\n"
+                "        {\n"
+                "            self.open_retention_exhausted_since = Some(now);\n"
                 "        }\n",
                 "",
             )
@@ -1959,6 +1961,56 @@ M7_CONNECTOR_CLIENT_CASES: list[Case] = [
             {
                 "m2_runtime::tests::"
                 "a_busy_session_at_its_live_limit_is_not_given_up_for_retention",
+                "m2_runtime::tests::"
+                "m6c196_retention_exhausted_while_busy_gives_up_once_the_live_streams_drain",
+            }
+        ),
+    ),
+    Case(
+        # M6-C196: at the live limit the clock restarts; it is not disarmed.
+        "a busy session's retention give-up clock restarts rather than disarms",
+        [
+            (
+                CLIENT / "src" / "m2_runtime.rs",
+                "            && self.open_retention_exhausted_since.is_some()\n"
+                "        {\n"
+                "            self.open_retention_exhausted_since = Some(now);\n",
+                "            && self.open_retention_exhausted_since.is_some()\n"
+                "        {\n"
+                "            self.open_retention_exhausted_since = None;\n",
+            )
+        ],
+        frozenset(
+            {
+                "m2_runtime::tests::"
+                "a_busy_session_at_its_live_limit_is_not_given_up_for_retention",
+                "m2_runtime::tests::"
+                "m6c196_retention_exhausted_while_busy_gives_up_once_the_live_streams_drain",
+                "m2_runtime::tests::"
+                "m6c196_retention_exhausted_at_the_live_limit_gives_up_after_the_streams_end",
+            }
+        ),
+    ),
+    Case(
+        # M6-C196: a full journal arms the clock even at the live limit.
+        "a full OPEN journal arms the give-up clock even at the live limit",
+        [
+            (
+                CLIENT / "src" / "m2_runtime.rs",
+                "                self.note_open_retention_exhausted();\n"
+                "                return self.send_rejected(&open, "
+                "open_refusal::OPEN_IDEMPOTENCY_FULL);\n",
+                "                if self.active_stream_count() < self.config.limits.max_streams {\n"
+                "                    self.note_open_retention_exhausted();\n"
+                "                }\n"
+                "                return self.send_rejected(&open, "
+                "open_refusal::OPEN_IDEMPOTENCY_FULL);\n",
+            )
+        ],
+        frozenset(
+            {
+                "m2_runtime::tests::"
+                "m6c196_retention_exhausted_while_busy_gives_up_once_the_live_streams_drain",
             }
         ),
     ),

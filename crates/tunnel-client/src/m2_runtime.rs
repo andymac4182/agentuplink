@@ -4323,9 +4323,15 @@ impl M2Actor {
     /// began recently (Windows counts from boot; hosted run of PR #186).
     fn check_open_retention_exhaustion_at(&mut self, now: Instant) -> Result<(), ClientError> {
         // A session at its live limit is busy, not wedged: its retention is
-        // concurrent work, so the give-up clock restarts.
-        if self.active_stream_count() >= self.config.limits.max_streams {
-            self.open_retention_exhausted_since = None;
+        // concurrent work, so the give-up clock restarts.  It restarts rather
+        // than disarms (task row M6-C196): retention stays exhausted until a
+        // STREAM_FORGET reclaims it, and a disarmed clock was re-armed only
+        // by a later refused OPEN, so a session whose live streams drained
+        // with no further OPEN never gave up.
+        if self.active_stream_count() >= self.config.limits.max_streams
+            && self.open_retention_exhausted_since.is_some()
+        {
+            self.open_retention_exhausted_since = Some(now);
         }
         // While control reads are stopped the clock is paused: the session
         // cannot read the STREAM_FORGETs that would reclaim its retention.
@@ -4380,12 +4386,14 @@ impl M2Actor {
                 // stream.  Admission is untouched, so a retry still receives
                 // the same typed refusal while the journal is full.
                 self.retired_streams.insert(open.stream_id);
-                // A journal held by the negotiated maximum of live streams is
-                // concurrent work, not unreclaimed retention (review of PR
-                // #171): only a session below its live limit starts the clock.
-                if self.active_stream_count() < self.config.limits.max_streams {
-                    self.note_open_retention_exhausted();
-                }
+                // Retention is exhausted whether or not the session is at its
+                // live limit.  A journal held by the negotiated maximum of
+                // live streams is concurrent work, not unreclaimed retention
+                // (review of PR #171), so the give-up check restarts the
+                // clock for as long as the session stays busy; it is not
+                // left unarmed, which let a session exhausted while busy
+                // outlive its live streams and never give up (M6-C196).
+                self.note_open_retention_exhausted();
                 return self.send_rejected(&open, open_refusal::OPEN_IDEMPOTENCY_FULL);
             }
             Err(OpenJournalError::MissingMessage | OpenJournalError::ConflictingResponse) => {
@@ -4473,8 +4481,10 @@ impl M2Actor {
             || self.streams.len() >= retained_stream_limit(self.config.limits.max_streams)
         {
             // A table full of *terminal* streams is retention the owner has
-            // not reclaimed, not concurrent work (task row M7-C95).
-            if self.active_stream_count() < self.config.limits.max_streams {
+            // not reclaimed, not concurrent work (task row M7-C95).  At the
+            // live limit the give-up check keeps restarting the clock until
+            // the live streams drain (M6-C196).
+            if self.streams.len() >= retained_stream_limit(self.config.limits.max_streams) {
                 self.note_open_retention_exhausted();
             }
             return self.send_open_rejected_journaled(open, open_refusal::STREAM_LIMIT);
@@ -17533,6 +17543,152 @@ mod tests {
         Ok(())
     }
 
+    /// Task row M6-C196, on the real session loop: the mechanism of the hosted
+    /// failure of the test above (run 36270434775), made deterministic.  The
+    /// test above paces its OPENs so that live streams end while it fills the
+    /// journal, and passes only when the session happens to be below its live
+    /// limit at the refusal that exhausts retention.  Here the OPENs arrive
+    /// faster than any stream ends, so the session reaches its live limit
+    /// around that refusal: either the refusal is made at the limit (the old
+    /// code never armed the clock) or deferred OPENs are admitted just after
+    /// it (the old busy check disarmed the clock).  No further OPEN arrives
+    /// and the owner never forgets.  Once the live streams' own deadlines end
+    /// them the session must give up with the typed retention cause; before
+    /// the fix it stayed up for good (traced: armed at 49 live streams, then
+    /// disarmed once the deferred OPENs took it to 64).
+    #[tokio::test]
+    async fn m6c196_retention_exhausted_at_the_live_limit_gives_up_after_the_streams_end()
+    -> Result<(), String> {
+        let (control_client, mut control_peer) = test_websocket_pair().await?;
+        let (data_client, mut data_peer) = test_websocket_pair().await?;
+        let (control_sink, control_stream) = control_client.split();
+        let (data_sink, data_stream) = data_client.split();
+        let cancellation = CancellationToken::new();
+        let (readiness, readiness_receiver) = watch::channel(Readiness::Connecting);
+        let (status, _status_receiver) = watch::channel(ConnectionStatus::default());
+        let config = RuntimeConfig::default();
+        let max = config.limits.max_streams as u64;
+        let session = SessionInfo {
+            session_id: "session".to_owned(),
+            epoch: 1,
+            generation: 1,
+        };
+        let rotation_config = RotationConfig::new(300_000, 100, 200)
+            .map_err(|error| format!("test rotation config: {error:?}"))?;
+        let mut actor = tokio::spawn(run_m2_session(
+            config,
+            session,
+            runtime_welcome(),
+            "owner".to_owned(),
+            None,
+            rotation_config,
+            control_sink,
+            control_stream,
+            data_sink,
+            data_stream,
+            cancellation.clone(),
+            readiness,
+            status,
+            None,
+            None,
+            None,
+            HttpHandlers::default(),
+        ));
+        tokio::spawn(async move { while data_peer.next().await.is_some() {} });
+
+        // Send the live limit's worth of OPENs, each after the reply to the
+        // one before, so none is refused for a full spill.
+        for stream_id in 1..=max {
+            control_peer
+                .send(websocket_control(&ControlMessage::Open(test_open(
+                    stream_id,
+                ))))
+                .await
+                .map_err(|error| format!("OPEN {stream_id} should reach the actor: {error}"))?;
+            match timeout(Duration::from_secs(5), control_peer.next()).await {
+                Ok(Some(Ok(Message::Text(text)))) => match decode_control(text.as_bytes()) {
+                    Ok(ControlMessage::Rejected(rejected)) => {
+                        return Err(format!(
+                            "OPEN {stream_id} was refused {} below the live limit",
+                            rejected.code
+                        ));
+                    }
+                    Ok(_) => {}
+                    Err(error) => return Err(format!("undecodable control reply: {error}")),
+                },
+                other => return Err(format!("OPEN {stream_id} got no reply: {other:?}")),
+            }
+        }
+        // Then, without waiting, as many OPENs as fill the journal and one more
+        // that the full journal refuses.  No OPEN follows.
+        let burst = 2 * max + 1;
+        let mut last_sent_at = Instant::now();
+        for stream_id in max + 1..=burst {
+            last_sent_at = Instant::now();
+            control_peer
+                .send(websocket_control(&ControlMessage::Open(test_open(
+                    stream_id,
+                ))))
+                .await
+                .map_err(|error| format!("OPEN {stream_id} should reach the actor: {error}"))?;
+        }
+        let exhausted = timeout(Duration::from_secs(10), async {
+            while let Some(Ok(message)) = control_peer.next().await {
+                if let Message::Text(text) = message
+                    && let Ok(ControlMessage::Rejected(rejected)) = decode_control(text.as_bytes())
+                    && rejected.code == "RESOURCE_EXHAUSTED"
+                    && rejected
+                        .reason
+                        .contains("OPEN idempotency retention is full")
+                {
+                    return Some(rejected.stream_id);
+                }
+            }
+            None
+        })
+        .await
+        .map_err(|_| "the OPEN journal never reported exhaustion".to_owned())?
+        .ok_or_else(|| "the control socket closed before exhaustion".to_owned())?;
+        let exhausted_at = Instant::now();
+        if exhausted != burst {
+            return Err(format!(
+                "retention was exhausted at stream {exhausted}, not by the burst's last OPEN \
+                 {burst}"
+            ));
+        }
+        tokio::spawn(async move { while control_peer.next().await.is_some() {} });
+
+        let joined = timeout(Duration::from_secs(30), &mut actor).await;
+        let actor_result = match joined {
+            Ok(joined) => joined,
+            Err(_) => {
+                cancellation.cancel();
+                actor.abort();
+                return Err(format!(
+                    "the session stayed up {:?} after its OPEN retention was exhausted at its \
+                     live limit",
+                    exhausted_at.elapsed()
+                ));
+            }
+        };
+        assert!(
+            matches!(&actor_result, Ok(Err(ClientError::OpenRetentionFull))),
+            "the session must end with the typed retention cause: {actor_result:?}"
+        );
+        let grace = Duration::from_millis(300) + OPEN_RETENTION_EXHAUSTION_MARGIN;
+        assert!(
+            last_sent_at.elapsed() >= grace,
+            "it gave up only after the bounded grace"
+        );
+        let closed = readiness_receiver.borrow().clone();
+        assert!(
+            matches!(&closed, Readiness::Closed { reason }
+                if reason == "OPEN idempotency retention is full; start a fresh session"),
+            "{closed:?}"
+        );
+        Ok(())
+    }
+
     /// Task row M7-C95, review of PR #171: a session whose retention is full
     /// because it is at its negotiated live-stream limit is busy, not wedged,
     /// and must never be given up; the clock restarts instead.  Once the
@@ -17556,13 +17712,91 @@ mod tests {
             actor.check_open_retention_exhaustion_at(past_grace).is_ok(),
             "a session at its live limit is busy"
         );
-        assert!(actor.open_retention_exhausted_since.is_none());
+        // The clock restarts rather than disarms (task row M6-C196): the
+        // retention is still exhausted, and no later OPEN need re-arm it.
+        assert_eq!(actor.open_retention_exhausted_since, Some(past_grace));
         actor.streams.remove(&1);
-        actor.open_retention_exhausted_since = Some(since);
+        assert!(
+            actor
+                .check_open_retention_exhaustion_at(past_grace + Duration::from_secs(1))
+                .is_ok(),
+            "the grace counts from the last busy check"
+        );
         assert!(matches!(
-            actor.check_open_retention_exhaustion_at(past_grace),
+            actor.check_open_retention_exhaustion_at(
+                past_grace + actor.open_retention_exhaustion_grace()
+            ),
             Err(ClientError::OpenRetentionFull)
         ));
+    }
+
+    /// Task row M6-C196 (hosted run 36270434775): OPEN retention that fills
+    /// while the session is at its live limit must still give the session up
+    /// once those live streams finish and the owner never forgets them.  The
+    /// clock used to be armed only by a refusal made below the live limit and
+    /// cleared by any busy check, so a session exhausted while busy, whose
+    /// owner sent no further OPEN, stayed up forever with a journal that
+    /// refuses every OPEN "start a fresh session".
+    #[tokio::test]
+    async fn m6c196_retention_exhausted_while_busy_gives_up_once_the_live_streams_drain() {
+        let (mut actor, _key, _receiver, mut control_receiver) =
+            test_actor_with_control_capacity(M2_CARRIER_QUEUE_FRAMES, 16);
+        let max = actor.config.limits.max_streams as u64;
+        for stream_id in 1..=max {
+            actor.streams.insert(stream_id, test_stream());
+        }
+        // Fill the OPEN journal with retention the owner never forgets.
+        let mut filler = 0_u64;
+        loop {
+            match actor.open_journal.observe(
+                &format!("filler-{filler}"),
+                b"filler",
+                10_000 + filler,
+                "filler",
+            ) {
+                Ok(_) => filler += 1,
+                Err(OpenJournalError::Capacity) => break,
+                Err(error) => panic!("unexpected journal error: {error:?}"),
+            }
+        }
+        actor
+            .handle_control(ControlMessage::Open(test_open(max + 1)))
+            .await
+            .expect("a full journal refuses the OPEN");
+        assert!(
+            drain_control_messages(&mut control_receiver).iter().any(
+                |message| matches!(message, ControlMessage::Rejected(rejected)
+                    if rejected.code == "RESOURCE_EXHAUSTED"
+                        && rejected.reason.contains("OPEN idempotency retention is full"))
+            ),
+            "the OPEN is refused for exhausted retention"
+        );
+        let refused_at = Instant::now();
+        let grace = actor.open_retention_exhaustion_grace();
+        // Busy for longer than the grace: never given up.
+        let busy_until = refused_at + grace + Duration::from_secs(1);
+        assert!(
+            actor.check_open_retention_exhaustion_at(busy_until).is_ok(),
+            "a session at its live limit is busy"
+        );
+        // Every live stream finishes; the owner never forgets any of them,
+        // and sends no further OPEN.
+        for stream in actor.streams.values_mut() {
+            stream.output_fin = true;
+        }
+        assert!(
+            actor
+                .check_open_retention_exhaustion_at(busy_until + Duration::from_secs(1))
+                .is_ok(),
+            "the grace counts from the last busy check"
+        );
+        assert!(
+            matches!(
+                actor.check_open_retention_exhaustion_at(busy_until + grace),
+                Err(ClientError::OpenRetentionFull)
+            ),
+            "a session exhausted while busy must give up once its live streams drain"
+        );
     }
 
     /// Task row M6-C148, on the real session loop.  OPEN retention is
