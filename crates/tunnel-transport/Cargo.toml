@@ -33,6 +33,11 @@ x509-parser = "0.17.0"
 rustix = { version = "1.1", default-features = false, features = ["std"] }
 
 [dev-dependencies]
+# HTTP/2 client, streamed bodies and body collection for the M6-C193
+# turnover tests; all already in Cargo.lock.
+futures-util = "0.3"
+http-body-util = "0.1"
+hyper = { version = "1.8.1", features = ["client", "http1", "http2", "server"] }
 rcgen = "0.13"
 # Races between a peer driver and a concurrent shutdown only exist when two
 # tasks can poll at once (M7-C105).

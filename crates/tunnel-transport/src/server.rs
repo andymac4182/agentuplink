@@ -269,6 +269,10 @@ pub struct AcceptedSocketDiagnostics {
     nodelay_set: Arc<AtomicUsize>,
     /// Accepted sockets whose `TCP_NODELAY` read back as clear or unreadable.
     nodelay_unset: Arc<AtomicUsize>,
+    /// Served connections closed for turnover under pressure (M6-C193).
+    fairness_recycles: Arc<AtomicUsize>,
+    /// Over-limit connections served with a handed-off permit (M6-C193).
+    fairness_handoffs: Arc<AtomicUsize>,
 }
 
 impl AcceptedSocketDiagnostics {
@@ -295,6 +299,26 @@ impl AcceptedSocketDiagnostics {
 
     fn record_capacity_refusal(&self) {
         self.capacity_refusals.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Connections accepted over the limit that were served with a permit
+    /// freed within [`crate::HANDOFF_WAIT`] (task row M6-C193).
+    pub fn fairness_handoffs(&self) -> usize {
+        self.fairness_handoffs.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn record_fairness_handoff(&self) {
+        self.fairness_handoffs.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Served connections this listener closed after a response to turn its
+    /// permit over while it was full (task row M6-C193).
+    pub fn fairness_recycles(&self) -> usize {
+        self.fairness_recycles.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn record_fairness_recycle(&self) {
+        self.fairness_recycles.fetch_add(1, Ordering::AcqRel);
     }
 
     fn record_send_buffer_bytes(&self, bytes: usize) {
@@ -337,6 +361,10 @@ pub struct AcceptedSocketOptions {
     pub listener: Option<&'static str>,
     /// The connection limit and its over-capacity refusal (M6-C153).
     pub capacity: ListenerCapacity,
+    /// Connection turnover while the listener is full (M6-C193).  `None`,
+    /// the default, never recycles a connection; the relay sets it on the
+    /// public consumer listener only.
+    pub turnover: Option<crate::ListenerTurnover>,
 }
 
 /// Errors returned by the listener supervisor itself.  A malformed or
@@ -384,6 +412,14 @@ pub enum TransportError {
     #[error("listener capacity {field} is invalid: {reason}")]
     InvalidListenerCapacity {
         /// Name of the offending [`ListenerCapacity`] field.
+        field: &'static str,
+        /// Bounded explanation; it never contains connection data.
+        reason: &'static str,
+    },
+    /// A configured [`crate::ListenerTurnover`] value was outside its range.
+    #[error("listener turnover {field} is invalid: {reason}")]
+    InvalidListenerTurnover {
+        /// Name of the offending [`crate::ListenerTurnover`] field.
         field: &'static str,
         /// Bounded explanation; it never contains connection data.
         reason: &'static str,
@@ -471,6 +507,10 @@ pub async fn serve_with_listener_options(
     timeouts.validate()?;
     let capacity = socket_options.capacity;
     capacity.validate()?;
+    let turnover = socket_options.turnover;
+    if let Some(turnover) = &turnover {
+        turnover.validate()?;
+    }
     let acceptor = TlsAcceptor::from(config);
     let permits = Arc::new(tokio::sync::Semaphore::new(capacity.max_connections));
     let refusals = Arc::new(tokio::sync::Semaphore::new(capacity.refusal_margin));
@@ -478,6 +518,10 @@ pub async fn serve_with_listener_options(
     let child_cancel = cancel.child_token();
     let mut first_error = None;
     let listener_name = socket_options.listener.unwrap_or("unnamed");
+    // M6-C193: refusals mark the listener under pressure, which is what lets
+    // served connections turn their permits over.
+    let pressure =
+        crate::fairness::ListenerPressure::new(listener_name, socket_options.diagnostics.clone());
 
     loop {
         // M6-C153: take a slot before accepting.  While neither a connection
@@ -560,6 +604,9 @@ pub async fn serve_with_listener_options(
         match slot {
             Slot::Serve(permit) => {
                 let router = router.clone();
+                let turnover = turnover.map(|policy| {
+                    crate::fairness::ConnectionTurnover::new(policy, pressure.clone())
+                });
                 tasks.spawn(async move {
                     let _permit = permit;
                     if let Err(error) = serve_connection(
@@ -569,6 +616,7 @@ pub async fn serve_with_listener_options(
                         connection_cancel,
                         timeouts,
                         listener_name,
+                        turnover,
                     )
                     .await
                     {
@@ -578,20 +626,58 @@ pub async fn serve_with_listener_options(
                 });
             }
             Slot::Refuse(refusal) => {
-                if let Some(diagnostics) = &socket_options.diagnostics {
-                    diagnostics.record_capacity_refusal();
-                }
-                if let Some(suppressed) = CAPACITY_REFUSAL_LOG.admit(listener_name) {
-                    tracing::info!(
-                        phase = "listener_capacity",
-                        listener = listener_name,
-                        max_connections = capacity.max_connections,
-                        suppressed,
-                        "refusing connection over the listener connection limit"
-                    );
-                }
+                pressure.record_full();
+                // M6-C193 hand-off: on a listener with turnover, wait briefly
+                // (before any TLS work) in the permit queue, so a permit freed
+                // by turnover reaches a connection that was already waiting.
+                let handoff = turnover.map(|policy| (policy, permits.clone()));
+                let router = router.clone();
+                let pressure = pressure.clone();
+                let diagnostics = socket_options.diagnostics.clone();
                 tasks.spawn(async move {
+                    let mut refusal = Some(refusal);
+                    if let Some((policy, permits)) = handoff {
+                        let permit = tokio::select! {
+                            biased;
+                            _ = connection_cancel.cancelled() => return Ok(()),
+                            permit = timeout(crate::HANDOFF_WAIT, permits.acquire_owned()) => permit,
+                        };
+                        if let Ok(Ok(permit)) = permit {
+                            refusal = None;
+                            pressure.record_handoff();
+                            let turnover =
+                                crate::fairness::ConnectionTurnover::new(policy, pressure);
+                            let _permit = permit;
+                            if let Err(error) = serve_connection(
+                                stream,
+                                acceptor,
+                                router,
+                                connection_cancel,
+                                timeouts,
+                                listener_name,
+                                Some(turnover),
+                            )
+                            .await
+                            {
+                                tracing::debug!(%remote_addr, ?error, "TLS/HTTP connection closed");
+                            }
+                            return Ok(());
+                        }
+                    }
                     let _refusal = refusal;
+                    if let Some(diagnostics) = &diagnostics {
+                        diagnostics.record_capacity_refusal();
+                    }
+                    pressure.record_refusal();
+                    if let Some(suppressed) = CAPACITY_REFUSAL_LOG.admit(listener_name) {
+                        tracing::info!(
+                            phase = "listener_capacity",
+                            listener = listener_name,
+                            max_connections = capacity.max_connections,
+                            suppressed,
+                            "refusing connection over the listener connection limit"
+                        );
+                    }
                     refuse_connection(
                         stream,
                         acceptor,
@@ -864,6 +950,61 @@ where
     }
 }
 
+/// Hyper service wrapper that applies connection turnover (task row
+/// M6-C193) to each response.
+///
+/// It counts each dispatched request and, when the listener is under pressure
+/// and this connection has used its budget, closes the connection after the
+/// response it is returning: `Connection: close` on HTTP/1, a GOAWAY on
+/// HTTP/2 (via [`crate::fairness::ConnectionTurnover::goaway`]).  A
+/// `101 Switching Protocols` response is never marked, so an upgraded
+/// connection (a device or consumer WebSocket) is never recycled, and a
+/// response body is never cut: HTTP/1 closes after the body ends, and HTTP/2
+/// GOAWAY lets accepted streams finish.
+#[derive(Clone)]
+struct TurnoverService<S> {
+    inner: S,
+    turnover: Option<Arc<crate::fairness::ConnectionTurnover>>,
+}
+
+impl<S, B, ResBody> hyper::service::Service<http::Request<B>> for TurnoverService<S>
+where
+    S: hyper::service::Service<http::Request<B>, Response = http::Response<ResBody>>,
+    S::Future: Send + 'static,
+    S::Error: Send + 'static,
+    ResBody: Send + 'static,
+{
+    type Response = http::Response<ResBody>;
+    type Error = S::Error;
+    type Future = std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>,
+    >;
+
+    fn call(&self, request: http::Request<B>) -> Self::Future {
+        let Some(turnover) = self.turnover.clone() else {
+            return Box::pin(self.inner.call(request));
+        };
+        turnover.on_request();
+        let version = request.version();
+        let response = self.inner.call(request);
+        Box::pin(async move {
+            let mut response = response.await?;
+            if response.status() != http::StatusCode::SWITCHING_PROTOCOLS && turnover.recycle_now()
+            {
+                if version < http::Version::HTTP_2 {
+                    response.headers_mut().insert(
+                        http::header::CONNECTION,
+                        http::HeaderValue::from_static("close"),
+                    );
+                } else {
+                    turnover.goaway.cancel();
+                }
+            }
+            Ok(response)
+        })
+    }
+}
+
 async fn serve_connection(
     stream: TcpStream,
     acceptor: TlsAcceptor,
@@ -871,6 +1012,7 @@ async fn serve_connection(
     cancel: CancellationToken,
     timeouts: ListenerTimeouts,
     listener: &'static str,
+    turnover: Option<Arc<crate::fairness::ConnectionTurnover>>,
 ) -> Result<(), TransportError> {
     let handshake = timeout(timeouts.handshake_timeout, acceptor.accept(stream));
     let tls_stream = match tokio::select! {
@@ -903,9 +1045,17 @@ async fn serve_connection(
         None => router,
     };
     let first_request = CancellationToken::new();
-    let service = ObserveFirstRequest {
-        inner: TowerToHyperService::new(router.into_service()),
-        first_request: first_request.clone(),
+    // M6-C193: an HTTP/2 connection chosen for turnover sends GOAWAY; one
+    // that has none never does.
+    let goaway = turnover
+        .as_ref()
+        .map_or_else(CancellationToken::new, |turnover| turnover.goaway.clone());
+    let service = TurnoverService {
+        inner: ObserveFirstRequest {
+            inner: TowerToHyperService::new(router.into_service()),
+            first_request: first_request.clone(),
+        },
+        turnover,
     };
     let mut builder = auto::Builder::new(TokioExecutor::new());
     // Hyper discards its header-read deadline and logs a warning when no timer
@@ -929,6 +1079,7 @@ async fn serve_connection(
     let pre_request_deadline = tokio::time::sleep(timeouts.pre_request_timeout);
     tokio::pin!(pre_request_deadline);
     let mut pre_request_phase = true;
+    let mut going_away = false;
 
     loop {
         tokio::select! {
@@ -939,6 +1090,13 @@ async fn serve_connection(
             }
             result = &mut connection => {
                 return result.map_err(|error| TransportError::Http(error.to_string()));
+            }
+            _ = goaway.cancelled(), if !going_away => {
+                // HTTP/2 turnover (M6-C193): GOAWAY, then every stream
+                // already accepted runs to its end before the connection
+                // future completes and releases the permit.
+                going_away = true;
+                connection.as_mut().graceful_shutdown();
             }
             _ = first_request.cancelled(), if pre_request_phase => {
                 pre_request_phase = false;
@@ -1411,6 +1569,7 @@ mod tests {
                 diagnostics: Some(diagnostics.clone()),
                 listener: None,
                 capacity: ListenerCapacity::default(),
+                turnover: None,
             },
         ));
 
@@ -1462,6 +1621,7 @@ mod tests {
                 diagnostics: Some(diagnostics.clone()),
                 listener: None,
                 capacity: ListenerCapacity::default(),
+                turnover: None,
             },
         ));
 
@@ -1525,6 +1685,7 @@ mod tests {
                     refusal_margin: 1,
                     ..ListenerCapacity::default()
                 },
+                turnover: None,
             },
         ));
 
@@ -1589,6 +1750,7 @@ mod tests {
                 diagnostics: None,
                 listener: None,
                 capacity: ListenerCapacity::default(),
+                turnover: None,
             },
         ));
 
