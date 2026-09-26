@@ -94,20 +94,26 @@ The decisions, and what each rests on:
   The settings are explicit so that neither default can apply. A stopped relay
   drops every device session and owner lease. (`fly launch` is not used here:
   it would rewrite `fly.toml`.)
-- **No per-machine connection cap below the relay's own.** A service's
-  `concurrency.type = "connections"` is the default, and Fly stops sending new
+- **Capacity: 64 connections per listener, about 21 to 32 devices.** The
+  relay's own limit is `listener_max_connections` (M6-C153), default 64 per
+  listener, applied to the consumer and device listeners separately. The Fly
+  `relay.toml` does not set it, so the deployed relay (`main-a8f105d`) serves
+  at most 64 device connections at once -- each device holds two, three
+  during a data rotation, so **about 21 to 32 devices** -- and 64 consumer
+  connections, and answers `503 CONNECTION_LIMIT` above that. (The relay's
+  separate admission limit of 1,024 devices never binds here.) Fly's
+  `concurrency.type = "connections"` is the default and Fly stops sending new
   connections to a machine at `hard_limit`
-  (<https://fly.io/docs/reference/configuration/>). The relay admits at most
-  1,024 devices by default and each device holds more than one connection, so
-  both services set `hard_limit = 1000` per listener.
-  **Since M6-C153 (`main-a8f105d` on Fly) the relay's own cap is lower**:
-  `listener_max_connections`, default 64 per listener, applied to the
-  consumer and device listeners separately. The Fly `relay.toml` does not set
-  it, so the deployed relay serves at most 64 device connections at once
-  (each device holds two, three during a data rotation, so about 21 to 32
-  devices) and 64 consumer connections, and answers `503 CONNECTION_LIMIT`
-  above that; Fly's `hard_limit = 1000` never binds. Enough for the private
-  alpha's handful of testers; raising it is an open decision (M6-C198).
+  (<https://fly.io/docs/reference/configuration/>); both services set
+  `hard_limit = 1000`, far above the relay's cap, so Fly never limits first.
+  **Decision (M6-C198, decided by the coordinator under the owner's
+  delegation, 2026-09-27): keep the default 64.** It covers the current
+  testers and protects the 256 MB machine. Before onboarding more than about
+  15 testers, measure per-device RSS on the machine and its open-file limit
+  (operator.md, M6-C155), then raise `listener_max_connections` in
+  `deploy/fly/relay/relay.toml` and check it with `check-serve-config`. An
+  image older than M6-C153 refuses that key, so remove it before any such
+  rollback.
 - **Health checks.** The consumer service checks `GET /readyz` over HTTPS on
   the private network (`tls_skip_verify`, because the relay's certificate names
   its public host). The device service has a bare TCP check; the local proof
