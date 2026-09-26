@@ -260,8 +260,8 @@ live entries reach the tracked-entry cap still refuses admission with
 carries that outcome out itself (task row M7-C95). Suppose it refuses an OPEN
 because its journal is full or its retained stream table is full. While the
 negotiated active limit of streams is live the session is busy, not wedged,
-so the clock restarts at every check; it counts only from the last check at
-which fewer streams were live. It restarts rather than stops (task row
+so the clock restarts at every check made at the live limit; it counts from
+the last such check. It restarts rather than stops (task row
 M6-C196): a session whose retention filled while it was at its live limit
 still gives up once those streams end unreclaimed, without waiting for a
 later OPEN to be refused.
