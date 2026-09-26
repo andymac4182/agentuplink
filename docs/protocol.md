@@ -258,8 +258,13 @@ Exhaustion keeps its meaning for genuinely concurrent work. A session whose
 live entries reach the tracked-entry cap still refuses admission with
 `RESOURCE_EXHAUSTED` and the fresh-session outcome. The connector also
 carries that outcome out itself (task row M7-C95). Suppose it refuses an OPEN
-because its journal is full, or because its retained stream table is full of
-*terminal* streams while fewer than the negotiated active limit are live.
+because its journal is full or its retained stream table is full. While the
+negotiated active limit of streams is live the session is busy, not wedged,
+so the clock restarts at every check made at the live limit; it counts from
+the last such check. It restarts rather than stops (task row
+M6-C196): a session whose retention filled while it was at its live limit
+still gives up once those streams end unreclaimed, without waiting for a
+later OPEN to be refused.
 If no entry is then reclaimed for longer than the rotation overlap deadline
 plus one handshake budget plus 5 s, it ends the session with the typed,
 retryable `RESOURCE_EXHAUSTED` (`OpenRetentionFull`). The owner withholds
