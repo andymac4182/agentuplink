@@ -409,7 +409,11 @@ EXPECTED_GUARD_ANCHORS = {
     # Then **90** after the review of #203 added the case that keeps a
     # recorded maintenance failure: `--check-anchors` reports 90 across 22
     # suites; 91 fails naming m3.
-    "m3-guard-deletion.py": 90,
+    # Then **93** on branch `fix-c196` (M6-C196), which re-anchors the
+    # busy-session case and adds the restart-not-disarm, full-journal and
+    # (review of PR #219) full-stream-table cases to `m7-connector-client`:
+    # `--check-anchors` reports 93 across 22 suites; 94 fails naming m3.
+    "m3-guard-deletion.py": 93,
     # **Two harnesses that were never in this registry at all**, added by the
     # m6c3 worker (M6-C06/M6-C07).  Absence here is quieter than a stale
     # floor: every rule this file holds over a guard harness -- the
