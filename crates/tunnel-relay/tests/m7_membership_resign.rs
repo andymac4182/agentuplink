@@ -81,10 +81,18 @@ impl CheckpointAuthority for TestCheckpointAuthority {
     }
 }
 
+/// A pending re-sign the source performs during its next read.
+type PendingResign = Arc<std::sync::Mutex<Option<(Arc<MembershipIssuer>, u64)>>>;
+
 #[derive(Clone)]
 struct TestMembershipSource {
     records: Arc<RwLock<Vec<SignedMembershipRecord>>>,
     fail_reads: Arc<AtomicBool>,
+    /// When set, the next read re-signs both nodes' records at this version
+    /// *during the read*, with an un-backdated `not_before`: the shape of a
+    /// publisher whose re-sign lands after the relay fetched its checkpoint
+    /// but before it read the records (M7-C170).
+    resign_during_read: PendingResign,
 }
 
 impl MembershipRecordSource for TestMembershipSource {
@@ -94,6 +102,26 @@ impl MembershipRecordSource for TestMembershipSource {
         Box::pin(async move {
             if self.fail_reads.load(Ordering::Acquire) {
                 return Err(MembershipSourceError::Catalog);
+            }
+            let resign = self
+                .resign_during_read
+                .lock()
+                .expect("resign-during-read mutex")
+                .take();
+            if let Some((issuer, version)) = resign {
+                // The publish lands strictly after the relay received its
+                // checkpoint, so its signing instant is later than that.
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                *self.records.write().await = vec![
+                    sign_record_signed_now(&issuer, NODE_ID, version, "key-1", SPKI_SHA256),
+                    sign_record_signed_now(
+                        &issuer,
+                        PEER_NODE_ID,
+                        version,
+                        "peer-key-1",
+                        PEER_SPKI_SHA256,
+                    ),
+                ];
             }
             Ok(self.records.read().await.clone())
         })
@@ -138,6 +166,7 @@ impl Fixture {
         let source = TestMembershipSource {
             records: Arc::new(RwLock::new(Vec::new())),
             fail_reads: Arc::new(AtomicBool::new(false)),
+            resign_during_read: Arc::new(std::sync::Mutex::new(None)),
         };
         let config = MembershipRuntimeConfig::new(
             DEPLOYMENT_ID,
@@ -312,6 +341,50 @@ fn sign_record_with_route(
         issued_at: now - chrono::Duration::seconds(1),
         not_before: now - chrono::Duration::seconds(1),
         expires_at: now + chrono::Duration::seconds(lifetime_s),
+    };
+    SignedMembershipRecord {
+        version,
+        bytes: issuer
+            .sign_membership_bytes(record)
+            .expect("signed membership record"),
+    }
+}
+
+/// A record signed the way a live publisher signs a routine re-sign: its
+/// `issued_at`, `not_before` and key `not_before` are the signing instant,
+/// not backdated (compare `sign_record`, which backdates by one second).
+fn sign_record_signed_now(
+    issuer: &MembershipIssuer,
+    node_id: &str,
+    version: u64,
+    key_id: &str,
+    spki: &str,
+) -> SignedMembershipRecord {
+    let now = Utc::now();
+    let host = if node_id == NODE_ID {
+        "10.0.0.1"
+    } else {
+        "10.0.0.2"
+    };
+    let record = MembershipRecord {
+        schema_version: MEMBERSHIP_SCHEMA_VERSION,
+        deployment_id: DEPLOYMENT_ID.to_owned(),
+        deployment_incarnation: DEPLOYMENT_INCARNATION.to_owned(),
+        node_id: node_id.to_owned(),
+        record_version: version,
+        roles: vec![RELAY_PEER_ROLE.to_owned()],
+        peer_endpoint: format!("{host}:8443"),
+        server_name: host.to_owned(),
+        keys: vec![RelayKey {
+            key_id: key_id.to_owned(),
+            spki_sha256: spki.to_owned(),
+            not_before: now,
+            expires_at: now + chrono::Duration::seconds(30),
+            revoked: false,
+        }],
+        issued_at: now,
+        not_before: now,
+        expires_at: now + chrono::Duration::seconds(30),
     };
     SignedMembershipRecord {
         version,
@@ -716,5 +789,112 @@ async fn back_to_back_resigns_end_ready_and_keep_a_live_admission() {
     assert!(
         !stream.is_cancelled(),
         "M7-C83: back-to-back same-key re-signs cancelled a live admission"
+    );
+}
+
+// --------------------------------------------------------------- M7-C170
+
+/// **M7-C170.** A same-key re-sign published *after* the relay fetched its
+/// checkpoint but *before* it read the records carries a signing instant
+/// later than the checkpoint's receipt. The verifier accepts such a record
+/// (it is inside the one-second clock-skew allowance), so it must also be
+/// usable: evaluating its key window at the earlier checkpoint-receipt
+/// instant found no active local key, reported `PeerRejected`, took the
+/// relay out of Ready and cancelled every admission as `MembershipRevoked`
+/// -- the hosted `verify-m7-resign-stream` failure on main 9aa5cf1c.
+#[tokio::test]
+async fn a_resign_published_between_checkpoint_and_records_keeps_ready_and_admissions() {
+    let fixture = Fixture::ready().await;
+    let local = fixture
+        .runtime
+        .admit_peer(Fixture::identity())
+        .expect("a local-identity admission");
+    let peer = fixture
+        .runtime
+        .admit_peer(MembershipPeerIdentity::new(
+            PEER_NODE_ID,
+            "boot-peer",
+            PEER_SPKI_SHA256,
+        ))
+        .expect("a peer admission");
+    let local_stream = local.cancellation();
+    let peer_stream = peer.cancellation();
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    for version in 2..=4 {
+        *fixture
+            .source
+            .resign_during_read
+            .lock()
+            .expect("resign-during-read mutex") = Some((Arc::clone(&fixture.issuer), version));
+        let result = fixture.runtime.reconcile_once().await;
+        assert!(
+            result.is_ok(),
+            "M7-C170: a same-key re-sign published between checkpoint receipt and record \
+             read failed reconcile at version {version}: {:?}",
+            result.err()
+        );
+        assert_eq!(fixture.runtime.readiness(), MembershipReadiness::Ready);
+    }
+    assert!(
+        !local_stream.is_cancelled() && !peer_stream.is_cancelled(),
+        "M7-C170: the re-sign cancelled a live admission (local {:?}, peer {:?})",
+        local_stream.reason(),
+        peer_stream.reason()
+    );
+}
+
+/// **M7-C170 race witness.** The deterministic test above places the publish
+/// inside the read. This one does not: a publisher task re-signs both nodes'
+/// records back to back with un-backdated signing instants while the runtime
+/// reconciles in a loop, so the publish lands between checkpoint receipt and
+/// record read only as often as real scheduling puts it there. Every
+/// reconcile must end Ready. Before the M7-C170 fix a fraction of passes
+/// failed `PeerRejected`; the failure message reports that fraction.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn racing_same_key_resigns_never_reject_the_local_key() {
+    const PASSES: usize = 5_000;
+    let fixture = Fixture::ready().await;
+    let stop = Arc::new(AtomicBool::new(false));
+    let publisher = {
+        let records = Arc::clone(&fixture.source.records);
+        let issuer = Arc::clone(&fixture.issuer);
+        let stop = Arc::clone(&stop);
+        tokio::spawn(async move {
+            let mut version = 2;
+            while !stop.load(Ordering::Acquire) {
+                let signed = vec![
+                    sign_record_signed_now(&issuer, NODE_ID, version, "key-1", SPKI_SHA256),
+                    sign_record_signed_now(
+                        &issuer,
+                        PEER_NODE_ID,
+                        version,
+                        "peer-key-1",
+                        PEER_SPKI_SHA256,
+                    ),
+                ];
+                *records.write().await = signed;
+                version += 1;
+                tokio::task::yield_now().await;
+            }
+            version
+        })
+    };
+    let mut rejected = 0usize;
+    let mut other = 0usize;
+    for _ in 0..PASSES {
+        match fixture.runtime.reconcile_once().await {
+            Ok(_) => {}
+            Err(tunnel_relay::MembershipRuntimeError::PeerRejected) => rejected += 1,
+            Err(_) => other += 1,
+        }
+    }
+    stop.store(true, Ordering::Release);
+    let published = publisher.await.expect("publisher task");
+    assert!(published > 2, "the publisher never raced a reconcile");
+    assert_eq!(
+        (rejected, other),
+        (0, 0),
+        "M7-C170: {rejected} of {PASSES} reconcile passes rejected the local key \
+         ({other} other failures) while same-key re-signs raced them"
     );
 }

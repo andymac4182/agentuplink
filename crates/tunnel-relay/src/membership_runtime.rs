@@ -1655,7 +1655,6 @@ impl MembershipRuntime {
         let request_started_mono = Instant::now();
         let response = self.fetch_checkpoint(request).await?;
         let checkpoint_received_wall = Utc::now();
-        let checkpoint_received_mono = Instant::now();
 
         // Stage all verification against a clone. Existing verified bindings
         // remain usable while a candidate is being persisted; only the
@@ -1679,6 +1678,17 @@ impl MembershipRuntime {
             .await?;
 
         let records = self.read_memberships().await?;
+        // Record and key windows are evaluated at the instant the records
+        // were read, not at checkpoint receipt. A same-key re-sign published
+        // between the two carries a signing instant later than checkpoint
+        // receipt; the verifier accepts it (it is inside the clock-skew
+        // allowance) and retains it as the node's highest version, so judging
+        // its key window at the earlier instant found no active local key,
+        // reported `PeerRejected`, and revoked every admission (M7-C170).
+        // Nothing is widened: the read instant is the moment this relay
+        // actually holds the evidence, and every check stays strict at it.
+        let records_received_wall = Utc::now();
+        let records_received_mono = Instant::now();
         let record_result = (|| {
             if records.len() > MAX_MEMBERSHIP_RECORDS {
                 return Err(MembershipRuntimeError::Source(
@@ -1707,7 +1717,7 @@ impl MembershipRuntime {
                     ));
                 }
                 candidate_verifier
-                    .verify_membership(&catalog_record.bytes, checkpoint_received_wall)
+                    .verify_membership(&catalog_record.bytes, records_received_wall)
                     .map_err(MembershipRuntimeError::Membership)?;
             }
             Ok::<_, MembershipRuntimeError>(())
@@ -1797,8 +1807,8 @@ impl MembershipRuntime {
             local_membership.keys().iter().find(|key| {
                 !key.revoked
                     && key.spki_sha256 == spki
-                    && key.not_before <= checkpoint_received_wall
-                    && key.expires_at >= checkpoint_received_wall
+                    && key.not_before <= records_received_wall
+                    && key.expires_at >= records_received_wall
             })
         });
         let Some(local_key) = local_key else {
@@ -1806,7 +1816,7 @@ impl MembershipRuntime {
                 local_membership.keys().iter().any(|key| {
                     !key.revoked
                         && key.spki_sha256 == spki
-                        && key.expires_at < checkpoint_received_wall
+                        && key.expires_at < records_received_wall
                 })
             });
             let (reason, error, invalidation_reason) = if local_key_has_expired_pin {
@@ -1852,8 +1862,7 @@ impl MembershipRuntime {
             request_started_mono,
             trust_wall_expiry,
         );
-        if trust_deadline <= checkpoint_received_mono
-            || local_key.expires_at <= checkpoint_received_wall
+        if trust_deadline <= records_received_mono || local_key.expires_at <= records_received_wall
         {
             let version_state = candidate_verifier.version_state();
             self.persist_if_changed(version_state, checkpoint_received_wall)
@@ -1888,8 +1897,8 @@ impl MembershipRuntime {
         state.trust_deadline = Some(trust_deadline);
         state.last_verified_at = Some(checkpoint_received_wall);
         let invalidations = state.revalidate_active(
-            checkpoint_received_wall,
-            checkpoint_received_mono,
+            records_received_wall,
+            records_received_mono,
             PeerInvalidationReason::MembershipChanged,
         );
         let snapshot = state.snapshot();
