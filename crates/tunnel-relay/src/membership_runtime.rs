@@ -281,6 +281,36 @@ pub enum CheckpointAuthorityError {
     Cancelled,
 }
 
+impl CheckpointAuthorityError {
+    /// Whether this failure is a shared control-plane outage that every
+    /// relay sees alike, rather than something about this relay (M7-C186).
+    ///
+    /// **Coordinator decision under the owner's delegation (2026-09-27).**
+    /// Shared: the authority unreachable or failing -- a transport failure,
+    /// a deadline, a 5xx, `408 Request Timeout`, `429 Too Many Requests`, or
+    /// an unusable answer. Specific to this relay, so it counts toward the
+    /// prolonged-unready surrender: any other 4xx (for example `401`/`403`
+    /// refusing a decommissioned relay's client certificate -- exempting it
+    /// would recreate M7-C181 through the authority) and this relay's own
+    /// invalid endpoint, request or trust bundle. A TLS-level refusal of the
+    /// client certificate surfaces as `Transport` and cannot be told apart
+    /// from an unreachable authority, so it stays shared.
+    #[must_use]
+    pub const fn is_shared_outage(&self) -> bool {
+        match self {
+            Self::HttpStatus(status) => {
+                !(*status >= 400 && *status < 500) || *status == 408 || *status == 429
+            }
+            Self::InvalidEndpoint | Self::InvalidRequest | Self::InvalidTrustBundle => false,
+            Self::Transport
+            | Self::DeadlineExceeded
+            | Self::InvalidResponse
+            | Self::BodyTooLarge
+            | Self::Cancelled => true,
+        }
+    }
+}
+
 impl fmt::Display for CheckpointAuthorityError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -1884,7 +1914,10 @@ impl MembershipRuntime {
         // moves them to relays that are just as unready, so such a pass
         // neither advances the publish-race run nor accrues unready time.
         let shared_outage = std::mem::take(&mut state.pass_publisher_outage)
-            || matches!(result, Err(MembershipRuntimeError::Authority(_)));
+            || matches!(
+                result,
+                Err(MembershipRuntimeError::Authority(error)) if error.is_shared_outage()
+            );
         let missing_local_membership = state.readiness
             == MembershipReadiness::Unready(MembershipUnreadyReason::MissingLocalMembership);
 

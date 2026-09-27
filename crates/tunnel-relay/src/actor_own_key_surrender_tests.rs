@@ -75,6 +75,8 @@ struct SignedAuthority {
     issuer: Arc<MembershipIssuer>,
     next_version: AtomicU64,
     fail: AtomicBool,
+    /// When non-zero, answer with this HTTP status instead of a checkpoint.
+    fail_status: AtomicU64,
     /// Sign checkpoints that do not name this node (M7-C182, case (a)).
     omit_node: AtomicBool,
     /// The minimum record version the checkpoint requires of this node.
@@ -91,6 +93,12 @@ impl CheckpointAuthority for SignedAuthority {
         Box::pin(async move {
             if self.fail.load(Ordering::Acquire) {
                 return Err(CheckpointAuthorityError::Transport);
+            }
+            let status = self.fail_status.load(Ordering::Acquire);
+            if status != 0 {
+                return Err(CheckpointAuthorityError::HttpStatus(
+                    u16::try_from(status).expect("synthetic HTTP status"),
+                ));
             }
             let now = Utc::now();
             let checkpoint = MembershipCheckpoint {
@@ -179,6 +187,7 @@ impl Fixture {
             issuer: Arc::clone(&issuer),
             next_version: AtomicU64::new(1),
             fail: AtomicBool::new(false),
+            fail_status: AtomicU64::new(0),
             omit_node: AtomicBool::new(false),
             minimum_version: AtomicU64::new(1),
             others: std::sync::Mutex::new(BTreeMap::new()),
@@ -723,6 +732,19 @@ impl Fixture {
         assert_eq!(
             self.membership.readiness(),
             MembershipReadiness::Unready(MembershipUnreadyReason::MembershipRejected)
+        );
+    }
+
+    /// One reconcile pass whose checkpoint authority answers `status`.
+    async fn authority_status_pass(&self, status: u16) {
+        self.authority
+            .fail_status
+            .store(u64::from(status), Ordering::Release);
+        assert!(self.membership.reconcile_once().await.is_err());
+        self.authority.fail_status.store(0, Ordering::Release);
+        assert_eq!(
+            self.membership.readiness(),
+            MembershipReadiness::Unready(MembershipUnreadyReason::UnknownAuthority)
         );
     }
 
@@ -1278,6 +1300,146 @@ async fn a_named_record_at_its_minimum_that_fails_a_check_stays_fatal() {
     assert_eq!(
         fixture.membership.readiness(),
         MembershipReadiness::Unready(MembershipUnreadyReason::MembershipRejected)
+    );
+    fixture.shutdown().await;
+}
+
+/// **Red first (M7-C186, review of #230).** The authority refuses *this*
+/// relay -- `403`, as it would a decommissioned relay's client certificate.
+/// That is about this relay, not a shared outage, so it accrues toward the
+/// prolonged-unready surrender; exempting it would recreate M7-C181 through
+/// the authority. Red if every authority error counts as shared.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_authority_refusing_this_relay_accrues_toward_surrender() {
+    let fixture = Fixture::new().await;
+    let mut control = fixture.register().await;
+    fixture.set_bounds(LONG_BOUND, SHORT_BOUND);
+    fixture.authority_status_pass(403).await;
+    tokio::time::sleep(SHORT_BOUND * 5 / 4).await;
+    fixture.authority_status_pass(401).await;
+    assert_eq!(
+        fixture.membership.ownership_surrender_cause(),
+        Some(OwnershipSurrenderCause::ProlongedUnready)
+    );
+    assert!(wait_until_released(&fixture).await.is_some());
+    assert_eq!(
+        rejection_code(&mut control).await.as_deref(),
+        Some(MEMBERSHIP_UNREADY_PROLONGED)
+    );
+    fixture.shutdown().await;
+}
+
+/// **Control (M7-C186, review of #230).** An authority that is overloaded or
+/// failing -- `503`, `429`, `408` -- is a shared outage: nothing accrues
+/// however long it lasts. Red if those statuses count.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn authority_server_errors_and_throttling_never_accrue_toward_surrender() {
+    let fixture = Fixture::new().await;
+    let _control = fixture.register().await;
+    fixture.set_bounds(LONG_BOUND, SHORT_BOUND);
+    for status in [503, 429, 408, 500] {
+        fixture.authority_status_pass(status).await;
+        tokio::time::sleep(SHORT_BOUND * 3 / 4).await;
+    }
+    assert_eq!(fixture.membership.ownership_surrender_cause(), None);
+    fixture
+        .assert_kept("a failing authority counted toward the bound")
+        .await;
+    fixture.shutdown().await;
+}
+
+/// **Control (M7-C186, review of #230).** The publisher has stopped: the
+/// checkpoint raised this node's minimum and the catalog holds nothing, so
+/// no named record is fresh. The case (b) run does not advance on such
+/// passes, however long they last. Red if (b) ignores the shared outage.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_publisher_outage_never_advances_the_below_minimum_run() {
+    let fixture = Fixture::new().await;
+    let _control = fixture.register().await;
+    fixture.set_bounds(SHORT_BOUND, LONG_BOUND);
+    fixture
+        .authority
+        .minimum_version
+        .store(5, Ordering::Release);
+    fixture.set_records(Vec::new()).await;
+    for _ in 0..3 {
+        fixture.missing_membership_pass().await;
+        tokio::time::sleep(SHORT_BOUND * 3 / 4).await;
+    }
+    fixture.missing_membership_pass().await;
+    assert_eq!(fixture.membership.ownership_surrender_cause(), None);
+    fixture
+        .assert_kept("a publisher outage advanced the below-minimum run")
+        .await;
+    fixture.shutdown().await;
+}
+
+/// **Control (M7-C186).** A fresh record *below* its node's minimum is not
+/// evidence that the publisher is alive: with only this relay's older record
+/// in the catalog, the (b) run does not advance. Red if freshness ignores
+/// the minimum.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_record_below_its_minimum_is_not_evidence_the_publisher_is_alive() {
+    let fixture = Fixture::new().await;
+    let _control = fixture.register().await;
+    fixture.set_bounds(SHORT_BOUND, LONG_BOUND);
+    fixture
+        .authority
+        .minimum_version
+        .store(5, Ordering::Release);
+    fixture.publish(2, SERVED_SPKI).await;
+    for _ in 0..3 {
+        fixture.missing_membership_pass().await;
+        tokio::time::sleep(SHORT_BOUND * 3 / 4).await;
+    }
+    fixture.missing_membership_pass().await;
+    assert_eq!(fixture.membership.ownership_surrender_cause(), None);
+    fixture.shutdown().await;
+}
+
+/// **Red first (M7-C186).** Freshness allows the accepted clock skew, as
+/// verification does: another relay's record that expired a moment ago (well
+/// inside the 1 s skew of this fixture) still shows a live publisher, so this
+/// relay's below-minimum run advances and surrenders. Red if freshness drops
+/// the skew.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn freshness_allows_the_clock_skew() {
+    let fixture = Fixture::new().await;
+    let _control = fixture.register().await;
+    let bound = Duration::from_millis(250);
+    fixture.set_bounds(bound, LONG_BOUND);
+    fixture
+        .authority
+        .others
+        .lock()
+        .expect("other nodes")
+        .insert(PEER_NODE.to_owned(), 1);
+    fixture
+        .authority
+        .minimum_version
+        .store(5, Ordering::Release);
+    let now = Utc::now();
+    let own = fixture.signed(
+        NODE_ID,
+        2,
+        SERVED_SPKI,
+        now - ChronoDuration::seconds(1),
+        now + ChronoDuration::seconds(30),
+    );
+    let peer = fixture.signed(
+        PEER_NODE,
+        1,
+        OTHER_SPKI,
+        now - ChronoDuration::seconds(50),
+        now - ChronoDuration::milliseconds(50),
+    );
+    fixture.set_records(vec![own, peer]).await;
+    fixture.missing_membership_pass().await;
+    tokio::time::sleep(bound + Duration::from_millis(50)).await;
+    fixture.missing_membership_pass().await;
+    assert_eq!(
+        fixture.membership.ownership_surrender_cause(),
+        Some(OwnershipSurrenderCause::LocalRecordBelowMinimum)
     );
     fixture.shutdown().await;
 }
