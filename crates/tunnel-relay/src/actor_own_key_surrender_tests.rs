@@ -1337,11 +1337,20 @@ async fn authority_server_errors_and_throttling_never_accrue_toward_surrender() 
     let fixture = Fixture::new().await;
     let _control = fixture.register().await;
     fixture.set_bounds(LONG_BOUND, SHORT_BOUND);
-    for status in [503, 429, 408, 500] {
-        fixture.authority_status_pass(status).await;
-        tokio::time::sleep(SHORT_BOUND * 3 / 4).await;
+    // Each run alone spans more than the bound, so any one status counted
+    // would surrender.
+    for statuses in [[503, 500, 503], [429, 408, 429]] {
+        for status in statuses {
+            fixture.authority_status_pass(status).await;
+            tokio::time::sleep(SHORT_BOUND * 3 / 4).await;
+        }
+        fixture.authority_status_pass(statuses[0]).await;
+        assert_eq!(
+            fixture.membership.ownership_surrender_cause(),
+            None,
+            "authority status run {statuses:?} counted toward the bound"
+        );
     }
-    assert_eq!(fixture.membership.ownership_surrender_cause(), None);
     fixture
         .assert_kept("a failing authority counted toward the bound")
         .await;
