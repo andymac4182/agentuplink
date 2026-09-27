@@ -8632,7 +8632,10 @@ mod resign_loop_tests {
             tokio::time::sleep(INTERVAL).await;
             let current = versions(&directory);
             assert!(
-                current.iter().zip(&previous).all(|(now, before)| now > before),
+                current
+                    .iter()
+                    .zip(&previous)
+                    .all(|(now, before)| now > before),
                 "round {round}: every node's record must advance ({previous:?} -> {current:?})"
             );
             previous = current;
