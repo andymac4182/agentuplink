@@ -373,6 +373,51 @@ async fn a_cancellation_for_another_id_closes_nothing() {
     assert_eq!(export.diagnostics().cancelled_requests_closed, 0);
 }
 
+/// M3-10, stdio export kind: no resume, and it says so on the wire.  The
+/// bridge emits no SSE `id:` field, so a conforming client never has a
+/// `Last-Event-ID` to send.  A GET that carries one anyway is served as a
+/// fresh standalone stream of this session: nothing is replayed, from this
+/// stream or any other.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_stdio_export_emits_no_event_ids_and_replays_nothing() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let export = stdio_export_with(LEGACY, workspace.path(), 1, &fixture_binary(), "");
+    let session = open_session(&export).await;
+    let headers = legacy_headers(Some(&session));
+    let progress = within(exchange(
+        &export,
+        post(
+            &headers,
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"progress","arguments":{"steps":3},"_meta":{"progressToken":"m310"}}}"#,
+        ),
+    ))
+    .await;
+    assert_eq!(progress.status(), StatusCode::OK);
+    let body = body_bytes(progress).await.expect("progress body");
+    let text = String::from_utf8_lossy(&body);
+    assert!(text.contains("notifications/progress"), "an SSE response");
+    assert!(
+        !text.lines().any(|line| line.starts_with("id:")),
+        "no event carries an ID"
+    );
+    // A Last-Event-ID the export never issued opens a fresh stream.
+    let mut get_headers = legacy_headers(Some(&session));
+    get_headers.retain(|(name, _)| *name != "accept" && *name != "content-type");
+    get_headers.push(("accept", "text/event-stream".to_owned()));
+    get_headers.push(("last-event-id", "0".to_owned()));
+    let stream = within(exchange(
+        &export,
+        build("GET", &get_headers, Full::new(Bytes::new())),
+    ))
+    .await;
+    assert_eq!(stream.status(), StatusCode::OK);
+    let mut body = stream.into_body();
+    // Nothing is queued for this session, so nothing arrives: no replay of
+    // the progress stream above.
+    let first = tokio::time::timeout(Duration::from_millis(500), body.frame()).await;
+    assert!(first.is_err(), "nothing is replayed: {first:?}");
+}
+
 fn wrapper_script(dir: &Path) -> PathBuf {
     let script = dir.join("wrapper.sh");
     write_executable(

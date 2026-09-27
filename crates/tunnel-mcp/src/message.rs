@@ -342,12 +342,9 @@ pub fn check_message_headers(
                     .and_then(Value::as_str)
                 && offered != PROTOCOL_2025_11_25
             {
-                let mut rejection = McpRejection::new(
-                    400,
-                    codes::INVALID_PARAMS,
-                    "Unsupported protocol version",
-                )
-                .with_id(id);
+                let mut rejection =
+                    McpRejection::new(400, codes::INVALID_PARAMS, "Unsupported protocol version")
+                        .with_id(id);
                 rejection.supported = Some(PROTOCOL_2025_11_25);
                 return Err(rejection);
             }

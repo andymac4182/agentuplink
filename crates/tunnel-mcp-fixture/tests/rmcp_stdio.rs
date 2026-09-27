@@ -6,9 +6,7 @@ mod common;
 
 use std::time::Duration;
 
-use common::{
-    connect, connect_pinned, count_lines, gateway, stdio_export, wait_for_file, within,
-};
+use common::{connect, connect_pinned, count_lines, gateway, stdio_export, wait_for_file, within};
 use rmcp::model::{CallToolRequestParams, ClientRequest, Request, RequestMetaObject};
 use rmcp::service::PeerRequestOptions;
 use tunnel_mcp_fixture::{IMAGE_PNG_BASE64, STDERR_MARKER};
