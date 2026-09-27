@@ -458,6 +458,13 @@ Retained-state recovery exchanges two fixed `RESUME` messages, one for each logi
 The surviving authenticated control socket carries recovery. Control loss ends
 the session in M2. Only the relay coordinates recovery; a connector reports
 data loss with a current-context ROTATE_REQUEST whose reason is `data_loss`.
+The connector sends it only after closing that carrier, so the relay applies a
+`data_loss` request naming its still-attached active carrier as that carrier's
+close and enters recovery at once; it never starts a scheduled rotation for it.
+When a non-owner relay terminates the data carrier, the physical close reaches
+the owner through a peer hop and the request can arrive first (task row
+M7-C178). A close observed after the request names a carrier the owner already
+released and changes nothing.
 
 1. The relay sends RECOVERY_BEGIN with a fresh attempt, a fixed `episode_id`,
    attempt number 1..3, exact stream roster and remaining budget. One absolute
