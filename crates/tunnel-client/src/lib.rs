@@ -787,6 +787,14 @@ async fn open_socket(
         result = &mut handshake => result
             .map_err(|_| ClientError::HandshakeTimeout)?
             .map_err(|error| match tls_refusal(&error) {
+                // M6-C194 (a): a relay listener at its connection limit
+                // answers `503 CONNECTION_LIMIT`; keep its retry hint.
+                None if connection_limit_retry_after_ms(&error).is_some() => {
+                    ClientError::ConnectionLimit {
+                        retry_after_ms: connection_limit_retry_after_ms(&error)
+                            .unwrap_or(DEFAULT_CONNECTION_LIMIT_RETRY_AFTER_MS),
+                    }
+                }
                 // Classified before `sanitize_error` erases it: a certificate
                 // verification refusal is terminal, a certificate that is
                 // only not current on someone's clock is retryable with its
@@ -2343,6 +2351,59 @@ enum TlsFailure {
     },
 }
 
+/// The retry hint assumed for a `CONNECTION_LIMIT` refusal that carried
+/// none readable (task row M6-C194): the relay's documented value.
+pub const DEFAULT_CONNECTION_LIMIT_RETRY_AFTER_MS: u64 = 1_000;
+
+/// The largest `retry_after_ms` this client honours from a relay; a larger
+/// hint is capped here so a bad value cannot park a connector indefinitely.
+pub const MAX_HONOURED_RETRY_AFTER_MS: u64 = 300_000;
+
+/// If a WebSocket upgrade was refused by a relay listener at its connection
+/// limit (`503` with body code `CONNECTION_LIMIT`, task rows M6-C153 and
+/// M6-C194), its retry hint in milliseconds: the body's `retry_after_ms`,
+/// else the `Retry-After` header in seconds, else the documented default.
+/// `None` for any other failure.  Reads only a status, one header and two
+/// fixed JSON fields; nothing from the response is logged.
+fn connection_limit_retry_after_ms(error: &tokio_tungstenite::tungstenite::Error) -> Option<u64> {
+    let tokio_tungstenite::tungstenite::Error::Http(response) = error else {
+        return None;
+    };
+    if response.status() != http::StatusCode::SERVICE_UNAVAILABLE {
+        return None;
+    }
+    let body = response
+        .body()
+        .as_deref()
+        .and_then(|body| serde_json::from_slice::<serde_json::Value>(body).ok());
+    let header_ms = response
+        .headers()
+        .get(http::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(|seconds| seconds.saturating_mul(1_000));
+    match body
+        .as_ref()
+        .and_then(|body| body.get("code"))
+        .and_then(|code| code.as_str())
+    {
+        Some("CONNECTION_LIMIT") => {}
+        // A body that names another code is another refusal.
+        Some(_) => return None,
+        // The body may not have arrived with the head; the header then
+        // identifies a retryable refusal.
+        None if header_ms.is_some() => {}
+        None => return None,
+    }
+    let hinted = body
+        .as_ref()
+        .and_then(|body| body.get("retry_after_ms"))
+        .and_then(serde_json::Value::as_u64)
+        .or(header_ms)
+        .unwrap_or(DEFAULT_CONNECTION_LIMIT_RETRY_AFTER_MS);
+    Some(hinted.min(MAX_HONOURED_RETRY_AFTER_MS))
+}
+
 /// The certificate-verification failures of a handshake, classified **by
 /// rustls variant and never by message text** (task row M6-C23, reconnect).
 ///
@@ -2561,6 +2622,14 @@ pub enum ClientError {
     /// `CREDENTIAL_ERROR`, not retryable, and `connect` does not reconnect
     /// after it.
     TlsRefused(&'static str),
+    /// The relay's listener was at its connection limit and refused the
+    /// upgrade `503 CONNECTION_LIMIT` (task rows M6-C153, M6-C194).
+    /// Retryable, as `TRANSPORT_ERROR`; a caller that retries must wait at
+    /// least `retry_after_ms` first ([`ClientError::retry_after`]).
+    ConnectionLimit {
+        /// The relay's retry hint, capped at [`MAX_HONOURED_RETRY_AFTER_MS`].
+        retry_after_ms: u64,
+    },
     HandshakeTimeout,
     AuthorizationExpired,
     QueueLimit,
@@ -2580,7 +2649,7 @@ impl ClientError {
             Self::Credential(_) => "CREDENTIAL_ERROR",
             Self::Invalid(_) => "INVALID_INVOCATION",
             Self::Protocol(_) => "PROTOCOL_ERROR",
-            Self::Transport { .. } => "TRANSPORT_ERROR",
+            Self::Transport { .. } | Self::ConnectionLimit { .. } => "TRANSPORT_ERROR",
             Self::OwnerBusy => "OWNER_BUSY",
             Self::TlsRefused(_) => "CREDENTIAL_ERROR",
             Self::HandshakeTimeout => "DEADLINE_EXCEEDED",
@@ -2597,8 +2666,23 @@ impl ClientError {
         // fresh session starts with an empty journal (task row M7-C95).
         matches!(
             self,
-            Self::Transport { .. } | Self::HandshakeTimeout | Self::OpenRetentionFull
+            Self::Transport { .. }
+                | Self::ConnectionLimit { .. }
+                | Self::HandshakeTimeout
+                | Self::OpenRetentionFull
         )
+    }
+
+    /// The least time to wait before retrying, when the relay said so: a
+    /// `CONNECTION_LIMIT` refusal's `retry_after_ms` (task row M6-C194).
+    #[must_use]
+    pub fn retry_after(&self) -> Option<std::time::Duration> {
+        match self {
+            Self::ConnectionLimit { retry_after_ms } => {
+                Some(std::time::Duration::from_millis(*retry_after_ms))
+            }
+            _ => None,
+        }
     }
 
     fn safe_message(&self) -> String {
@@ -2636,6 +2720,9 @@ impl ClientError {
                     .to_owned()
             }
             Self::TlsRefused(reason) => (*reason).to_owned(),
+            Self::ConnectionLimit { retry_after_ms } => {
+                format!("relay listener connection limit reached; retry after {retry_after_ms} ms")
+            }
             Self::HandshakeTimeout => "TLS/WebSocket handshake deadline exceeded".to_owned(),
             Self::AuthorizationExpired => AUTHORIZATION_EXPIRED_MESSAGE.to_owned(),
             Self::QueueLimit => "bounded connector queue limit reached".to_owned(),
@@ -2786,6 +2873,107 @@ mod tests {
         );
         drop(socket);
         server.await.expect("server task");
+    }
+
+    /// Task row M6-C194 (a): a device upgrade refused by a relay listener
+    /// at its connection limit keeps the refusal's `retry_after_ms`, so the
+    /// `connect` loop can wait at least that long.  A real
+    /// `tunnel_transport` listener with one permit, held by a silent TCP
+    /// connection, answers the upgrade `503 CONNECTION_LIMIT`.
+    ///
+    /// Red before the fix: the refusal was an opaque `Transport` error with
+    /// no retry hint.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_connection_limit_refusal_keeps_its_retry_hint() {
+        let key = rcgen::KeyPair::generate().expect("key");
+        let mut params =
+            rcgen::CertificateParams::new(vec!["localhost".to_owned()]).expect("params");
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "M6-C194 synthetic relay");
+        let certificate = params.self_signed(&key).expect("certificate");
+        let server = tunnel_transport::load_server_config_from_pem(
+            certificate.pem().as_bytes(),
+            key.serialize_pem().as_bytes(),
+            None,
+        )
+        .expect("server config");
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind");
+        let address = listener.local_addr().expect("address");
+        let diagnostics = tunnel_transport::AcceptedSocketDiagnostics::new();
+        let cancel = CancellationToken::new();
+        tokio::spawn(tunnel_transport::serve_with_listener_options(
+            listener,
+            axum::Router::new(),
+            server,
+            cancel.clone(),
+            tunnel_transport::AcceptedSocketOptions {
+                diagnostics: Some(diagnostics.clone()),
+                capacity: tunnel_transport::ListenerCapacity {
+                    max_connections: 1,
+                    refusal_margin: 1,
+                    ..tunnel_transport::ListenerCapacity::default()
+                },
+                ..tunnel_transport::AcceptedSocketOptions::default()
+            },
+            tunnel_transport::ListenerTimeouts {
+                handshake_timeout: Duration::from_secs(60),
+                pre_request_timeout: Duration::from_secs(60),
+                http1_header_read_timeout: Duration::from_secs(60),
+            },
+        ));
+        // A silent connection takes the only permit until its handshake
+        // deadline; wait until the listener has accepted it.
+        let _holder = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("holder");
+        let accepted = Instant::now() + Duration::from_secs(10);
+        while diagnostics.nodelay_counts().0 < 1 {
+            assert!(Instant::now() < accepted, "the holder was never accepted");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(certificate.der().clone()).expect("root");
+        let tls = Arc::new(
+            rustls::ClientConfig::builder_with_provider(Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .expect("protocol versions")
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+        );
+        let url = Url::parse(&format!(
+            "wss://localhost:{}/v1/device/control",
+            address.port()
+        ))
+        .expect("url");
+        let error = open_socket(
+            &url,
+            tls,
+            None,
+            "agent-tunnel.test.v1",
+            64 * 1024,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect_err("the upgrade over the limit was not refused");
+        assert!(
+            matches!(
+                error,
+                ClientError::ConnectionLimit {
+                    retry_after_ms: 1_000
+                }
+            ),
+            "{error:?}"
+        );
+        assert_eq!(error.code(), "TRANSPORT_ERROR");
+        assert!(error.retryable());
+        assert_eq!(error.retry_after(), Some(Duration::from_millis(1_000)));
+        assert_eq!(diagnostics.capacity_refusals(), 1);
+        cancel.cancel();
     }
 
     #[test]

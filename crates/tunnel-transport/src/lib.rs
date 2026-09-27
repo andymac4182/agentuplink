@@ -8,6 +8,7 @@
 
 #![deny(missing_docs)]
 
+mod fairness;
 pub mod log_limit;
 mod peer;
 mod peer_identity;
@@ -15,6 +16,11 @@ mod peer_probe;
 mod server;
 mod tls;
 
+pub use fairness::{
+    DEFAULT_TURNOVER_MAX_AGE, DEFAULT_TURNOVER_MAX_REQUESTS, HANDOFF_WAIT,
+    ListenerFairnessSnapshot, ListenerTurnover, MAX_TURNOVER_MAX_AGE, MAX_TURNOVER_MAX_REQUESTS,
+    MIN_TURNOVER_MAX_AGE, PRESSURE_WINDOW, listener_fairness,
+};
 pub use peer::{
     DEFAULT_PEER_BODY_CHUNK_BYTES, DEFAULT_PEER_CONNECTION_BODY_BYTES, DEFAULT_PEER_CONNECTIONS,
     DEFAULT_PEER_DESTINATIONS, DEFAULT_PEER_HANDSHAKE_TIMEOUT, DEFAULT_PEER_HEADER_BYTES,
@@ -47,7 +53,8 @@ pub use tls::{
     CertificateRole, ClientTlsConfigError, ProviderAlreadyInstalled, SanName, SpkiSha256,
     TlsConfigError, TlsIdentity, TlsIdentityError, install_process_crypto_provider,
     leaf_identity_from_der, load_client_config_from_pem, load_client_config_from_pem_with_alpn,
-    load_peer_client_config_from_pem, load_peer_server_config_from_pem, load_quinn_client_config,
-    load_quinn_server_config, load_server_config_from_pem, load_server_config_from_pem_with_alpn,
-    process_provider_is_ring, require_client_ca, require_root_certificates, spki_sha256_from_der,
+    load_consumer_server_config_from_pem, load_peer_client_config_from_pem,
+    load_peer_server_config_from_pem, load_quinn_client_config, load_quinn_server_config,
+    load_server_config_from_pem, load_server_config_from_pem_with_alpn, process_provider_is_ring,
+    require_client_ca, require_root_certificates, spki_sha256_from_der,
 };

@@ -384,6 +384,43 @@ pub fn load_server_config_from_pem(
     )
 }
 
+/// Build the public consumer listener's TLS configuration (task row
+/// M6-C194, option (e)).
+///
+/// The same as [`load_server_config_from_pem`], plus **TLS 1.3 stateless
+/// session tickets** when the listener does not require client certificates
+/// (`client_ca_pem` is `None`).  A client that resumes skips the server's
+/// certificate signature, which is most of a full handshake's server CPU, so
+/// the reconnects that connection turnover (M6-C193) and `CONNECTION_LIMIT`
+/// refusals cause are cheaper.  The ticket key is generated in memory by
+/// rustls's `Ticketer`, which rotates it every six hours; it is never
+/// written, logged or shared between relays (a resumption on another relay
+/// falls back to a full handshake).  Early data (0-RTT) stays off, so a
+/// resumed connection cannot replay a request.  With a client CA the listener
+/// is an mTLS listener and resumption stays disabled, as on the device and
+/// peer listeners: every mTLS connection presents fresh certificate evidence.
+pub fn load_consumer_server_config_from_pem(
+    certificate_pem: &[u8],
+    private_key_pem: &[u8],
+    client_ca_pem: Option<&[u8]>,
+) -> Result<Arc<ServerConfig>, TlsConfigError> {
+    let config = load_server_config_from_pem(certificate_pem, private_key_pem, client_ca_pem)?;
+    if client_ca_pem.is_some() {
+        return Ok(config);
+    }
+    let mut config = Arc::unwrap_or_clone(config);
+    config.ticketer = rustls::crypto::ring::Ticketer::new().map_err(TlsConfigError::Rustls)?;
+    config.send_tls13_tickets = CONSUMER_TLS13_TICKETS;
+    // 0-RTT stays off: a resumed connection must not replay a request.
+    config.max_early_data_size = 0;
+    config.send_half_rtt_data = false;
+    Ok(Arc::new(config))
+}
+
+/// Tickets sent after each full consumer handshake: one per reconnect a
+/// client may make before its next full handshake refreshes them.
+const CONSUMER_TLS13_TICKETS: usize = 2;
+
 /// Build a TLS 1.3 server configuration with explicit ALPN and optional
 /// mandatory client authentication.
 pub fn load_server_config_from_pem_with_alpn(

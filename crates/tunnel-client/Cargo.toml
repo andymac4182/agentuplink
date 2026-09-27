@@ -60,6 +60,9 @@ tunnel-fs-host = { path = "../tunnel-fs-host" }
 rustix = { version = "1.1", default-features = false, features = ["fs", "process", "std"] }
 
 [dev-dependencies]
+# M6-C194: a real relay listener at its connection limit, in a unit test of
+# the upgrade's `CONNECTION_LIMIT` classification (already locked).
+axum = { version = "0.8.9", default-features = false }
 tempfile = "3.21"
 # Paused-time tests of the connect-status rate bound (M7-C167 review).
 tokio = { version = "1.47", features = ["test-util"] }

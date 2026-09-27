@@ -174,6 +174,76 @@ pub(crate) struct MetricsInput<'a> {
     pub(crate) consumer_refusals: BTreeMap<(&'static str, &'static str), u64>,
     /// The single relay actor's load (M6-C182, M6-C183).
     pub(crate) actor_load: crate::actor::ActorLoadSnapshot,
+    /// The public listeners' pressure and turnover (M6-C193).
+    pub(crate) listeners: Vec<tunnel_transport::ListenerFairnessSnapshot>,
+}
+
+/// The fixed `listener` label for a named public listener, or `None` for a
+/// name outside the closed set (a fixture's own name is never rendered).
+fn listener_label(name: &str) -> Option<&'static str> {
+    match name {
+        "consumer" => Some("consumer"),
+        "device" => Some("device"),
+        _ => None,
+    }
+}
+
+/// One listener series: name, type, help, and its value from a snapshot.
+type ListenerFamily = (
+    &'static str,
+    &'static str,
+    &'static str,
+    fn(&tunnel_transport::ListenerFairnessSnapshot) -> u64,
+);
+
+/// Public listener pressure and connection turnover (task row M6-C193), one
+/// sample per listener in the closed set `consumer`, `device`.
+fn render_listener_fairness(
+    out: &mut Writer,
+    listeners: &[tunnel_transport::ListenerFairnessSnapshot],
+) {
+    let labelled: Vec<_> = listeners
+        .iter()
+        .filter_map(|listener| listener_label(listener.listener).map(|label| (label, listener)))
+        .collect();
+    let families: [ListenerFamily; 5] = [
+        (
+            "tunnel_relay_listener_under_pressure",
+            "gauge",
+            "1 while a connection reached the public listener with every permit held within the last second, else 0.",
+            |listener| u64::from(listener.under_pressure),
+        ),
+        (
+            "tunnel_relay_listener_pressure_episodes_total",
+            "counter",
+            "Pressure episodes begun on the public listener: a connection over the limit after at least one second without one.",
+            |listener| listener.pressure_episodes,
+        ),
+        (
+            "tunnel_relay_listener_capacity_refusals_total",
+            "counter",
+            "Connections the public listener answered 503 CONNECTION_LIMIT (M6-C153).",
+            |listener| listener.capacity_refusals,
+        ),
+        (
+            "tunnel_relay_listener_fairness_handoffs_total",
+            "counter",
+            "Connections over the public listener's limit served with a permit freed while they waited (M6-C193).",
+            |listener| listener.handoffs,
+        ),
+        (
+            "tunnel_relay_listener_fairness_recycled_total",
+            "counter",
+            "Served keep-alive connections closed after a response to turn their permit over while the listener was under pressure (M6-C193).",
+            |listener| listener.recycled,
+        ),
+    ];
+    for (name, kind, help, value) in families {
+        out.family(name, kind, help);
+        for (label, listener) in &labelled {
+            out.sample(name, &[("listener", label)], value(listener));
+        }
+    }
 }
 
 /// The authority check's state and counters (M6-C67).
@@ -386,6 +456,8 @@ pub(crate) fn render(input: &MetricsInput<'_>) -> String {
         load.queue_capacity,
     );
 
+    render_listener_fairness(&mut out, &input.listeners);
+
     let sessions = &snapshot.sessions;
     gauge(
         &mut out,
@@ -571,6 +643,7 @@ async fn scrape(State(state): State<MetricsState>) -> Response {
         snapshot: &snapshot,
         consumer_refusals: consumer_refusals(),
         actor_load: state.handle.actor_load(),
+        listeners: tunnel_transport::listener_fairness(),
     });
     ([(header::CONTENT_TYPE, CONTENT_TYPE)], body).into_response()
 }

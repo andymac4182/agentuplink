@@ -3516,6 +3516,7 @@ dependencies = [
 name = "tunnel-client"
 version = "0.1.0"
 dependencies = [
+ "axum",
  "bytes",
  "futures-util",
  "http",
@@ -3845,9 +3846,11 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "bytes",
+ "futures-util",
  "h3",
  "h3-quinn",
  "http",
+ "http-body-util",
  "hyper",
  "hyper-util",
  "quinn",
