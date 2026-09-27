@@ -50,6 +50,7 @@ import statistics
 import subprocess
 import sys
 import threading
+import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -467,6 +468,11 @@ class Stack:
                     f"command = {tq(self.bins / 'tunnel-mcp-fixture')}\nargs = [\"stdio\"]\n"
                     f"workspace = {tq(ws)}\n")
         doc = "\n".join(lines[:start] + ["\n".join(tables).rstrip()] + lines[end:]) + "\n"
+        # M6-C195: a short, private supervisor socket, so `status --json` (the
+        # connector's payload-free rotation phase and drain counters) works;
+        # the default beside the key exceeds the 103-byte socket path limit.
+        ipc_dir = Path(tempfile.mkdtemp(prefix="au-ipc-"))
+        doc += f"\n[supervisor]\nipc_path = {tq(ipc_dir / (name + '.sock'))}\n"
         config = d / "client.toml"
         config.write_text(doc)
         run([self.bins / "tunnel-client", "credentials", "create", "--config", config,
@@ -690,7 +696,11 @@ METRIC_SERIES = ("tunnel_relay_device_sessions", "tunnel_relay_device_sockets",
                  "tunnel_relay_consumer_refusals_total", "tunnel_relay_consumer_write_timeouts_total",
                  "tunnel_relay_http_writer_parks_total", "tunnel_relay_http_writer_reparks_total",
                  "tunnel_relay_ready", "tunnel_relay_actor_commands_total",
-                 "tunnel_relay_actor_busy_microseconds_total", "tunnel_relay_actor_queue_depth")
+                 "tunnel_relay_actor_busy_microseconds_total", "tunnel_relay_actor_queue_depth",
+                 # M6-C195: sessions per rotation phase, so a long freeze's phase is sampled.
+                 *(f"rotation_phase_{phase}" for phase in (
+                     "preparing", "quiescing", "draining", "committing", "retiring",
+                     "aborting", "recovering")))
 
 
 def scrape_metrics(port: int) -> dict[str, float]:
@@ -713,6 +723,8 @@ def scrape_metrics(port: int) -> dict[str, float]:
         if len(parts) != 2:
             continue
         name = parts[0].split("{", 1)[0]
+        if name == "tunnel_relay_sessions_by_rotation_phase" and 'phase="' in parts[0]:
+            name = "rotation_phase_" + parts[0].split('phase="', 1)[1].split('"', 1)[0]
         if name in METRIC_SERIES:
             try:
                 values[name] = values.get(name, 0.0) + float(parts[1])
@@ -1496,6 +1508,13 @@ def base_stack(args, run_dir, nonce, tag, redis=None, mcp=True, **kw) -> Stack:
     return stack
 
 
+def parse_rotation(text: str) -> tuple[int, int, int]:
+    """`INTERVAL,HANDSHAKE,OVERLAP` seconds for relay and devices (M6-C195): a
+    short interval puts many data rotations under one flood."""
+    interval, handshake, overlap = (int(part) for part in text.split(","))
+    return interval, handshake, overlap
+
+
 def parse_redis(text: str) -> tuple[str, int]:
     host, port = text.rsplit(":", 1)
     return host, int(port)
@@ -1632,7 +1651,8 @@ async def load(args: argparse.Namespace) -> None:
 
 async def fairness(args: argparse.Namespace) -> None:
     run_dir, nonce = make_run(args, "fairness")
-    stack = base_stack(args, run_dir, nonce, "m6-03-fair", mcp=False)
+    stack = base_stack(args, run_dir, nonce, "m6-03-fair", mcp=False,
+                       rotation=parse_rotation(args.rotation))
     rec = Recorder(run_dir / "requests.csv", nonce)
     sampler = None
     attribution: dict[str, dict] = {}
@@ -1722,7 +1742,8 @@ async def flood(args: argparse.Namespace) -> None:
     consumers for a fixed time; report every device session end and whether
     `connect` exited, and with what."""
     run_dir, nonce = make_run(args, "flood")
-    stack = base_stack(args, run_dir, nonce, "m6-03-flood", mcp=False)
+    stack = base_stack(args, run_dir, nonce, "m6-03-flood", mcp=False,
+                       rotation=parse_rotation(args.rotation))
     rec = Recorder(run_dir / "requests.csv", nonce)
     try:
         stack.start_relay()
@@ -2015,6 +2036,10 @@ def main() -> None:
                            help="MCP sessions shared by a step's workers (the stdio export's "
                                 "default max_children is 8); every session is DELETEd after "
                                 "the step")
+        if name in ("flood", "fairness"):
+            p.add_argument("--rotation", default="300,10,30",
+                           help="INTERVAL,HANDSHAKE,OVERLAP seconds for the relay and every "
+                                "device (M6-C195); a short interval rotates under the flood")
         if name == "flood":
             p.add_argument("--workers", type=int, default=128)
             p.add_argument("--seconds", type=float, default=60)

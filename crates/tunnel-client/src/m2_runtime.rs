@@ -2556,6 +2556,38 @@ impl M2Actor {
             RotationPhase::Recovering => "recovering",
             RotationPhase::Closed => "closed",
         };
+        // What this connector's drain proof is waiting for (M6-C195): owner
+        // fence entries naming a stream this connector holds no state for
+        // (all of them, and those fenced above zero), and entries whose
+        // received cursor is still below the fence.
+        let mut drain_wait_unknown_streams = 0_usize;
+        let mut drain_wait_unknown_nonzero_streams = 0_usize;
+        let mut drain_wait_below_fence_streams = 0_usize;
+        if rotation_status.phase == RotationPhase::Draining
+            && !self.sent_drain_proof
+            && let Some(fence) = self.peer_fence.as_ref()
+        {
+            for entry in &fence.entries {
+                match self.streams.get(&entry.stream_id) {
+                    None => {
+                        drain_wait_unknown_streams += 1;
+                        if entry.last_emitted > 0 {
+                            drain_wait_unknown_nonzero_streams += 1;
+                        }
+                    }
+                    Some(stream)
+                        if stream
+                            .sequence
+                            .direction(Direction::RelayToConnector)
+                            .recv_contiguous()
+                            < entry.last_emitted =>
+                    {
+                        drain_wait_below_fence_streams += 1;
+                    }
+                    Some(_) => {}
+                }
+            }
+        }
         let status = ConnectionStatus {
             phase: phase.to_owned(),
             session_id: Some(self.session.session_id.clone()),
@@ -2605,6 +2637,9 @@ impl M2Actor {
                 .iter()
                 .filter(|drained| **drained)
                 .count(),
+            drain_wait_unknown_streams,
+            drain_wait_unknown_nonzero_streams,
+            drain_wait_below_fence_streams,
             replay_frames,
             replay_bytes,
             queue_frames: self.pending_outputs.len(),

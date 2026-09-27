@@ -178,6 +178,13 @@ pub struct SessionStatus {
     pub received_sequences: u64,
     pub drain_fences: usize,
     pub drain_acks: usize,
+    /// See `ConnectionStatus::drain_wait_unknown_streams` (M6-C195).
+    #[serde(default)]
+    pub drain_wait_unknown_streams: usize,
+    #[serde(default)]
+    pub drain_wait_unknown_nonzero_streams: usize,
+    #[serde(default)]
+    pub drain_wait_below_fence_streams: usize,
     pub queue_frames: usize,
     pub queue_bytes: usize,
     pub replay_frames: usize,
@@ -205,6 +212,9 @@ impl From<&crate::ConnectionStatus> for SessionStatus {
             received_sequences: status.received_sequences,
             drain_fences: status.drain_fences,
             drain_acks: status.drain_acks,
+            drain_wait_unknown_streams: status.drain_wait_unknown_streams,
+            drain_wait_unknown_nonzero_streams: status.drain_wait_unknown_nonzero_streams,
+            drain_wait_below_fence_streams: status.drain_wait_below_fence_streams,
             queue_frames: status.queue_frames,
             queue_bytes: status.queue_bytes,
             replay_frames: status.replay_frames,
