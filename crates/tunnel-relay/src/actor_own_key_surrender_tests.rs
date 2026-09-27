@@ -1531,6 +1531,77 @@ async fn a_lapsed_revision_superseding_a_live_peer_record_stays_fatal() {
     fixture.shutdown().await;
 }
 
+/// **Red first (M7-C187 carve-out bound, review of #233).** The carve-out
+/// only protects a retained record that is still inside its window. Here
+/// relay-b's version 1 is retained, then lapses past its lifetime plus skew,
+/// and only then does the publisher write an already-expired version 2. With
+/// nothing routable left to protect, version 2 is absent for relay-b: this
+/// relay is `Ready` with no route to relay-b. Without the bound, the
+/// withdrawal would block `Ready` on every pass and count toward M7-C184.
+/// Red if the carve-out ignores the retained record's expiry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_withdrawal_after_the_retained_peer_record_lapsed_is_absent() {
+    let fixture = Fixture::new().await;
+    let _control = fixture.register().await;
+    fixture
+        .authority
+        .others
+        .lock()
+        .expect("other nodes")
+        .insert(PEER_NODE.to_owned(), 1);
+    let now = Utc::now();
+    let own = fixture.signed(
+        NODE_ID,
+        2,
+        SERVED_SPKI,
+        now - ChronoDuration::seconds(1),
+        now + ChronoDuration::seconds(30),
+    );
+    let v1_expiry = now + ChronoDuration::seconds(1);
+    let v1 = fixture.signed(
+        PEER_NODE,
+        1,
+        OTHER_SPKI,
+        now - ChronoDuration::seconds(1),
+        v1_expiry,
+    );
+    fixture.set_records(vec![own.clone(), v1]).await;
+    fixture.ready_pass().await;
+    assert!(
+        fixture
+            .membership
+            .verified_peer_route_targets()
+            .iter()
+            .any(|target| target.node_id() == PEER_NODE),
+        "relay-b is routable on its live version 1"
+    );
+    // Version 1 lapses past its lifetime and the 1 s skew.
+    while Utc::now() <= v1_expiry + ChronoDuration::milliseconds(1_200) {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let later = Utc::now();
+    let withdrawal = fixture.signed(
+        PEER_NODE,
+        2,
+        OTHER_SPKI,
+        later - ChronoDuration::seconds(3),
+        later - ChronoDuration::seconds(2),
+    );
+    fixture.set_records(vec![own, withdrawal]).await;
+    fixture.ready_pass().await;
+    fixture.ready_pass().await;
+    assert!(
+        fixture
+            .membership
+            .verified_peer_route_targets()
+            .iter()
+            .all(|target| target.node_id() != PEER_NODE),
+        "a lapsed withdrawal must leave no route to relay-b"
+    );
+    assert_eq!(fixture.membership.ownership_surrender_cause(), None);
+    fixture.shutdown().await;
+}
+
 /// **Red first (M7-C187).** Only *another* node's lapsed record is absent:
 /// this relay's own record, aged past its lifetime plus skew, keeps its
 /// current meaning -- it is still verified, the pass fails on it (`Expired`),

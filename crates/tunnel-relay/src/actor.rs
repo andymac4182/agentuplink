@@ -18742,6 +18742,44 @@ mod stream_identity_tests {
         assert!(sequences.windows(2).all(|pair| pair[0] < pair[1]));
     }
 
+    /// **Task row M6-C189 (review of #233).** `close_all` drains the owner
+    /// backlog without sealing it: the supervisor drains again after the
+    /// actor ends, so an owner kept between the two must still be kept, not
+    /// refused. Only the supervisor's final drain seals. Red if `close_all`
+    /// passes `seal = true`.
+    #[tokio::test]
+    async fn close_all_leaves_the_owner_backlog_open_for_the_supervisor() {
+        let now = Utc::now();
+        let key = SessionKey {
+            tenant_id: Uuid::from_u128(1),
+            device_id: Uuid::from_u128(2),
+            session_id: "c189-close-all".to_owned(),
+            epoch: 1,
+        };
+        let (mut actor, _registration) =
+            admitted_control_actor(ec061_identity(&key, now), key.clone());
+        let backlog = actor.owner_backlog.clone();
+        actor.close_all().await;
+        assert!(
+            !backlog.is_sealed(),
+            "close_all sealed the backlog before the supervisor's drain"
+        );
+        let late = OwnerToken {
+            deployment_incarnation: "test-incarnation".to_owned(),
+            tenant_id: key.tenant_id,
+            device_id: key.device_id,
+            node_id: "test-node".to_owned(),
+            boot_id: "test-boot".to_owned(),
+            session_id: "late".to_owned(),
+            epoch: 2,
+        };
+        assert_eq!(
+            backlog.try_keep(super::OwnerCleanupItem::Token(late)),
+            super::BacklogKeep::Kept,
+            "an owner kept after close_all must wait for the supervisor"
+        );
+    }
+
     pub(super) fn admitted_control_actor(
         identity: DeviceIdentity,
         key: SessionKey,
