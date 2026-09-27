@@ -48,10 +48,10 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tunnel_http_bridge::{
     BridgeConfig, CarrierClosed, CarrierEvent, CarrierReader, CarrierWriter, ExchangeReport,
-    Execution, FrameSender, HANDOFF_CAPACITY, InboundEnd, OutboundEnd, Outcome, PauseController,
-    PauseSignal, Profile, QueueStats, ResetDetail, ResetNotifier, ResetSignal, SignaledReset,
-    begin_paused, channel, detail_from_reason, detail_from_status, pump_inbound, pump_outbound,
-    rejection_response, reset_reason_for, reset_signal_pair,
+    Execution, FrameSender, GatewayError, HANDOFF_CAPACITY, InboundEnd, OutboundEnd, Outcome,
+    PauseController, PauseSignal, Profile, QueueStats, ResetDetail, ResetNotifier, ResetSignal,
+    SignaledReset, begin_paused, channel, detail_from_reason, detail_from_status, pump_inbound,
+    pump_outbound, rejection_response, reset_reason_for, reset_signal_pair,
 };
 use tunnel_http_forward::HttpErrorCode;
 use tunnel_protocol::{ResultDetail, reset_reason};
@@ -1305,7 +1305,12 @@ pub(crate) fn spawn_peer_hop<S: PeerSendHalf, R: PeerRecvHalf>(
             drop(record);
             match decoded {
                 HopRecord::Data(data) => {
-                    if fin_seen || shared.peer_terminal.is_cancelled() {
+                    // After a recorded refusal nothing ran, so DATA is a
+                    // protocol violation (task row M6-C213).
+                    if fin_seen
+                        || shared.peer_terminal.is_cancelled()
+                        || shared.open_refusal.get().is_some()
+                    {
                         shared.push(CarrierEvent::Closed);
                         break;
                     }
@@ -1342,6 +1347,12 @@ pub(crate) fn spawn_peer_hop<S: PeerSendHalf, R: PeerRecvHalf>(
                     let _ = shared.open_refusal.set(code);
                 }
                 HopRecord::Fin => {
+                    // A refused stream ends with RESET, never FIN (task row
+                    // M6-C213).
+                    if shared.open_refusal.get().is_some() {
+                        shared.push(CarrierEvent::Closed);
+                        break;
+                    }
                     fin_seen = true;
                     shared.peer_terminal.cancel();
                     shared.push(CarrierEvent::Fin);
@@ -2000,7 +2011,9 @@ pub(crate) async fn http_forward_route(
             // answer the owner's local consumer gets, not the bridge's
             // `unknown`.  A freeze refusal is not counted here: through a
             // peer hop it is the owner's refusal, not this relay's.
-            if let Some(refused) = open_refusal_response(owner_refusal.get().copied()) {
+            if let Some(refused) =
+                forwarded_refusal_response(&response, owner_refusal.get().copied())
+            {
                 return refused;
             }
             response.map(axum::body::Body::new)
@@ -2145,6 +2158,20 @@ fn refused_open_response(open_refusal: Option<&'static str>) -> Option<Response>
 /// An unknown code, or none, keeps the bridge's answer.  Used by the owner's
 /// local route and, for a refusal carried across a peer hop (M6-C213), by the
 /// ingress.
+/// The ingress's answer for a forwarded `http-forward/1` stream whose OPEN
+/// the owner reported refused (task row M6-C213): [`open_refusal_response`],
+/// but only in place of the bridge's own failure head (it carries
+/// `GatewayError`).  A device head means the request reached the device, so
+/// it is never replaced with a `not_dispatched` refusal (Opus review of
+/// #237).
+fn forwarded_refusal_response<B>(
+    head: &axum::http::Response<B>,
+    open_refusal: Option<&str>,
+) -> Option<Response> {
+    head.extensions().get::<GatewayError>()?;
+    open_refusal_response(open_refusal)
+}
+
 pub(crate) fn open_refusal_response(open_refusal: Option<&str>) -> Option<Response> {
     match open_refusal? {
         crate::actor::ROTATION_FREEZE_ECHO_CODE => Some(rotation_freeze_response(
@@ -3453,6 +3480,71 @@ mod tests {
                 "{refusal:?}"
             );
         }
+    }
+
+    /// M6-C213 control (Opus review of #237): DATA or FIN after a `Refused`
+    /// record is a protocol violation too.  The receiving hop delivers no
+    /// DATA and ends `Closed`, so a device head can never follow a recorded
+    /// refusal to the consumer.
+    #[tokio::test]
+    async fn m6c213_data_or_fin_after_a_refusal_is_a_violation() {
+        for then_fin in [false, true] {
+            let (mut writer, mut pair) = refusal_hop_pair();
+            let _ = writer
+                .commands
+                .send(HopCommand::Record(encode_hop(&HopRecord::Refused(
+                    "DEVICE_REJECTED",
+                ))))
+                .await;
+            if then_fin {
+                writer.finish().await.expect("fin");
+            } else {
+                writer
+                    .data(Bytes::from_static(b"synthetic"))
+                    .await
+                    .expect("data");
+            }
+            let event =
+                tokio::time::timeout(Duration::from_secs(2), pair.receiver_reader.next()).await;
+            assert!(
+                matches!(event, Ok(CarrierEvent::Closed)),
+                "then_fin={then_fin}: {event:?}"
+            );
+        }
+    }
+
+    /// M6-C213 compatibility: a relay built before M6-C213 does not decode
+    /// tag 6.  Its reader treats an undecodable record as a lost hop and ends
+    /// `Closed`, which its bridge answers `HTTP_STREAM_INTERRUPTED`/`unknown`
+    /// -- the answer it gave a refused stream anyway.  Simulated with a tag
+    /// this build does not decode either.
+    #[tokio::test]
+    async fn m6c213_an_undecodable_hop_record_is_a_lost_hop() {
+        let (writer, mut pair) = refusal_hop_pair();
+        let _ = writer.commands.send(HopCommand::Record(vec![7, 0])).await;
+        let event = tokio::time::timeout(Duration::from_secs(2), pair.receiver_reader.next()).await;
+        assert!(matches!(event, Ok(CarrierEvent::Closed)), "{event:?}");
+    }
+
+    /// M6-C213 control (Opus review of #237): a recorded refusal replaces
+    /// only the bridge's own failure head, never a device head.
+    #[test]
+    fn m6c213_a_refusal_never_replaces_a_device_head() {
+        let device_head = axum::http::Response::builder()
+            .status(StatusCode::OK)
+            .body(())
+            .expect("head");
+        assert!(forwarded_refusal_response(&device_head, Some("DEVICE_REJECTED")).is_none());
+        let mut bridge_failure = axum::http::Response::builder()
+            .status(StatusCode::BAD_GATEWAY)
+            .body(())
+            .expect("head");
+        bridge_failure.extensions_mut().insert(GatewayError {
+            code: HttpErrorCode::StreamInterrupted,
+            execution: Execution::Unknown,
+        });
+        assert!(forwarded_refusal_response(&bridge_failure, Some("DEVICE_REJECTED")).is_some());
+        assert!(forwarded_refusal_response(&bridge_failure, None).is_none());
     }
 
     /// M6-C213 control: a `Refused` record after DATA is a protocol violation,
