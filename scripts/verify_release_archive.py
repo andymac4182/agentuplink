@@ -554,6 +554,15 @@ def controls(root: Path, archive: Path, checksum: Path, target: str) -> list[tup
         return check_checksums(archive, bad)
     expect("checksum names another digest", "checksum-mismatch", flipped_checksum)
 
+    def unexpected_top_level(tmp):
+        # A document shipped from outside docs/ lands at a new top-level
+        # directory, as `packages/` did from 0d30a4e2 (docs/tasks.md M6-C216).
+        copy = _copy(root, tmp)
+        (copy / "packages" / "client").mkdir(parents=True)
+        (copy / "packages" / "client" / "README.md").write_text("# not part of the archive\n")
+        return check_layout(copy, archive, target, None, None)
+    expect("an unexpected top-level entry (M6-C216)", "top-level", unexpected_top_level)
+
     def relay_in_wrong_half(tmp):
         copy = _copy(root, tmp)
         relay = copy / "bin" / exe(target, "tunnel-relay")

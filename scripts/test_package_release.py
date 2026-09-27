@@ -145,7 +145,14 @@ class PackagingTests(unittest.TestCase):
                 self.assertFalse((unpacked / "docs" / "testing.md").exists())
 
     def test_a_guide_link_that_cannot_ship_is_refused(self):
-        for link in ("../site/docs/downloads.html", "missing.md", "../../outside.md"):
+        # `../README.md` and `../packages/...` exist in the synthetic root
+        # but lie outside `docs/`: shipping them would add a top-level entry
+        # (M6-C216).
+        (self.root / "README.md").write_text("# Top-level readme\n")
+        (self.root / "packages" / "client").mkdir(parents=True)
+        (self.root / "packages" / "client" / "README.md").write_text("# Client\n")
+        for link in ("../site/docs/downloads.html", "missing.md", "../../outside.md",
+                     "../README.md", "../packages/client/README.md"):
             with self.subTest(link=link):
                 (self.root / GUIDE).write_text(GUIDE_TEXT + f"\n[x]({link})\n")
                 with self.assertRaises(ValueError):
@@ -178,6 +185,29 @@ class PackagingTests(unittest.TestCase):
                     expected = "tree" if (ROOT / target).is_dir() else "blob"
                     self.assertTrue((ROOT / target).exists(), f"{document}: {url}")
                     self.assertEqual(kind, expected, f"{document}: {url}")
+
+    def test_the_real_repository_packs_the_layout_the_verifier_expects(self):
+        # docs/tasks.md M6-C216.  Against this repository's real documents
+        # and examples, with synthetic binaries: every target's archive
+        # unpacks to exactly the top level `scripts/verify_release_archive.py`
+        # requires, and its whole `layout` check passes.  #224 linked
+        # `../packages/client/README.md` from the guide; packaging shipped it
+        # at `packages/`, so the archive gained a top-level entry and the
+        # release workflow's `verify` jobs went red on main -- while every
+        # test here, which packs a synthetic guide, stayed green.
+        import verify_release_archive as verifier
+        for target in TARGETS + CI_ONLY_TARGETS:
+            with self.subTest(target=target):
+                binaries = self.root / "target" / target / "release"
+                output = self.root / "real-dist" / target
+                archive = package(ROOT, target, self.sha, "123", output, {"packages": []}, binaries=binaries)
+                unpacked = self.root / "real-unpacked" / target
+                verifier.unpack(archive, unpacked)
+                top = sorted(entry.name for entry in unpacked.iterdir())
+                self.assertEqual(top, sorted(verifier.TOP_LEVEL), archive.name)
+                layout = verifier.check_layout(unpacked, archive, target, self.sha, "123")
+                self.assertTrue(layout.ok, layout.render())
+                self.assertEqual(unresolved_links(unpacked), [])
 
     def test_an_example_the_documents_name_but_the_repository_lacks_is_refused(self):
         (self.root / GUIDE).write_text(GUIDE_TEXT + "\nThen `examples/absent.toml`.\n")

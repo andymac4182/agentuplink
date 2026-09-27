@@ -172,7 +172,13 @@ def release_documents(root):
         if local is None or not local[0]:
             continue
         target = _resolve(GUIDE, local[0])
-        if target is None or not target.endswith(".md") or not (root / target).is_file():
+        # Under `docs/` only: a document ships at its repository path, so one
+        # anywhere else adds a top-level entry the archive's fixed layout
+        # (`scripts/verify_release_archive.py` TOP_LEVEL) refuses.  The guide
+        # linking `../packages/client/README.md` shipped `packages/` and held
+        # every release red from 0d30a4e2 (docs/tasks.md M6-C216).
+        if (target is None or not target.startswith("docs/") or not target.endswith(".md")
+                or not (root / target).is_file()):
             raise ValueError(
                 f"{GUIDE} links {link!r}, which cannot ship as a document beside it; "
                 "link a document under docs/ or an absolute URL"
@@ -317,10 +323,16 @@ def normalised_member(member):
     return member
 
 
-def package(root, target, sha, run, output, metadata):
+def package(root, target, sha, run, output, metadata, binaries=None):
     # Read from the manifest under `root` rather than from the module-level
     # TARGETS, so a caller packaging a different checkout is checked against
     # *that* checkout's declaration.
+    #
+    # `binaries` is the directory the built binaries are read from, by default
+    # `root/target/<target>/release`.  A test passes a directory of synthetic
+    # binaries so it can package *this repository's* real documents and
+    # examples and check the archive's layout before a release does
+    # (docs/tasks.md M6-C216).
     if target not in advertised_targets(root) + ci_only_targets(root):
         raise ValueError("unsupported target")
     tag = version(root, sha, run)
@@ -333,7 +345,7 @@ def package(root, target, sha, run, output, metadata):
         (staging / "bin").mkdir()
         for binary in binaries_for(target, root):
             name = binary + (".exe" if windows else "")
-            source = root / "target" / target / "release" / name
+            source = (binaries or root / "target" / target / "release") / name
             if not source.is_file() or source.stat().st_size == 0:
                 raise ValueError(f"missing release binary: {name}")
             shutil.copy2(source, staging / "bin" / name)
