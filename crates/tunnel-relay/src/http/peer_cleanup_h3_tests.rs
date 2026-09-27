@@ -324,15 +324,11 @@ impl H3PeerFixture {
         }
     }
 
-    /// Mint a consumer token whose `exp` is `lifetime_secs` from now.  The
-    /// owner derives the stream's absolute authorization deadline from that
-    /// claim, so a short lifetime bounds the stream deterministically.
-    fn mint_consumer_token(&self, lifetime_secs: i64) -> String {
-        mint_consumer_token(&self.consumer_signer, lifetime_secs)
-    }
-
     /// Mint a consumer token whose `exp` claim is exactly `exp_secs`, so a
     /// test knows the owner's absolute authorization deadline to the second.
+    /// There is deliberately no lifetime-only variant here: a short
+    /// whole-second lifetime hides a sub-second window from the test (task
+    /// rows M6-C208 and M6-C209).
     fn mint_consumer_token_expiring_at(&self, exp_secs: i64) -> String {
         mint_consumer_token_expiring_at(&self.consumer_signer, exp_secs)
     }
