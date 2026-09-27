@@ -159,6 +159,12 @@ const OWNER_FORGET_FAILURE_TIMEOUT: Duration = Duration::from_secs(5);
 // below, making this an explicit total-entry bound of at most 2 * N.
 const RETAINED_ECHO_STREAM_FACTOR: usize = 2;
 const AUTHORITY_UNAVAILABLE: &str = "AUTHORITY_UNAVAILABLE";
+/// Typed session close reason when this relay surrenders the device ownership
+/// it holds because its own served peer key is no longer approved by its own
+/// signed membership record (task row M7-C181). The name matches the QUIC
+/// close reason (`local identity retired`) its outbound peer connections use
+/// for the same event.
+pub(crate) const LOCAL_IDENTITY_RETIRED: &str = "LOCAL_IDENTITY_RETIRED";
 /// Typed session close reason when the **device's own control socket closed**.
 ///
 /// Named rather than spelled inline because it is one of the two teardowns
@@ -2889,6 +2895,12 @@ enum Command {
     Snapshot {
         response: oneshot::Sender<RelaySnapshot>,
     },
+    /// Close every device session this relay owns with
+    /// [`LOCAL_IDENTITY_RETIRED`] and release each owner lease through the
+    /// fenced cleanup path (M7-C181). Answers the number of sessions closed.
+    SurrenderOwnership {
+        response: oneshot::Sender<usize>,
+    },
     /// Test hook: run a closure against the live actor between commands.
     #[cfg(test)]
     TestMutate(Box<dyn FnOnce(&mut RelayActor) + Send>),
@@ -2945,7 +2957,8 @@ impl Command {
             | Self::AttachForwardedData { .. }
             | Self::OpenEchoStream { .. }
             | Self::OpenHttpStream { .. }
-            | Self::OpenFsStream { .. } => HttpMaintenanceScope::All,
+            | Self::OpenFsStream { .. }
+            | Self::SurrenderOwnership { .. } => HttpMaintenanceScope::All,
         }
     }
 }
@@ -3837,6 +3850,19 @@ impl RelayHandle {
         self.reply(receiver).await.ok_or(RelayError::Shutdown)
     }
 
+    /// Surrender every device session this relay owns because its own served
+    /// peer key is retired (M7-C181): each closes with
+    /// `LOCAL_IDENTITY_RETIRED` and its owner lease is released through the
+    /// fenced cleanup path. Returns how many sessions were closed.
+    pub async fn surrender_ownership(&self) -> Result<usize, RelayError> {
+        let (response, receiver) = oneshot::channel();
+        self.tx
+            .send(Command::SurrenderOwnership { response })
+            .await
+            .map_err(|_| RelayError::Shutdown)?;
+        self.reply(receiver).await.ok_or(RelayError::Shutdown)
+    }
+
     pub async fn shutdown(&self) -> Result<(), RelayError> {
         // A supervisor that has already terminated cannot consume a newly
         // queued Shutdown command.  Observe its recorded outcome first so a
@@ -4496,6 +4522,10 @@ impl RelayActor {
             }
             Command::Snapshot { response } => {
                 let _ = response.send(self.snapshot());
+            }
+            Command::SurrenderOwnership { response } => {
+                let closed = self.surrender_ownership().await;
+                let _ = response.send(closed);
             }
             Command::Shutdown(response) => {
                 self.shutting_down = true;
@@ -16064,6 +16094,39 @@ impl RelayActor {
         }
     }
 
+    /// Give up every device session this relay owns because its own served
+    /// peer key is retired (M7-C181).
+    ///
+    /// Each session is closed with the typed [`LOCAL_IDENTITY_RETIRED`]
+    /// reason. `close_session` removes it, so the maintenance tick no longer
+    /// renews its owner lease, and queues its exact owner token on the owner
+    /// cleanup worker, whose compare-and-release deletes only that token: a
+    /// successor can claim at once, and a successor that already holds the
+    /// scope is never touched. A token the bounded queue cannot take is kept
+    /// on the owner backlog and offered again, exactly as a tick-driven close
+    /// is (M6-C186). Admission is not changed here: the relay is already
+    /// unready, which refuses new device and consumer work.
+    async fn surrender_ownership(&mut self) -> usize {
+        let keys: Vec<_> = self
+            .sessions
+            .values()
+            .filter(|session| !session.closed)
+            .map(|session| session.key.clone())
+            .collect();
+        for key in &keys {
+            self.close_session(key, LOCAL_IDENTITY_RETIRED).await;
+        }
+        if !keys.is_empty() {
+            tracing::warn!(
+                sessions = keys.len(),
+                reason = LOCAL_IDENTITY_RETIRED,
+                phase = "ownership_surrendered",
+                "relay surrendered device ownership: its served peer key is not approved by its membership record"
+            );
+        }
+        keys.len()
+    }
+
     async fn close_all(&mut self) {
         let deadline = tokio::time::Instant::now() + CLEANUP_SHUTDOWN_TIMEOUT;
         let refused_count = self
@@ -17269,6 +17332,23 @@ impl RunningRelay {
         );
         let cancel = self.cancel.child_token();
         tokio::spawn(crate::metrics::serve_bounded(listener, router, cancel))
+    }
+
+    /// Start the own-key ownership surrender watcher for this relay (task
+    /// row M7-C181): while `membership` reports a confirmed retired served
+    /// key, every owned device session is closed with
+    /// `LOCAL_IDENTITY_RETIRED` and its owner lease released through the
+    /// fenced cleanup path. The task stops when this relay is cancelled.
+    pub fn spawn_own_key_surrender(
+        &self,
+        membership: Arc<crate::membership_runtime::MembershipRuntime>,
+    ) -> JoinHandle<()> {
+        tokio::spawn(crate::own_key_surrender::own_key_surrender_loop(
+            membership,
+            self.handle.clone(),
+            crate::own_key_surrender::OWN_KEY_SURRENDER_POLL,
+            self.cancel.child_token(),
+        ))
     }
 
     /// Return the same redacted, in-process diagnostics as [`RelayHandle`].
@@ -26625,6 +26705,10 @@ mod stream_identity_tests {
 #[cfg(test)]
 #[path = "actor_lifecycle_tests.rs"]
 mod lifecycle_tests;
+
+#[cfg(test)]
+#[path = "actor_own_key_surrender_tests.rs"]
+mod own_key_surrender_tests;
 
 #[cfg(test)]
 #[path = "actor_admission_race_tests.rs"]

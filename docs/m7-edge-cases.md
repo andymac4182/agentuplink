@@ -360,6 +360,17 @@ rows, and the 98-row matrix count is unchanged.
 - **M7-C153** (verified local): staging is refused mid-rotation (including mid-switch), for a retired key, and for any certificate that is not the same relay under the same CA and names.
 - **M7-C154** (verified local): the outbound drain set is bounded at four, and a full set keeps a destination on its still-approved predecessor.
 
+## Own served key retirement task rows (M7-C181, M7-C182)
+
+These rows are tracked in [tasks.md](tasks.md). They extend EC-019 (a peer
+certificate or lease changes mid-connection) and EC-011 (readiness becomes
+false and admission stops) to the owner side: a relay whose own served key its
+signed record no longer approves gives up the device ownership it holds. They
+are task rows, not new matrix rows, and the 98-row matrix count is unchanged.
+
+- **M7-C181** (verified local): after two consecutive reconcile passes concluding `MissingLocalKey`, every owned device session closes with `LOCAL_IDENTITY_RETIRED` and its lease is released by exact compare-and-release; transient reconcile failures and clock-offset not-ready never trigger it.
+- **M7-C182** (open): whether a checkpoint that no longer names the node (`MissingLocalMembership`) should also trigger the surrender.
+
 ## M7 completion rule
 
 The matrix is complete only when every applicable row has a concrete test or
@@ -475,3 +486,4 @@ re-verification event times must match the row's `Completed at` timestamp.
 - 2026-09-27T15:59:41+10:00: Added coverage, no status change, for EC-019 (M7-C171, M7-C173 in [tasks.md](tasks.md)). M7-C171 is decided as option (a) (coordinator decision under the owner's delegation): a key's and a record's activation are honoured up to the cluster clock-skew bound, now one shared 5 s constant (M7-C173), so a same-key re-sign from a signer ahead inside the skew no longer makes a relay reject its own key or revoke peer admissions; a signer ahead beyond it is refused. Expiry stays strict. The matrix count and row statuses are unchanged.
 - 2026-09-27T16:41:11+10:00: Correction and added coverage, no status change, for EC-019 (M7-C171 in [tasks.md](tasks.md), review of PR #225). The previous entry's "Expiry stays strict" holds for keys, bindings, trust deadlines and pins; records and checkpoints are accepted up to 5 s past expiry by the verifier, and recovery approvals are consumed strictly against Redis `TIME`. Peer route targets and pin sets now honour the same activation skew as binding, so a peer signed ahead inside the skew is also routable. The matrix count and row statuses are unchanged.
 - 2026-09-27T19:20:04+10:00: Added coverage, no status change, for EC-057 and EC-058 ([M7-C178](tasks.md)). A connector's `data_loss` report that reaches the owner before the peer-hop carrier close now enters retained recovery at once instead of starting a scheduled rotation whose doomed extra candidate carrier shifted the recovery-attempts fixture's routes (hosted main run 36306342690). Red-first relay test; `verify-m7-i08-recovery-attempts` 40/40 locally with the fix. Hosted M7 on the PR pending.
+- 2026-09-27T19:37:01+10:00: New task-row links M7-C181 and M7-C182 (own served key retirement), extending EC-019 and EC-011 to the owner side; the matrix count and row statuses are unchanged. M7-C181 first completion (local) is recorded in [tasks.md](tasks.md#completion-history); M7-C182 is open.
