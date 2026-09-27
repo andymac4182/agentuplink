@@ -1861,7 +1861,11 @@ async fn handle_consumer_stream(
             }
         }
     }
-    let _ = send_socket(&mut socket, Message::Close(None)).await;
+    let _ = send_socket(
+        &mut socket,
+        consumer_stream_close(registration.open_refusal()),
+    )
+    .await;
     finish_consumer_task(
         &handle,
         key,
@@ -1872,6 +1876,28 @@ async fn handle_consumer_stream(
         &mut cleanup,
     )
     .await;
+}
+
+/// The WebSocket close code of a local echo stream whose OPEN the connector
+/// refused during a scheduled rotation freeze: 1013, Try Again Later.
+pub(crate) const ROTATION_FREEZE_STREAM_CLOSE_CODE: u16 = 1013;
+
+/// The close a local consumer echo stream ends with (task row M6-C210).  The
+/// 101 is sent before the connector admits the OPEN, so a refusal can only be
+/// told to the consumer in the close.  An OPEN the connector refused `GOAWAY`
+/// inside a scheduled rotation freeze never ran anything, and the stream
+/// closes 1013 (Try Again Later) with reason `ROTATION_FREEZE`: the retryable,
+/// `not_dispatched` answer a new stream refused by the same freeze gets.
+/// Every other end keeps the codeless close.
+fn consumer_stream_close(open_refusal: Option<&'static str>) -> Message {
+    if open_refusal == Some(crate::actor::ROTATION_FREEZE_ECHO_CODE) {
+        crate::metrics::count_local_rotation_freeze("stream");
+        return Message::Close(Some(CloseFrame {
+            code: ROTATION_FREEZE_STREAM_CLOSE_CODE,
+            reason: ROTATION_FREEZE_CODE.into(),
+        }));
+    }
+    Message::Close(None)
 }
 
 /// EC-061: the single exit of the public consumer stream adapter.
@@ -4993,6 +5019,42 @@ fn error_response(
 
 #[cfg(test)]
 mod tests {
+    /// M6-C210: a local echo stream whose OPEN the connector refused `GOAWAY`
+    /// during a rotation freeze closes 1013 (Try Again Later) with reason
+    /// `ROTATION_FREEZE`; every other end keeps the codeless close.
+    #[test]
+    fn m6c210_an_echo_stream_refused_by_a_rotation_freeze_closes_try_again_later() {
+        match super::consumer_stream_close(Some(crate::actor::ROTATION_FREEZE_ECHO_CODE)) {
+            Message::Close(Some(frame)) => {
+                assert_eq!(frame.code, 1013);
+                assert_eq!(frame.code, super::ROTATION_FREEZE_STREAM_CLOSE_CODE);
+                assert_eq!(frame.reason.as_str(), "ROTATION_FREEZE");
+            }
+            other => panic!("unexpected close {other:?}"),
+        }
+        for other in [None, Some("DEVICE_REJECTED"), Some("RESOURCE_EXHAUSTED")] {
+            assert!(
+                matches!(super::consumer_stream_close(other), Message::Close(None)),
+                "{other:?}"
+            );
+        }
+    }
+
+    /// M6-C211: a unary echo whose challenge read failed is answered as
+    /// admission answers a catalog outage, `503 AUTHORIZATION_UNAVAILABLE`,
+    /// `not_dispatched`.
+    #[tokio::test]
+    async fn m6c211_an_unavailable_authorization_is_503_not_dispatched() {
+        let response = echo_failure_response("AUTHORIZATION_UNAVAILABLE", "not_dispatched");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .expect("bounded body");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("JSON body");
+        assert_eq!(body["code"], "AUTHORIZATION_UNAVAILABLE");
+        assert_eq!(body["execution"], "not_dispatched");
+    }
+
     /// M6-C120: an echo refused by the owner's per-device capacity before
     /// dispatch is answered as retryable with a bounded `Retry-After`, so a
     /// flooding consumer backs off instead of seeing the device as gone.
@@ -5883,6 +5945,9 @@ mod peer_cleanup_tests;
 
 #[cfg(test)]
 mod pending_open_abandon_tests;
+
+#[cfg(test)]
+mod rotation_refusal_route_tests;
 
 #[cfg(test)]
 mod task_closure_tests;
