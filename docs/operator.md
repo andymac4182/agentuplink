@@ -1054,10 +1054,30 @@ offset from Redis is above the warning threshold` at `warn` with `offset_ms`
 and stays ready; above 5 s it logs `relay clock offset from Redis exceeds the
 cluster clock-skew bound; not ready` and answers `503` until a measurement is
 back within 5 s (`relay clock offset back within the bound; readiness
-restored`). Each is logged once per change. A failed `TIME` read changes
-nothing but a counter. Fix the host clock (NTP) rather than the bound: past
-5 s, signed membership records, recovery approvals and Redis authority reads
-start failing closed anyway. This is exercised with an injected clock
+restored`). Each is logged once per change. Readiness changes only after two
+consecutive samples on the other side of 5 s, in either direction, and a
+sample whose round trip exceeds 750 ms is discarded. A failed `TIME` read
+changes nothing but a counter.
+
+Three consequences to plan for:
+
+- **The bounds are not symmetric.** `/readyz` goes `503` beyond 5 s either
+  way, but the Redis authority accepts a caller timestamp up to 5 s ahead of
+  Redis and up to 7 s behind it (its 2 s reply deadline plus the skew). So a
+  relay 5-7 s behind Redis is out of rotation while its authority reads still
+  succeed; a relay more than 5 s ahead is out of rotation and also refused by
+  Redis.
+- **Redis's clock is the reference for the whole fleet.** A step in the Redis
+  host's clock, or a failover to a Redis whose clock differs by more than 5 s,
+  makes every relay's offset exceed the bound at once and takes the whole
+  fleet out of rotation until Redis's clock is corrected. Keep the Redis
+  host's clock disciplined exactly like the relays'.
+- **`max_clock_skew_seconds` does not change this check.** A stricter
+  `[cluster]` `max_clock_skew_seconds = 1` tightens signed membership
+  verification only; the Redis authority scripts and this readiness check
+  stay at the fixed 5 s bound.
+
+Fix the host clock (NTP) rather than the bound. This is exercised with an injected clock
 (`crates/tunnel-relay/src/clock_offset_tests.rs`) and against the local Redis
 for `TIME` itself; it was not exercised by stepping a real host clock.
 
