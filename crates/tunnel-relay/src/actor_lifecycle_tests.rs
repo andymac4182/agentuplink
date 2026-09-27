@@ -1222,8 +1222,9 @@ async fn an_owner_guard_dropped_while_owners_are_kept_does_not_cancel_the_relay(
 
 /// **Task row M6-C186 (review of PR #215), cap refusal.** With the backlog
 /// at its bound and the queue full, one more owner cleanup is refused: it is
-/// logged, the backlog does not grow, the owner stays claimed until its
-/// lease expires, and the relay keeps running.
+/// counted (`refused_count`, the refusal the log reports; asserted through
+/// the counter since M6-C189 (3)), the backlog does not grow, the owner
+/// stays claimed until its lease expires, and the relay keeps running.
 #[tokio::test]
 async fn an_owner_cleanup_refused_at_the_backlog_cap_is_left_to_lease_expiry() {
     let catalog = HeldCatalog::new();
@@ -1234,22 +1235,14 @@ async fn an_owner_cleanup_refused_at_the_backlog_cap_is_left_to_lease_expiry() {
         Duration::from_secs(30),
     );
     let (tenant_id, device_ids, registrations) = register_live_sessions(&handle, &catalog, 2).await;
-    let captured = super::connector_rejected::Captured::default();
-    let subscriber = tracing_subscriber::fmt()
-        .with_writer(captured.clone())
-        .with_env_filter("info")
-        .with_ansi(false)
-        .finish();
-    let guard = tracing::subscriber::set_default(subscriber);
-    // Callsite interest is cached process-wide; another test thread can
-    // cache "never" for a shared callsite just before this subscriber exists.
-    tracing::callsite::rebuild_interest_cache();
 
     let kept_after = Arc::new(AtomicUsize::new(usize::MAX));
     let refused_device = Arc::new(std::sync::Mutex::new(None));
+    let refused_count = Arc::new(std::sync::Mutex::new(None));
     {
         let kept_after = kept_after.clone();
         let refused_device = refused_device.clone();
+        let refused_count = refused_count.clone();
         handle
             .tx
             .send(Command::TestMutate(Box::new(move |actor| {
@@ -1259,6 +1252,8 @@ async fn an_owner_cleanup_refused_at_the_backlog_cap_is_left_to_lease_expiry() {
                     .clone()
                     .expect("cleanup dispatcher present while running");
                 actor.owner_backlog.set_cap(CAP);
+                *refused_count.lock().expect("refused count") =
+                    Some(dispatcher.refused_count.clone());
                 let filler = synthetic_owner("filler");
                 while dispatcher
                     .enqueue_if_room(|| Some(super::OwnerCleanupItem::Token(filler.clone())))
@@ -1296,7 +1291,6 @@ async fn an_owner_cleanup_refused_at_the_backlog_cap_is_left_to_lease_expiry() {
     }
     // Give the worker time to drain the queue and the kept items.
     tokio::time::sleep(Duration::from_millis(1_000)).await;
-    drop(guard);
 
     assert_eq!(
         kept_after.load(Ordering::Acquire),
@@ -1320,12 +1314,13 @@ async fn an_owner_cleanup_refused_at_the_backlog_cap_is_left_to_lease_expiry() {
             .is_some(),
         "the refused owner was released instead of left to lease expiry"
     );
-    let text = captured.text();
-    assert!(
-        text.contains("owner cleanup refused past the cleanup queue and its backlog")
-            && text.contains("backlog_cap=2"),
-        "the refusal was not logged: {text}"
-    );
+    let refused = refused_count
+        .lock()
+        .expect("refused count")
+        .clone()
+        .expect("the mutation ran")
+        .load(Ordering::Acquire);
+    assert_eq!(refused, 1, "the refusal at the backlog cap was not counted");
     assert_eq!(device_ids.len(), 2);
     cancel.cancel();
     let _ = timeout(Duration::from_secs(5), handle.shutdown())
@@ -1353,6 +1348,7 @@ async fn kept_owner_release_counts_releases_in_flight_at_the_deadline() {
         &shared,
         &backlog,
         tokio::time::Instant::now() + Duration::from_millis(1_010),
+        false,
     )
     .await;
     assert!(backlog.is_empty());
@@ -1378,7 +1374,7 @@ async fn kept_owner_release_past_its_deadline_starts_nothing() {
     let shared: tunnel_catalog::SharedCatalog = Arc::new(catalog.clone());
     let deadline = tokio::time::Instant::now();
     tokio::time::advance(Duration::from_millis(1)).await;
-    let result = super::release_backlog_until(&shared, &backlog, deadline).await;
+    let result = super::release_backlog_until(&shared, &backlog, deadline, false).await;
     assert_eq!(result, (0, 20));
     assert!(backlog.is_empty());
     assert_eq!(
@@ -1413,9 +1409,13 @@ async fn kept_owner_release_is_concurrent_and_bounded() {
     }
     let shared: tunnel_catalog::SharedCatalog = Arc::new(catalog.clone());
     let started = tokio::time::Instant::now();
-    let (released, abandoned) =
-        super::release_backlog_until(&shared, &backlog, started + super::CLEANUP_SHUTDOWN_TIMEOUT)
-            .await;
+    let (released, abandoned) = super::release_backlog_until(
+        &shared,
+        &backlog,
+        started + super::CLEANUP_SHUTDOWN_TIMEOUT,
+        false,
+    )
+    .await;
     assert_eq!(
         (released, abandoned),
         (KEPT, 0),
@@ -1449,38 +1449,121 @@ async fn close_all_logs_the_abandoned_live_session_owner_count() {
     let (tenant_id, device_ids, registrations) =
         register_live_sessions(&handle, &catalog, LIVE).await;
     catalog.release_delay_ms.store(10_000, Ordering::Release);
-    let captured = super::connector_rejected::Captured::default();
-    let subscriber = tracing_subscriber::fmt()
-        .with_writer(captured.clone())
-        .with_env_filter("info")
-        .with_ansi(false)
-        .finish();
-    let guard = tracing::subscriber::set_default(subscriber);
-    // Callsite interest is cached process-wide; another test thread can
-    // cache "never" for a shared callsite just before this subscriber exists.
-    tracing::callsite::rebuild_interest_cache();
+    let backlog = handle.owner_backlog.clone();
 
     cancel.cancel();
     let shutdown = timeout(Duration::from_secs(30), handle.shutdown())
         .await
         .expect("shutdown is bounded");
-    drop(guard);
     // The worker's drain outlasting the deadline is itself reported as a
     // failed shutdown; only the owner count matters here.
     drop(shutdown);
     catalog.release_delay_ms.store(0, Ordering::Release);
     assert_eq!(still_claimed(&catalog, tenant_id, &device_ids).await, LIVE);
-    let text = captured.text();
-    let line = text
-        .lines()
-        .find(|line| line.contains("owner cleanup beyond the cleanup queue exceeded"))
-        .unwrap_or_else(|| panic!("no abandoned-owner log line: {text}"));
+    // The counters carry the numbers the abandoned-owner error log reports
+    // (asserted through them since M6-C189 (3)).
     let kept = LIVE - super::CLEANUP_QUEUE_CAPACITY;
-    assert!(
-        line.contains(&format!("abandoned={kept}")) && line.contains("attempted=0"),
-        "the log did not count all {kept} kept owners as abandoned: {line}"
+    let counters = backlog.counters();
+    assert_eq!(
+        (
+            counters.shutdown_attempted.load(Ordering::Acquire),
+            counters.shutdown_abandoned.load(Ordering::Acquire),
+        ),
+        (0, kept),
+        "not all {kept} kept owners were counted as abandoned"
     );
     drop(registrations);
+}
+
+/// **Red first (task row M6-C189 (2)).** The cleanup worker wakes the actor
+/// after each release while owners are kept, so the backlog refills the
+/// queue as the worker drains it, not once per maintenance tick.  The queue
+/// is full behind one 100 ms release and one owner is kept; it must reach the
+/// queue when that release completes, well before the next tick
+/// (`MAINTENANCE_TICK`, 500 ms).  Paused time on one thread makes the timing
+/// exact; no command reaches the actor meanwhile, so only the worker's
+/// signal (or a tick) can offer the kept owner.
+#[tokio::test(start_paused = true)]
+async fn the_worker_wakes_the_actor_to_refill_the_queue_between_ticks() {
+    const RELEASE_MS: u64 = 100;
+    let catalog = HeldCatalog::new();
+    catalog
+        .release_delay_ms
+        .store(RELEASE_MS, Ordering::Release);
+    let cancel = CancellationToken::new();
+    let handle = test_handle_with_catalog(
+        cancel.clone(),
+        Arc::new(catalog.clone()),
+        Duration::from_secs(30),
+    );
+    let backlog = handle.owner_backlog.clone();
+    let fill = || {
+        Command::TestMutate(Box::new(|actor| {
+            let dispatcher = actor
+                .cleanup_dispatcher
+                .clone()
+                .expect("cleanup dispatcher present while running");
+            let filler = synthetic_owner("filler");
+            while dispatcher
+                .enqueue_if_room(|| Some(super::OwnerCleanupItem::Token(filler.clone())))
+            {
+            }
+        }))
+    };
+    // Fill the queue, let the worker take the first filler into its 100 ms
+    // release, then top the queue up again and keep one owner behind it.
+    handle
+        .tx
+        .send(fill())
+        .await
+        .expect("actor accepts the fill");
+    tokio::time::sleep(Duration::from_millis(1)).await;
+    let kept_at = Arc::new(std::sync::Mutex::new(None));
+    {
+        let kept_at = kept_at.clone();
+        handle
+            .tx
+            .send(Command::TestMutate(Box::new(move |actor| {
+                let dispatcher = actor
+                    .cleanup_dispatcher
+                    .clone()
+                    .expect("cleanup dispatcher present while running");
+                let filler = synthetic_owner("filler");
+                while dispatcher
+                    .enqueue_if_room(|| Some(super::OwnerCleanupItem::Token(filler.clone())))
+                {
+                }
+                dispatcher.enqueue(super::OwnerCleanupItem::Token(synthetic_owner("kept")));
+                *kept_at.lock().expect("kept at") =
+                    Some((tokio::time::Instant::now(), actor.owner_backlog.len()));
+            })))
+            .await
+            .expect("actor accepts the test mutation");
+    }
+    let (kept_at, kept) = loop {
+        if let Some(kept) = *kept_at.lock().expect("kept at") {
+            break kept;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    };
+    assert_eq!(kept, 1, "the owner was not kept behind the full queue");
+    let give_up = kept_at + super::MAINTENANCE_TICK * 4;
+    while !backlog.is_empty() && tokio::time::Instant::now() < give_up {
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    let refilled_after = tokio::time::Instant::now() - kept_at;
+    assert!(backlog.is_empty(), "the kept owner never reached the queue");
+    assert!(
+        refilled_after <= Duration::from_millis(RELEASE_MS + 10),
+        "the kept owner reached the queue {refilled_after:?} after it was kept; the worker's \
+         release completed after {RELEASE_MS} ms, and the next maintenance tick is up to {:?} away",
+        super::MAINTENANCE_TICK
+    );
+    catalog.release_delay_ms.store(0, Ordering::Release);
+    cancel.cancel();
+    let _ = timeout(Duration::from_secs(30), handle.shutdown())
+        .await
+        .expect("shutdown is bounded");
 }
 
 #[tokio::test]
