@@ -5795,3 +5795,122 @@ fn m6c214_lapsed_challenge_codes() {
     );
     assert_eq!(lapsed_challenge_code(window, true), "ROTATION_FREEZE");
 }
+
+/// Saturate the session's data lane, as the relay's own buffering would, and
+/// return the bytes taken so the test can give them back.
+fn m4_47_saturate_data_lane(fixture: &FreezeFixture) -> usize {
+    let budget = fixture.session().queue_budget.clone();
+    let room = budget.data_limit().saturating_sub(budget.used());
+    assert!(budget.reserve_data(room), "saturate the data lane");
+    assert!(budget.data_exhausted(), "no data-lane headroom remains");
+    room
+}
+
+/// Task row M4-47, site 2: a unary echo's response DATA arrives, valid and
+/// inside its bounds, while the session's data lane is saturated by the
+/// relay's own buffering.  Before the fix the refused charge folded into
+/// `INVALID_SEQUENCE` and the whole device session was fenced, as if the
+/// connector had violated the protocol.  Now only this exchange is given up:
+/// its consumer is answered `RESOURCE_EXHAUSTED` with `unknown` execution
+/// (the device ran it), the response is acknowledged and discarded, and the
+/// exchange is forgotten as a completed one.
+#[tokio::test]
+async fn m4_47_a_unary_response_the_data_lane_cannot_hold_abandons_only_that_exchange() {
+    let mut fixture = FreezeFixture::new("m4-47-unary-response", false);
+    let (stream_id, operation_id, _, mut receiver) = fixture.admit_unary_echo(UNARY_BODY).await;
+    fixture.authorize_unary_echo(stream_id);
+    assert_eq!(sequenced(&drain_data(&mut fixture.old_rx)).len(), 2);
+    let room = m4_47_saturate_data_lane(&fixture);
+
+    fixture
+        .connector_echo_response(stream_id, UNARY_REPLY, 2)
+        .await;
+
+    assert!(
+        fixture.session_alive(),
+        "the relay's own backpressure must not fence the device session"
+    );
+    assert!(matches!(
+        receiver.try_recv(),
+        Ok(EchoOutcome::Failure {
+            code: "RESOURCE_EXHAUSTED",
+            execution: "unknown"
+        })
+    ));
+    assert_eq!(
+        acks_for(&drain_data(&mut fixture.old_rx), stream_id),
+        vec![1, 2],
+        "the discarded response DATA and the FIN are both acknowledged"
+    );
+    let forgets = FreezeFixture::stream_forgets(&fixture.drain_control());
+    assert_eq!(forgets.len(), 1, "the exchange is forgotten");
+    assert_eq!(forgets[0].stream_id, stream_id);
+    assert_eq!(forgets[0].operation_id, operation_id);
+    fixture.session().queue_budget.release(room);
+}
+
+/// Task row M4-47, site 3: the relay has confirmed a unary echo's
+/// authorization and cannot queue the request because the data lane is
+/// saturated.  Before the fix the call failed `REVERSE_CHANNEL_UNAVAILABLE`
+/// and the relay closed both of the device's sockets.  Nothing reached the
+/// device, so the call is now refused with the retryable
+/// `RESOURCE_EXHAUSTED`, `not_dispatched`, and the relay ends its own
+/// direction with a RESET on the reserved capacity; the session stays up.
+#[tokio::test]
+async fn m4_47_a_unary_request_refused_by_backpressure_is_not_dispatched_and_keeps_the_session() {
+    let mut fixture = FreezeFixture::new("m4-47-unary-request", false);
+    let (stream_id, operation_id, _, mut receiver) = fixture.admit_unary_echo(UNARY_BODY).await;
+    // On the real path the connector's challenge marks the OPEN admitted
+    // (`begin_device_challenge`); the fixture applies the result directly.
+    fixture
+        .actor
+        .sessions
+        .get_mut(&fixture.key.scope())
+        .and_then(|session| session.pending.get_mut(&stream_id))
+        .expect("finite echo is pending")
+        .abandon
+        .admitted = true;
+    let room = m4_47_saturate_data_lane(&fixture);
+
+    fixture.authorize_unary_echo(stream_id);
+
+    assert!(
+        fixture.session_alive(),
+        "the relay's own backpressure must not end the device session"
+    );
+    assert!(matches!(
+        receiver.try_recv(),
+        Ok(EchoOutcome::Failure {
+            code: "RESOURCE_EXHAUSTED",
+            execution: "not_dispatched"
+        })
+    ));
+    let items = drain_data(&mut fixture.old_rx);
+    assert!(
+        !items.iter().any(|item| matches!(item, Observed::Close)),
+        "the data socket is not closed"
+    );
+    let generation = fixture.attempt.old_generation;
+    assert_eq!(
+        sequenced(&items),
+        vec![(FrameKind::Reset, 1, generation)],
+        "no request DATA or FIN; the relay ends its direction with RESET"
+    );
+
+    fixture
+        .connector_frame(Frame::reset(
+            1,
+            generation,
+            stream_id,
+            1,
+            1,
+            tunnel_protocol::reset_reason::CANCELLED,
+        ))
+        .await;
+    assert!(fixture.session_alive());
+    let forgets = FreezeFixture::stream_forgets(&fixture.drain_control());
+    assert_eq!(forgets.len(), 1, "the refused exchange is forgotten");
+    assert_eq!(forgets[0].stream_id, stream_id);
+    assert_eq!(forgets[0].operation_id, operation_id);
+    fixture.session().queue_budget.release(room);
+}

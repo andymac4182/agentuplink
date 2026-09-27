@@ -161,6 +161,28 @@ const M2_RESET_AUTH_EXPIRED: u16 = tunnel_protocol::reset_reason::AUTHORIZATION_
 const M2_RESET_PROTOCOL: u16 = tunnel_protocol::reset_reason::PROTOCOL;
 const M2_RESET_RECORD_LIMIT: u16 = tunnel_protocol::reset_reason::RECORD_LIMIT;
 const OWNER_FENCE_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
+/// The outer bound on a long-lived stream's operation deadline.
+const M2_LONG_LIVED_STREAM_LIFETIME: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// How long an admitted operation may run before the connector ends it.
+///
+/// `limits.operation_timeout_ms` bounds one exchange: a unary echo or one
+/// `http-forward/1` request.  An echo stream and a filesystem session are
+/// long-lived instead, and take the outer bound.  A filesystem session is a
+/// session, not a request: the contract bounds it by the consumer token (the
+/// relay closes it at expiry, and every confirmation is capped at the token's
+/// remaining lifetime), by the idle-session timeout and by the stall bound,
+/// never by one request's deadline (docs/filesystem-api.md, "Who enforces
+/// each limit").  Before task row M4-55 it took `operation_timeout_ms`, so
+/// every filesystem session was reset `AUTHORIZATION_EXPIRED` -- a consumer
+/// close 1008 `AUTH_EXPIRED` -- 30 s after its OPEN however live it was.
+fn operation_lifetime(operation: &str, operation_timeout_ms: u64) -> Duration {
+    if operation == "echo_stream" || operation == FS_STREAM_OPERATION {
+        M2_LONG_LIVED_STREAM_LIFETIME
+    } else {
+        Duration::from_millis(operation_timeout_ms)
+    }
+}
 
 fn critical_reserved_bytes(max_queue_bytes: usize) -> usize {
     // Keep the reserve bounded at one quarter of the configured budget.  The
@@ -4190,11 +4212,7 @@ impl M2Actor {
         let operation_deadline = DualDeadline::new(
             started,
             started_wall,
-            if open.operation == "echo_stream" {
-                Duration::from_secs(24 * 60 * 60)
-            } else {
-                Duration::from_millis(self.config.limits.operation_timeout_ms)
-            },
+            operation_lifetime(&open.operation, self.config.limits.operation_timeout_ms),
         )
         .ok_or_else(|| ClientError::Protocol("operation deadline overflow".to_owned()))?;
         Ok(PendingOpen {
@@ -10379,6 +10397,57 @@ mod tests {
     /// silently dropped every tick, so a filesystem session could never renew
     /// its grant and expired at its admission deadline while it was still in
     /// use.  This is the regression test for docs/tasks.md row **M4-22**.
+    /// Task row M4-55: a filesystem session is not ended at one request's
+    /// deadline.  Before the fix `prepare_pending_open` gave an `fs_9p` OPEN
+    /// `limits.operation_timeout_ms` (30 s by default) as its operation
+    /// deadline, so the refresh tick expired every live filesystem session
+    /// 30 s after its OPEN and reset it `AUTHORIZATION_EXPIRED`, which the
+    /// relay closes 1008 `AUTH_EXPIRED`.  The control is an `http-forward/1`
+    /// request, which is one exchange and still takes that deadline.
+    #[tokio::test]
+    async fn a_filesystem_session_outlives_the_single_operation_timeout() {
+        async fn expired_after_the_operation_timeout(operation: &str) -> u64 {
+            let (mut actor, _active_key, _carrier_receiver, _control_receiver) =
+                test_actor_with_control_capacity(M2_CARRIER_QUEUE_FRAMES, 16);
+            actor.config.limits.operation_timeout_ms = 1;
+            let mut open = test_open(1);
+            open.operation = operation.to_owned();
+            let reservation = actor
+                .reserve_pending_open(&open)
+                .expect("the OPEN is within its budget");
+            let pending = actor
+                .prepare_pending_open(open, reservation)
+                .expect("the OPEN is well formed");
+            let mut stream = test_stream();
+            stream.operation = operation.to_owned();
+            stream.sequence = StreamState::new(1, 1_024).expect("test stream sequence");
+            stream.auth.confirmed = true;
+            stream.auth.refresh_in_flight = false;
+            stream.auth.deadline =
+                DualDeadline::new(Instant::now(), SystemTime::now(), Duration::from_secs(5))
+                    .expect("a confirmed five-second window");
+            stream.auth.operation_deadline = pending.operation_deadline;
+            actor.streams.insert(1, stream);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            actor
+                .refresh_authorizations()
+                .await
+                .expect("a refresh tick");
+            actor.auth_expired_streams
+        }
+
+        assert_eq!(
+            expired_after_the_operation_timeout(FS_STREAM_OPERATION).await,
+            0,
+            "a live filesystem session must not expire at the single-operation timeout"
+        );
+        assert_eq!(
+            expired_after_the_operation_timeout(HTTP_FORWARD_OPERATION).await,
+            1,
+            "an http-forward/1 request still ends at the single-operation timeout"
+        );
+    }
+
     #[tokio::test]
     async fn filesystem_stream_authorization_refresh_is_queued() {
         let (mut actor, _active_key, _carrier_receiver, mut control_receiver) =

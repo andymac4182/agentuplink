@@ -13593,33 +13593,45 @@ impl RelayActor {
             );
             return;
         }
-        if queue_data(&data_tx, &queue_budget, frame).is_err() {
-            self.fail_pending(
-                &key,
-                challenge.stream_id,
-                "REVERSE_CHANNEL_UNAVAILABLE",
-                "unknown",
-            );
-            let _ = data_tx.try_send(DataOutbound::Close);
-            let _ = control_tx.try_send(ControlOutbound::Close);
-            let _ = self
-                .command_tx
-                .try_send(Command::DisconnectControl(key.clone()));
-            return;
-        }
-        if queue_data(&data_tx, &queue_budget, fin).is_err() {
-            self.fail_pending(
-                &key,
-                challenge.stream_id,
-                "REVERSE_CHANNEL_UNAVAILABLE",
-                "unknown",
-            );
-            let _ = data_tx.try_send(DataOutbound::Close);
-            let _ = control_tx.try_send(ControlOutbound::Close);
-            let _ = self
-                .command_tx
-                .try_send(Command::DisconnectControl(key.clone()));
-            return;
+        // The request's DATA and FIN go out together or not at all (task row
+        // M4-47, site 3).  Before, each was queued on its own and any refusal
+        // -- the session's own data-lane budget and a momentarily full writer
+        // as much as a closed carrier -- failed the call
+        // `REVERSE_CHANNEL_UNAVAILABLE` and disconnected the device's control
+        // socket.  Backpressure that refuses the pair before either frame is
+        // queued refuses only this call: nothing reached the device, so it is
+        // the retryable `RESOURCE_EXHAUSTED`, `not_dispatched`, and the
+        // exchange is abandoned so the connector's confirmed stream is ended
+        // by the relay's RESET (M7-C94).  A closed carrier, or a refusal
+        // after the DATA went out, keeps the fence.
+        match queue_data_pair(&data_tx, &queue_budget, frame, fin) {
+            Ok(()) => {}
+            Err(PairRefusal {
+                refusal: QueueRefusal::Budget | QueueRefusal::Full,
+                first_queued: false,
+            }) => {
+                self.fail_pending(
+                    &key,
+                    challenge.stream_id,
+                    "RESOURCE_EXHAUSTED",
+                    "not_dispatched",
+                );
+                return;
+            }
+            Err(_) => {
+                self.fail_pending(
+                    &key,
+                    challenge.stream_id,
+                    "REVERSE_CHANNEL_UNAVAILABLE",
+                    "unknown",
+                );
+                let _ = data_tx.try_send(DataOutbound::Close);
+                let _ = control_tx.try_send(ControlOutbound::Close);
+                let _ = self
+                    .command_tx
+                    .try_send(Command::DisconnectControl(key.clone()));
+                return;
+            }
         }
         let mut application_dispatched = false;
         if let Some(session) = self.session_mut(&key)
@@ -14271,6 +14283,9 @@ impl RelayActor {
                 // An abandoned exchange's consumer already has its outcome
                 // (M7-C94): its response bytes are acknowledged, not kept.
                 let discard_response;
+                // The response DATA was valid and inside its bounds, but the
+                // session's data lane had no room to hold it (task row M4-47).
+                let response_overloaded;
                 let (update, data_tx, queue_budget, tenant_id, operation_id) = {
                     let Some(session) = self.session_mut(&key) else {
                         return;
@@ -14299,12 +14314,27 @@ impl RelayActor {
                         || frame.sequence != pending.response_sequence.saturating_add(1)
                         || (frame.kind == FrameKind::Data
                             && !discard_response
-                            && (pending
+                            && pending
                                 .response_body
                                 .len()
                                 .saturating_add(frame.payload.len())
-                                > max_response_bytes
-                                || !queue_budget.reserve_data(frame.payload.len())));
+                                > max_response_bytes);
+                    // A valid response DATA the data lane cannot hold is the
+                    // relay's own backpressure, not a peer violation (task
+                    // row M4-47, site 2).  Before, it folded into
+                    // `INVALID_SEQUENCE` and fenced the whole session.  On an
+                    // M2 session the exchange is abandoned instead -- its
+                    // consumer answered `RESOURCE_EXHAUSTED`, `unknown`
+                    // because the device already ran it -- and this and every
+                    // later response frame is acknowledged and discarded
+                    // (M7-C94).  An M1 session keeps no journal and has no
+                    // abandon path, so it keeps the fence.
+                    let refused_charge = !invalid_frame
+                        && frame.kind == FrameKind::Data
+                        && !discard_response
+                        && !queue_budget.reserve_data(frame.payload.len());
+                    response_overloaded = refused_charge && forgets_unary;
+                    let invalid_frame = invalid_frame || (refused_charge && !forgets_unary);
                     if invalid_frame {
                         (
                             ResponseFrameUpdate::Invalid,
@@ -14318,7 +14348,7 @@ impl RelayActor {
                         // Validated above as at most the relay's FIN.
                         pending.forget.peer_acked = pending.forget.peer_acked.max(frame.ack);
                         if frame.kind == FrameKind::Data {
-                            if !discard_response {
+                            if !discard_response && !response_overloaded {
                                 pending.response_body.extend_from_slice(&frame.payload);
                             }
                             (
@@ -14358,9 +14388,13 @@ impl RelayActor {
                 };
                 if matches!(&update, ResponseFrameUpdate::Accepted)
                     && !discard_response
+                    && !response_overloaded
                     && let Some(session) = self.session_mut(&key)
                 {
                     session.queued_bytes = session.queued_bytes.saturating_add(frame.payload.len());
+                }
+                if response_overloaded {
+                    self.abandon_pending(&key, stream_id, "RESOURCE_EXHAUSTED", "unknown");
                 }
                 let ack_sequence = match &update {
                     ResponseFrameUpdate::Accepted | ResponseFrameUpdate::Complete(_, _) => {
@@ -14755,7 +14789,9 @@ impl RelayActor {
                     let Some(stream) = session.streams.get_mut(&frame.stream_id) else {
                         return;
                     };
-                    if held_available && reserve_m2_bytes(&queue_budget, stream, input_bytes) {
+                    if held_available
+                        && reserve_m2_inbound_bytes(&queue_budget, stream, frame.kind, input_bytes)
+                    {
                         if let Some(rotation) = session.rotation.as_mut()
                             && let Some(recovery) = rotation.recovery.as_mut()
                         {
@@ -14782,8 +14818,8 @@ impl RelayActor {
                 let Some(stream) = session.streams.get_mut(&frame.stream_id) else {
                     return;
                 };
-                let can_charge =
-                    deferred_available && reserve_m2_bytes(&queue_budget, stream, input_bytes);
+                let can_charge = deferred_available
+                    && reserve_m2_inbound_bytes(&queue_budget, stream, frame.kind, input_bytes);
                 if !can_charge {
                     deferred_rejected = true;
                 } else if let Some(rotation) = session.rotation.as_mut()
@@ -14834,7 +14870,8 @@ impl RelayActor {
             let Some(stream) = session.streams.get_mut(&frame.stream_id) else {
                 return;
             };
-            let charged_input = reserve_m2_bytes(&queue_budget, stream, input_bytes);
+            let charged_input =
+                reserve_m2_inbound_bytes(&queue_budget, stream, frame.kind, input_bytes);
             let replay_before = stream
                 .sequence
                 .direction(Direction::RelayToConnector)
@@ -17238,15 +17275,27 @@ impl RelayActor {
                     pending.response_sequence,
                     tunnel_protocol::reset_reason::CANCELLED,
                 );
-                let queued = frame.encode().is_ok_and(|encoded| {
-                    queue_data(&data_tx, &session.queue_budget, encoded).is_ok()
-                });
-                if queued {
-                    if let Some(pending) = session.pending.get_mut(&stream_id) {
-                        pending.abandon.relay_reset = true;
+                // The RESET is cancellation, which docs/protocol.md gives
+                // reserved capacity (M4-37).  Backpressure from a live carrier
+                // leaves it owed: the tick's `flush_frozen_writes` retries it,
+                // bounded by `unary_abandon_bound` (task row M4-47).  Only a
+                // closed carrier or an unencodable frame fails closed.
+                let queued = frame
+                    .encode()
+                    .map_err(|_| QueueRefusal::Closed)
+                    .and_then(|encoded| {
+                        queue_flow_control(&data_tx, &session.queue_budget, encoded)
+                    });
+                match queued {
+                    Ok(()) => {
+                        if let Some(pending) = session.pending.get_mut(&stream_id) {
+                            pending.abandon.relay_reset = true;
+                        }
                     }
-                } else {
-                    publish_failed = Some((data_tx, session.control_tx.clone()));
+                    Err(QueueRefusal::Budget | QueueRefusal::Full) => {}
+                    Err(QueueRefusal::Closed) => {
+                        publish_failed = Some((data_tx, session.control_tx.clone()));
+                    }
                 }
             }
         }
@@ -17522,6 +17571,36 @@ fn reserve_m2_bytes(budget: &QueueBudget, stream: &mut M2Stream, bytes: usize) -
     true
 }
 
+/// Charge a frame the connector sent on an M2 stream as it is received.
+///
+/// DATA is application data and is charged to the data lane, which the
+/// relay's own buffering can saturate.  A FIN or RESET is not: it ends the
+/// stream, its payload is at most a two-byte reason, and at most one arrives
+/// per stream direction.  docs/protocol.md gives cancellation reserved
+/// capacity, so a terminal is charged as the relay's own flow-control frames
+/// are (M4-37), up to the full budget.  Before task row M4-47 a terminal
+/// refused by a saturated data lane set `invalid`, and the session closed
+/// `INVALID_SEQUENCE` -- a peer protocol violation -- for the relay's own
+/// backpressure.
+fn reserve_m2_inbound_bytes(
+    budget: &QueueBudget,
+    stream: &mut M2Stream,
+    kind: FrameKind,
+    bytes: usize,
+) -> bool {
+    if kind == FrameKind::Data {
+        return reserve_m2_bytes(budget, stream, bytes);
+    }
+    if bytes == 0 {
+        return true;
+    }
+    if !budget.reserve_control(bytes) {
+        return false;
+    }
+    stream.budget_bytes = stream.budget_bytes.saturating_add(bytes);
+    true
+}
+
 fn release_m2_bytes(budget: &QueueBudget, stream: &mut M2Stream, bytes: usize) {
     if bytes == 0 {
         return;
@@ -17614,6 +17693,56 @@ fn queue_data(
         return Err(QueueRefusal::Budget);
     }
     enqueue_data(sender, budget, bytes)
+}
+
+/// Why [`queue_data_pair`] refused, and whether its first frame had already
+/// been queued when it did.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PairRefusal {
+    refusal: QueueRefusal,
+    first_queued: bool,
+}
+
+/// Queue two data frames that must reach the carrier together -- a unary
+/// request's DATA and FIN (task row M4-47) -- checking the carrier, its free
+/// slots and the data-lane charge for both before either is queued.  Only
+/// the actor queues on a session's carrier, so free slots cannot be taken
+/// between the check and the sends; a refusal after the first frame is
+/// still reported, with `first_queued` set.
+fn queue_data_pair(
+    sender: &mpsc::Sender<DataOutbound>,
+    budget: &QueueBudget,
+    first: Vec<u8>,
+    second: Vec<u8>,
+) -> Result<(), PairRefusal> {
+    let refused = |refusal| {
+        budget.pressure().record_data_refusal();
+        Err(PairRefusal {
+            refusal,
+            first_queued: false,
+        })
+    };
+    if sender.is_closed() {
+        return refused(QueueRefusal::Closed);
+    }
+    if sender.capacity() < 2 {
+        return refused(QueueRefusal::Full);
+    }
+    let second_len = second.len();
+    if !budget.reserve_data(first.len().saturating_add(second_len)) {
+        return refused(QueueRefusal::Budget);
+    }
+    if let Err(refusal) = enqueue_data(sender, budget, first) {
+        budget.release(second_len);
+        return Err(PairRefusal {
+            refusal,
+            first_queued: false,
+        });
+    }
+    enqueue_data(sender, budget, second).map_err(|refusal| PairRefusal {
+        refusal,
+        first_queued: true,
+    })
 }
 
 /// Queue a relay **flow-control** frame -- an `ACK`, a `WINDOW_UPDATE`, or the
@@ -23742,6 +23871,58 @@ mod stream_identity_tests {
             budget.data_exhausted(),
             "and they drew on the reserved capacity, not the saturated data lane"
         );
+        budget.release(room);
+        drop(registration);
+    }
+
+    /// Task row M4-47, site 1 (terminal frames).  A connector `RESET`'s
+    /// two-byte reason is its payload, and it was charged to the data lane on
+    /// receipt like application DATA.  With the lane saturated by the relay's
+    /// own buffering and the carrier live, the refused charge set `invalid`
+    /// and the whole session closed `INVALID_SEQUENCE` -- a peer protocol
+    /// violation -- for backpressure the relay applied to itself, before the
+    /// RESET was even sequenced.  A terminal is cancellation, which
+    /// docs/protocol.md gives reserved capacity; it is now charged there.
+    #[tokio::test]
+    async fn m4_47_a_connector_reset_on_a_saturated_data_lane_does_not_fence_the_session() {
+        let (mut actor, mut control, mut data_rx, carrier, key, registration) =
+            m4_37_opened_echo_stream(4_471, "m4-47-reset").await;
+        let budget = actor.sessions[&key.scope()].queue_budget.clone();
+        let room = budget.data_limit().saturating_sub(budget.used());
+        assert!(budget.reserve_data(room), "saturate the data lane");
+        assert!(budget.data_exhausted() && !data_rx.is_closed());
+
+        let reset = Frame::reset(
+            key.epoch,
+            carrier.generation,
+            registration.stream_id,
+            1,
+            0,
+            tunnel_protocol::reset_reason::CANCELLED,
+        );
+        actor.inbound_m2_stream_data(carrier, reset, false).await;
+
+        let close = m4_37_session_close_code(&mut control);
+        assert!(
+            actor.sessions.contains_key(&key.scope()),
+            "a connector RESET within protocol must not fence the device session over the \
+             relay's own backpressure (it closed as {close:?})"
+        );
+        assert_eq!(close, None, "no session close was sent to the device");
+        let stream = &actor.sessions[&key.scope()].streams[&registration.stream_id];
+        assert!(
+            stream.terminal,
+            "the RESET was sequenced and ended the stream"
+        );
+        assert_eq!(
+            stream
+                .sequence
+                .direction(Direction::ConnectorToRelay)
+                .recv_contiguous(),
+            1,
+            "the RESET was received in order"
+        );
+        let _ = m6c160_drain_kinds(&mut data_rx);
         budget.release(room);
         drop(registration);
     }
