@@ -1531,6 +1531,59 @@ async fn a_lapsed_revision_superseding_a_live_peer_record_stays_fatal() {
     fixture.shutdown().await;
 }
 
+/// **Red first (M7-C187 carve-out, version condition).** The carve-out
+/// only covers a lapsed record *above* the retained version. A lapsed record
+/// at an older version than the live one this relay retains -- a stale
+/// rewrite of an expired record -- supersedes nothing, so it is absent and
+/// relay-b stays routable on its retained, newer version. Red if the
+/// carve-out ignores the version order (the pass then fails `Expired`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_lapsed_older_peer_record_beside_a_live_retained_version_is_absent() {
+    let fixture = Fixture::new().await;
+    let _control = fixture.register().await;
+    fixture
+        .authority
+        .others
+        .lock()
+        .expect("other nodes")
+        .insert(PEER_NODE.to_owned(), 1);
+    let now = Utc::now();
+    let own = fixture.signed(
+        NODE_ID,
+        2,
+        SERVED_SPKI,
+        now - ChronoDuration::seconds(1),
+        now + ChronoDuration::seconds(30),
+    );
+    let live_v2 = fixture.signed(
+        PEER_NODE,
+        2,
+        OTHER_SPKI,
+        now - ChronoDuration::seconds(1),
+        now + ChronoDuration::seconds(50),
+    );
+    fixture.set_records(vec![own.clone(), live_v2]).await;
+    fixture.ready_pass().await;
+    let lapsed_v1 = fixture.signed(
+        PEER_NODE,
+        1,
+        OTHER_SPKI,
+        now - ChronoDuration::seconds(50),
+        now - ChronoDuration::seconds(10),
+    );
+    fixture.set_records(vec![own, lapsed_v1]).await;
+    fixture.ready_pass().await;
+    assert!(
+        fixture
+            .membership
+            .verified_peer_route_targets()
+            .iter()
+            .any(|target| target.node_id() == PEER_NODE),
+        "relay-b stays routable on its retained live version 2"
+    );
+    fixture.shutdown().await;
+}
+
 /// **Red first (M7-C187 carve-out bound, review of #233).** The carve-out
 /// only protects a retained record that is still inside its window. Here
 /// relay-b's version 1 is retained, then lapses past its lifetime plus skew,
