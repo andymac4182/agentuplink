@@ -234,11 +234,16 @@ async fn legacy_http_export_forwards_last_event_id_to_the_backend() {
     assert_eq!(initialized.status(), http::StatusCode::ACCEPTED);
     let _ = body_bytes(initialized).await;
 
+    // The seen event is the first progress notification, so the resumed
+    // stream owes at least the other `STEPS - 1`.
+    const STEPS: usize = 20;
     let call = within(exchange(
         &export,
         post(
             Some(&session),
-            r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"progress","arguments":{"steps":20},"_meta":{"progressToken":"m310"}}}"#,
+            &format!(
+                r#"{{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{{"name":"progress","arguments":{{"steps":{STEPS}}},"_meta":{{"progressToken":"m310"}}}}}}"#
+            ),
         ),
     ))
     .await;
@@ -289,7 +294,7 @@ async fn legacy_http_export_forwards_last_event_id_to_the_backend() {
         rest.iter()
             .filter(|(_, data)| data.contains("notifications/progress"))
             .count()
-            >= 19,
+            >= STEPS - 1,
         "the rest of the request's progress arrives on the resumed stream"
     );
     drop(body);

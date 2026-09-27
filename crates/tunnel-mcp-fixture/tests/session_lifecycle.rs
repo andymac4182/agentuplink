@@ -479,22 +479,73 @@ async fn the_stdio_export_emits_no_event_ids_and_replays_nothing() {
         !text.lines().any(|line| line.starts_with("id:")),
         "no event carries an ID"
     );
-    // A Last-Event-ID the export never issued opens a fresh stream.
+    // The standalone stream: server messages that belong to no request.
     let mut get_headers = legacy_headers(Some(&session));
     get_headers.retain(|(name, _)| *name != "accept" && *name != "content-type");
     get_headers.push(("accept", "text/event-stream".to_owned()));
-    get_headers.push(("last-event-id", "0".to_owned()));
-    let stream = within(exchange(
+    let log = |label: &str, id: u64| {
+        format!(
+            r#"{{"jsonrpc":"2.0","id":{id},"method":"tools/call","params":{{"name":"log","arguments":{{"label":"{label}","count":3}}}}}}"#
+        )
+    };
+    let first = within(exchange(
         &export,
         build("GET", &get_headers, Full::new(Bytes::new())),
     ))
     .await;
-    assert_eq!(stream.status(), StatusCode::OK);
-    let mut body = stream.into_body();
-    // Nothing is queued for this session, so nothing arrives: no replay of
-    // the progress stream above.
-    let first = tokio::time::timeout(Duration::from_millis(500), body.frame()).await;
-    assert!(first.is_err(), "nothing is replayed: {first:?}");
+    assert_eq!(first.status(), StatusCode::OK);
+    let mut first = first.into_body();
+    let call = within(exchange(&export, post(&headers, &log("before", 4)))).await;
+    let _ = body_bytes(call).await;
+    let delivered = read_until(&mut first, r#""label":"before","seq":2"#).await;
+    assert!(delivered.contains(r#""label":"before","seq":0"#));
+    assert!(
+        !delivered.lines().any(|line| line.starts_with("id:")),
+        "no standalone event carries an ID"
+    );
+    drop(first);
+    // Reconnect with a Last-Event-ID, as a resuming client would.  The old
+    // stream's close is noticed asynchronously, so a GET that still meets
+    // the open stream is refused and retried, bounded.
+    get_headers.push(("last-event-id", "0".to_owned()));
+    let mut second = None;
+    for _ in 0..200 {
+        let response = within(exchange(
+            &export,
+            build("GET", &get_headers, Full::new(Bytes::new())),
+        ))
+        .await;
+        if response.status() == StatusCode::OK {
+            second = Some(response.into_body());
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let mut second = second.expect("a second standalone stream opens");
+    let call = within(exchange(&export, post(&headers, &log("after", 5)))).await;
+    let _ = body_bytes(call).await;
+    let resumed = read_until(&mut second, r#""label":"after","seq":2"#).await;
+    // A resuming bridge would deliver the messages already seen first.
+    assert!(
+        !resumed.contains(r#""label":"before""#),
+        "nothing already delivered is replayed: {resumed}"
+    );
+    assert!(resumed.contains(r#""label":"after","seq":0"#));
+}
+
+/// Read `body` until `needle` has arrived; returns everything read.
+async fn read_until(body: &mut tunnel_http_bridge::ChannelBody, needle: &str) -> String {
+    let mut text = String::new();
+    within(async {
+        while !text.contains(needle) {
+            let frame = body.frame().await.expect("stream open").expect("frame");
+            if let Ok(data) = frame.into_data() {
+                text.push_str(std::str::from_utf8(&data).expect("utf-8"));
+            }
+        }
+    })
+    .await;
+    text
 }
 
 fn wrapper_script(dir: &Path) -> PathBuf {
