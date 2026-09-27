@@ -2032,19 +2032,44 @@ pub(crate) async fn http_forward_route(
 }
 
 /// The local `http-forward/1` answer for a stream whose OPEN the connector
-/// refused (task row M6-C210), replacing the bridge's own failure.  No device
-/// byte can precede OPENED, so a refused stream's head is always the
-/// bridge's failure, and it would say `HTTP_STREAM_INTERRUPTED`/`unknown`
-/// because the request head had already entered the bridge.  An OPEN refused
-/// `GOAWAY` inside a scheduled rotation freeze never ran, so the consumer
-/// gets the retryable `503 ROTATION_FREEZE`/`not_dispatched` with its retry
-/// hint instead, as a new request refused by the same freeze does.  Every
-/// other refusal keeps the bridge's answer.
+/// refused (task rows M6-C210 and M6-C215), replacing the bridge's own
+/// failure: [`open_refusal_response`], with a freeze refusal counted under
+/// route `http-forward`.
 fn refused_open_response(open_refusal: Option<&'static str>) -> Option<Response> {
-    (open_refusal == Some(crate::actor::ROTATION_FREEZE_ECHO_CODE)).then(|| {
+    let response = open_refusal_response(open_refusal)?;
+    if open_refusal == Some(crate::actor::ROTATION_FREEZE_ECHO_CODE) {
         crate::metrics::count_local_rotation_freeze("http-forward");
-        rotation_freeze_response(crate::actor::ROTATION_FREEZE_RETRY_AFTER_MS)
-    })
+    }
+    Some(response)
+}
+
+/// The `http-forward/1` answer for a stream whose OPEN the connector refused,
+/// from the consumer-facing code the owner's actor published
+/// (`connector_open_refusal_code`).  No device byte can precede OPENED, so a
+/// refused stream's head is always the bridge's failure, and it would say
+/// `HTTP_STREAM_INTERRUPTED`/`unknown` because the request head had already
+/// entered the bridge.  Nothing ran, so every answer is `not_dispatched`, and
+/// each is the unary echo's answer for the same refusal:
+///
+/// * `ROTATION_FREEZE` (`GOAWAY` inside a scheduled rotation freeze): the
+///   retryable `503 ROTATION_FREEZE` with its retry hint (M6-C210);
+/// * `RESOURCE_EXHAUSTED` (the connector's capacity): the retryable
+///   `503 RESOURCE_EXHAUSTED` with its retry hint (M6-C215);
+/// * `DEVICE_REJECTED` (every other refusal): `503 DEVICE_REJECTED`, with no
+///   retry hint (M6-C215).
+///
+/// An unknown code, or none, keeps the bridge's answer.  Used by the owner's
+/// local route and, for a refusal carried across a peer hop (M6-C213), by the
+/// ingress.
+pub(crate) fn open_refusal_response(open_refusal: Option<&str>) -> Option<Response> {
+    match open_refusal? {
+        crate::actor::ROTATION_FREEZE_ECHO_CODE => Some(rotation_freeze_response(
+            crate::actor::ROTATION_FREEZE_RETRY_AFTER_MS,
+        )),
+        "RESOURCE_EXHAUSTED" => Some(echo_capacity_response()),
+        "DEVICE_REJECTED" => Some(failure_outcome("DEVICE_REJECTED", "not_dispatched")),
+        _ => None,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2495,8 +2520,34 @@ mod tests {
         assert_eq!(body["execution"], "not_dispatched");
         assert_eq!(body["retryable"], true);
         assert_eq!(body["retry_after_ms"], 250);
-        for other in [None, Some("DEVICE_REJECTED"), Some("RESOURCE_EXHAUSTED")] {
+        for other in [None, Some("AUTHORIZATION_REVOKED")] {
             assert!(refused_open_response(other).is_none(), "{other:?}");
+        }
+    }
+
+    /// M6-C215: a refusal outside a freeze replaces the bridge's answer too:
+    /// the retryable `503 RESOURCE_EXHAUSTED` with its hint for capacity,
+    /// `503 DEVICE_REJECTED` without one otherwise, both `not_dispatched`.
+    #[tokio::test]
+    async fn m6c215_an_open_refused_outside_a_freeze_is_answered_with_its_code() {
+        for (refusal, retry_after) in [("RESOURCE_EXHAUSTED", Some("1")), ("DEVICE_REJECTED", None)]
+        {
+            let response = refused_open_response(Some(refusal)).expect("replaced");
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(
+                response
+                    .headers()
+                    .get(header::RETRY_AFTER)
+                    .and_then(|value| value.to_str().ok()),
+                retry_after,
+                "{refusal}"
+            );
+            let body = axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .expect("bounded body");
+            let body: serde_json::Value = serde_json::from_slice(&body).expect("JSON body");
+            assert_eq!(body["code"], refusal);
+            assert_eq!(body["execution"], "not_dispatched");
         }
     }
 

@@ -1882,22 +1882,50 @@ async fn handle_consumer_stream(
 /// refused during a scheduled rotation freeze: 1013, Try Again Later.
 pub(crate) const ROTATION_FREEZE_STREAM_CLOSE_CODE: u16 = 1013;
 
-/// The close a local consumer echo stream ends with (task row M6-C210).  The
-/// 101 is sent before the connector admits the OPEN, so a refusal can only be
-/// told to the consumer in the close.  An OPEN the connector refused `GOAWAY`
-/// inside a scheduled rotation freeze never ran anything, and the stream
-/// closes 1013 (Try Again Later) with reason `ROTATION_FREEZE`: the retryable,
-/// `not_dispatched` answer a new stream refused by the same freeze gets.
-/// Every other end keeps the codeless close.
+/// The WebSocket close code of a stream whose OPEN the device refused for a
+/// reason other than a freeze or its capacity (`DEVICE_REJECTED`): 1011
+/// (task row M6-C215).  In the filesystem contract 1011 reads `SESSION_LOST`,
+/// the session ending without a verdict about effects; 1008 would read as an
+/// expired or revoked credential, which a device refusal is not.
+pub(crate) const DEVICE_REJECTED_STREAM_CLOSE_CODE: u16 = 1011;
+
+/// The coded close for a stream whose OPEN the connector refused (task rows
+/// M6-C210 and M6-C215), from the consumer-facing refusal code the actor
+/// published (`connector_open_refusal_code`): `ROTATION_FREEZE` and
+/// `RESOURCE_EXHAUSTED` close 1013 (Try Again Later, retryable), and
+/// `DEVICE_REJECTED` closes 1011.  The reason is the code itself.  The 101
+/// (or, forwarded, the peer's 200) precedes the connector's admission, so a
+/// refusal can only be told in the close.  Nothing ran: the relay never
+/// sends a record before OPENED.  Shared by the echo stream, the filesystem
+/// session and the forwarded echo stream's peer `Close` record (M6-C213).
+pub(crate) fn open_refusal_close(open_refusal: Option<&str>) -> Option<(u16, &'static str)> {
+    match open_refusal? {
+        crate::actor::ROTATION_FREEZE_ECHO_CODE => Some((
+            ROTATION_FREEZE_STREAM_CLOSE_CODE,
+            crate::actor::ROTATION_FREEZE_ECHO_CODE,
+        )),
+        "RESOURCE_EXHAUSTED" => Some((ROTATION_FREEZE_STREAM_CLOSE_CODE, "RESOURCE_EXHAUSTED")),
+        "DEVICE_REJECTED" => Some((DEVICE_REJECTED_STREAM_CLOSE_CODE, "DEVICE_REJECTED")),
+        _ => None,
+    }
+}
+
+/// The close a local consumer echo stream ends with (task rows M6-C210 and
+/// M6-C215).  An OPEN the connector refused never ran anything, and the
+/// stream closes with the refusal's code ([`open_refusal_close`]); a freeze
+/// refusal is counted under route `stream`.  Every other end keeps the
+/// codeless close.
 fn consumer_stream_close(open_refusal: Option<&'static str>) -> Message {
+    let Some((code, reason)) = open_refusal_close(open_refusal) else {
+        return Message::Close(None);
+    };
     if open_refusal == Some(crate::actor::ROTATION_FREEZE_ECHO_CODE) {
         crate::metrics::count_local_rotation_freeze("stream");
-        return Message::Close(Some(CloseFrame {
-            code: ROTATION_FREEZE_STREAM_CLOSE_CODE,
-            reason: ROTATION_FREEZE_CODE.into(),
-        }));
     }
-    Message::Close(None)
+    Message::Close(Some(CloseFrame {
+        code,
+        reason: reason.into(),
+    }))
 }
 
 /// EC-061: the single exit of the public consumer stream adapter.
@@ -5032,7 +5060,27 @@ mod tests {
             }
             other => panic!("unexpected close {other:?}"),
         }
-        for other in [None, Some("DEVICE_REJECTED"), Some("RESOURCE_EXHAUSTED")] {
+        assert!(matches!(
+            super::consumer_stream_close(None),
+            Message::Close(None)
+        ));
+    }
+
+    /// M6-C215: a refusal outside a freeze closes with its own code: 1013
+    /// `RESOURCE_EXHAUSTED` for capacity, 1011 `DEVICE_REJECTED` otherwise;
+    /// no refusal (or an unknown one) keeps the codeless close.
+    #[test]
+    fn m6c215_an_echo_stream_refused_outside_a_freeze_closes_with_its_code() {
+        for (refusal, code) in [("RESOURCE_EXHAUSTED", 1013), ("DEVICE_REJECTED", 1011)] {
+            match super::consumer_stream_close(Some(refusal)) {
+                Message::Close(Some(frame)) => {
+                    assert_eq!(frame.code, code, "{refusal}");
+                    assert_eq!(frame.reason.as_str(), refusal);
+                }
+                other => panic!("unexpected close {other:?}"),
+            }
+        }
+        for other in [None, Some("AUTHORIZATION_REVOKED")] {
             assert!(
                 matches!(super::consumer_stream_close(other), Message::Close(None)),
                 "{other:?}"

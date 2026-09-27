@@ -311,6 +311,18 @@ impl Stage {
     /// Wait for the consumer's OPEN, freeze the session with that OPEN in the
     /// roster, and have the connector refuse it `GOAWAY`.
     async fn refuse_open_during_freeze(&mut self) {
+        self.refuse_open(tunnel_protocol::open_refusal::CONNECTOR_DRAINING, true)
+            .await;
+    }
+
+    /// Wait for the consumer's OPEN and have the connector refuse that exact
+    /// OPEN with `refusal`; with `freeze`, the session is first frozen with the
+    /// OPEN in the roster (task rows M6-C210 and M6-C215).
+    async fn refuse_open(
+        &mut self,
+        refusal: tunnel_protocol::open_refusal::OpenRefusal,
+        freeze: bool,
+    ) {
         let open = timeout(BUDGET, async {
             loop {
                 if let Some(open) = drain_control(&mut self.control_rx).into_iter().find_map(
@@ -326,24 +338,26 @@ impl Stage {
         })
         .await
         .expect("the consumer's OPEN is queued");
-        self.handle
-            .enter_rotation_freeze_for_test(self.key.clone())
-            .await;
-        let quiesced = drain_control(&mut self.control_rx);
-        assert!(
-            quiesced.iter().any(|message| matches!(
-                message,
-                ControlMessage::RotateQuiesce(quiesce)
-                    if quiesce.roster.stream_ids.contains(&open.stream_id)
-            )),
-            "the OPEN is in the frozen roster"
-        );
-        let goaway = tunnel_protocol::open_refusal::CONNECTOR_DRAINING;
+        if freeze {
+            self.handle
+                .enter_rotation_freeze_for_test(self.key.clone())
+                .await;
+            let quiesced = drain_control(&mut self.control_rx);
+            assert!(
+                quiesced.iter().any(|message| matches!(
+                    message,
+                    ControlMessage::RotateQuiesce(quiesce)
+                        if quiesce.roster.stream_ids.contains(&open.stream_id)
+                )),
+                "the OPEN is in the frozen roster"
+            );
+        }
+        let goaway = refusal;
         self.handle
             .inbound_control(
                 self.key.clone(),
                 ControlMessage::Rejected(Rejected::new(
-                    "route-test-goaway",
+                    "route-test-refusal",
                     open.message_id.clone(),
                     self.key.session_id.clone(),
                     self.key.epoch,
@@ -478,4 +492,150 @@ async fn m6c210_route_http_forward_refused_during_a_freeze_is_503_rotation_freez
     assert_eq!(body["execution"], "not_dispatched");
     assert_eq!(body["retryable"], true);
     assert_eq!(body["retry_after_ms"], 250);
+}
+
+// Task row M6-C215: a stream OPEN the connector refuses outside a rotation
+// freeze gets an explicit, `not_dispatched` answer on the wire.  Before
+// M6-C215 `http-forward/1` answered `502 HTTP_STREAM_INTERRUPTED`/`unknown`
+// and an echo stream or filesystem session closed with no code.
+
+/// A refusal the actor answers `DEVICE_REJECTED` (the connector's export
+/// allowlist) and one it answers `RESOURCE_EXHAUSTED` (its stream limit).
+fn device_rejected() -> tunnel_protocol::open_refusal::OpenRefusal {
+    tunnel_protocol::open_refusal::EXPORT_NOT_ALLOWLISTED
+}
+fn capacity() -> tunnel_protocol::open_refusal::OpenRefusal {
+    tunnel_protocol::open_refusal::STREAM_LIMIT
+}
+
+/// Send one `http-forward/1` request, have the connector refuse its OPEN with
+/// `refusal` outside a freeze, and return the response head and JSON body.
+async fn http_forward_refused(
+    label: &str,
+    refusal: tunnel_protocol::open_refusal::OpenRefusal,
+) -> (String, serde_json::Value) {
+    let mut stage = Stage::start(label).await;
+    let body = r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#;
+    let request = format!(
+        "POST {} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\
+         Authorization: Bearer {}\r\nContent-Type: application/json\r\n\
+         Accept: application/json, text/event-stream\r\n\
+         MCP-Protocol-Version: 2026-07-28\r\nContent-Length: {}\r\n\r\n{body}",
+        stage.path(http_service(), "http/mcp"),
+        stage.token,
+        body.len(),
+    );
+    let mut socket = TcpStream::connect(stage.address).await.expect("connect");
+    socket
+        .write_all(request.as_bytes())
+        .await
+        .expect("write request");
+    stage.refuse_open(refusal, false).await;
+    let mut response = Vec::new();
+    timeout(BUDGET, socket.read_to_end(&mut response))
+        .await
+        .expect("answered in time")
+        .expect("read response");
+    let response = String::from_utf8(response).expect("UTF-8 response");
+    let (head, body) = response.split_once("\r\n\r\n").expect("head and body");
+    (
+        head.to_owned(),
+        serde_json::from_str(body).expect("JSON body"),
+    )
+}
+
+/// M6-C215: `http-forward/1` refused by the device (not a freeze) answers
+/// `503 DEVICE_REJECTED`/`not_dispatched`, the unary echo's answer for the
+/// same refusal, with no retry hint.
+#[tokio::test]
+async fn m6c215_route_http_forward_refused_by_the_device_is_503_device_rejected() {
+    let (head, body) = http_forward_refused("m6c215-route-http-rejected", device_rejected()).await;
+    assert!(head.starts_with("HTTP/1.1 503"), "{head}");
+    assert!(
+        !head
+            .lines()
+            .any(|line| line.to_ascii_lowercase().starts_with("retry-after")),
+        "{head}"
+    );
+    assert_eq!(body["code"], "DEVICE_REJECTED");
+    assert_eq!(body["execution"], "not_dispatched");
+    assert!(body.get("retry_after_ms").is_none(), "{body}");
+}
+
+/// M6-C215: `http-forward/1` refused for the connector's capacity answers the
+/// retryable `503 RESOURCE_EXHAUSTED`/`not_dispatched` with its retry hint.
+#[tokio::test]
+async fn m6c215_route_http_forward_refused_for_capacity_is_retryable_resource_exhausted() {
+    let (head, body) = http_forward_refused("m6c215-route-http-capacity", capacity()).await;
+    assert!(head.starts_with("HTTP/1.1 503"), "{head}");
+    assert!(
+        head.lines()
+            .any(|line| line.eq_ignore_ascii_case("retry-after: 1")),
+        "{head}"
+    );
+    assert_eq!(body["code"], "RESOURCE_EXHAUSTED");
+    assert_eq!(body["execution"], "not_dispatched");
+    assert_eq!(body["retryable"], true);
+    assert_eq!(body["retry_after_ms"], 250);
+}
+
+/// M6-C215: an echo stream refused outside a freeze closes with a code:
+/// 1011 `DEVICE_REJECTED` for a device refusal, 1013 `RESOURCE_EXHAUSTED`
+/// (Try Again Later) for capacity.
+#[tokio::test]
+async fn m6c215_route_echo_stream_refused_outside_a_freeze_closes_with_its_code() {
+    for (label, refusal, expected) in [
+        (
+            "m6c215-route-echo-rejected",
+            device_rejected(),
+            (1011, "DEVICE_REJECTED"),
+        ),
+        (
+            "m6c215-route-echo-capacity",
+            capacity(),
+            (1013, "RESOURCE_EXHAUSTED"),
+        ),
+    ] {
+        let mut stage = Stage::start(label).await;
+        let socket = stage
+            .websocket(echo_service(), "stream", ECHO_STREAM_SUBPROTOCOL)
+            .await;
+        stage.refuse_open(refusal, false).await;
+        assert_eq!(
+            close_of(socket).await,
+            Some((expected.0, expected.1.to_owned())),
+            "{label}"
+        );
+    }
+}
+
+/// M6-C215: a filesystem session refused outside a freeze closes with a code
+/// from the filesystem contract: 1011 `DEVICE_REJECTED` (the client reads
+/// `SESSION_LOST`) for a device refusal, 1013 `RESOURCE_EXHAUSTED` for
+/// capacity.
+#[tokio::test]
+async fn m6c215_route_fs_session_refused_outside_a_freeze_closes_with_its_code() {
+    for (label, refusal, expected) in [
+        (
+            "m6c215-route-fs-rejected",
+            device_rejected(),
+            (1011, "DEVICE_REJECTED"),
+        ),
+        (
+            "m6c215-route-fs-capacity",
+            capacity(),
+            (1013, "RESOURCE_EXHAUSTED"),
+        ),
+    ] {
+        let mut stage = Stage::start(label).await;
+        let socket = stage
+            .websocket(fs_service(), "fs", tunnel_fs_core::TRANSPORT_SUBPROTOCOL)
+            .await;
+        stage.refuse_open(refusal, false).await;
+        assert_eq!(
+            close_of(socket).await,
+            Some((expected.0, expected.1.to_owned())),
+            "{label}"
+        );
+    }
 }
