@@ -2178,12 +2178,26 @@ impl MembershipRuntime {
                 // nothing: a skipped record is never retained, bound or
                 // routed to. Everything else stays fatal: a bad signature,
                 // non-canonical encoding, a rollback, an equal-version
-                // conflict, and any record at or above its minimum that
-                // fails any check.
+                // conflict, and any unexpired record at or above its minimum
+                // that fails any check (expired peer records: M7-C187 below).
                 let Some(&minimum) = checkpoint_minimums.get(&signed.node_id) else {
                     continue;
                 };
                 if signed.record_version < minimum {
+                    continue;
+                }
+                // M7-C187: another node's record past its signed lifetime
+                // plus the accepted skew -- exactly the instant verification
+                // would report `Expired` -- is absent for that node only, so
+                // one lapsed record costs that node its route instead of
+                // failing every relay's pass. Selected from the claimed
+                // expiry before verification, like M7-C185, and never
+                // signature-checked: it grants nothing, because routing and
+                // peer binding re-check the retained record's own window
+                // and an unverified record is never retained. This relay's
+                // own expired record is still verified and stays fatal, and
+                // every unexpired record still fails the pass on any check.
+                if signed.node_id != self.config.node_id && signed.expires_at < freshness_floor {
                     continue;
                 }
                 candidate_verifier
