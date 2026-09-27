@@ -22,7 +22,8 @@ use tunnel_catalog::{
 use tunnel_protocol::rotation::RotationPhase;
 use tunnel_protocol::rotation_control::{
     DrainProof, FenceSnapshot, ResumeDirectionState, RotateAborted, RotateCommitted, RotateDrained,
-    RotateFrozen, RotateRetired, RotationAttemptIdentity, StreamAck, StreamFence, StreamForget,
+    RotateFrozen, RotateRequest, RotateRetired, RotationAttemptIdentity, StreamAck, StreamFence,
+    StreamForget,
 };
 use tunnel_protocol::{
     ControlMessage, Direction, Frame, FrameKind, Rejected, StreamState, Terminal,
@@ -4409,4 +4410,122 @@ async fn m6c160_an_ack_owed_on_the_retired_carrier_is_resent_on_the_new_one_at_c
         "nothing is owed once it went out"
     );
     assert_eq!(fixture.session().flow_control_owed_deadline, None);
+}
+
+/// A connector `data_loss` report naming `generation`/`connection_id`.
+fn m7c178_loss_report(
+    fixture: &FreezeFixture,
+    generation: u64,
+    connection_id: &str,
+) -> ControlMessage {
+    ControlMessage::RotateRequest(RotateRequest {
+        message_id: format!("m7c178-loss-{generation}"),
+        reply_to: String::new(),
+        session_id: fixture.key.session_id.clone(),
+        epoch: fixture.key.epoch,
+        owner_id: fixture.attempt.owner_id.clone(),
+        generation,
+        connection_id: connection_id.to_owned(),
+        desired_interval_ms: None,
+        reason: Some("data_loss".to_owned()),
+    })
+}
+
+/// Task row M7-C178, negative: after COMMIT the session is on generation
+/// g+1 and the old generation-g carrier is still retiring.  A late or forged
+/// `data_loss` report naming generation g (the old connection) is stale: it
+/// must not be applied as a physical close of the retiring carrier, which
+/// would record the owner's old-socket closure and complete the rotation.
+#[tokio::test]
+async fn m7c178_a_stale_generation_loss_report_does_not_close_the_retiring_carrier() {
+    let mut fixture = FreezeFixture::new("m7c178-stale-generation", false);
+    fixture.quiesce();
+    assert!(fixture.complete_barrier().is_empty());
+    fixture.connector_frozen(0).await;
+    fixture.connector_drained().await;
+    fixture.connector_committed().await;
+    fixture.connector_retired().await;
+    assert_eq!(fixture.phase(), RotationPhase::Retiring);
+    assert_eq!(fixture.session().generation, fixture.attempt.new_generation);
+    let _ = fixture.drain_control();
+
+    let old_generation = fixture.attempt.old_generation;
+    assert_eq!(old_generation + 1, fixture.attempt.new_generation);
+    let old_connection_id = fixture.attempt.old_connection_id.clone();
+    let report = m7c178_loss_report(&fixture, old_generation, &old_connection_id);
+    fixture
+        .actor
+        .inbound_control(fixture.key.clone(), report)
+        .await;
+
+    assert!(fixture.actor.sessions.contains_key(&fixture.key.scope()));
+    assert_eq!(
+        fixture.phase(),
+        RotationPhase::Retiring,
+        "a stale-generation loss report must not stand in for the retiring carrier's close (M7-C178)"
+    );
+    assert!(
+        !fixture
+            .drain_control()
+            .iter()
+            .any(|message| matches!(message, ControlMessage::RotateComplete(_))),
+        "no ROTATE_COMPLETE without the owner's own old-carrier close"
+    );
+    assert!(fixture.session().active_carrier.is_some());
+
+    // The real physical close still completes the attempt.
+    fixture
+        .actor
+        .disconnect_data(fixture.old_carrier.clone())
+        .await;
+    assert_eq!(fixture.phase(), RotationPhase::Active);
+}
+
+/// Task row M7-C178, negative: mid-rotation (Draining) a `data_loss` report
+/// naming the rotation candidate's generation and connection is not a
+/// current-context report (the session is still on the old generation).  It
+/// must not be applied as the candidate's close, which would abort the
+/// attempt.
+#[tokio::test]
+async fn m7c178_a_loss_report_naming_the_candidate_does_not_abort_the_rotation() {
+    let mut fixture = FreezeFixture::new("m7c178-candidate", false);
+    fixture.quiesce();
+    assert!(fixture.complete_barrier().is_empty());
+    fixture.connector_frozen(0).await;
+    assert_eq!(fixture.phase(), RotationPhase::Draining);
+    let _ = fixture.drain_control();
+
+    let candidate_connection_id = fixture.attempt.new_connection_id.clone();
+    let report = m7c178_loss_report(
+        &fixture,
+        fixture.attempt.new_generation,
+        &candidate_connection_id,
+    );
+    fixture
+        .actor
+        .inbound_control(fixture.key.clone(), report)
+        .await;
+
+    assert!(fixture.actor.sessions.contains_key(&fixture.key.scope()));
+    assert_eq!(
+        fixture.phase(),
+        RotationPhase::Draining,
+        "a loss report naming the candidate must not abort the rotation (M7-C178)"
+    );
+    assert!(
+        fixture
+            .session()
+            .rotation
+            .as_ref()
+            .is_some_and(|rotation| rotation.candidate.is_some()),
+        "the candidate carrier stays attached"
+    );
+    assert!(
+        !fixture
+            .drain_control()
+            .iter()
+            .any(|message| matches!(message, ControlMessage::RotateAbort(_))),
+        "no ROTATE_ABORT is queued"
+    );
+    assert!(fixture.session().active_carrier.is_some());
 }
