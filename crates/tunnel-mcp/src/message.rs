@@ -76,6 +76,10 @@ pub struct McpMessage {
     /// The request or response ID: a JSON string or integer.
     pub id: Option<Value>,
     pub method: Option<String>,
+    /// M3-38: `compact` is not the consumer's body but a re-serialized
+    /// `initialize` whose `params.protocolVersion` was rewritten to the
+    /// profile's revision.  An export must dispatch `compact`, not the body.
+    pub protocol_version_rewritten: bool,
 }
 
 impl core::fmt::Debug for McpMessage {
@@ -270,6 +274,7 @@ pub fn parse_message(body: &[u8]) -> Result<McpMessage, McpRejection> {
         id: id.cloned(),
         method,
         value,
+        protocol_version_rewritten: false,
     })
 }
 
@@ -327,24 +332,25 @@ pub fn check_message_headers(
                     return Err(rejection);
                 }
             }
-            // M3-38: this profile speaks exactly one revision.  An
-            // `initialize` offering another would be accepted by many
-            // servers, and the client's next request, whose header names
-            // that revision, refused above.  Refuse the `initialize` itself,
-            // before dispatch, with the lifecycle's unsupported-version
-            // error, so the failure comes first.  The offered value is
-            // consumer data and is not echoed.
+            // M3-38: an `initialize` must offer a revision.  A missing or
+            // non-string `protocolVersion` is malformed and refused before
+            // dispatch.  A well-formed offer of another revision is not
+            // refused: `negotiate_initialize` rewrites it (the 2025-11-25
+            // lifecycle's MUST).  Nothing offered is echoed.
             if message.is_initialize()
-                && let Some(offered) = message
+                && message
                     .value
                     .get("params")
                     .and_then(|params| params.get("protocolVersion"))
                     .and_then(Value::as_str)
-                && offered != PROTOCOL_2025_11_25
+                    .is_none()
             {
-                let mut rejection =
-                    McpRejection::new(400, codes::INVALID_PARAMS, "Unsupported protocol version")
-                        .with_id(id);
+                let mut rejection = McpRejection::new(
+                    400,
+                    codes::INVALID_PARAMS,
+                    "initialize requires a string protocolVersion",
+                )
+                .with_id(id);
                 rejection.supported = Some(PROTOCOL_2025_11_25);
                 return Err(rejection);
             }
@@ -438,7 +444,127 @@ pub fn validate_post(
     check_post_headers(headers)?;
     let message = parse_message(body)?;
     check_message_headers(profile, headers, &message)?;
-    Ok(message)
+    Ok(negotiate_initialize(profile, message))
+}
+
+/// M3-38: the 2025-11-25 lifecycle says that a server which does not support
+/// the protocol version a client offers in `initialize` MUST answer with a
+/// version it does support.  A `mcp-2025-11-25` service speaks exactly that
+/// revision, so an `initialize` offering any other is rewritten to offer
+/// `2025-11-25` before dispatch.  The server then answers `2025-11-25`, and
+/// the client continues or disconnects as the lifecycle says.  Only the
+/// bytes of that one string value change: the rest of the compact message,
+/// its member order and its numbers included, is kept exactly.
+#[must_use]
+pub fn negotiate_initialize(profile: McpProfile, mut message: McpMessage) -> McpMessage {
+    if profile != McpProfile::V2025_11_25 || !message.is_initialize() {
+        return message;
+    }
+    let offered = message
+        .value
+        .get("params")
+        .and_then(|params| params.get("protocolVersion"))
+        .and_then(Value::as_str);
+    if offered.is_none_or(|offered| offered == PROTOCOL_2025_11_25) {
+        return message;
+    }
+    let Some(span) = member_span(&message.compact, "params").and_then(|params| {
+        member_span(&message.compact[params.clone()], "protocolVersion")
+            .map(|inner| params.start + inner.start..params.start + inner.end)
+    }) else {
+        return message;
+    };
+    let mut compact = Vec::with_capacity(message.compact.len());
+    compact.extend_from_slice(&message.compact[..span.start]);
+    compact.push(b'"');
+    compact.extend_from_slice(PROTOCOL_2025_11_25.as_bytes());
+    compact.push(b'"');
+    compact.extend_from_slice(&message.compact[span.end..]);
+    let Ok(value) = serde_json::from_slice::<Value>(&compact) else {
+        return message;
+    };
+    message.compact = compact;
+    message.value = value;
+    message.protocol_version_rewritten = true;
+    message
+}
+
+/// The byte range of the value of the top-level member `name` of a compact
+/// JSON object (no insignificant whitespace), comparing decoded keys.
+fn member_span(object: &[u8], name: &str) -> Option<std::ops::Range<usize>> {
+    if object.first() != Some(&b'{') {
+        return None;
+    }
+    let mut position = 1;
+    while position < object.len() && object[position] != b'}' {
+        let key_end = string_end(object, position)?;
+        let key: String = serde_json::from_slice(&object[position..key_end]).ok()?;
+        if object.get(key_end) != Some(&b':') {
+            return None;
+        }
+        let value_start = key_end + 1;
+        let value_end = value_end(object, value_start)?;
+        if key == name {
+            return Some(value_start..value_end);
+        }
+        position = value_end;
+        if object.get(position) == Some(&b',') {
+            position += 1;
+        }
+    }
+    None
+}
+
+/// The index just past the JSON string starting at `start`.
+fn string_end(bytes: &[u8], start: usize) -> Option<usize> {
+    if bytes.get(start) != Some(&b'"') {
+        return None;
+    }
+    let mut position = start + 1;
+    while position < bytes.len() {
+        match bytes[position] {
+            b'\\' => position += 2,
+            b'"' => return Some(position + 1),
+            _ => position += 1,
+        }
+    }
+    None
+}
+
+/// The index just past the compact JSON value starting at `start`.
+fn value_end(bytes: &[u8], start: usize) -> Option<usize> {
+    match bytes.get(start)? {
+        b'"' => string_end(bytes, start),
+        b'{' | b'[' => {
+            let mut depth = 0usize;
+            let mut position = start;
+            while position < bytes.len() {
+                match bytes[position] {
+                    b'"' => {
+                        position = string_end(bytes, position)?;
+                        continue;
+                    }
+                    b'{' | b'[' => depth += 1,
+                    b'}' | b']' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return Some(position + 1);
+                        }
+                    }
+                    _ => {}
+                }
+                position += 1;
+            }
+            None
+        }
+        _ => {
+            let mut position = start;
+            while position < bytes.len() && !matches!(bytes[position], b',' | b'}' | b']') {
+                position += 1;
+            }
+            Some(position)
+        }
+    }
 }
 
 /// Validate a legacy GET (standalone SSE stream) head.

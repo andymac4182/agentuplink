@@ -408,7 +408,9 @@ async fn an_id_reused_right_after_its_cancel_is_never_interrupted() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     // Now let the old POST end, and its cleanup run.
-    let old = within(first).await.expect("the cancelled POST ends cleanly");
+    let old = within(first)
+        .await
+        .expect("the cancelled POST ends cleanly");
     assert_eq!(old.status(), StatusCode::OK);
     let reuse = tokio::time::timeout(Duration::from_secs(3), reuse).await;
     match reuse {

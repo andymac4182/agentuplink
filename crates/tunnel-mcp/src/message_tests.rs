@@ -314,31 +314,68 @@ fn the_2025_profile_requires_its_version_except_on_initialize() {
     );
 }
 
-/// M3-38: the legacy profile speaks exactly 2025-11-25, so an `initialize`
-/// offering another revision is refused before dispatch with the lifecycle's
-/// unsupported-version error (`-32602`), naming the supported revision and
-/// never echoing the requested one.
+/// M3-38: the legacy profile speaks exactly 2025-11-25.  The 2025-11-25
+/// lifecycle says a server that does not support the offered version MUST
+/// answer with one it supports, so an `initialize` offering another revision
+/// is rewritten to offer `2025-11-25` before dispatch.  Everything else in
+/// the message is kept, in order.  Only a malformed offer (missing or not a
+/// string) is refused.
 #[test]
-fn the_2025_profile_refuses_initialize_for_another_revision() {
+fn the_2025_profile_rewrites_initialize_for_another_revision() {
     let profile = McpProfile::V2025_11_25;
     for offered in ["2025-06-18", "2025-03-26", "2026-07-28", "v999"] {
         let init = format!(
-            r#"{{"jsonrpc":"2.0","id":0,"method":"initialize","params":{{"protocolVersion":"{offered}"}}}}"#
+            r#"{{"jsonrpc":"2.0","id":0,"method":"initialize","params":{{"protocolVersion":"{offered}","capabilities":{{"x":{{"n":1}}}},"clientInfo":{{"name":"c","version":"1"}}}}}}"#
         );
-        let rejection = validate_post(profile, &map(BASE), init.as_bytes()).unwrap_err();
-        assert_eq!(rejection.status, 400, "{offered}");
-        assert_eq!(rejection.code, codes::INVALID_PARAMS, "{offered}");
-        assert_eq!(rejection.supported, Some("2025-11-25"), "{offered}");
-        assert_eq!(rejection.id, Some(serde_json::json!(0)), "{offered}");
-        assert!(
-            !String::from_utf8_lossy(&rejection.body()).contains(offered),
-            "{offered} is not echoed"
+        let message = validate_post(profile, &map(BASE), init.as_bytes()).expect(offered);
+        assert!(message.protocol_version_rewritten, "{offered}");
+        let expected = br#"{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{"x":{"n":1}},"clientInfo":{"name":"c","version":"1"}}}"#;
+        assert_eq!(
+            String::from_utf8_lossy(&message.compact),
+            String::from_utf8_lossy(expected),
+            "{offered}"
         );
+        assert_eq!(message.value["params"]["protocolVersion"], "2025-11-25");
+        assert_eq!(message.id, Some(serde_json::json!(0)));
     }
-    // The pinned revision, with or without the optional header, is admitted.
+    // Only the top-level offer changes: a nested member of the same name, a
+    // key that needs decoding, whitespace-free numbers and escapes are kept.
+    let init = br#"{"jsonrpc":"2.0","id":"a\"b","method":"initialize","params":{"capabilities":{"protocolVersion":"keep","n":[1.50,12345678901234567890123]},"clientInfo":{"name":"q\u00e9"},"protocol\u0056ersion":"2025-06-18"}}"#;
+    let message = validate_post(profile, &map(BASE), init).expect("escaped");
+    assert!(message.protocol_version_rewritten);
+    let expected = br#"{"jsonrpc":"2.0","id":"a\"b","method":"initialize","params":{"capabilities":{"protocolVersion":"keep","n":[1.50,12345678901234567890123]},"clientInfo":{"name":"q\u00e9"},"protocol\u0056ersion":"2025-11-25"}}"#;
+    assert_eq!(
+        String::from_utf8_lossy(&message.compact),
+        String::from_utf8_lossy(expected)
+    );
+    // The pinned revision, with or without the optional header, is untouched.
     let init = br#"{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-11-25"}}"#;
-    assert!(validate_post(profile, &map(BASE), init).is_ok());
+    let message = validate_post(profile, &map(BASE), init).expect("pinned");
+    assert!(!message.protocol_version_rewritten);
+    assert_eq!(message.compact, init.to_vec());
     let mut with_version = BASE.to_vec();
     with_version.push(("mcp-protocol-version", "2025-11-25"));
     assert!(validate_post(profile, &map(&with_version), init).is_ok());
+    // A malformed offer is refused, and nothing in it is echoed.
+    for params in [
+        r#"{}"#,
+        r#"{"protocolVersion":7}"#,
+        r#"{"protocolVersion":null}"#,
+    ] {
+        let init = format!(r#"{{"jsonrpc":"2.0","id":0,"method":"initialize","params":{params}}}"#);
+        let rejection = validate_post(profile, &map(BASE), init.as_bytes()).unwrap_err();
+        assert_eq!(rejection.status, 400, "{params}");
+        assert_eq!(rejection.code, codes::INVALID_PARAMS, "{params}");
+        assert_eq!(rejection.supported, Some("2025-11-25"), "{params}");
+        assert_eq!(rejection.id, Some(serde_json::json!(0)), "{params}");
+    }
+    // Nothing but `initialize` is ever rewritten.
+    let other = br#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#;
+    let mut with_version = BASE.to_vec();
+    with_version.push(("mcp-protocol-version", "2025-11-25"));
+    assert!(
+        !validate_post(profile, &map(&with_version), other)
+            .unwrap()
+            .protocol_version_rewritten
+    );
 }

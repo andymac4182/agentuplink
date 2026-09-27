@@ -113,26 +113,27 @@ async fn legacy_profile_http_export_round_trip_and_cancellation() {
     http_export_round_trip("mcp-2025-11-25", true).await;
 }
 
-/// M3-38 for the Streamable HTTP export kind: an `initialize` offering an
-/// older revision is refused by the export before anything is dispatched to
-/// the backend, which would otherwise have accepted it.
+/// M3-38 for the Streamable HTTP export kind: an offered `2025-06-18` is
+/// rewritten to `2025-11-25` before it is dispatched to the backend, which
+/// supports both and therefore answers with whichever it received.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn legacy_profile_http_export_refuses_an_older_revision_at_initialize() {
+async fn legacy_profile_http_export_answers_an_older_offer_with_its_own_revision() {
     let dir = tempfile::tempdir().expect("dir");
     let (url, shutdown) = rmcp_http_backend(true, dir.path()).await;
     let export = http_export("mcp-2025-11-25", &url, None);
     let gateway = gateway(export.clone(), dir.path());
-    let outcome = connect_pinned(&gateway, rmcp::model::ProtocolVersion::V_2025_06_18).await;
-    assert!(
-        outcome.is_err(),
-        "initialize offering 2025-06-18 must fail at initialize"
-    );
-    let diagnostics = export.diagnostics();
-    assert_eq!(diagnostics.dispatched, 0, "{diagnostics:?}");
-    let current = connect_pinned(&gateway, rmcp::model::ProtocolVersion::V_2025_11_25)
+    let client = connect_pinned(&gateway, rmcp::model::ProtocolVersion::V_2025_06_18)
         .await
-        .expect("2025-11-25 initialize");
-    let _ = within(current.cancel()).await;
+        .expect("initialize offering 2025-06-18 is answered");
+    let negotiated = client
+        .peer_info()
+        .expect("server info")
+        .protocol_version
+        .clone();
+    assert_eq!(negotiated, rmcp::model::ProtocolVersion::V_2025_11_25);
+    let tools = within(client.list_all_tools()).await.expect("tools/list");
+    assert!(tools.iter().any(|tool| tool.name == "progress"));
+    let _ = within(client.cancel()).await;
     shutdown.cancel();
 }
 
