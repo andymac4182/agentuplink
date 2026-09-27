@@ -363,9 +363,17 @@ impl RedisMembershipPublisher {
     }
 
     /// Publish one independently signed relay record into the bounded
-    /// operator directory.  The node id is an index only; it does not grant
-    /// trust and is checked again against the signed bytes by the reader and
-    /// cluster verifier.
+    /// operator directory.
+    ///
+    /// A publish whose reply is lost after it was dispatched returns
+    /// [`CatalogError::WriteOutcomeUnknown`], not a definite failure: the
+    /// record may have committed (M7-C189).  The directory refuses a second,
+    /// different record at the same version as a conflict, so a publisher
+    /// that retries must sign a strictly newer version rather than re-sign
+    /// the one whose outcome it does not know.
+    ///
+    /// The node id is an index only; it does not grant trust and is checked
+    /// again against the signed bytes by the reader and cluster verifier.
     pub async fn publish_signed_membership_for_node(
         &self,
         node_id: &str,
@@ -1462,7 +1470,7 @@ impl RedisCatalog {
             .arg(version)
             .arg(bytes)
             .arg(cluster::MEMBERSHIP_TTL_SECONDS.to_string());
-        self.connection.query(&command).await
+        self.connection.query_write(&command).await
     }
 
     async fn eval_membership_publish_directory(
@@ -1483,7 +1491,7 @@ impl RedisCatalog {
             .arg(envelope)
             .arg(MAX_SIGNED_MEMBERSHIP_RECORDS.to_string())
             .arg(cluster::MEMBERSHIP_TTL_SECONDS.to_string());
-        self.connection.query(&command).await
+        self.connection.query_write(&command).await
     }
 
     async fn read_signed_membership_directory(

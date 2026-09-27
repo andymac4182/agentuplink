@@ -33,7 +33,8 @@ use tokio::{
 use tunnel_catalog::{
     Catalog, CatalogError, CatalogFixture, CredentialRecord, FixtureDevice, GrantSpec,
     MembershipRecord, MembershipRole, OwnerClaimRequest, PermissionSet, PrincipalIdentity,
-    RedisCatalog, ServiceSpec, TenantRecord, UnknownWriteCause, UserRecord,
+    RedisCatalog, RedisMembershipPublisher, ServiceSpec, SignedMembershipRecord, TenantRecord,
+    UnknownWriteCause, UserRecord,
 };
 use uuid::Uuid;
 
@@ -791,6 +792,135 @@ async fn m7_ec014_committed_owner_write_withheld_reply_is_bounded_unknown_once()
         (Ok(()), Ok(())) => {}
         (primary, cleanup) => {
             panic!("EC-014 lost-reply scenario failed: primary={primary:?}; cleanup={cleanup:?}")
+        }
+    }
+}
+
+/// M7-C189: a signed membership publish whose reply is lost after it was
+/// dispatched is the typed unknown outcome, because it may have committed --
+/// and here it did.  The catalog used to report it as a definite
+/// `Database` failure, so a control plane that trusted that and re-signed the
+/// same version with a fresh issue time was refused as a same-version
+/// conflict on every retry (the chaos gate's re-signer, M7-C188).
+async fn run_membership_publish_scenario(
+    catalog: RedisCatalog,
+    upstream_url: String,
+    namespace: String,
+) {
+    let node_id = "relay-c189";
+    let committed = format!(r#"{{"node_id":"{node_id}","issued":"first"}}"#).into_bytes();
+    let proxy = LoopbackProxy::start(&upstream_url).await;
+    let control = proxy.control.clone();
+    let proxied = RedisMembershipPublisher::connect(&proxy.url, &namespace)
+        .await
+        .expect("connect proxied membership publisher");
+    control.arm_selected_mutation();
+    let outcome = timeout(
+        StdDuration::from_secs(5),
+        proxied.publish_signed_membership_for_node(
+            node_id,
+            &SignedMembershipRecord {
+                version: 2,
+                bytes: committed.clone(),
+            },
+        ),
+    )
+    .await;
+    control.wait_selected_mutation().await;
+    assert_typed_unknown(outcome, "membership publish");
+    drop(proxied);
+    proxy.shutdown().await;
+    assert_eq!(
+        control.selected_count(),
+        1,
+        "the membership publish EVAL must run exactly once"
+    );
+
+    // The lost-reply publish committed: the unknown outcome was the truth.
+    let records = catalog
+        .read_signed_memberships()
+        .await
+        .expect("authoritative directory read after the lost publish reply");
+    assert_eq!(records.len(), 1, "exactly the lost-reply record is present");
+    assert_eq!(records[0].version, 2);
+    assert_eq!(records[0].bytes, committed);
+
+    // Why the outcome must not read as a definite failure: re-signing the
+    // same version is refused, and only a strictly newer version succeeds.
+    let direct = RedisMembershipPublisher::connect(&upstream_url, &namespace)
+        .await
+        .expect("connect direct membership publisher");
+    let resigned = format!(r#"{{"node_id":"{node_id}","issued":"second"}}"#).into_bytes();
+    match direct
+        .publish_signed_membership_for_node(
+            node_id,
+            &SignedMembershipRecord {
+                version: 2,
+                bytes: resigned.clone(),
+            },
+        )
+        .await
+    {
+        Err(CatalogError::Conflict(_)) => {}
+        other => panic!("a same-version re-sign must be a conflict, got {other:?}"),
+    }
+    direct
+        .publish_signed_membership_for_node(
+            node_id,
+            &SignedMembershipRecord {
+                version: 3,
+                bytes: resigned,
+            },
+        )
+        .await
+        .expect("a strictly newer version replaces the committed record");
+}
+
+#[tokio::test]
+#[ignore = "requires TUNNEL_CATALOG_REDIS_URL Redis primary fixture"]
+async fn m7_c189_membership_publish_withheld_reply_is_typed_unknown_and_committed() {
+    let upstream_url = std::env::var("TUNNEL_CATALOG_REDIS_URL")
+        .expect("M7-C189 lost-reply test requires TUNNEL_CATALOG_REDIS_URL");
+    let namespace = format!("test-c189-lost-publish-{}", Uuid::new_v4());
+    let cleanup_catalog = RedisCatalog::connect(&upstream_url, &namespace)
+        .await
+        .expect("connect cleanup catalog");
+    let scenario_catalog = cleanup_catalog.clone();
+    let scenario_upstream = upstream_url.clone();
+    let scenario_namespace = namespace.clone();
+    let mut scenario = tokio::spawn(async move {
+        run_membership_publish_scenario(scenario_catalog, scenario_upstream, scenario_namespace)
+            .await;
+    });
+    let primary = match timeout(StdDuration::from_secs(30), &mut scenario).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(join_error)) if join_error.is_panic() => {
+            Err(format!("scenario panicked: {join_error}"))
+        }
+        Ok(Err(join_error)) => Err(format!("scenario did not complete: {join_error}")),
+        Err(_) => {
+            scenario.abort();
+            let _ = scenario.await;
+            Err("scenario deadline exceeded after 30 seconds".into())
+        }
+    };
+    let cleanup = match timeout(
+        StdDuration::from_secs(5),
+        cleanup_catalog.cleanup_fixture_namespace(),
+    )
+    .await
+    {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(format!("cleanup failed: {error}")),
+        Err(_) => Err("cleanup deadline exceeded after 5 seconds".into()),
+    };
+    match (primary, cleanup) {
+        (Ok(()), Ok(())) => {}
+        (primary, cleanup) => {
+            panic!(
+                "M7-C189 lost membership publish scenario failed: primary={primary:?}; \
+                 cleanup={cleanup:?}"
+            )
         }
     }
 }
