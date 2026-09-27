@@ -1882,22 +1882,76 @@ async fn handle_consumer_stream(
 /// refused during a scheduled rotation freeze: 1013, Try Again Later.
 pub(crate) const ROTATION_FREEZE_STREAM_CLOSE_CODE: u16 = 1013;
 
-/// The close a local consumer echo stream ends with (task row M6-C210).  The
-/// 101 is sent before the connector admits the OPEN, so a refusal can only be
-/// told to the consumer in the close.  An OPEN the connector refused `GOAWAY`
-/// inside a scheduled rotation freeze never ran anything, and the stream
-/// closes 1013 (Try Again Later) with reason `ROTATION_FREEZE`: the retryable,
-/// `not_dispatched` answer a new stream refused by the same freeze gets.
-/// Every other end keeps the codeless close.
+/// The WebSocket close code of a stream whose OPEN the device refused for a
+/// reason other than a freeze or its capacity (`DEVICE_REJECTED`): 1011
+/// (task row M6-C215).  In the filesystem contract 1011 reads `SESSION_LOST`,
+/// the session ending without a verdict about effects; 1008 would read as an
+/// expired or revoked credential, which a device refusal is not.
+pub(crate) const DEVICE_REJECTED_STREAM_CLOSE_CODE: u16 = 1011;
+
+/// The coded close for a stream whose OPEN the connector refused (task rows
+/// M6-C210 and M6-C215), from the consumer-facing refusal code the actor
+/// published (`connector_open_refusal_code`): `ROTATION_FREEZE` and
+/// `RESOURCE_EXHAUSTED` close 1013 (Try Again Later, retryable), and
+/// `DEVICE_REJECTED` closes 1011.  The reason is the code itself.  The 101
+/// (or, forwarded, the peer's 200) precedes the connector's admission, so a
+/// refusal can only be told in the close.  Nothing ran: the relay never
+/// sends a record before OPENED.  Shared by the echo stream, the filesystem
+/// session and the forwarded echo stream's peer `Close` record (M6-C213).
+pub(crate) fn open_refusal_close(open_refusal: Option<&str>) -> Option<(u16, &'static str)> {
+    match open_refusal? {
+        crate::actor::ROTATION_FREEZE_ECHO_CODE => Some((
+            ROTATION_FREEZE_STREAM_CLOSE_CODE,
+            crate::actor::ROTATION_FREEZE_ECHO_CODE,
+        )),
+        "RESOURCE_EXHAUSTED" => Some((ROTATION_FREEZE_STREAM_CLOSE_CODE, "RESOURCE_EXHAUSTED")),
+        "DEVICE_REJECTED" => Some((DEVICE_REJECTED_STREAM_CLOSE_CODE, "DEVICE_REJECTED")),
+        _ => None,
+    }
+}
+
+/// The body of the peer `Close` record an owner sends the ingress for a
+/// forwarded echo stream whose OPEN the connector refused (task row
+/// M6-C213): the two-byte close code and the reason, as the record kind
+/// defines it.
+fn open_refusal_close_record(open_refusal: Option<&str>) -> Option<Vec<u8>> {
+    let (code, reason) = open_refusal_close(open_refusal)?;
+    let mut body = code.to_be_bytes().to_vec();
+    body.extend_from_slice(reason.as_bytes());
+    Some(body)
+}
+
+/// The coded close an ingress sends its consumer for a peer `Close` record
+/// from the owner (task row M6-C213).  Only the exact closes an owner sends
+/// for a refused OPEN ([`open_refusal_close`]) are carried; any other body
+/// keeps the codeless close the ingress sent before M6-C213.
+fn forwarded_refusal_close(body: &[u8]) -> Option<CloseFrame> {
+    let (code, reason) = body.split_first_chunk::<2>()?;
+    let code = u16::from_be_bytes(*code);
+    let reason = std::str::from_utf8(reason).ok()?;
+    let (expected_code, expected_reason) = open_refusal_close(Some(reason))?;
+    (code == expected_code).then(|| CloseFrame {
+        code,
+        reason: expected_reason.into(),
+    })
+}
+
+/// The close a local consumer echo stream ends with (task rows M6-C210 and
+/// M6-C215).  An OPEN the connector refused never ran anything, and the
+/// stream closes with the refusal's code ([`open_refusal_close`]); a freeze
+/// refusal is counted under route `stream`.  Every other end keeps the
+/// codeless close.
 fn consumer_stream_close(open_refusal: Option<&'static str>) -> Message {
+    let Some((code, reason)) = open_refusal_close(open_refusal) else {
+        return Message::Close(None);
+    };
     if open_refusal == Some(crate::actor::ROTATION_FREEZE_ECHO_CODE) {
         crate::metrics::count_local_rotation_freeze("stream");
-        return Message::Close(Some(CloseFrame {
-            code: ROTATION_FREEZE_STREAM_CLOSE_CODE,
-            reason: ROTATION_FREEZE_CODE.into(),
-        }));
     }
-    Message::Close(None)
+    Message::Close(Some(CloseFrame {
+        code,
+        reason: reason.into(),
+    }))
 }
 
 /// EC-061: the single exit of the public consumer stream adapter.
@@ -2024,6 +2078,7 @@ async fn handle_remote_consumer_stream(
     // before any byte is queued for the peer: an over-limit prefix closes the
     // public stream here and is never forwarded.
     let mut cursor = ConsumerRecordCursor::new(STREAM_RECORD_LIMIT);
+    let mut refusal_close = None;
 
     enum RemoteConsumerEvent<Inbound, Remote> {
         Expired,
@@ -2231,7 +2286,12 @@ async fn handle_remote_consumer_stream(
                             break;
                         }
                     }
-                    PeerRecordKind::Close => break,
+                    PeerRecordKind::Close => {
+                        // The owner's coded close for an OPEN its connector
+                        // refused (task row M6-C213).
+                        refusal_close = forwarded_refusal_close(record.body());
+                        break;
+                    }
                     _ => break,
                 }
             }
@@ -2243,7 +2303,12 @@ async fn handle_remote_consumer_stream(
         let _ = forwarder.await;
     }
     recv.cancel();
-    let _ = send_socket_until(&mut socket, Message::Close(None), consumer_deadline).await;
+    let _ = send_socket_until(
+        &mut socket,
+        Message::Close(refusal_close),
+        consumer_deadline,
+    )
+    .await;
 }
 
 async fn service_and_grant(
@@ -3940,6 +4005,18 @@ async fn handle_peer_consumer_stream(
                                 other => break other,
                             }
                         };
+                        // A write the actor answered because the connector
+                        // refused this stream's OPEN never reached the
+                        // device: end the loop so the refusal's coded close
+                        // is sent to the ingress below (task row M6-C213).
+                        if matches!(
+                            waited,
+                            BoundedStreamWrite::Completed(Err(_)) | BoundedStreamWrite::StreamClosed
+                        ) && registration.open_refusal().is_some()
+                        {
+                            registration_closed = true;
+                            break 'peer;
+                        }
                         let response = match waited {
                             BoundedStreamWrite::Completed(Ok(response)) => response,
                             BoundedStreamWrite::Completed(Err(error)) => {
@@ -4040,6 +4117,29 @@ async fn handle_peer_consumer_stream(
                     }
                 }
             }
+        }
+        // The connector refused this stream's OPEN, so nothing ran: tell the
+        // ingress the owner's coded close in a peer `Close` record before the
+        // request ends, so its consumer gets the answer the owner's local
+        // consumer gets (task row M6-C213, [`open_refusal_close`]).  An
+        // ingress built before M6-C213 ends its consumer's socket on any
+        // `Close` record with no code, exactly as it does on the request end
+        // this replaces, so the record is backward compatible.
+        if registration_closed
+            && let Some(body) = open_refusal_close_record(registration.open_refusal())
+            && let Err(error) = send.send_message(PeerRecordKind::Close, &body).await
+        {
+            if matches!(error, PeerRuntimeError::MembershipExpired) {
+                terminal_cause = Some(StreamTerminalCause::PeerMembershipExpired);
+            }
+            let (outcome, h3_code) = peer_consumer_diagnostic_outcome(&error);
+            handle.record_peer_consumer_diagnostic(
+                &diagnostic_context,
+                PeerConsumerDiagnosticRole::OwnerSend,
+                outcome,
+                h3_code,
+            );
+            return Err(error);
         }
         Ok(())
     }
@@ -4628,6 +4728,12 @@ fn echo_failure_response(code: &'static str, execution: &'static str) -> Respons
     if code == "RESOURCE_EXHAUSTED" && execution == "not_dispatched" {
         return echo_capacity_response();
     }
+    // A challenge read that found this relay no longer owns the device, or
+    // an owner lease inside its safety margin (task row M6-C214): the answer
+    // admission gives an owner that is not ready, retryable with its hint.
+    if code == crate::actor::OWNER_UNAVAILABLE_CODE && execution == "not_dispatched" {
+        return retryable_peer_failure_response(OWNER_NOT_READY_RETRY_AFTER_MS);
+    }
     failure_outcome(code, execution)
 }
 
@@ -5032,7 +5138,75 @@ mod tests {
             }
             other => panic!("unexpected close {other:?}"),
         }
-        for other in [None, Some("DEVICE_REJECTED"), Some("RESOURCE_EXHAUSTED")] {
+        assert!(matches!(
+            super::consumer_stream_close(None),
+            Message::Close(None)
+        ));
+    }
+
+    /// M6-C213: the owner's peer `Close` record for a refused OPEN carries
+    /// the local close exactly, and the ingress accepts only such a record:
+    /// a mismatched code, an unknown reason, a short or empty body (the
+    /// pre-M6-C213 codeless record) keeps the codeless close.
+    #[test]
+    fn m6c213_the_forwarded_refusal_close_is_exact() {
+        for refusal in ["ROTATION_FREEZE", "RESOURCE_EXHAUSTED", "DEVICE_REJECTED"] {
+            let body = super::open_refusal_close_record(Some(refusal)).expect("a refusal close");
+            let frame = super::forwarded_refusal_close(&body).expect("accepted");
+            assert_eq!(
+                Some((frame.code, frame.reason.as_str())),
+                super::open_refusal_close(Some(refusal)),
+                "{refusal}"
+            );
+        }
+        assert_eq!(super::open_refusal_close_record(None), None);
+        let mut wrong_code = 1000u16.to_be_bytes().to_vec();
+        wrong_code.extend_from_slice(b"DEVICE_REJECTED");
+        for body in [
+            wrong_code,
+            [1011u16.to_be_bytes().as_slice(), b"AUTHORIZATION_REVOKED"].concat(),
+            vec![0x03],
+            Vec::new(),
+        ] {
+            assert!(super::forwarded_refusal_close(&body).is_none(), "{body:?}");
+        }
+    }
+
+    /// M6-C214: a unary echo refused because this relay lost the device's
+    /// ownership (or its owner lease entered the safety margin) is answered
+    /// as admission answers an owner that is not ready: `503
+    /// PEER_UNAVAILABLE`, `not_dispatched`, retryable, with its hint.
+    #[tokio::test]
+    async fn m6c214_an_unavailable_owner_is_503_peer_unavailable_retryable() {
+        let response =
+            super::echo_failure_response(crate::actor::OWNER_UNAVAILABLE_CODE, "not_dispatched");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(response.headers().get(header::RETRY_AFTER).is_some());
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .expect("bounded body");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("JSON body");
+        assert_eq!(body["code"], "PEER_UNAVAILABLE");
+        assert_eq!(body["execution"], "not_dispatched");
+        assert_eq!(body["retryable"], true);
+        assert!(body["retry_after_ms"].as_u64().is_some_and(|ms| ms > 0));
+    }
+
+    /// M6-C215: a refusal outside a freeze closes with its own code: 1013
+    /// `RESOURCE_EXHAUSTED` for capacity, 1011 `DEVICE_REJECTED` otherwise;
+    /// no refusal (or an unknown one) keeps the codeless close.
+    #[test]
+    fn m6c215_an_echo_stream_refused_outside_a_freeze_closes_with_its_code() {
+        for (refusal, code) in [("RESOURCE_EXHAUSTED", 1013), ("DEVICE_REJECTED", 1011)] {
+            match super::consumer_stream_close(Some(refusal)) {
+                Message::Close(Some(frame)) => {
+                    assert_eq!(frame.code, code, "{refusal}");
+                    assert_eq!(frame.reason.as_str(), refusal);
+                }
+                other => panic!("unexpected close {other:?}"),
+            }
+        }
+        for other in [None, Some("AUTHORIZATION_REVOKED")] {
             assert!(
                 matches!(super::consumer_stream_close(other), Message::Close(None)),
                 "{other:?}"

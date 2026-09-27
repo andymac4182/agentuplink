@@ -2558,6 +2558,66 @@ struct M2Stream {
 /// after the stream's `closed` token fires.  Payload-free.
 pub(crate) type StreamOpenRefusal = Arc<std::sync::OnceLock<&'static str>>;
 
+/// The consumer code for a unary challenge whose read found no owner claim:
+/// this relay lost the device's ownership (task row M6-C214).  It is the
+/// public vocabulary's answer for an owner that is not ready, which admission
+/// gives the same condition: retryable, `not_dispatched`, never a
+/// revocation.
+pub(crate) const OWNER_UNAVAILABLE_CODE: &str = "PEER_UNAVAILABLE";
+
+/// Which bounds of a unary challenge's authorization are still open.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ChallengeBounds {
+    /// The challenge's own window (and, at the send, the dispatch deadline
+    /// derived from every bound).
+    window: bool,
+    /// The grant snapshot the read returned.
+    snapshot: bool,
+    /// The consumer's token.
+    token: bool,
+    /// The owner lease, less its safety margin.
+    owner: bool,
+    /// The device credential.
+    credential: bool,
+}
+
+impl ChallengeBounds {
+    const fn all_open(self) -> bool {
+        self.window && self.snapshot && self.token && self.owner && self.credential
+    }
+}
+
+/// The consumer answer for a unary challenge that can no longer be confirmed
+/// although the read authorized it, from the bounds that lapsed (task rows
+/// M6-C207, M6-C211 and M6-C214).  Nothing was dispatched, so every answer is
+/// `not_dispatched`.
+///
+/// * A lapsed consumer token, grant snapshot or device credential stays
+///   `AUTHORIZATION_REVOKED`: revocation is strict.
+/// * Otherwise a lapsed owner lease (inside its safety margin) is an owner
+///   that is not ready, not a revocation: the retryable `PEER_UNAVAILABLE`
+///   (M6-C214).
+/// * Otherwise only the challenge window lapsed: the freeze's retryable
+///   `ROTATION_FREEZE` if a freeze held the result (M6-C207), else the
+///   retryable `AUTHORIZATION_UNAVAILABLE` (M6-C211).
+/// * With nothing lapsed there is no lapse to answer; the historical
+///   `AUTHORIZATION_REVOKED` stands.
+fn lapsed_challenge_code(bounds: ChallengeBounds, held_by_freeze: bool) -> &'static str {
+    if !bounds.token || !bounds.snapshot || !bounds.credential {
+        "AUTHORIZATION_REVOKED"
+    } else if !bounds.owner {
+        OWNER_UNAVAILABLE_CODE
+    } else if !bounds.window {
+        if held_by_freeze {
+            freeze_hold::ROTATION_FREEZE_ECHO_CODE
+        } else {
+            "AUTHORIZATION_UNAVAILABLE"
+        }
+    } else {
+        "AUTHORIZATION_REVOKED"
+    }
+}
+
 /// The consumer answer for a connector's refusal of an OPEN it never admitted
 /// (a `REJECTED` answering that OPEN's own message ID), for a unary echo and
 /// for a stream alike.  Nothing ran, so every answer is `not_dispatched`.
@@ -3372,6 +3432,8 @@ impl RelayHandle {
             owner_backlog: owner_backlog.clone(),
         };
         let actor = RelayActor {
+            #[cfg(test)]
+            dispatch_race_delay: None,
             options,
             catalog,
             command_tx: tx.clone(),
@@ -4314,6 +4376,11 @@ struct RelayActor {
     /// New OPENs held across a data-rotation freeze (task row M3-15).
     freeze_hold: freeze_hold::FreezeHold,
     actor_load: Arc<ActorLoad>,
+    /// Test hook (task row M6-C214): block this long after a unary
+    /// challenge's dispatch deadline is fixed, so a test can make the
+    /// deadline pass between the checks and the send.
+    #[cfg(test)]
+    dispatch_race_delay: Option<Duration>,
 }
 
 impl RelayActor {
@@ -13286,7 +13353,18 @@ impl RelayActor {
             return;
         };
         let Some(owner) = owner else {
-            self.invalidate_pending(&key, challenge.stream_id, &challenge, "owner unavailable");
+            // No owner claim: this relay lost the device's ownership, which
+            // says nothing about the principal's authorization (task row
+            // M6-C214).  The consumer gets admission's answer for an owner
+            // that is not ready, the retryable `PEER_UNAVAILABLE`/
+            // `not_dispatched`; the connector is told as before.
+            self.invalidate_pending_with(
+                &key,
+                challenge.stream_id,
+                &challenge,
+                "owner unavailable",
+                OWNER_UNAVAILABLE_CODE,
+            );
             return;
         };
         let Some(identity) = identity else {
@@ -13350,33 +13428,23 @@ impl RelayActor {
             .min(credential_remaining);
         let remaining_ms = remaining.as_millis().min(5_000) as u64;
         if remaining_ms == 0 {
-            // A freeze that outlasted the challenge's window, with a fresh
-            // read still authorizing and every other bound open, is the
-            // freeze's doing, not a revocation (task row M6-C207): the
-            // challenge can no longer be confirmed, nothing was dispatched,
-            // and the consumer gets the retryable answer a request refused by
-            // the same freeze gets.  The connector is told as before.
-            //
-            // Outside a freeze the same lapse -- a catalog read slower than
-            // the challenge window, with every other bound open -- is not a
-            // revocation either (task row M6-C211): the read above has just
-            // authorized, only the window to confirm it has passed, so the
-            // consumer gets the retryable `AUTHORIZATION_UNAVAILABLE`/
-            // `not_dispatched` a catalog outage gets.  Every revocation the
-            // read shows was refused above, and a lapsed consumer token,
-            // owner lease or device credential stays `AUTHORIZATION_REVOKED`.
-            let window_lapsed = challenge_remaining.is_zero()
-                && !snapshot_remaining.is_zero()
-                && !token_remaining.is_zero()
-                && !owner_remaining.is_zero()
-                && !credential_remaining.is_zero();
-            let code = if !window_lapsed {
-                "AUTHORIZATION_REVOKED"
-            } else if freeze_authorization != FreezeAuthorization::NotHeld {
-                freeze_hold::ROTATION_FREEZE_ECHO_CODE
-            } else {
-                "AUTHORIZATION_UNAVAILABLE"
-            };
+            // The challenge can no longer be confirmed; nothing was
+            // dispatched.  Which bound lapsed decides the answer
+            // ([`lapsed_challenge_code`], task rows M6-C207, M6-C211 and
+            // M6-C214).  The connector is told "authorization expired".  A
+            // bound with less than the one millisecond a confirmation can
+            // carry is the one that lapsed.
+            let open = |left: Duration| left >= Duration::from_millis(1);
+            let code = lapsed_challenge_code(
+                ChallengeBounds {
+                    window: open(challenge_remaining),
+                    snapshot: open(snapshot_remaining),
+                    token: open(token_remaining),
+                    owner: open(owner_remaining),
+                    credential: open(credential_remaining),
+                },
+                freeze_authorization != FreezeAuthorization::NotHeld,
+            );
             self.invalidate_pending_with(
                 &key,
                 challenge.stream_id,
@@ -13387,16 +13455,30 @@ impl RelayActor {
             return;
         }
         let dispatch_deadline = Instant::now() + Duration::from_millis(remaining_ms);
+        #[cfg(test)]
+        if let Some(delay) = self.dispatch_race_delay {
+            std::thread::sleep(delay);
+        }
         let owner_safe_until = owner.lease_expires_at - OWNER_LEASE_SAFETY_MARGIN_WALL;
         let grant_read_started_at = current.read_started_at;
-        let authorization_is_live = || {
+        // Each bound still open now.  The dispatch deadline is the smallest
+        // of the bounds above; the wall-clock bounds are re-read here, so a
+        // passed deadline with every wall-clock bound open is the challenge
+        // window (task row M6-C214).
+        let live_bounds = || {
             let now = Utc::now();
-            Instant::now() < dispatch_deadline
-                && now >= grant_read_started_at
-                && now < current.valid_until
-                && now < consumer_expires_at
-                && now < identity.expires_at
-                && now < owner_safe_until
+            ChallengeBounds {
+                window: Instant::now() < dispatch_deadline,
+                snapshot: now >= grant_read_started_at && now < current.valid_until,
+                token: now < consumer_expires_at,
+                owner: now < owner_safe_until,
+                credential: now < identity.expires_at,
+            }
+        };
+        // A bound that passes between the checks above and the send is the
+        // same lapse by another route (task row M6-C214): answered as above.
+        let lapse_code = |bounds: ChallengeBounds| {
+            lapsed_challenge_code(bounds, freeze_authorization != FreezeAuthorization::NotHeld)
         };
 
         if self
@@ -13480,12 +13562,14 @@ impl RelayActor {
                 return;
             }
         };
-        if !authorization_is_live() {
-            self.invalidate_pending(
+        let bounds = live_bounds();
+        if !bounds.all_open() {
+            self.invalidate_pending_with(
                 &key,
                 challenge.stream_id,
                 &challenge,
                 "authorization expired",
+                lapse_code(bounds),
             );
             return;
         }
@@ -13498,12 +13582,14 @@ impl RelayActor {
             );
             return;
         }
-        if !authorization_is_live() {
-            self.invalidate_pending(
+        let bounds = live_bounds();
+        if !bounds.all_open() {
+            self.invalidate_pending_with(
                 &key,
                 challenge.stream_id,
                 &challenge,
                 "authorization expired",
+                lapse_code(bounds),
             );
             return;
         }
@@ -19083,6 +19169,8 @@ mod stream_identity_tests {
         let mut sessions = HashMap::new();
         sessions.insert(key.scope(), session);
         let actor = RelayActor {
+            #[cfg(test)]
+            dispatch_race_delay: None,
             options,
             catalog: Arc::new(MemoryCatalog::new()) as SharedCatalog,
             command_tx,

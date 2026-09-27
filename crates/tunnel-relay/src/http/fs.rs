@@ -742,20 +742,27 @@ fn close_frame(code: SessionErrorCode) -> Option<axum::extract::ws::CloseFrame> 
 }
 
 /// The close a filesystem session ends with.  A session whose OPEN the
-/// connector refused `GOAWAY` inside a scheduled rotation freeze, and which
-/// has no other code, closes **1013** (Try Again Later, which the contract
-/// maps to the retryable `RESOURCE_EXHAUSTED`) with reason `ROTATION_FREEZE`
-/// (task row M6-C210): nothing reached the device.  Before M6-C210 it closed
-/// with no code, through the actor-cancelled arm.
+/// connector refused, and which has no other code, closes with the refusal's
+/// code (task rows M6-C210 and M6-C215, [`crate::http::open_refusal_close`]):
+/// **1013** `ROTATION_FREEZE` for a freeze and 1013 `RESOURCE_EXHAUSTED` for
+/// capacity (Try Again Later, which the contract maps to the retryable
+/// `RESOURCE_EXHAUSTED`), and **1011** `DEVICE_REJECTED` for any other device
+/// refusal (the contract's `SESSION_LOST`).  Nothing reached the device.
+/// Before M6-C210 and M6-C215 every refused session closed with no code,
+/// through the actor-cancelled arm.
 fn consumer_close_frame(
     close_with: Option<SessionErrorCode>,
     open_refusal: Option<&'static str>,
 ) -> Option<axum::extract::ws::CloseFrame> {
-    if close_with.is_none() && open_refusal == Some(crate::actor::ROTATION_FREEZE_ECHO_CODE) {
-        crate::metrics::count_local_rotation_freeze("fs");
+    if close_with.is_none()
+        && let Some((code, reason)) = crate::http::open_refusal_close(open_refusal)
+    {
+        if open_refusal == Some(crate::actor::ROTATION_FREEZE_ECHO_CODE) {
+            crate::metrics::count_local_rotation_freeze("fs");
+        }
         return Some(axum::extract::ws::CloseFrame {
-            code: crate::http::ROTATION_FREEZE_STREAM_CLOSE_CODE,
-            reason: ROTATION_FREEZE_FS_CODE.into(),
+            code,
+            reason: reason.into(),
         });
     }
     close_with.and_then(close_frame)
