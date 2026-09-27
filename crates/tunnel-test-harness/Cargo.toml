@@ -15,6 +15,7 @@ name = "tunnel-test-harness"
 path = "src/entry.rs"
 
 [dependencies]
+axum = "0.8.9"
 async-trait = "0.1.89"
 bytes = "1"
 http = "1"

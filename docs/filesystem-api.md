@@ -55,7 +55,7 @@ JSON errors use `{ "error": { "code": "...", "message": "...", "requestId": "...
 | 403 | `ACCESS_DENIED`; authenticated, discoverable export but requested operation/session permission is absent, or a valid token without the `fs:connect` scope (M6-C53) |
 | 409 | `CAPABILITIES_CHANGED`; descriptor revision no longer matches; no filesystem work admitted |
 | 429 | `RESOURCE_EXHAUSTED`; consumer/tenant/session admission limit; bounded `Retry-After` |
-| 503 | `DEVICE_OFFLINE` or `BACKEND_UNAVAILABLE`; no filesystem session created. `ROTATION_FREEZE`: the device's scheduled data rotation outlasted the relay's bounded admission hold, or the hold was full; no session created, bounded `Retry-After`, safe to retry (task row M3-15) |
+| 503 | `DEVICE_OFFLINE` or `BACKEND_UNAVAILABLE`; no filesystem session created. `ROTATION_FREEZE`: the device's scheduled data rotation outlasted the relay's bounded admission hold, or the hold was full; no session created, bounded `Retry-After`, safe to retry (task row M3-15). `CONNECTION_LIMIT` (flat body, `retry_after_ms` and `Retry-After`): the relay listener was at its connection limit and refused before any route ran, so it can answer any request, this endpoint's included; the shared TypeScript client reports it as `CONNECTION_LIMIT` with `retryAfterMs`, and a caller must wait that long before a fresh connect (task rows M6-C153, M6-C200) |
 | 400 / 426 | Invalid upgrade or unsupported subprotocol; report supported profile without credentials |
 
 ## Authentication and ownership
