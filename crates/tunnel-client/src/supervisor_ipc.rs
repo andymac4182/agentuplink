@@ -933,6 +933,43 @@ mod tests {
         server.await.expect("server joins");
     }
 
+    /// M0-03 review: a peer the kernel reports as another UID is closed
+    /// unanswered **before** its request is read, so its `disconnect` never
+    /// reaches the stop channel.
+    #[tokio::test]
+    async fn another_uids_disconnect_never_delivers_a_stop() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let dir = private_dir();
+        let path = dir.path().join("s.sock");
+        let other = effective_uid().wrapping_add(1);
+        let lock = ProfileLock::acquire(&path).expect("lock");
+        let ipc = SupervisorIpc::bind_for_uid(&path, other, &lock).expect("bind");
+        let (stop_tx, mut stop_rx) = tokio::sync::mpsc::channel(1);
+        let (_tx, rx) = watch::channel(snapshot());
+        let cancel = CancellationToken::new();
+        let server = tokio::spawn(ipc.with_disconnect(stop_tx).serve(rx, cancel.clone()));
+        let mut stream = tokio::net::UnixStream::connect(&path)
+            .await
+            .expect("connect");
+        stream
+            .write_all(format!("{DISCONNECT_REQUEST}\n").as_bytes())
+            .await
+            .expect("request written");
+        let mut answer = Vec::new();
+        let read = tokio::time::timeout(IPC_IO_TIMEOUT, stream.read_to_end(&mut answer))
+            .await
+            .expect("answer within the IPC timeout");
+        assert!(read.is_ok(), "a refused peer must see a clean close: {read:?}");
+        assert!(answer.is_empty(), "a refused peer is not answered");
+        drop(stream);
+        cancel.cancel();
+        server.await.expect("server joins");
+        assert!(
+            stop_rx.try_recv().is_err(),
+            "another UID's disconnect must never deliver a stop"
+        );
+    }
+
     /// A server with nowhere to deliver `disconnect` refuses it rather than
     /// answering as though it would stop.
     #[tokio::test]
