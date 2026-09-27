@@ -175,14 +175,23 @@ fn oidc_fixture_with_signer() -> (Arc<OidcVerifier>, String, EncodingKey) {
 }
 
 /// Mint a consumer bearer token that expires `lifetime_secs` from now.
+///
+/// `exp` is a whole second and the verifier checks it strictly, so the life
+/// left is `(lifetime_secs - 1, lifetime_secs]` seconds, depending on where
+/// in the current second the token is minted.
 fn mint_consumer_token(signer: &EncodingKey, lifetime_secs: i64) -> String {
+    mint_consumer_token_expiring_at(signer, Utc::now().timestamp() + lifetime_secs)
+}
+
+/// Mint a consumer bearer token whose `exp` claim is exactly `exp_secs`.
+fn mint_consumer_token_expiring_at(signer: &EncodingKey, exp_secs: i64) -> String {
     let mut header = Header::new(Algorithm::EdDSA);
     header.kid = Some("cleanup".to_owned());
     let claims = Claims {
         iss: ISSUER.to_owned(),
         sub: SUBJECT.to_owned(),
         aud: AUDIENCE.to_owned(),
-        exp: (Utc::now().timestamp() + lifetime_secs) as usize,
+        exp: usize::try_from(exp_secs).expect("post-epoch exp"),
         scope: crate::ECHO_OPERATION.to_owned(),
     };
     encode(&header, &claims, signer).expect("OIDC token")
