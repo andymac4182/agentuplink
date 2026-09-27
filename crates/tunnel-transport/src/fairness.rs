@@ -406,7 +406,6 @@ mod tests {
             ListenerTurnover {
                 max_age: Duration::from_secs(3_600),
                 max_requests: 3,
-                ..ListenerTurnover::default()
             },
             pressure.clone(),
         );

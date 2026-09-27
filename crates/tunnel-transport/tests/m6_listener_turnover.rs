@@ -357,7 +357,6 @@ async fn under_pressure_a_late_client_is_served_while_a_flood_holds_every_permit
         Some(ListenerTurnover {
             max_age: Duration::from_secs(1),
             max_requests: 1_000_000,
-            ..ListenerTurnover::default()
         }),
     )
     .await?;
@@ -471,7 +470,6 @@ async fn without_pressure_nothing_is_recycled() -> TestResult {
         Some(ListenerTurnover {
             max_age: Duration::from_secs(1),
             max_requests: 5,
-            ..ListenerTurnover::default()
         }),
     )
     .await?;
@@ -513,7 +511,6 @@ async fn http1_turnover_never_cuts_a_response_or_an_upgrade() -> TestResult {
         Some(ListenerTurnover {
             max_age: Duration::from_secs(1),
             max_requests: 1_000_000,
-            ..ListenerTurnover::default()
         }),
     )
     .await?;
@@ -591,7 +588,6 @@ async fn http2_turnover_sends_goaway_and_lets_streams_finish() -> TestResult {
         Some(ListenerTurnover {
             max_age: Duration::from_secs(1),
             max_requests: 1_000_000,
-            ..ListenerTurnover::default()
         }),
     )
     .await?;
