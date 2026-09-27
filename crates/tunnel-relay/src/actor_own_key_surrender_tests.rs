@@ -170,16 +170,21 @@ struct Fixture {
 
 impl Fixture {
     async fn new() -> Self {
-        Self::build(true).await
+        Self::build(true, Duration::from_secs(1)).await
+    }
+
+    /// A fixture whose runtime accepts `max_clock_skew`.
+    async fn with_skew(max_clock_skew: Duration) -> Self {
+        Self::build(true, max_clock_skew).await
     }
 
     /// A fixture whose watcher is not running, so a test can drive the
     /// surrender request by hand.
     async fn without_watcher() -> Self {
-        Self::build(false).await
+        Self::build(false, Duration::from_secs(1)).await
     }
 
-    async fn build(watcher: bool) -> Self {
+    async fn build(watcher: bool, max_clock_skew: Duration) -> Self {
         let (issuer, _private_key) =
             MembershipIssuer::generate(PUBLISHER_KEY_ID).expect("synthetic membership issuer");
         let issuer = Arc::new(issuer);
@@ -206,7 +211,7 @@ impl Fixture {
             Duration::from_secs(20),
             Duration::from_secs(1),
             Duration::from_secs(1),
-            Duration::from_secs(1),
+            max_clock_skew,
         )
         .expect("bounded runtime configuration")
         .with_local_spki_sha256(SERVED_SPKI)
@@ -1305,7 +1310,8 @@ async fn a_named_record_at_its_minimum_that_fails_a_check_stays_fatal() {
 }
 
 /// **Red first (M7-C186, review of #230).** The authority refuses *this*
-/// relay -- `403`, as it would a decommissioned relay's client certificate.
+/// relay -- `403`, `404`, `401`, as it would a decommissioned relay's client
+/// certificate.
 /// That is about this relay, not a shared outage, so it accrues toward the
 /// prolonged-unready surrender; exempting it would recreate M7-C181 through
 /// the authority. Red if every authority error counts as shared.
@@ -1314,8 +1320,12 @@ async fn an_authority_refusing_this_relay_accrues_toward_surrender() {
     let fixture = Fixture::new().await;
     let mut control = fixture.register().await;
     fixture.set_bounds(LONG_BOUND, SHORT_BOUND);
+    // 403, 404, 401: each interval is shorter than the bound, so the
+    // surrender needs every one of them counted, 404 included.
     fixture.authority_status_pass(403).await;
-    tokio::time::sleep(SHORT_BOUND * 5 / 4).await;
+    tokio::time::sleep(SHORT_BOUND * 3 / 4).await;
+    fixture.authority_status_pass(404).await;
+    tokio::time::sleep(SHORT_BOUND * 3 / 4).await;
     fixture.authority_status_pass(401).await;
     assert_eq!(
         fixture.membership.ownership_surrender_cause(),
@@ -1330,25 +1340,26 @@ async fn an_authority_refusing_this_relay_accrues_toward_surrender() {
 }
 
 /// **Control (M7-C186, review of #230).** An authority that is overloaded or
-/// failing -- `503`, `429`, `408` -- is a shared outage: nothing accrues
-/// however long it lasts. Red if those statuses count.
+/// failing -- `503`, `500`, `429`, `408` -- is a shared outage: nothing
+/// accrues however long it lasts. One status per run, four passes spanning
+/// more than the bound, so counting any single one of them surrenders: red
+/// under each single-status exemption mutation.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn authority_server_errors_and_throttling_never_accrue_toward_surrender() {
     let fixture = Fixture::new().await;
     let _control = fixture.register().await;
     fixture.set_bounds(LONG_BOUND, SHORT_BOUND);
-    // Each run alone spans more than the bound, so any one status counted
-    // would surrender.
-    for statuses in [[503, 500, 503], [429, 408, 429]] {
-        for status in statuses {
+    for status in [503, 500, 429, 408] {
+        for pass in 0..4 {
+            if pass > 0 {
+                tokio::time::sleep(SHORT_BOUND * 3 / 4).await;
+            }
             fixture.authority_status_pass(status).await;
-            tokio::time::sleep(SHORT_BOUND * 3 / 4).await;
         }
-        fixture.authority_status_pass(statuses[0]).await;
         assert_eq!(
             fixture.membership.ownership_surrender_cause(),
             None,
-            "authority status run {statuses:?} counted toward the bound"
+            "a run of authority status {status} counted toward the bound"
         );
     }
     fixture
@@ -1407,13 +1418,13 @@ async fn a_record_below_its_minimum_is_not_evidence_the_publisher_is_alive() {
 }
 
 /// **Red first (M7-C186).** Freshness allows the accepted clock skew, as
-/// verification does: another relay's record that expired a moment ago (well
-/// inside the 1 s skew of this fixture) still shows a live publisher, so this
+/// verification does: another relay's record that expired a second ago (well
+/// inside the 5 s skew of this fixture) still shows a live publisher, so this
 /// relay's below-minimum run advances and surrenders. Red if freshness drops
 /// the skew.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn freshness_allows_the_clock_skew() {
-    let fixture = Fixture::new().await;
+    let fixture = Fixture::with_skew(Duration::from_secs(5)).await;
     let _control = fixture.register().await;
     let bound = Duration::from_millis(250);
     fixture.set_bounds(bound, LONG_BOUND);
@@ -1440,7 +1451,7 @@ async fn freshness_allows_the_clock_skew() {
         1,
         OTHER_SPKI,
         now - ChronoDuration::seconds(50),
-        now - ChronoDuration::milliseconds(50),
+        now - ChronoDuration::seconds(1),
     );
     fixture.set_records(vec![own, peer]).await;
     fixture.missing_membership_pass().await;
