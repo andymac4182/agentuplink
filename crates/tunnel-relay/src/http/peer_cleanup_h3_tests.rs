@@ -123,19 +123,27 @@ struct H3PeerFixture {
 
 impl H3PeerFixture {
     async fn new() -> Self {
-        Self::new_with(|runtime, handle, catalog, oidc, _device, returned_errors| {
-            let production_handler = peer_ingress_handler(
-                handle,
-                catalog,
-                oidc,
-                DESTINATION_NODE.to_owned(),
-                DESTINATION_BOOT.to_owned(),
-            );
-            runtime.server_handler(RecordingHandler {
-                inner: production_handler,
-                returned_errors,
-            })
-        })
+        Self::new_production(test_limits()).await
+    }
+
+    /// The production handler behind the given transport limits.
+    async fn new_production(limits: PeerTransportLimits) -> Self {
+        Self::new_with_limits(
+            limits,
+            |runtime, handle, catalog, oidc, _device, returned_errors| {
+                let production_handler = peer_ingress_handler(
+                    handle,
+                    catalog,
+                    oidc,
+                    DESTINATION_NODE.to_owned(),
+                    DESTINATION_BOOT.to_owned(),
+                );
+                runtime.server_handler(RecordingHandler {
+                    inner: production_handler,
+                    returned_errors,
+                })
+            },
+        )
         .await
     }
 
@@ -172,6 +180,21 @@ impl H3PeerFixture {
     }
 
     async fn new_with<H, F>(handler_factory: F) -> Self
+    where
+        H: PeerRequestHandler,
+        F: FnOnce(
+            Arc<PeerRuntime>,
+            RelayHandle,
+            Arc<MemoryCatalog>,
+            Arc<OidcVerifier>,
+            DeviceIdentity,
+            Arc<AtomicUsize>,
+        ) -> H,
+    {
+        Self::new_with_limits(test_limits(), handler_factory).await
+    }
+
+    async fn new_with_limits<H, F>(limits: PeerTransportLimits, handler_factory: F) -> Self
     where
         H: PeerRequestHandler,
         F: FnOnce(
@@ -248,7 +271,6 @@ impl H3PeerFixture {
             .expect("source relay identity");
         let router: Arc<OwnerRouter<dyn Catalog>> =
             Arc::new(OwnerRouter::new(catalog.clone(), identity).expect("owner router"));
-        let limits = test_limits();
         let client = PeerClient::new(
             client_endpoint,
             approved_pin(&destination_leaf),
@@ -307,6 +329,12 @@ impl H3PeerFixture {
     /// claim, so a short lifetime bounds the stream deterministically.
     fn mint_consumer_token(&self, lifetime_secs: i64) -> String {
         mint_consumer_token(&self.consumer_signer, lifetime_secs)
+    }
+
+    /// Mint a consumer token whose `exp` claim is exactly `exp_secs`, so a
+    /// test knows the owner's absolute authorization deadline to the second.
+    fn mint_consumer_token_expiring_at(&self, exp_secs: i64) -> String {
+        mint_consumer_token_expiring_at(&self.consumer_signer, exp_secs)
     }
 
     async fn stop_server(&mut self) {
@@ -1685,18 +1713,81 @@ async fn peer_consumer_idle_deadline_closes_exact_stream_and_preserves_sibling()
     fixture.shutdown().await;
 }
 
+/// Whole seconds from mint to the consumer token's `exp` in
+/// [`peer_consumer_outstanding_write_is_bounded_by_consumer_expiry`].  `exp`
+/// is a whole second and strict, so the life left at mint is `(4, 5]` s and
+/// the setup between mint and the early probe has more than 3.5 s.  The test
+/// used to mint a one-second token, whose life at mint was `(0, 1]` s
+/// depending on where in the second the test happened to mint it; a run that
+/// minted within its setup latency of the next whole second presented the
+/// token after `exp`, and the owner correctly refused the expired credential
+/// (task row M6-C208).
+const OUTSTANDING_WRITE_TOKEN_SECS: i64 = 5;
+/// The transport receive idle deadline for that test.  It is far above the
+/// consumer deadline plus [`OUTSTANDING_WRITE_DEADLINE_SLACK`], so, as in the
+/// original design, the consumer deadline is deliberately below the receive
+/// idle deadline and nothing but the consumer deadline can end the parked
+/// write inside the observation window.
+const OUTSTANDING_WRITE_IDLE: Duration = Duration::from_secs(20);
+/// Scheduling slack after the consumer deadline within which the owner must
+/// have terminalized the stream.
+const OUTSTANDING_WRITE_DEADLINE_SLACK: Duration = Duration::from_secs(3);
+/// How long before the consumer deadline the stream is probed to prove it is
+/// still parked, i.e. that nothing earlier than the deadline ended it.
+const OUTSTANDING_WRITE_EARLY_PROBE: Duration = Duration::from_millis(500);
+
+fn outstanding_write_limits() -> PeerTransportLimits {
+    PeerTransportLimits::new_with_timeouts(
+        64 * 1024,
+        256 * 1024,
+        1024 * 1024,
+        4,
+        4,
+        4,
+        16 * 1024,
+        Duration::from_secs(3),
+        Duration::from_secs(3),
+        OUTSTANDING_WRITE_IDLE,
+        Duration::from_secs(3),
+    )
+    .expect("bounded outstanding-write peer limits")
+}
+
+fn outstanding_target_terminal(
+    snapshot: &RelaySnapshot,
+    session_id: &str,
+    epoch: u64,
+    stream: &RelayStreamSnapshot,
+) -> bool {
+    find_session(snapshot, device_id()).is_some_and(|session| {
+        session.session_id == session_id
+            && session.epoch == epoch
+            && session.streams.iter().any(|candidate| {
+                candidate.stream_id == stream.stream_id
+                    && candidate.operation_id == stream.operation_id
+                    && candidate.terminal
+            })
+    })
+}
+
 #[tokio::test]
 async fn peer_consumer_outstanding_write_is_bounded_by_consumer_expiry() {
     // Full top-level consumer scope: the owner handler awaits an actor write
     // that can never complete because the device never confirms the stream's
     // authorization, so the actor parks the record.  Registration closure (no
     // one closes the stream) cannot end that wait, and the consumer's
-    // one-second absolute deadline is deliberately below the fixture's
-    // two-second H3 receive idle deadline, which the handler keeps observing
-    // while parked (EC-045).  The consumer's absolute authorization deadline
-    // must therefore bound the outstanding write itself and terminalize
-    // exactly this stream while the sibling stays untouched.
-    let fixture = H3PeerFixture::new().await;
+    // absolute deadline is deliberately below the fixture's H3 receive idle
+    // deadline, which the handler keeps observing while parked (EC-045).  The
+    // consumer's absolute authorization deadline must therefore bound the
+    // outstanding write itself and terminalize exactly this stream while the
+    // sibling stays untouched.
+    //
+    // M6-C208: the deadline is the token's exact `exp` second, known to the
+    // test, with more than 3.5 s of setup budget before the early probe.  The test
+    // proves the stream is still parked shortly before that instant and
+    // terminal shortly after it, instead of relying on a one-second token
+    // that a slow runner could present after its expiry.
+    let fixture = H3PeerFixture::new_production(outstanding_write_limits()).await;
     let target = register_control(
         &fixture,
         DEVICE_SPKI,
@@ -1733,8 +1824,11 @@ async fn peer_consumer_outstanding_write_is_bounded_by_consumer_expiry() {
     let _sibling_rx = sibling.rx;
 
     let owner = current_target_owner(&fixture).await;
-    let short_lived_token = fixture.mint_consumer_token(1);
     let mut stream = open_raw(&fixture, InternalRoute::ConsumerStreams).await;
+    let exp_secs = Utc::now().timestamp() + OUTSTANDING_WRITE_TOKEN_SECS;
+    let consumer_deadline =
+        chrono::DateTime::<Utc>::from_timestamp(exp_secs, 0).expect("consumer deadline");
+    let short_lived_token = fixture.mint_consumer_token_expiring_at(exp_secs);
     admit_consumer(
         &mut stream,
         &owner.token,
@@ -1779,10 +1873,16 @@ async fn peer_consumer_outstanding_write_is_bounded_by_consumer_expiry() {
         .send_chunk(encode_peer_record(PeerRecordKind::ConsumerChunk, &record))
         .await
         .expect("send parked consumer record");
+    let early_probe_at = consumer_deadline
+        - ChronoDuration::from_std(OUTSTANDING_WRITE_EARLY_PROBE).expect("probe offset");
+    assert!(
+        Utc::now() < early_probe_at,
+        "setup must park the write before the consumer deadline's early probe"
+    );
 
-    // Keep the client stream open: only the consumer's one-second absolute
-    // deadline may end the outstanding write.  A stranded handler would keep
-    // this stream live far beyond the bound below.
+    // Keep the client stream open: only the consumer's absolute deadline may
+    // end the outstanding write.  A stranded handler would keep this stream
+    // live far beyond the bound below.
     let owner_receive_before = fixture
         .handle
         .snapshot()
@@ -1790,27 +1890,44 @@ async fn peer_consumer_outstanding_write_is_bounded_by_consumer_expiry() {
         .expect("outstanding-write baseline snapshot")
         .peer_consumer_diagnostics
         .owner_receive_count;
-    let started = tokio::time::Instant::now();
-    let terminal_snapshot =
-        wait_snapshot_for(&fixture.handle, Duration::from_secs(6), &mut |snapshot| {
-            find_session(snapshot, device_id()).is_some_and(|session| {
-                session.session_id == target_session_id
-                    && session.epoch == target_epoch
-                    && session.streams.iter().any(|stream| {
-                        stream.stream_id == target_stream_before.stream_id
-                            && stream.operation_id == target_stream_before.operation_id
-                            && stream.terminal
-                    })
-            }) && find_session(snapshot, sibling_device_id()).is_some_and(|session| {
-                session.session_id == sibling_before.session_id
-                    && session.epoch == sibling_before.epoch
-            })
-        })
-        .await;
+
+    // Shortly before the deadline the write is still parked: nothing earlier
+    // than the consumer deadline ended it.
+    tokio::time::sleep((early_probe_at - Utc::now()).to_std().unwrap_or_default()).await;
+    let early = fixture
+        .handle
+        .snapshot()
+        .await
+        .expect("outstanding-write early probe snapshot");
     assert!(
-        started.elapsed() < Duration::from_secs(6),
-        "the outstanding write must be bounded by the consumer's absolute deadline"
+        Utc::now() < consumer_deadline,
+        "the early probe must be taken before the consumer deadline"
     );
+    assert!(
+        !outstanding_target_terminal(
+            &early,
+            &target_session_id,
+            target_epoch,
+            &target_stream_before
+        ),
+        "the outstanding write must stay parked until the consumer deadline"
+    );
+
+    let wait_bound = (consumer_deadline - Utc::now())
+        .to_std()
+        .unwrap_or_default()
+        + OUTSTANDING_WRITE_DEADLINE_SLACK;
+    let terminal_snapshot = wait_snapshot_for(&fixture.handle, wait_bound, &mut |snapshot| {
+        outstanding_target_terminal(
+            snapshot,
+            &target_session_id,
+            target_epoch,
+            &target_stream_before,
+        ) && find_session(snapshot, sibling_device_id()).is_some_and(|session| {
+            session.session_id == sibling_before.session_id && session.epoch == sibling_before.epoch
+        })
+    })
+    .await;
     // The bound came from the consumer deadline, not from the receive idle
     // deadline: no owner receive outcome was recorded.
     assert_eq!(
