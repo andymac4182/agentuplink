@@ -345,6 +345,19 @@ impl OpenRefusalCounts {
             .map(|index| self.counts[index])
     }
 
+    /// Set the count for `code`; `false`, and nothing changed, if it is not
+    /// one of the fixed labels.  For a reader rebuilding a snapshot (the
+    /// supervisor IPC `status`, M7-C168); the connector itself only records.
+    pub fn set(&mut self, code: &str, count: u64) -> bool {
+        match open_refusal::CODES.iter().position(|known| *known == code) {
+            Some(index) => {
+                self.counts[index] = count;
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Every fixed label with its count, in `CODES` order, zeros included.
     pub fn iter(&self) -> impl Iterator<Item = (&'static str, u64)> + '_ {
         open_refusal::CODES

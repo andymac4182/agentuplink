@@ -53,13 +53,30 @@ export interface ServerConnection {
   readonly received: Message[];
 }
 
+/**
+ * A refusal the endpoint answers. `body` is JSON-encoded; `rawBody`, when set,
+ * is sent byte for byte instead (an empty string sends no body at all), so a
+ * test can answer exactly what a relay listener writes. `headers` are added to
+ * the response, for a `Retry-After`.
+ */
+export interface Failure {
+  status: number;
+  body?: unknown;
+  rawBody?: string | undefined;
+  headers?: Record<string, string> | undefined;
+}
+
+function failureBody(failure: Failure): string {
+  return failure.rawBody ?? JSON.stringify(failure.body);
+}
+
 export interface EndpointOptions {
   /** Answered to an authenticated `GET` with no `Upgrade`. */
   descriptor?: unknown;
   /** Status and body for a `GET` that should fail. */
-  descriptorFailure?: { status: number; body: unknown } | undefined;
+  descriptorFailure?: Failure | undefined;
   /** Status and body for an upgrade that should fail. */
-  upgradeFailure?: { status: number; body: unknown } | undefined;
+  upgradeFailure?: Failure | undefined;
   /** Omit the subprotocol from the 101, which the client must refuse. */
   omitSubprotocol?: boolean;
   /** Answer with a wrong `Sec-WebSocket-Accept`. */
@@ -236,8 +253,9 @@ export async function startEndpoint(options: EndpointOptions, msize = 65536): Pr
       response.writeHead(failure.status, {
         'Content-Type': 'application/json',
         'Cache-Control': 'no-store',
+        ...failure.headers,
       });
-      response.end(JSON.stringify(failure.body));
+      response.end(failureBody(failure));
       return;
     }
     response.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
@@ -248,9 +266,12 @@ export async function startEndpoint(options: EndpointOptions, msize = 65536): Pr
     endpoint.lastUpgradeHeaders = request.headers;
     const rejection = options.upgradeFailure;
     if (rejection !== undefined) {
-      const body = JSON.stringify(rejection.body);
+      const body = failureBody(rejection);
+      const extra = Object.entries(rejection.headers ?? {})
+        .map(([name, value]) => `${name}: ${value}\r\n`)
+        .join('');
       socket.write(
-        `HTTP/1.1 ${rejection.status} Refused\r\nContent-Type: application/json\r\nContent-Length: ${Buffer.byteLength(body)}\r\nConnection: close\r\n\r\n${body}`,
+        `HTTP/1.1 ${rejection.status} Refused\r\nContent-Type: application/json\r\n${extra}Content-Length: ${Buffer.byteLength(body)}\r\nConnection: close\r\n\r\n${body}`,
       );
       socket.end();
       return;

@@ -23,6 +23,8 @@ pub mod production_cluster;
 pub mod redis_lane_restart;
 pub mod redis_restart;
 pub mod redis_tls;
+/// M6-C200: the shared TypeScript client against a real over-limit listener.
+pub mod ts_connection_limit;
 
 /// The catalog profile identifier of the synthetic gate-3/4 `http-forward`
 /// fixture service.  It is not an application profile a production relay

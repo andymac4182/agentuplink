@@ -123,7 +123,7 @@ while it runs (section 2.5). Anything larger is not supported yet:
 | Automatic reconnect of `connect` after a relay restart or a network loss | Supported, with bounded jittered backoff (section 3.1) | M6-C23 |
 | Service installation | Example systemd units (relay and client) and a launchd agent (client) in `examples/service/`, checked but not packaged in the bundle (section 4); **Windows service: not supported in this alpha** | M6-C23 |
 | Upgrade | Stop, replace the binaries from one bundle, start (section 4); **rolling or mixed-version upgrade: not supported in this alpha** in general. One piece is nonetheless mixed-version safe by design: the statuses a cluster owner uses to refuse a forwarded device session, so a new relay never turns an older one's transient refusal into a terminal device exit ([runtime.md](runtime.md), M6-C38) | M6-C23 |
-| Supervisor IPC, `status` | **Not supported in this alpha** | M6-06 |
+| Supervisor IPC, `status` | Supported on Linux and macOS: `tunnel-client status` reads a redacted snapshot over an owner-only Unix socket ([runtime.md](runtime.md#supervisor-status-ipc)); **not on Windows** | M6-06, M6-C206 |
 | Backup and restore of the Redis catalog | Operator's Redis tooling only; restore goes through the recovery commands, which need an external signing authority that is not shipped | M6-C22 |
 | A Redis restart in place that keeps its data (one relay) | Supported: a serving relay with `redis_restart_continuity_seconds` re-binds by itself on a durable Redis (`appendfsync always`); a relay started after the restart needs `tunnel-relay rebind-redis-run` once (section 4). A Redis that came back empty or older than the relay's last token is refused. **Failover to a replica, or a restore: not supported this way** | M6-C65 |
 | Metrics and audit log | Metrics: a minimal, opt-in, unauthenticated listener on a loopback or private address (`metrics_bind`, section 5). Audit log: **not supported in this alpha** | M6-C24 |
@@ -1097,10 +1097,11 @@ retryable transport failure and never retries sooner than the hint (it floors
 its own backoff at `retry_after_ms`, capped at 300 s). The Rust demo clients
 (`mcp-demo-client`, `acp-demo-client`) have no retry loop of their own: a
 refusal ends the demo with an error. The TypeScript
-client (`packages/client`) retries nothing itself; a caller or SDK wrapper
-that retries a fresh connect after `CONNECTION_LIMIT` must wait
-`retry_after_ms` first, and the planned shared TypeScript client must do so
-when it gains a retry. The soak harness (`scripts/m6-soak.py`) deliberately
+client (`packages/client`) retries nothing itself; since M6-C200 it reports
+the refusal as its own code, `CONNECTION_LIMIT`, with `retryAfterMs` read the
+same way (body, then `Retry-After`, then 1 s, capped at 300 s), and a caller or
+SDK wrapper that retries a fresh connect after it must wait `retryAfterMs`
+first ([packages/client/README.md](../packages/client/README.md)). The soak harness (`scripts/m6-soak.py`) deliberately
 does not back off unless given `--honor-retry-after`: it models a misbehaving
 client.
 
@@ -1637,7 +1638,11 @@ refused` lines come after authentication and are not limited:
   On the device, `connect --json` counts the refusals it sent in each
   `connect-status` event's `open_refusals_sent`, one counter per fixed code
   and no reason text (M7-C167; [runtime.md](runtime.md), "Events"), so a
-  `503 DEVICE_REJECTED` can be attributed from the device side as well.
+  `503 DEVICE_REJECTED` can be attributed from the device side as well. A
+  device run without `--json` reports the same counts through its supervisor:
+  `tunnel-client status --json` carries them as `session.open_refusals_sent`,
+  and plain `status` prints an `OPEN refusals sent:` line with the non-zero
+  codes (M7-C168; [runtime.md](runtime.md#supervisor-status-ipc)).
 
 The device listing (`GET /v1/devices`) reports `last_seen_at`: the relay
 writes it when it admits the device's session and at every owner-lease renewal

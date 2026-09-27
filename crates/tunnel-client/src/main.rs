@@ -519,6 +519,18 @@ async fn run_status(path: &Path, json: bool) -> Result<(), CliError> {
         ),
         None => println!("Session: none"),
     }
+    if let Some(session) = &status.session {
+        let sent: Vec<String> = session
+            .open_refusals_sent
+            .0
+            .iter()
+            .filter(|(_, count)| *count > 0)
+            .map(|(code, count)| format!("{code}={count}"))
+            .collect();
+        if !sent.is_empty() {
+            println!("OPEN refusals sent: {}", sent.join(" "));
+        }
+    }
     if let Some(code) = &status.last_error_code {
         println!("Last session end: {code}");
     }

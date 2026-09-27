@@ -544,7 +544,11 @@ export function upgrade(options: UpgradeOptions): Promise<BinaryTransport> {
       response.on('data', (chunk: Buffer) => chunks.push(chunk));
       response.on('end', () => {
         reject(
-          new UpgradeRejected(response.statusCode ?? 0, Buffer.concat(chunks).toString('utf8')),
+          new UpgradeRejected(
+            response.statusCode ?? 0,
+            Buffer.concat(chunks).toString('utf8'),
+            headerValue(response.headers['retry-after']),
+          ),
         );
       });
     });
@@ -625,11 +629,23 @@ export function upgrade(options: UpgradeOptions): Promise<BinaryTransport> {
 export class UpgradeRejected extends Error {
   readonly status: number;
   readonly body: string;
+  /**
+   * The refusal's `Retry-After` header, when it carried one: the only header
+   * kept, because a connection-limit refusal's hint may arrive there alone
+   * (M6-C200).
+   */
+  readonly retryAfter: string | undefined;
 
-  constructor(status: number, body: string) {
+  constructor(status: number, body: string, retryAfter?: string | undefined) {
     super(`upgrade refused with ${status}`);
     this.name = 'UpgradeRejected';
     this.status = status;
     this.body = body;
+    this.retryAfter = retryAfter;
   }
+}
+
+/** A single header's value; a repeated header is not one value and reads as absent. */
+function headerValue(value: string | string[] | undefined): string | undefined {
+  return typeof value === 'string' ? value : undefined;
 }
