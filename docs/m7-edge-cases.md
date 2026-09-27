@@ -360,16 +360,19 @@ rows, and the 98-row matrix count is unchanged.
 - **M7-C153** (verified local): staging is refused mid-rotation (including mid-switch), for a retired key, and for any certificate that is not the same relay under the same CA and names.
 - **M7-C154** (verified local): the outbound drain set is bounded at four, and a full set keeps a destination on its still-approved predecessor.
 
-## Own served key retirement task rows (M7-C181, M7-C182)
+## Own served key retirement and ownership surrender task rows (M7-C181, M7-C182, M7-C184, M7-C185)
 
 These rows are tracked in [tasks.md](tasks.md). They extend EC-019 (a peer
 certificate or lease changes mid-connection) and EC-011 (readiness becomes
 false and admission stops) to the owner side: a relay whose own served key its
-signed record no longer approves gives up the device ownership it holds. They
+signed record no longer approves, whose node its checkpoint removes, or whose
+membership stays unready too long gives up the device ownership it holds. They
 are task rows, not new matrix rows, and the 98-row matrix count is unchanged.
 
 - **M7-C181** (verified local): after two consecutive reconcile passes concluding `MissingLocalKey`, every owned device session closes with `LOCAL_IDENTITY_RETIRED` and its lease is released by exact compare-and-release; transient reconcile failures and clock-offset not-ready never trigger it.
-- **M7-C182** (open): whether a checkpoint that no longer names the node (`MissingLocalMembership`) should also trigger the surrender.
+- **M7-C182** (verified local): `MissingLocalMembership` is split. A fresh checkpoint that omits the node surrenders on the same two passes (`LOCAL_MEMBERSHIP_WITHDRAWN`); a record below the checkpoint's minimum -- the publish race -- never surrenders on passes, only after it persists for one record lifetime plus skew (65 s), measured between passes. The actor re-checks the cause before collecting sessions, so a re-sign that lands while the request is queued closes nothing.
+- **M7-C184** (verified local): membership unready for any reason except an unreachable catalog, confirmed by passes for longer than the owner lease plus that margin (95 s), surrenders with `MEMBERSHIP_UNREADY_PROLONGED`; unreachable-catalog intervals never count and a `Ready` pass resets it.
+- **M7-C185** (planned): one catalog record that the checkpoint omits or places below its minimum fails every relay's whole pass as `MembershipRejected`; with M7-C184 a blackout past 95 s now surrenders devices cluster-wide. Recorded from source with options.
 
 ## M7 completion rule
 
