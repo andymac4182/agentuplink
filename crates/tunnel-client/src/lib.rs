@@ -352,6 +352,19 @@ impl OpenRefusalCounts {
             .map(|index| self.counts[index])
     }
 
+    /// Set the count for `code`; `false`, and nothing changed, if it is not
+    /// one of the fixed labels.  For a reader rebuilding a snapshot (the
+    /// supervisor IPC `status`, M7-C168); the connector itself only records.
+    pub fn set(&mut self, code: &str, count: u64) -> bool {
+        match open_refusal::CODES.iter().position(|known| *known == code) {
+            Some(index) => {
+                self.counts[index] = count;
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Every fixed label with its count, in `CODES` order, zeros included.
     pub fn iter(&self) -> impl Iterator<Item = (&'static str, u64)> + '_ {
         open_refusal::CODES
@@ -2362,8 +2375,9 @@ pub const MAX_HONOURED_RETRY_AFTER_MS: u64 = 300_000;
 /// If a WebSocket upgrade was refused by a relay listener at its connection
 /// limit (`503` with body code `CONNECTION_LIMIT`, task rows M6-C153 and
 /// M6-C194), its retry hint in milliseconds: the body's `retry_after_ms`,
-/// else the `Retry-After` header in seconds, else the documented default.
-/// `None` for any other failure.  Reads only a status, one header and two
+/// else the `Retry-After` header in whole seconds (digits only), else the
+/// documented default.  The body's code is its flat `code` or its
+/// `error.code` (M7-C176).  `None` for any other failure.  Reads only a status, one header and two
 /// fixed JSON fields; nothing from the response is logged.
 fn connection_limit_retry_after_ms(error: &tokio_tungstenite::tungstenite::Error) -> Option<u64> {
     let tokio_tungstenite::tungstenite::Error::Http(response) = error else {
@@ -2380,13 +2394,21 @@ fn connection_limit_retry_after_ms(error: &tokio_tungstenite::tungstenite::Error
         .headers()
         .get(http::header::RETRY_AFTER)
         .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(str::trim)
+        // RFC 9110 `delay-seconds` is digits only: `parse` alone would also
+        // take `+5` (task row M7-C176).  An HTTP-date is not read.
+        .filter(|value| !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()))
+        .and_then(|value| value.parse::<u64>().ok())
         .map(|seconds| seconds.saturating_mul(1_000));
-    match body
-        .as_ref()
-        .and_then(|body| body.get("code"))
-        .and_then(|code| code.as_str())
-    {
+    // The code the body names: the relay's flat `code`, or the filesystem
+    // contract's `error.code` (task row M7-C176), so a contract-shaped 503
+    // such as `ROTATION_FREEZE` is never taken for a connection limit.
+    let named = body.as_ref().and_then(|body| {
+        body.get("code")
+            .or_else(|| body.get("error").and_then(|error| error.get("code")))
+            .and_then(|code| code.as_str())
+    });
+    match named {
         Some("CONNECTION_LIMIT") => {}
         // A body that names another code is another refusal.
         Some(_) => return None,
@@ -2974,6 +2996,102 @@ mod tests {
         assert_eq!(error.retry_after(), Some(Duration::from_millis(1_000)));
         assert_eq!(diagnostics.capacity_refusals(), 1);
         cancel.cancel();
+    }
+
+    /// Task row M7-C176: the retry-hint reader classifies a refusal by the
+    /// code its body names in either shape, and reads `Retry-After` only as
+    /// RFC 9110 `delay-seconds` (digits only).  Red before the fix: a
+    /// contract-shaped `{"error":{"code":"ROTATION_FREEZE"}}` 503 with a
+    /// `Retry-After` was taken for `CONNECTION_LIMIT`, and `+5` read as 5 s.
+    #[test]
+    fn m7c176_connection_limit_hint_reads_both_body_shapes_and_strict_seconds() {
+        fn hint(status: u16, body: Option<&str>, retry_after: Option<&str>) -> Option<u64> {
+            let mut response = http::Response::builder().status(status);
+            if let Some(value) = retry_after {
+                response = response.header(http::header::RETRY_AFTER, value);
+            }
+            let response = response
+                .body(body.map(|body| body.as_bytes().to_vec()))
+                .expect("response");
+            connection_limit_retry_after_ms(&tokio_tungstenite::tungstenite::Error::Http(Box::new(
+                response,
+            )))
+        }
+        let flat = r#"{"code":"CONNECTION_LIMIT"}"#;
+        /// Status, body, `Retry-After`, expected hint.
+        type Case<'a> = (u16, Option<&'a str>, Option<&'a str>, Option<u64>);
+        let cases: &[Case<'_>] = &[
+            (
+                503,
+                Some(tunnel_transport::CONNECTION_LIMIT_BODY),
+                Some("1"),
+                Some(1_000),
+            ),
+            (
+                503,
+                Some(r#"{"code":"CONNECTION_LIMIT","retry_after_ms":2500}"#),
+                Some("7"),
+                Some(2_500),
+            ),
+            (503, Some(flat), Some("7"), Some(7_000)),
+            (503, Some(flat), None, Some(1_000)),
+            (503, None, Some("3"), Some(3_000)),
+            (
+                503,
+                Some(r#"{"code":"CONNECTION_LIMIT","retry_after_ms":0}"#),
+                None,
+                Some(0),
+            ),
+            (503, Some(flat), Some("0"), Some(0)),
+            (
+                503,
+                Some(r#"{"code":"CONNECTION_LIMIT","retry_after_ms":10000000}"#),
+                None,
+                Some(300_000),
+            ),
+            (503, Some(flat), Some("86400"), Some(300_000)),
+            // Not delay-seconds: the header is not a hint.
+            (503, Some(flat), Some("+5"), Some(1_000)),
+            (503, Some(flat), Some("-5"), Some(1_000)),
+            (503, Some(flat), Some("1.5"), Some(1_000)),
+            (503, Some(flat), Some("1, 2"), Some(1_000)),
+            (503, None, Some("+5"), None),
+            // Another refusal, in either body shape, is not this one.
+            (
+                503,
+                Some(r#"{"error":{"code":"ROTATION_FREEZE","message":"m","requestId":"r"}}"#),
+                Some("1"),
+                None,
+            ),
+            (
+                503,
+                Some(r#"{"error":{"code":"CONNECTION_LIMIT"}}"#),
+                Some("4"),
+                Some(4_000),
+            ),
+            (
+                503,
+                Some(r#"{"code":"BACKEND_UNAVAILABLE"}"#),
+                Some("1"),
+                None,
+            ),
+            (
+                429,
+                Some(tunnel_transport::CONNECTION_LIMIT_BODY),
+                Some("1"),
+                None,
+            ),
+        ];
+        let mismatches: Vec<String> = cases
+            .iter()
+            .filter_map(|(status, body, retry_after, expected)| {
+                let got = hint(*status, *body, *retry_after);
+                (got != *expected).then(|| {
+                    format!("status={status} body={body:?} retry_after={retry_after:?} got={got:?} expected={expected:?}")
+                })
+            })
+            .collect();
+        assert!(mismatches.is_empty(), "{mismatches:#?}");
     }
 
     #[test]

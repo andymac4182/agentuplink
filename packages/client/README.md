@@ -331,16 +331,28 @@ this client's own socket path would not be.
   is tested for its schemas, bounds, abort propagation and model-visible
   outcomes, and driven by the real `generateText` with a scripted model; what a
   real model does with a `retrySafe: false` result is untested.
-* **Honouring a relay's `CONNECTION_LIMIT` retry hint (task rows M6-C194,
-  M6-C200).** A relay listener at its connection limit answers `503` with body
-  code `CONNECTION_LIMIT` and `retry_after_ms` (and `Retry-After`), and every
-  client must wait at least that long before its next attempt
+* **Retrying after a relay's `CONNECTION_LIMIT` is the caller's job (task
+  rows M6-C194, M6-C200).** A relay listener at its connection limit answers
+  `503` with body code `CONNECTION_LIMIT` and `retry_after_ms` (and
+  `Retry-After`), and every client must wait at least that long before its
+  next attempt
   ([operator.md](../../docs/operator.md#32-health-endpoints-and-load-balancers)).
-  This client retries nothing itself, so it cannot retry too soon, but today
-  it reports that refusal as `BACKEND_UNAVAILABLE` and drops the hint, so a
-  caller that retries cannot honour it. Surfacing `retryAfterMs`, and
-  honouring it in any retry this client or an SDK wrapper adds, is required
-  and not yet done.
+  This client reports that refusal, at the descriptor `GET` or at the upgrade,
+  as a `FilesystemError` with code `CONNECTION_LIMIT`, `retryable: true`,
+  `outcome: 'not_started'` and `retryAfterMs`: the body's `retry_after_ms`,
+  else `Retry-After` in whole seconds, else 1 s
+  (`DEFAULT_CONNECTION_LIMIT_RETRY_AFTER_MS`), capped at 300 s
+  (`MAX_HONOURED_RETRY_AFTER_MS`) -- the Rust `connect`'s reading.
+  `retryAfterMs` is set for that code and no other. **Neither this client nor
+  its four adapters retry or reconnect anything**, so none can retry too soon;
+  a caller or SDK retry wrapper that retries a fresh connect after
+  `CONNECTION_LIMIT` **must** wait at least `error.retryAfterMs` first, and
+  any retry later added to this package must do the same. Tested over the
+  loopback harness (`test/connection-limit.test.ts`) and against the relay's
+  real listener at a one-connection limit (harness command
+  `verify-m6-ts-connection-limit`, in `scripts/m4-harness-verify.sh`); an
+  adapter surfaces the error as its framework's error type, and whether a
+  framework's own retry reads `retryAfterMs` is not tested.
 * **Aggregate budgets across borrowers.** The demo lends one client to all four
   adapters in sequence; no test closes one borrower while another has live fids,
   or drives two at once against the shared budget.

@@ -192,6 +192,53 @@ pub struct SessionStatus {
     pub recovery_attempt: Option<u64>,
     pub recovery_attempt_deadline_ms: Option<u64>,
     pub recovery_episode_deadline_ms: Option<u64>,
+    /// OPEN refusals this session sent, one key per fixed code in
+    /// `tunnel_protocol::open_refusal::CODES`, zeros included (M7-C167,
+    /// M7-C168).  Added within schema version 1, so `None` means "not
+    /// reported": a supervisor from before M7-C168 omits it, and this reader
+    /// keeps it omitted rather than printing zeros that would read as "no
+    /// refusals".  A code this reader does not know is dropped, not kept and
+    /// not an error: the label set is fixed, and a newer supervisor's extra
+    /// code is reported by a reader of that version.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub open_refusals_sent: Option<OpenRefusalsSent>,
+}
+
+/// [`crate::OpenRefusalCounts`] on the wire: `{"GOAWAY": n, ...}` with every
+/// fixed code present, the same shape as `connect --json`'s
+/// `open_refusals_sent`.  Only fixed labels and counts are representable.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct OpenRefusalsSent(pub crate::OpenRefusalCounts);
+
+impl Serialize for OpenRefusalsSent {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_map(self.0.iter())
+    }
+}
+
+impl<'de> Deserialize<'de> for OpenRefusalsSent {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = OpenRefusalsSent;
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a map of OPEN refusal codes to counts")
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut counts = crate::OpenRefusalCounts::default();
+                // Bounded by the response limit (`MAX_RESPONSE_BYTES`).  An
+                // unknown code is not stored: it is dropped, not an error.
+                while let Some((code, count)) = map.next_entry::<String, u64>()? {
+                    counts.set(&code, count);
+                }
+                Ok(OpenRefusalsSent(counts))
+            }
+        }
+        deserializer.deserialize_map(Visitor)
+    }
 }
 
 impl From<&crate::ConnectionStatus> for SessionStatus {
@@ -222,6 +269,7 @@ impl From<&crate::ConnectionStatus> for SessionStatus {
             recovery_attempt: status.recovery_attempt,
             recovery_attempt_deadline_ms: status.recovery_attempt_deadline_ms,
             recovery_episode_deadline_ms: status.recovery_episode_deadline_ms,
+            open_refusals_sent: Some(OpenRefusalsSent(status.open_refusals_sent)),
         }
     }
 }
@@ -1012,5 +1060,112 @@ mod tests {
         assert_eq!(status.ipc.requests_served, 1);
         cancel.cancel();
         server.await.expect("server joins");
+    }
+}
+
+/// M7-C168: the per-code OPEN refusal counts in the `status` snapshot.
+#[cfg(test)]
+mod m7c168_tests {
+    use super::*;
+    use tunnel_protocol::open_refusal;
+
+    fn counted() -> crate::ConnectionStatus {
+        let mut status = crate::ConnectionStatus {
+            phase: "active".to_owned(),
+            ..crate::ConnectionStatus::default()
+        };
+        status
+            .open_refusals_sent
+            .record(open_refusal::CONNECTOR_DRAINING);
+        status
+            .open_refusals_sent
+            .record(open_refusal::CONNECTOR_DRAINING);
+        status
+            .open_refusals_sent
+            .record(open_refusal::STREAM_FORGOTTEN);
+        status
+    }
+
+    fn response_line(session: SessionStatus) -> String {
+        serde_json::to_string(&IpcResponse {
+            schema_version: IPC_SCHEMA_VERSION,
+            ok: true,
+            result: Some(SupervisorStatus {
+                pid: 7,
+                state: "ready".to_owned(),
+                session: Some(session),
+                ..SupervisorStatus::default()
+            }),
+            error: None,
+        })
+        .expect("serialize")
+    }
+
+    /// Red before the fix: the session object had no `open_refusals_sent`.
+    #[test]
+    fn m7c168_status_session_carries_every_fixed_refusal_code_and_round_trips() {
+        let line = response_line(SessionStatus::from(&counted()));
+        let value: serde_json::Value = serde_json::from_str(&line).expect("json");
+        let refusals = value["result"]["session"]["open_refusals_sent"]
+            .as_object()
+            .unwrap_or_else(|| panic!("no open_refusals_sent object in {line}"));
+        let keys: Vec<&str> = refusals.keys().map(String::as_str).collect();
+        let mut expected: Vec<&str> = open_refusal::CODES.to_vec();
+        expected.sort_unstable();
+        let mut sorted = keys.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, expected, "exactly the fixed codes, zeros included");
+        for code in open_refusal::CODES {
+            let want = match code {
+                "GOAWAY" => 2,
+                "STREAM_EXISTS" => 1,
+                _ => 0,
+            };
+            assert_eq!(refusals[code].as_u64(), Some(want), "{code}");
+        }
+        // Counters only: no reason text or category reaches the snapshot.
+        for refusal in open_refusal::ALL {
+            assert!(!line.contains(refusal.reason()), "reason in {line}");
+            assert!(
+                !line.contains(&format!("\"{}\"", refusal.category())),
+                "category in {line}"
+            );
+        }
+        // The reader the `status` command uses parses it back unchanged.
+        let parsed: IpcResponse = serde_json::from_str(&line).expect("parse");
+        assert_eq!(
+            serde_json::to_value(&parsed).expect("value"),
+            value,
+            "round trip"
+        );
+    }
+
+    /// Additive: a supervisor from before M7-C168 omits the field and a newer
+    /// one may add a code; the reader keeps schema version 1 and accepts both.
+    #[test]
+    fn m7c168_status_reader_accepts_an_older_or_newer_session_object() {
+        let line = response_line(SessionStatus::from(&counted()));
+        let mut value: serde_json::Value = serde_json::from_str(&line).expect("json");
+        let session = value["result"]["session"]
+            .as_object_mut()
+            .expect("session object");
+        session.remove("open_refusals_sent");
+        let older: IpcResponse = serde_json::from_value(value.clone()).expect("older parses");
+        let older = serde_json::to_value(&older).expect("value");
+        // Absent stays absent: an older supervisor's silence must not be
+        // re-printed as eight zeros, which would read as "no refusals".
+        assert!(
+            older["result"]["session"]
+                .get("open_refusals_sent")
+                .is_none(),
+            "an absent field was re-serialized: {older}"
+        );
+        value["result"]["session"]["open_refusals_sent"] =
+            serde_json::json!({"GOAWAY": 4, "SOME_FUTURE_CODE": 9});
+        let newer: IpcResponse = serde_json::from_value(value).expect("newer parses");
+        let newer = serde_json::to_value(&newer).expect("value");
+        let refusals = &newer["result"]["session"]["open_refusals_sent"];
+        assert_eq!(refusals["GOAWAY"].as_u64(), Some(4));
+        assert!(refusals.get("SOME_FUTURE_CODE").is_none(), "{refusals}");
     }
 }

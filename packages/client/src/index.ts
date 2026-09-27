@@ -20,7 +20,10 @@ export {
 } from './filesystem.ts';
 
 export {
+  DEFAULT_CONNECTION_LIMIT_RETRY_AFTER_MS,
   DIALECT,
+  MAX_HONOURED_RETRY_AFTER_MS,
+  connectionLimitRetryAfterMs,
   GRANT_REVISION_HEADER,
   LIMIT_CEILINGS,
   SCHEMA_VERSION,

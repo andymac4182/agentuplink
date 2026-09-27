@@ -66,6 +66,12 @@ export type DiscoveryErrorCode =
   | 'BACKEND_UNAVAILABLE'
   /** The device's data rotation outlasted the relay's bounded admission hold (M3-15); retryable. */
   | 'ROTATION_FREEZE'
+  /**
+   * A relay listener at its connection limit refused the connection before
+   * serving it (`503 CONNECTION_LIMIT`, M6-C153, M6-C200); retryable, and the
+   * error's `retryAfterMs` says how long a caller must wait first.
+   */
+  | 'CONNECTION_LIMIT'
   | 'METHOD_NOT_ALLOWED'
   | 'SUBPROTOCOL_REQUIRED'
   | 'INVALID_UPGRADE'
@@ -94,6 +100,11 @@ export interface FilesystemErrorFields {
   /** For a session that closed: the WebSocket close code, when one arrived. */
   closeCode?: number | undefined;
   /**
+   * For `CONNECTION_LIMIT` only: the least time, in milliseconds, a caller must
+   * wait before a fresh connect. See `connectionLimitRetryAfterMs`.
+   */
+  retryAfterMs?: number | undefined;
+  /**
    * The error this one was built from, when it wraps something that carries no
    * outcome of its own — a refused path, or an exception out of a caller's own
    * chunk source. The wrapper exists so an applied composite always reports an
@@ -118,6 +129,14 @@ export class FilesystemError extends Error {
   readonly retryable: boolean;
   readonly bytesAcknowledged: number | undefined;
   readonly closeCode: number | undefined;
+  /**
+   * For `CONNECTION_LIMIT`: the relay's retry hint in milliseconds, already
+   * defaulted and capped, so it is always a number for that code and
+   * `undefined` for every other. This client retries nothing itself; a caller
+   * that retries a fresh connect after this error **must** wait at least this
+   * long first.
+   */
+  readonly retryAfterMs: number | undefined;
 
   constructor(fields: FilesystemErrorFields) {
     // The message carries the code and the operation and nothing else. The
@@ -137,6 +156,7 @@ export class FilesystemError extends Error {
       fields.outcome === 'partial' || fields.outcome === 'unknown' ? false : fields.retryable;
     this.bytesAcknowledged = fields.bytesAcknowledged;
     this.closeCode = fields.closeCode;
+    this.retryAfterMs = fields.retryAfterMs;
   }
 }
 
