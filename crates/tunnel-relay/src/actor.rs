@@ -108,19 +108,22 @@ const TERMINAL_STREAM_CHALLENGE_REASON: &str = "stream closed";
 /// Owner leases are stamped with this relay's wall clock and expired by the
 /// Redis server clock, so up to [`MAX_CLUSTER_CLOCK_SKEW`] of the margin can
 /// be consumed by skew alone (Opus review of #225, B2). The margin is
-/// therefore derived from the one cluster skew bound plus the 4 s of real
-/// safety the pre-M7-C173 value (5 s over a 1 s skew) left.
+/// therefore derived from the one cluster skew bound plus 4 s: at the full
+/// 5 s skew it still keeps at least 4 s of real safety for the relay's own
+/// wall-clock guards, which are the ones that protect the data plane --
+/// ticket issuance, data attachment and dispatch authorization.
 ///
-/// The device-side owner fence is separate and does not depend on any wall
-/// clock: the owner sends the connector a *relative* remaining budget
-/// (`remaining_ms`, from `owner_lease - OWNER_LEASE_SAFETY_MARGIN`), and the
-/// connector enforces it on its own monotonic clock. That fence is the
-/// data-plane guard; this margin guards the relay's own wall-clock decisions
-/// (ticket issuance, attachment, dispatch authorization).
+/// The device-side owner fence is not such a guard. Its relative budget
+/// (`remaining_ms`) bounds only the one-time `OWNER_FENCE` ->
+/// `OWNER_FENCED` ownership handshake (`tunnel-protocol`'s
+/// `owner_fencing`); ongoing dispatch freshness is the lease and
+/// authorization contract these checks enforce.
 ///
 /// [`MAX_CLUSTER_CLOCK_SKEW`]: tunnel_catalog::clock::MAX_CLUSTER_CLOCK_SKEW
 pub(crate) const OWNER_LEASE_SAFETY_MARGIN: Duration =
     tunnel_catalog::clock::MAX_CLUSTER_CLOCK_SKEW.saturating_add(Duration::from_secs(4));
+/// The relay maintenance tick, which renews owner leases.
+pub(crate) const MAINTENANCE_TICK: Duration = Duration::from_millis(500);
 /// [`OWNER_LEASE_SAFETY_MARGIN`] as a wall-clock delta.
 #[allow(clippy::cast_possible_wrap)]
 const OWNER_LEASE_SAFETY_MARGIN_WALL: ChronoDuration =
@@ -3212,7 +3215,7 @@ impl RelayHandle {
         let maintenance_task = tokio::spawn(async move {
             let completion = maintenance_completion_for_task;
             let failed = AssertUnwindSafe(async move {
-                let mut interval = tokio::time::interval(Duration::from_millis(500));
+                let mut interval = tokio::time::interval(MAINTENANCE_TICK);
                 loop {
                     tokio::select! {
                         _ = maintenance_cancel.cancelled() => break,
@@ -5102,10 +5105,9 @@ impl RelayActor {
             }
         };
         let (owner_fence, owner_fence_deadline) = if cluster_profile {
-            // The device-side owner fence: a relative budget the connector
-            // enforces on its own monotonic clock, so wall-clock skew between
-            // this relay, Redis and the device cannot extend it (see
-            // `OWNER_LEASE_SAFETY_MARGIN`).
+            // The owner fence's relative budget bounds only the one-time
+            // OWNER_FENCE -> OWNER_FENCED handshake; dispatch is guarded by
+            // the wall-clock checks `OWNER_LEASE_SAFETY_MARGIN` protects.
             let lease_budget = self
                 .options
                 .owner_lease

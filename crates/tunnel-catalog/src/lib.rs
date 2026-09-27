@@ -28,7 +28,7 @@ pub use recovery::{
     RecoveryPolicy, SignedRecoveryApproval, TrustedRecoveryKey, VerifiedRecoveryApproval,
 };
 pub use redis::{
-    DurableCatalogObservation, MAX_REDIS_NAMESPACE_BYTES, RedisCatalog, RedisMembershipPublisher,
+    DurableCatalogObservation, MAX_REDIS_NAMESPACE_BYTES, REDIS_OPERATION_TIMEOUT, RedisCatalog, RedisMembershipPublisher,
     RedisRunRebind, RedisTlsOptions, validate_device_addition, validate_redis_namespace,
     validate_service_addition, validate_user_addition,
 };

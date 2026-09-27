@@ -58,7 +58,8 @@ const DEFAULT_MAX_LIST_ITEMS: usize = 1_024;
 const MAX_IDENTIFIER_BYTES: usize = 128;
 /// Maximum accepted length of the authoritative Redis key namespace.
 pub const MAX_REDIS_NAMESPACE_BYTES: usize = 96;
-const REDIS_OPERATION_TIMEOUT: Duration = Duration::from_secs(2);
+/// The reply deadline of one Redis authority command.
+pub const REDIS_OPERATION_TIMEOUT: Duration = Duration::from_secs(2);
 /// Placeholder for the Redis run id in a script's arguments.  The lane that
 /// runs the script replaces it with the run its connection was verified
 /// against (see `AuthorityLane::query_eval`), so a script's run fence never
