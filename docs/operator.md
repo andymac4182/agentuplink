@@ -415,6 +415,30 @@ Keep private keys owner-only and outside source control. Use separate CAs for
 server identity, device clients and cluster peers
 ([runtime.md](runtime.md#device-authentication-contract)).
 
+**Use ECDSA P-256 server certificates (M6-C194).** Every connection to a
+public listener costs the relay one TLS handshake, including every connection
+it refuses with `CONNECTION_LIMIT` (section 3.2), and the server's signature
+is most of that cost with an RSA key. Measured server CPU per full TLS 1.3
+handshake on the relay's own configuration (rustls with ring, in memory, one
+core of an Apple M1 Pro, 2,000 handshakes after 200 warm-up, two runs):
+**RSA-2048 604 -- 607 µs, ECDSA P-256 78 -- 79 µs**, about 7.7× less. A
+consumer that resumes a TLS session (section 3.2) costs 73 -- 74 µs with
+either key. Reproduce with
+`cargo run --release --locked -p tunnel-transport --example handshake_cost -- CERT.pem KEY.pem LABEL`.
+A P-256 key and certificate from OpenSSL (use `keyUsage=digitalSignature`;
+`keyEncipherment` is for RSA):
+
+```
+openssl req -new -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
+  -subj "/CN=relay.example" -keyout relay-server-key.pem -out relay-server.csr
+```
+
+then sign the CSR with your server CA as for an RSA key. The relay loads the
+PKCS#8 P-256 key OpenSSL 3 writes (tested with the example above). Device certificates and CAs may stay RSA; this is
+about the relay's own server certificates, `consumer_tls_*` and
+`device_tls_*`. The JWKS rule above (RSA keys only) is about your identity
+issuer and is unrelated.
+
 ### 2.3 Tenant-scoped authorization and the first incarnation
 
 Tenants, users, devices, device credential registrations, services and grants
@@ -1061,6 +1085,43 @@ health checks headroom by raising the limit. Before M6-C153 such a connection
 was dropped before TLS and the client saw a connection reset. Design and
 rationale: [runtime.md](runtime.md#connections-over-the-limit-m6-c153).
 
+**Clients must honour `retry_after_ms` (M6-C194).** A client that reconnects
+at once after `CONNECTION_LIMIT` costs the relay a TLS handshake per attempt,
+and without back-off those refusals took about two thirds of a relay's CPU on
+a saturated host (M6-C182) and raised other users' latency about 17×
+(M6-C183); with back-off the served rate held within 5% of its plateau. Every
+client must wait at least the refusal's `retry_after_ms` (or `Retry-After`,
+in seconds) before its next attempt. The shipped clients: `tunnel-client
+connect` treats a `CONNECTION_LIMIT` refusal of its WebSocket upgrade as a
+retryable transport failure and never retries sooner than the hint (it floors
+its own backoff at `retry_after_ms`, capped at 300 s). The Rust demo clients
+(`mcp-demo-client`, `acp-demo-client`) have no retry loop of their own: a
+refusal ends the demo with an error. The TypeScript
+client (`packages/client`) retries nothing itself; a caller or SDK wrapper
+that retries a fresh connect after `CONNECTION_LIMIT` must wait
+`retry_after_ms` first, and the planned shared TypeScript client must do so
+when it gains a retry. The soak harness (`scripts/m6-soak.py`) deliberately
+does not back off unless given `--honor-retry-after`: it models a misbehaving
+client.
+
+**Turnover while full (M6-C193).** While the consumer listener is full (a
+connection arrived with every permit held within the last second), a served
+keep-alive connection is closed after its current response once it has lived
+`listener_turnover_max_age_seconds` (default 10, `1..=3600`) or served
+`listener_turnover_max_requests` (default 1000, `1..=1000000`) since that
+pressure began: `Connection: close` on HTTP/1.1, a graceful GOAWAY on HTTP/2.
+No response or upgraded connection is cut. A connection over the limit first
+waits up to 500 ms for a freed permit before it is refused, so the freed
+permit goes to a client that was waiting. Clients must therefore expect a
+keep-alive connection to be closed after a complete response while the relay
+is busy, and reconnect; every HTTP client library does. The device listener
+never does this. Outside pressure nothing changes. This bounds how long a
+late client is shut out, not each user's share: see
+[runtime.md](runtime.md#turnover-while-the-consumer-listener-is-full-m6-c193).
+The consumer listener also resumes TLS 1.3 sessions (stateless tickets, no
+early data) unless `consumer_tls_client_ca` is set, so these reconnects are
+cheaper for clients that resume.
+
 **Open-file limit (M6-C155).** Every connection is a file descriptor. The two
 public listeners alone can hold `2 x (listener_max_connections +
 listener_refusal_margin)` at once (160 with the defaults); Redis, peer and
@@ -1450,7 +1511,15 @@ over an interval is a **lower bound** on the actor's busy fraction, because
 only the command branch is timed, not terminal-cleanup drains, held-OPEN
 deadline service or owner-backlog offers; a value near 1 means the actor is
 the relay's bottleneck, a low value does not fully rule it out), and the gauges `actor_queue_depth` and
-`actor_queue_capacity` (task rows M6-C182, M6-C183). The owner's admission hold across a
+`actor_queue_capacity` (task rows M6-C182, M6-C183). Each public listener
+(`listener` `consumer` or `device`) has the gauge `listener_under_pressure`
+(1 while a connection arrived with every permit held within the last second)
+and the counters `listener_pressure_episodes_total`,
+`listener_capacity_refusals_total` (connections answered `503
+CONNECTION_LIMIT`), `listener_fairness_handoffs_total` (connections over the
+limit served with a permit freed while they waited) and
+`listener_fairness_recycled_total` (keep-alive connections closed for
+turnover) (task rows M6-C153, M6-C193). The owner's admission hold across a
 data-rotation freeze (M3-15; [protocol.md](protocol.md), "Quiesce
 admission") has its own series: `rotation_freeze_hold_held_total` (new OPENs
 held), the gauge `rotation_freeze_hold_current`,

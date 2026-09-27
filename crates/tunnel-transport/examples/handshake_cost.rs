@@ -12,7 +12,8 @@
 //! cargo run --release --locked -p tunnel-transport --example handshake_cost -- rsa.pem rsa.key
 //! ```
 //!
-//! Without arguments only the ECDSA P-256 rows are printed.  The key material
+//! Without arguments only the ECDSA P-256 rows (an `rcgen` key) are printed;
+//! a third argument labels the key from files (default `RSA-2048`).  The key material
 //! is synthetic and never printed.
 
 use std::{
@@ -163,9 +164,12 @@ fn main() {
         certificate.pem().as_bytes(),
         key.serialize_pem().as_bytes(),
     );
-    if let [certificate_path, key_path] = args.as_slice() {
-        let certificate = std::fs::read(certificate_path).expect("rsa certificate");
-        let key = std::fs::read(key_path).expect("rsa key");
-        run("RSA-2048", &certificate, &key);
+    // A certificate and key from files, labelled by the optional third
+    // argument (default `RSA-2048`, the key the soak harness uses).
+    if let [certificate_path, key_path, rest @ ..] = args.as_slice() {
+        let certificate = std::fs::read(certificate_path).expect("certificate file");
+        let key = std::fs::read(key_path).expect("key file");
+        let label = rest.first().map_or("RSA-2048", String::as_str);
+        run(label, &certificate, &key);
     }
 }

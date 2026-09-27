@@ -55,10 +55,13 @@ In `/tmp/cap-demo/flood-*/summary.json`:
   it had about 120,000 `CONN_ConnectionResetError`.
 * `device_session_ends` is `[]` and `after` shows 10 of 10 answered 200.
 
-In `requests.csv`, 64 workers hold the 64 served keep-alive connections and
-get 200 or `RESOURCE_EXHAUSTED`. The other 64 get `CONNECTION_LIMIT` on each
-attempt. That is the documented outcome while the served connections stay
-open: the limit is per connection, not per request.
+Before M6-C193, in `requests.csv` 64 workers held the 64 served keep-alive
+connections for the whole run and the other 64 got `CONNECTION_LIMIT` on
+every attempt. Since M6-C193 the consumer listener turns its permits over
+while it is full (below), so served workers change over the run: each served
+connection is closed after a response once it has lived 10 s under pressure,
+and a waiting connection takes its permit. Some `CONNECTION_LIMIT` refusals
+remain, because 128 workers still want 64 permits.
 
 The harness runs the relay with `RUST_LOG=warn`. At the default level, the
 relay also logs `refusing connection over the listener connection limit`
@@ -77,6 +80,58 @@ relay also logs `refusing connection over the listener connection limit`
   `listener_refusal_margin` (`0..=256`) at the top level of the relay
   config. A margin of `0` does no TLS work over the limit. Excess connections
   then wait in the backlog with no answer.
+
+## Turnover: a late client is served during a flood (M6-C193, M6-C194)
+
+Deterministic checks with no relay (real TCP and TLS 1.3):
+
+```sh
+cargo test --locked -p tunnel-transport --test m6_listener_turnover -- --nocapture
+cargo test --locked -p tunnel-transport --test m6_consumer_resumption
+```
+
+`under_pressure_a_late_client_is_served_while_a_flood_holds_every_permit`
+fills a 4-permit listener with busy keep-alive workers plus two that retry at
+once, then connects a new client. It prints how long the late client waited,
+for example `M6-C193 late client served after 498.556416ms and 0 refusals;
+flood served 31843, connections recycled 4, capacity refusals 2`. Before the
+fix the late client was refused on every attempt. Other tests in the file
+check that nothing is recycled without pressure, that a streaming response and
+a `101` upgrade are never cut, that HTTP/2 closes with GOAWAY after its
+in-flight streams finish, and the 500 ms hand-off.
+
+Through a real relay, user B connects 10 s into user A's 128-worker flood:
+
+```sh
+python3 scripts/m6-soak.py fairness --bin-dir target/release --logs /tmp/fair-demo \
+  --flood-processes 2 --quiet-late-seconds 10 --bin-head "$(git rev-parse HEAD)"
+```
+
+In `/tmp/fair-demo/fairness-*/summary.json`, each `flood-quiet-on-*` phase has
+`quiet_user_b_first_ok_s` with `all_served: true` and each B worker's seconds
+to its first success, and `cpu_percent` has `listener_recycled`,
+`listener_handoffs` and `listener_refusals` as rates per second. Before the
+fix a B that connected during the flood got no success at all (0 of 198 in the
+local run of M6-C193). Hosted results: task rows M6-C193 and M6-C194 and
+[soak-2026-09-27.md](../soak-2026-09-27.md) section 8.
+
+If B is never served: check that the relay is from this branch and that
+`listener_refusal_margin` is not `0` (with no margin there is no pressure and
+no turnover). Record the run directory on M6-C193; do not re-run for a green
+result.
+
+Server handshake cost by key type:
+
+```sh
+openssl req -x509 -newkey rsa:2048 -nodes -subj /CN=localhost \
+  -addext subjectAltName=DNS:localhost -addext basicConstraints=critical,CA:FALSE \
+  -keyout /tmp/rsa.key -out /tmp/rsa.pem -days 2
+cargo run --release --locked -p tunnel-transport --example handshake_cost -- /tmp/rsa.pem /tmp/rsa.key
+```
+
+prints the server CPU per full and resumed handshake for ECDSA P-256 and the
+given key (M1 Pro: RSA-2048 full about 605 µs, ECDSA P-256 about 79 µs,
+resumed about 74 µs with either).
 
 ## Descriptor exhaustion (M6-C155, M6-C156)
 

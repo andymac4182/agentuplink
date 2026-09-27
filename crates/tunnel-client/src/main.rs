@@ -2983,7 +2983,7 @@ mod tests {
     /// string the test chose itself.
     #[test]
     fn every_client_error_variant_maps_to_an_actionable_exit_code() {
-        let cases: [(ClientError, &str, u8); 12] = [
+        let cases: [(ClientError, &str, u8); 13] = [
             (
                 ClientError::Config(tunnel_client::RuntimeConfigError::Invalid("synthetic")),
                 "INVALID_CONFIG",
@@ -3021,6 +3021,15 @@ mod tests {
             (ClientError::QueueLimit, "RESOURCE_EXHAUSTED", 7),
             (ClientError::OpenRetentionFull, "RESOURCE_EXHAUSTED", 7),
             (ClientError::Cancelled, "CANCELLED", 130),
+            // M6-C194: a relay listener at its connection limit is a
+            // retryable transport failure, like a refused TCP connection.
+            (
+                ClientError::ConnectionLimit {
+                    retry_after_ms: 1_000,
+                },
+                "TRANSPORT_ERROR",
+                4,
+            ),
         ];
         let mut seen = std::collections::BTreeSet::new();
         for (error, expected_code, expected_exit) in cases {
@@ -3030,7 +3039,7 @@ mod tests {
             assert_eq!(cli.exit_code(), expected_exit, "exit code for {described}");
             seen.insert(expected_code);
         }
-        // `SupervisorPanicked` is the thirteenth variant and is covered by
+        // `SupervisorPanicked` is the fourteenth variant and is covered by
         // `only_protocol_and_supervisor_failures_exit_one` below, which also
         // states why it is one of the two that may stay at `1`.
         assert_eq!(
@@ -3038,7 +3047,7 @@ mod tests {
             1,
             "a failed supervisor is genuinely internal"
         );
-        assert_eq!(seen.len(), 10, "ten distinct codes across twelve variants");
+        assert_eq!(seen.len(), 10, "ten distinct codes across thirteen variants");
     }
 
     /// The point of the change: causes that need different operator actions
@@ -3232,7 +3241,7 @@ mod tests {
     #[test]
     fn the_cli_and_the_library_publish_the_same_diagnostic_code() {
         let errors = every_client_error();
-        assert_eq!(errors.len(), 12, "one entry per ClientError variant");
+        assert_eq!(errors.len(), 13, "one entry per ClientError variant");
         for error in errors {
             let described = format!("{error:?}");
             assert_eq!(
