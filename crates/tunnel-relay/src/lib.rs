@@ -23,6 +23,7 @@ pub mod http_forward_diagnostics;
 pub mod membership_runtime;
 pub mod membership_version_state;
 mod metrics;
+pub mod own_key_surrender;
 mod peer_consumer_transport_diagnostics;
 pub mod peer_fault_diagnostics;
 pub mod peer_rekey;
@@ -60,7 +61,7 @@ pub use http::{
 pub use membership_runtime::{
     AdmissionDeadline, CheckpointAuthority, CheckpointAuthorityError, CheckpointRequest,
     CheckpointResponse, HttpsCheckpointAuthority, LocalKeyApproval, LocalServingSwitchError,
-    MAX_MEMBERSHIP_PERSISTENCE_TIMEOUT, MembershipReadiness, MembershipRecordSource,
+    MAX_MEMBERSHIP_PERSISTENCE_TIMEOUT, MembershipReadiness, OWN_KEY_SURRENDER_CONFIRMATIONS, MembershipRecordSource,
     MembershipRuntime, MembershipRuntimeConfig, MembershipRuntimeError, MembershipRuntimeHandle,
     MembershipSnapshot, MembershipUnreadyReason, PeerAdmission,
     PeerIdentity as MembershipPeerIdentity, PeerInvalidationReason,

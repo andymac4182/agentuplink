@@ -63,6 +63,20 @@ pub const MAX_CHECKPOINT_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 pub const MAX_MEMBERSHIP_PERSISTENCE_TIMEOUT: Duration = Duration::from_secs(2);
 /// A reconciliation pass may never retain more than this many records.
 pub const MAX_MEMBERSHIP_RECORDS: usize = MAX_AUTHORIZED_NODES;
+/// Consecutive reconcile passes that must each conclude
+/// [`MembershipUnreadyReason::MissingLocalKey`] before this relay surrenders
+/// the device ownership it holds (task row M7-C181).
+///
+/// **Coordinator decision under the owner's delegation (2026-09-27).** Two:
+/// the pass that first observes the served key missing or revoked, and one
+/// independent confirming pass. One pass is never enough, so a single bad
+/// read of a record cannot close a fleet of device sessions; two keeps the
+/// surrender bounded by one reconcile interval (at most 5 s by
+/// configuration), well inside the 30 s owner lease the surrender exists to
+/// give up early. Any pass that concludes anything else -- `Ready`, a
+/// transient read or checkpoint failure, an expiry -- resets the count, so
+/// the surrender can only ever be later than this bound, never earlier.
+pub const OWN_KEY_SURRENDER_CONFIRMATIONS: u32 = 2;
 
 /// Boxed async boundary used by the injectable authority and catalog source.
 pub type MembershipFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -967,6 +981,11 @@ struct RuntimeState {
     active_peers: BTreeMap<PeerIdentity, ActivePeer>,
     callback: Option<PeerInvalidationCallback>,
     last_persisted_version_state: Option<MembershipVersionState>,
+    /// Consecutive completed reconcile passes that each concluded this
+    /// relay's served key is not approved by its own verified record
+    /// (`MissingLocalKey`). Reset by any pass that concludes otherwise
+    /// (M7-C181).
+    own_key_missing_passes: u32,
 }
 
 /// A cancellable, joined membership reconciliation task.
@@ -1197,6 +1216,7 @@ impl MembershipRuntime {
                 active_peers: BTreeMap::new(),
                 callback: None,
                 last_persisted_version_state: persisted_version_state,
+                own_key_missing_passes: 0,
             }),
             local_serving_spki: Mutex::new(config.local_spki_sha256.clone()),
             config,
@@ -1639,7 +1659,56 @@ impl MembershipRuntime {
         if let Err(error) = &result {
             self.mark_error(error);
         }
+        self.count_own_key_missing_pass(&result);
         result
+    }
+
+    /// Count this completed pass toward the own-key surrender (M7-C181).
+    ///
+    /// Only a pass that itself reached the `MissingLocalKey` conclusion counts:
+    /// that branch is the one that installs `Unready(MissingLocalKey)` and
+    /// returns `PeerRejected`, and `mark_error` leaves readiness alone for
+    /// `PeerRejected`. Every other outcome -- `Ready`, a checkpoint fetch or
+    /// catalog read failure, a rejected or expired record, a missing local
+    /// record -- resets the count. Runs under the reconcile gate, so passes
+    /// are counted in the order they completed.
+    fn count_own_key_missing_pass(&self, result: &Result<MembershipSnapshot, MembershipRuntimeError>) {
+        let mut state = self.state.lock().expect("membership state mutex poisoned");
+        let concluded_missing_key = matches!(result, Err(MembershipRuntimeError::PeerRejected))
+            && state.readiness
+                == MembershipReadiness::Unready(MembershipUnreadyReason::MissingLocalKey);
+        state.own_key_missing_passes = if concluded_missing_key {
+            state.own_key_missing_passes.saturating_add(1)
+        } else {
+            0
+        };
+    }
+
+    /// Consecutive completed reconcile passes that concluded this relay's
+    /// served key is not approved by its own verified record.
+    #[must_use]
+    pub fn own_key_missing_passes(&self) -> u32 {
+        self.state
+            .lock()
+            .expect("membership state mutex poisoned")
+            .own_key_missing_passes
+    }
+
+    /// Whether this relay must surrender the device ownership it holds
+    /// because its own served key is missing or revoked in its own verified
+    /// membership record, confirmed by [`OWN_KEY_SURRENDER_CONFIRMATIONS`]
+    /// consecutive reconcile passes (task row M7-C181).
+    ///
+    /// Deliberately narrower than "not ready": a checkpoint authority or
+    /// catalog read failure, a rejected record, an expired checkpoint or key
+    /// window, or clock-offset health never answers `true` here. Those only
+    /// withdraw readiness and admission (M7-C86, M7-C90, M7-C91); the owner
+    /// lease rules still bound what an unready owner may dispatch.
+    #[must_use]
+    pub fn own_key_surrender_required(&self) -> bool {
+        let state = self.state.lock().expect("membership state mutex poisoned");
+        state.readiness == MembershipReadiness::Unready(MembershipUnreadyReason::MissingLocalKey)
+            && state.own_key_missing_passes >= OWN_KEY_SURRENDER_CONFIRMATIONS
     }
 
     async fn reconcile_once_inner(&self) -> Result<MembershipSnapshot, MembershipRuntimeError> {
