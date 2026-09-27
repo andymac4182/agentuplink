@@ -50,7 +50,10 @@ use tokio_tungstenite::{
     tungstenite::{Message, client::IntoClientRequest, http::HeaderValue},
 };
 use tokio_util::sync::CancellationToken;
-use tunnel_catalog::{Catalog, OwnerClaimRequest, RedisMembershipPublisher, SharedCatalog};
+use tunnel_catalog::{
+    Catalog, OwnerClaimRequest, RedisMembershipPublisher, SharedCatalog,
+    SignedMembershipRecord as CatalogSignedMembershipRecord,
+};
 use tunnel_client::{ConnectOptions, ConnectionHandle, ConnectionStatus, TransportProfile};
 use tunnel_core::RotationConfig;
 use tunnel_relay::{
@@ -5088,9 +5091,13 @@ impl ProductionCluster {
                 "membership re-signing is already running in the background".into(),
             ));
         }
-        let inputs = &self.membership_resign_inputs;
-        let first_version = inputs.next_record_version;
+        let first_version = self.membership_resign_inputs.next_record_version;
         let version = first_version.saturating_add(count - 1);
+        // Spent before anything is published: a publish that errors may still
+        // have committed, so no later re-sign may reuse these versions with
+        // different bytes (M7-C188).
+        self.membership_resign_inputs.next_record_version = version.saturating_add(1);
+        let inputs = &self.membership_resign_inputs;
         let publisher =
             RedisMembershipPublisher::connect(&inputs.redis_url, &inputs.redis_namespace)
                 .await
@@ -5140,7 +5147,6 @@ impl ProductionCluster {
                     })?;
             }
         }
-        self.membership_resign_inputs.next_record_version = version.saturating_add(1);
         let nodes = self.membership_resign_inputs.nodes.len();
         // Convergence on record version, then the pin wait it gates (M7-C89);
         // see `settle_resign` for why the two live together and what is still
@@ -6371,6 +6377,30 @@ fn required_peer_routes(
         .collect()
 }
 
+/// Where the background re-signer puts a signed record.
+///
+/// The production implementation is the operator publisher over Redis; the
+/// unit tests substitute a scripted directory with the same compare-by-version
+/// semantics so the ambiguous-publish case (M7-C188) is deterministic instead
+/// of depending on where a resign tick lands inside a Redis pause.
+trait MembershipSink: Send + Sync + 'static {
+    fn publish(
+        &self,
+        node_id: &str,
+        record: &CatalogSignedMembershipRecord,
+    ) -> impl Future<Output = std::result::Result<(), tunnel_catalog::CatalogError>> + Send;
+}
+
+impl MembershipSink for RedisMembershipPublisher {
+    fn publish(
+        &self,
+        node_id: &str,
+        record: &CatalogSignedMembershipRecord,
+    ) -> impl Future<Output = std::result::Result<(), tunnel_catalog::CatalogError>> + Send {
+        self.publish_signed_membership_for_node(node_id, record)
+    }
+}
+
 /// Re-sign and republish every relay's membership record on a fixed interval.
 ///
 /// The relay's verifier caps a record's lifetime at the product maximum, so a
@@ -6378,10 +6408,27 @@ fn required_peer_routes(
 /// issued fresh ones, exactly as a real control plane issues them.  The first
 /// failure is kept in `failure` rather than only logged, so a re-signer that
 /// dies cannot quietly become flakiness in the gate that depends on it.
-async fn membership_resign_loop(
+///
+/// **A record version is spent once any publish of it was attempted**
+/// (M7-C188).  A publish that failed is not a publish that did not happen: a
+/// timed-out `EVAL` written into a paused Redis socket is delivered and
+/// committed when the pause ends, after the caller already saw the failure.
+/// Re-signing the *same* version with a fresh `issued_at` then produces
+/// different bytes, which the directory refuses as a same-version conflict on
+/// every later round, so the re-signer used to stall on the first node and
+/// never refresh the others; their records lapsed one lifetime later and the
+/// chaos gate failed whenever that lapse landed before the run ended.  Every
+/// attempt therefore signs a strictly newer version than any attempt before
+/// it, whatever the previous outcome was.  Versions may skip; the verifier
+/// only requires them to increase.
+///
+/// A failed round is retried after [`MEMBERSHIP_RESIGN_RETRY_INTERVAL`] rather
+/// than on the next scheduled tick, so a deliberate outage is ridden out
+/// inside the grace instead of consuming whole rounds.
+async fn membership_resign_loop<P: MembershipSink>(
     authority: Arc<FixtureCheckpointAuthority>,
     inputs: MembershipResignInputs,
-    publisher: RedisMembershipPublisher,
+    publisher: P,
     interval: Duration,
     failure: Arc<Mutex<Option<String>>>,
     shutdown: CancellationToken,
@@ -6403,72 +6450,71 @@ async fn membership_resign_loop(
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => break,
-            _ = ticker.tick() => {
-                let now = Utc::now();
-                let mut round_failed = false;
-                for (identity, peer_endpoint) in &inputs.nodes {
-                    let signed = match authority.issuer.sign_membership_identity(
-                        &inputs.deployment_id,
-                        &inputs.deployment_incarnation,
-                        identity,
-                        MembershipLifetimeOptions {
-                            record_version,
-                            peer_endpoint: *peer_endpoint,
-                            now,
-                            lifetime: M7_MEMBERSHIP_LIFETIME,
-                        },
-                    ) {
-                        Ok(signed) => signed,
-                        Err(error) => {
-                            record_failure(format!(
-                                "re-signing membership for {}: {error}",
-                                identity.node_id
-                            ));
-                            return;
-                        }
-                    };
-                    if let Err(error) = publisher
-                        .publish_signed_membership_for_node(
-                            &identity.node_id,
-                            &signed.catalog_record(),
-                        )
-                        .await
-                    {
-                        // A deliberate Redis outage makes this fail for as long
-                        // as it lasts.  Retry on the next tick rather than
-                        // dying inside the scenario that paused it.
-                        round_failed = true;
-                        tracing::debug!(
-                            node_id = %identity.node_id,
-                            ?error,
-                            stage = "membership_resign_publish",
-                            "membership republish failed; retrying on the next interval"
-                        );
-                        break;
-                    }
-                }
-                if round_failed {
-                    let since = *failing_since.get_or_insert_with(Instant::now);
-                    let failing_for = since.elapsed();
-                    if failing_for > MEMBERSHIP_RESIGN_FAILURE_GRACE {
+            _ = ticker.tick() => {}
+        }
+        // One scheduled round, retried quickly while it keeps failing.
+        loop {
+            let version = record_version;
+            // Spent before the first publish is attempted (M7-C188).
+            record_version = record_version.saturating_add(1);
+            let now = Utc::now();
+            let mut round_failed = false;
+            for (identity, peer_endpoint) in &inputs.nodes {
+                let signed = match authority.issuer.sign_membership_identity(
+                    &inputs.deployment_id,
+                    &inputs.deployment_incarnation,
+                    identity,
+                    MembershipLifetimeOptions {
+                        record_version: version,
+                        peer_endpoint: *peer_endpoint,
+                        now,
+                        lifetime: M7_MEMBERSHIP_LIFETIME,
+                    },
+                ) {
+                    Ok(signed) => signed,
+                    Err(error) => {
                         record_failure(format!(
-                            "membership republish kept failing for {} seconds, which is longer \
-                             than one record lifetime",
-                            failing_for.as_secs()
+                            "re-signing membership for {}: {error}",
+                            identity.node_id
                         ));
                         return;
                     }
-                    // Retry sooner than the ordinary interval so a brief
-                    // deliberate outage is ridden out inside the grace rather
-                    // than consuming whole scheduled rounds.
-                    tokio::select! {
-                        _ = shutdown.cancelled() => break,
-                        () = sleep(MEMBERSHIP_RESIGN_RETRY_INTERVAL) => {}
-                    }
-                    continue;
+                };
+                if let Err(error) = publisher
+                    .publish(&identity.node_id, &signed.catalog_record())
+                    .await
+                {
+                    // A deliberate Redis outage makes this fail for as long
+                    // as it lasts.  Retry rather than dying inside the
+                    // scenario that paused it.
+                    round_failed = true;
+                    tracing::debug!(
+                        node_id = %identity.node_id,
+                        record_version = version,
+                        ?error,
+                        stage = "membership_resign_publish",
+                        "membership republish failed; retrying with a newer version"
+                    );
+                    break;
                 }
+            }
+            if !round_failed {
                 failing_since = None;
-                record_version = record_version.saturating_add(1);
+                break;
+            }
+            let since = *failing_since.get_or_insert_with(Instant::now);
+            let failing_for = since.elapsed();
+            if failing_for > MEMBERSHIP_RESIGN_FAILURE_GRACE {
+                record_failure(format!(
+                    "membership republish kept failing for {} seconds, which is longer \
+                     than one record lifetime",
+                    failing_for.as_secs()
+                ));
+                return;
+            }
+            tokio::select! {
+                _ = shutdown.cancelled() => return,
+                () = sleep(MEMBERSHIP_RESIGN_RETRY_INTERVAL) => {}
             }
         }
     }
@@ -8424,5 +8470,181 @@ mod tests {
                 "{name}: expected {fragment:?} in diagnostic {diagnostic}"
             );
         }
+    }
+}
+
+/// M7-C188: the background re-signer against a scripted directory whose
+/// compare-by-version rules match the Redis publish script, so the ambiguous
+/// publish that stalled the chaos gate is deterministic.
+#[cfg(test)]
+mod resign_loop_tests {
+    use super::{
+        CatalogSignedMembershipRecord, FixtureCheckpointAuthority, MembershipResignInputs,
+        MembershipSink, membership_resign_loop,
+    };
+    use crate::cluster_fixture::{MembershipNodeIdentity, TestMembershipAuthority};
+    use std::collections::BTreeMap;
+    use std::future::Future;
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+    };
+    use std::time::Duration;
+    use tokio_util::sync::CancellationToken;
+    use tunnel_catalog::CatalogError;
+
+    const NODES: [&str; 3] = ["relay-a", "relay-b", "relay-c"];
+    const INTERVAL: Duration = Duration::from_secs(15);
+
+    /// A membership directory with the publish script's rules: a newer
+    /// version replaces, the same version with the same bytes is idempotent,
+    /// the same version with different bytes is a conflict, and an older one
+    /// is stale.  `lost_replies` publishes commit and then report the timeout
+    /// a caller sees when the reply is lost (a paused Redis socket).
+    #[derive(Default)]
+    struct ScriptedDirectory {
+        records: Mutex<BTreeMap<String, (u64, Vec<u8>)>>,
+        lost_replies: AtomicUsize,
+        refused: AtomicUsize,
+    }
+
+    impl MembershipSink for Arc<ScriptedDirectory> {
+        fn publish(
+            &self,
+            node_id: &str,
+            record: &CatalogSignedMembershipRecord,
+        ) -> impl Future<Output = Result<(), CatalogError>> + Send {
+            let outcome = (|| {
+                let mut records = self.records.lock().expect("directory lock");
+                if let Some((version, bytes)) = records.get(node_id) {
+                    if *version > record.version {
+                        self.refused.fetch_add(1, Ordering::Relaxed);
+                        return Err(CatalogError::Conflict("signed membership version"));
+                    }
+                    if *version == record.version {
+                        if *bytes == record.bytes {
+                            return Ok(());
+                        }
+                        self.refused.fetch_add(1, Ordering::Relaxed);
+                        return Err(CatalogError::Conflict("signed membership contents"));
+                    }
+                }
+                records.insert(node_id.to_owned(), (record.version, record.bytes.clone()));
+                if self
+                    .lost_replies
+                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |left| {
+                        left.checked_sub(1)
+                    })
+                    .is_ok()
+                {
+                    // Committed, but the caller never learns it.
+                    return Err(CatalogError::WriteOutcomeUnknown(
+                        tunnel_catalog::UnknownWriteCause::ReplyTimeout,
+                    ));
+                }
+                Ok(())
+            })();
+            std::future::ready(outcome)
+        }
+    }
+
+    fn inputs() -> MembershipResignInputs {
+        MembershipResignInputs {
+            redis_url: String::new(),
+            redis_namespace: String::new(),
+            deployment_id: "m7-c188-deployment".to_owned(),
+            deployment_incarnation: "m7-c188-incarnation".to_owned(),
+            nodes: NODES
+                .iter()
+                .enumerate()
+                .map(|(index, node_id)| {
+                    (
+                        MembershipNodeIdentity {
+                            node_id: (*node_id).to_owned(),
+                            peer_spki_sha256: format!("{index:02x}").repeat(32),
+                        },
+                        format!("127.0.0.1:{}", 40_000 + index)
+                            .parse()
+                            .expect("synthetic endpoint"),
+                    )
+                })
+                .collect(),
+            next_record_version: 2,
+        }
+    }
+
+    fn authority() -> Arc<FixtureCheckpointAuthority> {
+        Arc::new(FixtureCheckpointAuthority {
+            issuer: Arc::new(TestMembershipAuthority::new().expect("membership authority")),
+            deployment_id: "m7-c188-deployment".to_owned(),
+            deployment_incarnation: "m7-c188-incarnation".to_owned(),
+            minimum_versions: BTreeMap::new(),
+            next_checkpoint_version: Arc::new(AtomicU64::new(0)),
+        })
+    }
+
+    fn versions(directory: &ScriptedDirectory) -> Vec<u64> {
+        let records = directory.records.lock().expect("directory lock");
+        NODES
+            .iter()
+            .map(|node| records.get(*node).map_or(0, |(version, _)| *version))
+            .collect()
+    }
+
+    /// The first scheduled publish commits but its reply is lost, as a
+    /// timed-out `EVAL` written into a paused Redis socket is.  Every node
+    /// must still be refreshed on every later round: the re-signer used to
+    /// re-sign the version it had already spent, which the directory refused
+    /// as a same-version conflict forever, so `relay-a` stayed on the lost
+    /// write and `relay-b`/`relay-c` were never refreshed until they lapsed.
+    #[tokio::test(start_paused = true)]
+    async fn a_committed_publish_with_a_lost_reply_never_stalls_the_resigner() {
+        let directory = Arc::new(ScriptedDirectory::default());
+        directory.lost_replies.store(1, Ordering::Release);
+        let failure = Arc::new(Mutex::new(None));
+        let shutdown = CancellationToken::new();
+        let task = tokio::spawn(membership_resign_loop(
+            authority(),
+            inputs(),
+            Arc::clone(&directory),
+            INTERVAL,
+            Arc::clone(&failure),
+            shutdown.clone(),
+        ));
+
+        // Just past the first scheduled round: relay-a committed with a lost
+        // reply, and nothing else was published yet by that attempt.
+        tokio::time::sleep(INTERVAL + Duration::from_millis(100)).await;
+        assert_eq!(directory.lost_replies.load(Ordering::Acquire), 0);
+        // Past the quick retry: every node now holds a record, and the retry
+        // used a newer version than the committed lost write.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let after_retry = versions(&directory);
+        assert!(
+            after_retry.iter().all(|version| *version > 2),
+            "the retry must publish every node with a version newer than the lost write: \
+             {after_retry:?}"
+        );
+
+        // Three more scheduled rounds: every node advances on every round.
+        let mut previous = after_retry;
+        for round in 0..3 {
+            tokio::time::sleep(INTERVAL).await;
+            let current = versions(&directory);
+            assert!(
+                current.iter().zip(&previous).all(|(now, before)| now > before),
+                "round {round}: every node's record must advance ({previous:?} -> {current:?})"
+            );
+            previous = current;
+        }
+
+        shutdown.cancel();
+        task.await.expect("re-signer joins");
+        assert_eq!(
+            directory.refused.load(Ordering::Acquire),
+            0,
+            "no publish may be refused as a same-version conflict or a stale version"
+        );
+        assert_eq!(*failure.lock().expect("failure lock"), None);
     }
 }
