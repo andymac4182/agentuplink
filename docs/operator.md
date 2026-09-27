@@ -1554,7 +1554,13 @@ the clock offset from Redis (M7-C175, section 3.2): the signed gauge
 `clock_offset_milliseconds` (this relay's clock minus Redis `TIME`, absent
 before the first measurement; the only sample that can be negative),
 `clock_offset_ready`, `clock_offset_measurements_total` and
-`clock_offset_measurement_failures_total`; the gauges
+`clock_offset_measurement_failures_total`; on a relay with `[cluster]`,
+`membership_readiness{state}` (M0-03): one sample per fixed signed-membership
+state -- `starting`, `ready`, `unknown_authority`, `checkpoint_expired`,
+`catalog_unavailable`, `membership_rejected`, `missing_local_membership`,
+`missing_local_key`, `persistence_unavailable`, `cancelled` -- exactly one of
+them `1`, which says *why* a cluster relay's `/readyz` answers `unready` after
+bootstrap (the same words `serve` prints when bootstrap itself fails); the gauges
 `device_sessions`, `device_sockets`, `streams`, `sessions_rotating`,
 `sessions_owner_write_unknown`, `queue_bytes` and `replay_bytes` over the live
 sessions this relay owns; the counters `application_dispatches_total`,
