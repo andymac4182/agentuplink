@@ -477,6 +477,14 @@ from A but never a request stream; an untrusted signer naming a rogue SPKI
 leaves A unready with both the rogue and the replacement certificate refused;
 and a trusted record restores the replacement-only key set.
 
+The surrender requirement was not met by the relay before task row M7-C181.
+Earlier passes of this gate came from its Redis proxy, which cut every
+forwarded connection after the 5 s setup deadline (M7-C177) and so stopped the
+retired relay's lease renewals; with that proxy fixed, the gate failed with
+`the relay whose peer certificate was retired kept its owner claim past the
+bounded deadline` until the relay itself surrendered its ownership
+([cluster.md](cluster.md), *Own served key retired*).
+
 That rogue-signer phase is also **the regression for which unready states may
 keep a relay's peer pins** ([cluster.md](cluster.md#implementation-and-acceptance-gates)).
 An earlier attempt at the M7-C83 fix retained pins for *every* unready state and

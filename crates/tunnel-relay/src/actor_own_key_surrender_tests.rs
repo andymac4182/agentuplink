@@ -310,10 +310,7 @@ impl Fixture {
             .reconcile_once()
             .await
             .expect_err("the served key is not approved");
-        assert!(matches!(
-            error,
-            crate::MembershipRuntimeError::PeerRejected
-        ));
+        assert!(matches!(error, crate::MembershipRuntimeError::PeerRejected));
         assert_eq!(
             self.membership.readiness(),
             MembershipReadiness::Unready(MembershipUnreadyReason::MissingLocalKey)
@@ -485,7 +482,10 @@ async fn a_relay_serves_again_after_its_key_is_re_approved() {
         .expect("the served key is approved again");
     let _second = fixture.register().await;
     tokio::time::sleep(QUIET_WINDOW).await;
-    assert!(fixture.owned().await, "a re-approved relay owns devices again");
+    assert!(
+        fixture.owned().await,
+        "a re-approved relay owns devices again"
+    );
     assert_eq!(fixture.live_sessions().await, 1);
     fixture.shutdown().await;
 }
@@ -564,7 +564,10 @@ async fn a_clock_offset_not_ready_never_closes_sessions() {
     assert!(!clock.is_ready(), "the clock offset is beyond the bound");
     tokio::time::sleep(QUIET_WINDOW).await;
     assert!(!fixture.membership.own_key_surrender_required());
-    assert!(fixture.owned().await, "a clock-offset unready kept the lease");
+    assert!(
+        fixture.owned().await,
+        "a clock-offset unready kept the lease"
+    );
     assert_eq!(fixture.live_sessions().await, 1);
     fixture.shutdown().await;
 }

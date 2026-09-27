@@ -1672,7 +1672,10 @@ impl MembershipRuntime {
     /// catalog read failure, a rejected or expired record, a missing local
     /// record -- resets the count. Runs under the reconcile gate, so passes
     /// are counted in the order they completed.
-    fn count_own_key_missing_pass(&self, result: &Result<MembershipSnapshot, MembershipRuntimeError>) {
+    fn count_own_key_missing_pass(
+        &self,
+        result: &Result<MembershipSnapshot, MembershipRuntimeError>,
+    ) {
         let mut state = self.state.lock().expect("membership state mutex poisoned");
         let concluded_missing_key = matches!(result, Err(MembershipRuntimeError::PeerRejected))
             && state.readiness
