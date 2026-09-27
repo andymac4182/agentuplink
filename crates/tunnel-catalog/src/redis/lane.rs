@@ -590,6 +590,26 @@ impl AuthorityLane {
         .await
     }
 
+    /// Run one bounded write command on this lane.
+    ///
+    /// Same transport contract as [`Self::query`], except that once the
+    /// command has been dispatched a lost reply (a reply timeout or a severed
+    /// connection) is the typed [`CatalogError::WriteOutcomeUnknown`]: the
+    /// write may have committed on the authority, for example when it was
+    /// written into a stalled socket that later delivered it (M7-C189).  A
+    /// failure before dispatch and an actual authority reply keep their
+    /// definite shapes, and the write is never replayed.
+    pub(super) async fn query_write<T: FromRedisValue>(
+        &self,
+        command: &redis::Cmd,
+    ) -> Result<T, CatalogError> {
+        self.execute(
+            async |connection, _run_id| command.query_async::<T>(connection).await,
+            DispatchedFailure::Unknown,
+        )
+        .await
+    }
+
     /// Run one script on this lane.  Every argument equal to
     /// `bound_run_id()` is replaced, after the lane has verified its
     /// connection, by the run that connection was verified against, so a
