@@ -471,7 +471,7 @@ payload bytes; A's readiness stays ready for every sample across the overlap;
 the retired SPKI is refused once the replacement-only record is adopted, with
 A's readiness reflecting that pin transition while relay B is still running; the
 relay whose own key was retired surrenders its owner claim and closes its device
-session; a public request across the retired route returns
+session (M7-C181); a public request across the retired route returns
 `503 CLUSTER_UNREADY` / `not_dispatched` and the impostor receives a connection
 from A but never a request stream; an untrusted signer naming a rogue SPKI
 leaves A unready with both the rogue and the replacement certificate refused;
