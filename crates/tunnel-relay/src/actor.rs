@@ -165,6 +165,34 @@ const AUTHORITY_UNAVAILABLE: &str = "AUTHORITY_UNAVAILABLE";
 /// close reason (`local identity retired`) its outbound peer connections use
 /// for the same event.
 pub(crate) const LOCAL_IDENTITY_RETIRED: &str = "LOCAL_IDENTITY_RETIRED";
+/// Typed session close reason when this relay surrenders the device ownership
+/// it holds because its signed membership no longer includes it: a fresh
+/// checkpoint omits this node, or its record has stayed below the
+/// checkpoint's minimum version past the publish-race bound (M7-C182).
+pub(crate) const LOCAL_MEMBERSHIP_WITHDRAWN: &str = "LOCAL_MEMBERSHIP_WITHDRAWN";
+/// Typed session close reason when this relay surrenders the device ownership
+/// it holds because its membership has stayed unready, with the catalog
+/// reachable, past the prolonged-unready bound (M7-C184).
+pub(crate) const MEMBERSHIP_UNREADY_PROLONGED: &str = "MEMBERSHIP_UNREADY_PROLONGED";
+
+/// The typed session close reason for one ownership surrender cause.
+pub(crate) const fn surrender_close_reason(
+    cause: crate::membership_runtime::OwnershipSurrenderCause,
+) -> &'static str {
+    use crate::membership_runtime::OwnershipSurrenderCause as Cause;
+    match cause {
+        Cause::OwnKeyRetired => LOCAL_IDENTITY_RETIRED,
+        Cause::NodeRemoved | Cause::LocalRecordBelowMinimum => LOCAL_MEMBERSHIP_WITHDRAWN,
+        Cause::ProlongedUnready => MEMBERSHIP_UNREADY_PROLONGED,
+    }
+}
+
+/// Re-evaluates, inside the relay actor, whether ownership must still be
+/// surrendered and why (M7-C181..M7-C184). Called once, immediately before
+/// the owned sessions are collected, so a re-sign that lands while the
+/// command is queued cannot close sessions the relay is again entitled to.
+pub type OwnershipSurrenderCheck =
+    Box<dyn FnOnce() -> Option<crate::membership_runtime::OwnershipSurrenderCause> + Send>;
 /// Typed session close reason when the **device's own control socket closed**.
 ///
 /// Named rather than spelled inline because it is one of the two teardowns
@@ -2895,11 +2923,15 @@ enum Command {
     Snapshot {
         response: oneshot::Sender<RelaySnapshot>,
     },
-    /// Close every device session this relay owns with
-    /// [`LOCAL_IDENTITY_RETIRED`] and release each owner lease through the
-    /// fenced cleanup path (M7-C181). Answers the number of sessions closed.
+    /// Re-check the surrender condition and, if it still holds, close every
+    /// device session this relay owns with the cause's typed reason and
+    /// release each owner lease through the fenced cleanup path (M7-C181,
+    /// M7-C182, M7-C184). Answers the cause and the number of sessions
+    /// closed, or `None` when the re-check no longer requires a surrender.
     SurrenderOwnership {
-        response: oneshot::Sender<usize>,
+        check: OwnershipSurrenderCheck,
+        response:
+            oneshot::Sender<Option<(crate::membership_runtime::OwnershipSurrenderCause, usize)>>,
     },
     /// Test hook: run a closure against the live actor between commands.
     #[cfg(test)]
@@ -3850,14 +3882,20 @@ impl RelayHandle {
         self.reply(receiver).await.ok_or(RelayError::Shutdown)
     }
 
-    /// Surrender every device session this relay owns because its own served
-    /// peer key is retired (M7-C181): each closes with
-    /// `LOCAL_IDENTITY_RETIRED` and its owner lease is released through the
-    /// fenced cleanup path. Returns how many sessions were closed.
-    pub async fn surrender_ownership(&self) -> Result<usize, RelayError> {
+    /// Surrender every device session this relay owns if `check`, evaluated
+    /// inside the actor immediately before the sessions are collected, still
+    /// names a cause (M7-C181, M7-C182, M7-C184): each closes with that
+    /// cause's typed reason and its owner lease is released through the
+    /// fenced cleanup path. Returns the cause and how many sessions were
+    /// closed, or `None` if the condition no longer held.
+    pub async fn surrender_ownership(
+        &self,
+        check: OwnershipSurrenderCheck,
+    ) -> Result<Option<(crate::membership_runtime::OwnershipSurrenderCause, usize)>, RelayError>
+    {
         let (response, receiver) = oneshot::channel();
         self.tx
-            .send(Command::SurrenderOwnership { response })
+            .send(Command::SurrenderOwnership { check, response })
             .await
             .map_err(|_| RelayError::Shutdown)?;
         self.reply(receiver).await.ok_or(RelayError::Shutdown)
@@ -4523,9 +4561,16 @@ impl RelayActor {
             Command::Snapshot { response } => {
                 let _ = response.send(self.snapshot());
             }
-            Command::SurrenderOwnership { response } => {
-                let closed = self.surrender_ownership().await;
-                let _ = response.send(closed);
+            Command::SurrenderOwnership { check, response } => {
+                // Re-check here, not only in the watcher: a re-sign may have
+                // restored membership while this command was queued, and
+                // nothing else can register or close a session between this
+                // check and the collection below.
+                let surrendered = match check() {
+                    Some(cause) => Some((cause, self.surrender_ownership(cause).await)),
+                    None => None,
+                };
+                let _ = response.send(surrendered);
             }
             Command::Shutdown(response) => {
                 self.shutting_down = true;
@@ -16094,11 +16139,11 @@ impl RelayActor {
         }
     }
 
-    /// Give up every device session this relay owns because its own served
-    /// peer key is retired (M7-C181).
+    /// Give up every device session this relay owns because its membership
+    /// no longer entitles it to them (M7-C181, M7-C182, M7-C184).
     ///
-    /// Each session is closed with the typed [`LOCAL_IDENTITY_RETIRED`]
-    /// reason. `close_session` removes it, so the maintenance tick no longer
+    /// Each session is closed with the cause's typed reason
+    /// ([`surrender_close_reason`]). `close_session` removes it, so the maintenance tick no longer
     /// renews its owner lease, and queues its exact owner token on the owner
     /// cleanup worker, whose compare-and-release deletes only that token: a
     /// successor can claim at once, and a successor that already holds the
@@ -16106,7 +16151,11 @@ impl RelayActor {
     /// on the owner backlog and offered again, exactly as a tick-driven close
     /// is (M6-C186). Admission is not changed here: the relay is already
     /// unready, which refuses new device and consumer work.
-    async fn surrender_ownership(&mut self) -> usize {
+    async fn surrender_ownership(
+        &mut self,
+        cause: crate::membership_runtime::OwnershipSurrenderCause,
+    ) -> usize {
+        let reason = surrender_close_reason(cause);
         let keys: Vec<_> = self
             .sessions
             .values()
@@ -16114,14 +16163,15 @@ impl RelayActor {
             .map(|session| session.key.clone())
             .collect();
         for key in &keys {
-            self.close_session(key, LOCAL_IDENTITY_RETIRED).await;
+            self.close_session(key, reason).await;
         }
         if !keys.is_empty() {
             tracing::warn!(
                 sessions = keys.len(),
-                reason = LOCAL_IDENTITY_RETIRED,
+                reason,
+                cause = cause.label(),
                 phase = "ownership_surrendered",
-                "relay surrendered device ownership: its served peer key is not approved by its membership record"
+                "relay surrendered device ownership: its membership no longer entitles it to serve"
             );
         }
         keys.len()
@@ -17334,19 +17384,19 @@ impl RunningRelay {
         tokio::spawn(crate::metrics::serve_bounded(listener, router, cancel))
     }
 
-    /// Start the own-key ownership surrender watcher for this relay (task
-    /// row M7-C181): while `membership` reports a confirmed retired served
-    /// key, every owned device session is closed with
-    /// `LOCAL_IDENTITY_RETIRED` and its owner lease released through the
-    /// fenced cleanup path. The task stops when this relay is cancelled.
-    pub fn spawn_own_key_surrender(
+    /// Start the ownership surrender watcher for this relay (task rows
+    /// M7-C181, M7-C182, M7-C184): while `membership` reports a surrender
+    /// cause, every owned device session is closed with that cause's typed
+    /// reason and its owner lease released through the fenced cleanup path.
+    /// The task stops when this relay is cancelled.
+    pub fn spawn_ownership_surrender(
         &self,
         membership: Arc<crate::membership_runtime::MembershipRuntime>,
     ) -> JoinHandle<()> {
-        tokio::spawn(crate::own_key_surrender::own_key_surrender_loop(
+        tokio::spawn(crate::ownership_surrender::ownership_surrender_loop(
             membership,
             self.handle.clone(),
-            crate::own_key_surrender::OWN_KEY_SURRENDER_POLL,
+            crate::ownership_surrender::OWNERSHIP_SURRENDER_POLL,
             self.cancel.child_token(),
         ))
     }

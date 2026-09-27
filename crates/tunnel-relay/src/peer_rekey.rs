@@ -433,7 +433,24 @@ impl PeerRekey {
                     match approval {
                         LocalKeyApproval::Approved { .. } => {
                             let since = *staged.approved_since.get_or_insert(now);
-                            if now.saturating_duration_since(since) >= self.config.convergence_hold
+                            // M8-C65: the publisher withdrew the served key
+                            // before the hold elapsed. The relay is already
+                            // unready (`MissingLocalKey`) and nothing it serves
+                            // is approved any more; peers converging on the
+                            // same record reject the predecessor too, so the
+                            // hold protects nobody and waiting it out only
+                            // prolongs unreadiness. Switch now to the key the
+                            // same verified record approves.
+                            let served_withdrawn = matches!(
+                                self.membership
+                                    .local_key_approval(&self.identity.current_spki().to_hex()),
+                                LocalKeyApproval::Absent
+                                    | LocalKeyApproval::Revoked
+                                    | LocalKeyApproval::OutsideWindow
+                            );
+                            if served_withdrawn
+                                || now.saturating_duration_since(since)
+                                    >= self.config.convergence_hold
                             {
                                 Action::Switch
                             } else {

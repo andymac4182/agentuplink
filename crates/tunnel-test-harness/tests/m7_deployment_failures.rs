@@ -137,13 +137,27 @@ impl Fault {
 
     fn diagnostic_matches(self, lower: &str) -> bool {
         match self {
-            Self::InvalidMembership | Self::ExpiredMembership | Self::ConflictingCheckpoint => {
+            Self::InvalidMembership | Self::ExpiredMembership => {
                 // The public readiness surface deliberately redacts the
                 // verifier detail. These cases share membership_rejected:
-                // a record failed verification (bad signature, expired, or
-                // below the checkpoint's minimum version); each fixture
+                // a record at or above the checkpoint's minimum failed
+                // verification (bad signature or expired); each fixture
                 // mutation has its own precondition assertion.
                 lower.contains("reason=membership_rejected")
+                    && lower.contains("category=membership")
+            }
+            Self::ConflictingCheckpoint => {
+                // The checkpoint requires version 2 of this relay's record
+                // and Redis holds only version 1. Since M7-C185 a record
+                // below its node's minimum is absent for that node rather
+                // than a verification failure that fails every relay's pass,
+                // so this relay has no usable record of its own:
+                // missing_local_membership, M7-C182 case (b). It still fails
+                // closed with a typed, bounded membership reason. (An
+                // equal-version conflict or a bad record at or above the
+                // minimum stays membership_rejected; the cases above and the
+                // relay's unit tests pin that.)
+                lower.contains("reason=missing_local_membership")
                     && lower.contains("category=membership")
             }
             Self::MissingMembership => {
