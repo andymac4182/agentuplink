@@ -12031,6 +12031,19 @@ impl RelayActor {
         if self.session_for(&key).is_none() {
             return;
         }
+        // Task row M7-C178: the connector's loss report can overtake the
+        // physical close of a carrier another relay terminates.  Apply it as
+        // that close before anything else classifies the request, so the
+        // request below is journaled and consumed as the recovery's loss
+        // notification instead of starting a scheduled rotation.
+        if let ControlMessage::RotateRequest(request) = &message
+            && let Some(carrier) = self.connector_reported_active_loss(&key, request)
+        {
+            self.disconnect_data(carrier).await;
+            if self.session_for(&key).is_none() {
+                return;
+            }
+        }
         let starts_new_rotation = matches!(&message, ControlMessage::RotateRequest(_))
             && self.session_for(&key).is_some_and(|session| {
                 session.rotation.as_ref().is_some_and(|rotation| {
@@ -12513,6 +12526,51 @@ impl RelayActor {
                 );
             }
         }
+    }
+
+    /// The owner's active data carrier named by a current-context `data_loss`
+    /// ROTATE_REQUEST, if the owner still holds it.  protocol.md, "Recovery
+    /// control handshake": "Only the relay coordinates recovery; a connector
+    /// reports data loss with a current-context ROTATE_REQUEST whose reason
+    /// is `data_loss`."  The connector sends it only after it has closed that
+    /// carrier, so the owner's side of it can carry nothing: the report is
+    /// the same loss the physical close would deliver.  When the carrier is
+    /// terminated by a non-owner relay, that close reaches the owner through
+    /// a peer hop and the report, on the direct control socket, can win the
+    /// race.  Treating the report as a scheduled request then issued a
+    /// `rotation-candidate` ticket and PREPARE, and the connector dialed a
+    /// doomed extra candidate carrier before the late close converted the
+    /// attempt into recovery (task row M7-C178).
+    fn connector_reported_active_loss(
+        &self,
+        key: &SessionKey,
+        request: &tunnel_protocol::rotation_control::RotateRequest,
+    ) -> Option<CarrierKey> {
+        if request.reason.as_deref() != Some("data_loss") {
+            return None;
+        }
+        let session = self.session_for(key)?;
+        if !session.profile.supports_rotation() || session.rotation.is_none() {
+            return None;
+        }
+        if request.session_id != key.session_id
+            || request.epoch != key.epoch
+            || request.owner_id != runtime::owner_id(&session.owner)
+            || request.generation != session.generation
+            || request.connection_id != session.connection_id
+        {
+            return None;
+        }
+        let carrier = CarrierKey {
+            session: key.clone(),
+            generation: request.generation,
+            connection_id: request.connection_id.clone(),
+        };
+        session
+            .active_carrier
+            .as_ref()
+            .is_some_and(|active| active.context == carrier.context())
+            .then_some(carrier)
     }
 
     fn recovery_already_consumed_loss_request(
@@ -25263,6 +25321,235 @@ mod stream_identity_tests {
                 .map(|rotation| rotation.state.phase()),
             Some(RotationPhase::Recovering)
         );
+    }
+
+    /// Task row M7-C178: the connector's `data_loss` ROTATE_REQUEST can reach
+    /// the owner over the control socket before the owner observes the
+    /// physical close of a data carrier that another relay terminates (that
+    /// close crosses a peer hop).  The request is the connector's
+    /// authenticated report that the carrier is gone (protocol.md, "Recovery
+    /// control handshake"), so the owner must enter retained recovery at once.
+    /// It used to start an ordinary scheduled rotation instead: a
+    /// `rotation-candidate` ticket was issued and PREPARE sent, the connector
+    /// (still `Active`) dialed a doomed extra candidate carrier, and only the
+    /// later physical close converted the attempt into recovery.
+    #[tokio::test]
+    async fn loss_request_before_the_physical_close_enters_recovery_without_a_rotation_ticket() {
+        let now_ms = super::monotonic_millis();
+        let (fixture, device_id, tenant_id, _tenant_b, spki, _spki_b) = shared_device_fixture();
+        let catalog = MemoryCatalog::new();
+        catalog
+            .seed_fixture(&fixture)
+            .await
+            .expect("seed request-first fixture");
+        let identity = catalog
+            .resolve_device(&spki, Utc::now())
+            .await
+            .expect("resolve request-first identity")
+            .expect("request-first identity present");
+        let key = SessionKey {
+            tenant_id,
+            device_id,
+            session_id: "request-first-loss".to_owned(),
+            epoch: 1,
+        };
+        let (mut actor, _registration) = admitted_control_actor(identity, key.clone());
+        let owner_id = actor
+            .sessions
+            .get(&key.scope())
+            .map(|session| super::runtime::owner_id(&session.owner))
+            .expect("request-first owner identity");
+        let attempt = session_attempt(&key, &owner_id, "request-first-loss", 1);
+        let old_connection_id = attempt.old_connection_id.clone();
+        let mut rotation = test_rotation_runtime(now_ms, attempt, now_ms + 60_000);
+        rotation.attempt = None;
+        rotation.old_connection_id = old_connection_id.clone();
+        let (data_tx, _data_rx) = mpsc::channel(actor.options.limits.max_queue_messages);
+        if let Some(session) = actor.sessions.get_mut(&key.scope()) {
+            session.profile = super::RuntimeProfile::M2;
+            session.cluster_profile = true;
+            session.connection_id = old_connection_id.clone();
+            session.data_tx = Some(data_tx.clone());
+            session.active_carrier = Some(DataCarrier {
+                context: CarrierContext::new(
+                    key.session_id.clone(),
+                    key.epoch,
+                    1,
+                    old_connection_id.clone(),
+                ),
+                tx: data_tx,
+            });
+            session.rotation = Some(rotation);
+        } else {
+            panic!("request-first fixture session missing");
+        }
+
+        let request = RotateRequest {
+            message_id: "request-first-loss-request".to_owned(),
+            reply_to: String::new(),
+            session_id: key.session_id.clone(),
+            epoch: key.epoch,
+            owner_id,
+            generation: 1,
+            connection_id: old_connection_id.clone(),
+            desired_interval_ms: None,
+            reason: Some("data_loss".to_owned()),
+        };
+        actor
+            .inbound_control(key.clone(), ControlMessage::RotateRequest(request.clone()))
+            .await;
+
+        let session = actor
+            .sessions
+            .get(&key.scope())
+            .expect("a connector loss report must retain the session");
+        let rotation = session.rotation.as_ref().expect("rotation state retained");
+        assert!(
+            rotation.pending_ticket.is_none(),
+            "a data_loss report must not start a scheduled rotation-candidate ticket (M7-C178)"
+        );
+        assert_eq!(
+            rotation.state.phase(),
+            RotationPhase::Recovering,
+            "a data_loss report naming the active carrier enters retained recovery (M7-C178)"
+        );
+        assert!(session.data_tx.is_none());
+        assert!(session.active_carrier.is_none());
+        let status = rotation.state.status();
+        assert_eq!(status.active_generation, 1);
+        assert_eq!(status.active_connection_id, old_connection_id);
+        let recovery_attempt = status.attempt.expect("recovery attempt");
+        assert_eq!(recovery_attempt.old_connection_id, old_connection_id);
+        assert!(rotation.recovery.is_some());
+
+        // A retransmission of the same report is the idempotent journal
+        // entry the late-request path already consumes.
+        actor
+            .inbound_control(key.clone(), ControlMessage::RotateRequest(request))
+            .await;
+        assert_eq!(
+            actor
+                .sessions
+                .get(&key.scope())
+                .and_then(|session| session.rotation.as_ref())
+                .map(|rotation| rotation.state.phase()),
+            Some(RotationPhase::Recovering)
+        );
+
+        // The physical close that follows names a carrier the owner already
+        // released; it must not open a second episode or close the session.
+        actor
+            .disconnect_data(CarrierKey {
+                session: key.clone(),
+                generation: 1,
+                connection_id: old_connection_id,
+            })
+            .await;
+        let rotation = actor
+            .sessions
+            .get(&key.scope())
+            .and_then(|session| session.rotation.as_ref())
+            .expect("late physical close keeps the recovering session");
+        assert_eq!(rotation.state.phase(), RotationPhase::Recovering);
+        assert_eq!(
+            rotation
+                .state
+                .status()
+                .attempt
+                .map(|attempt| attempt.new_generation),
+            Some(recovery_attempt.new_generation),
+            "the late physical close must not start another recovery attempt"
+        );
+    }
+
+    /// The exception is narrow: a scheduled request (no `data_loss` reason)
+    /// still starts an ordinary rotation, and a `data_loss` request that does
+    /// not name the owner's active carrier never releases it.
+    #[tokio::test]
+    async fn only_a_loss_report_naming_the_active_carrier_releases_it() {
+        let now_ms = super::monotonic_millis();
+        let (fixture, device_id, tenant_id, _tenant_b, spki, _spki_b) = shared_device_fixture();
+        let catalog = MemoryCatalog::new();
+        catalog
+            .seed_fixture(&fixture)
+            .await
+            .expect("seed narrow-loss fixture");
+        let identity = catalog
+            .resolve_device(&spki, Utc::now())
+            .await
+            .expect("resolve narrow-loss identity")
+            .expect("narrow-loss identity present");
+        for (name, reason, carrier_generation) in [
+            ("scheduled-request", None, 1),
+            ("stale-carrier-loss", Some("data_loss"), 7),
+        ] {
+            let key = SessionKey {
+                tenant_id,
+                device_id,
+                session_id: name.to_owned(),
+                epoch: 1,
+            };
+            let (mut actor, _registration) = admitted_control_actor(identity.clone(), key.clone());
+            let owner_id = actor
+                .sessions
+                .get(&key.scope())
+                .map(|session| super::runtime::owner_id(&session.owner))
+                .expect("narrow-loss owner identity");
+            let attempt = session_attempt(&key, &owner_id, name, 1);
+            let old_connection_id = attempt.old_connection_id.clone();
+            let mut rotation = test_rotation_runtime(now_ms, attempt, now_ms + 60_000);
+            rotation.attempt = None;
+            rotation.old_connection_id = old_connection_id.clone();
+            let (data_tx, _data_rx) = mpsc::channel(actor.options.limits.max_queue_messages);
+            if let Some(session) = actor.sessions.get_mut(&key.scope()) {
+                session.profile = super::RuntimeProfile::M2;
+                session.cluster_profile = true;
+                session.connection_id = old_connection_id.clone();
+                session.data_tx = Some(data_tx.clone());
+                session.active_carrier = Some(DataCarrier {
+                    context: CarrierContext::new(
+                        key.session_id.clone(),
+                        key.epoch,
+                        carrier_generation,
+                        old_connection_id.clone(),
+                    ),
+                    tx: data_tx,
+                });
+                session.rotation = Some(rotation);
+            } else {
+                panic!("narrow-loss fixture session missing");
+            }
+            let request = RotateRequest {
+                message_id: format!("{name}-request"),
+                reply_to: String::new(),
+                session_id: key.session_id.clone(),
+                epoch: key.epoch,
+                owner_id,
+                generation: 1,
+                connection_id: old_connection_id,
+                desired_interval_ms: None,
+                reason: reason.map(str::to_owned),
+            };
+            actor
+                .inbound_control(key.clone(), ControlMessage::RotateRequest(request))
+                .await;
+            let session = actor
+                .sessions
+                .get(&key.scope())
+                .expect("the session is retained");
+            assert!(
+                session.active_carrier.is_some() && session.data_tx.is_some(),
+                "{name}: the owner's active carrier must not be released"
+            );
+            assert_ne!(
+                session
+                    .rotation
+                    .as_ref()
+                    .map(|rotation| rotation.state.phase()),
+                Some(RotationPhase::Recovering),
+                "{name}: no recovery episode may start"
+            );
+        }
     }
 
     #[tokio::test]
