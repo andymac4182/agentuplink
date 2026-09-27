@@ -543,11 +543,11 @@ async fn run_disconnect(
         .map_err(CliError::from_ipc)?;
     let deadline = started + timeout;
     loop {
-        match query_status(&socket).await {
-            Err(IpcError::Absent) => break,
-            // Still stopping -- answering, or closing a connection unanswered
-            // as its server shuts down: keep waiting, within the bound.
-            Ok(_) | Err(_) => {}
+        // Anything but "absent" -- still answering, or closing a connection
+        // unanswered as its server shuts down -- is still stopping: keep
+        // waiting, within the bound.
+        if let Err(IpcError::Absent) = query_status(&socket).await {
+            break;
         }
         if tokio::time::Instant::now() >= deadline {
             return Err(CliError {
