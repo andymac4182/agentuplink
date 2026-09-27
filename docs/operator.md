@@ -1563,7 +1563,9 @@ sessions this relay owns; the counters `application_dispatches_total`,
 refusal stages below, counted even when their log line was rate limited, for
 the whole process, plus stage `rotation_freeze`: a request this relay, as the
 device's owner, refused `ROTATION_FREEZE` on the `echo`, `stream`,
-`http-forward` or `fs` route, counted without a log line; a freeze refusal for
+`http-forward` or `fs` route, counted without a log line, including a unary
+echo whose roster OPEN the connector refused `GOAWAY` during the freeze
+(M6-C204); a freeze refusal for
 a request that reached the owner through a peer hop is a peer fault with cause
 `rotation_freeze` instead), `peer_faults_total{stage}` and
 `peer_fault_causes_total{cause}`. The single relay actor, which every device
@@ -1662,14 +1664,17 @@ refused` lines come after authentication and are not limited:
   stay at `debug`.
 - `connector rejected an OPEN` (`phase="connector_rejected"`, M7-C160), one
   line per connector `REJECTED` for a live session, which is what a consumer
-  sees as `503 DEVICE_REJECTED` (or `RESOURCE_EXHAUSTED`). Fields:
+  sees as `503 DEVICE_REJECTED` (or `RESOURCE_EXHAUSTED`, or for a unary
+  echo refused `GOAWAY` during a frozen rotation attempt `ROTATION_FREEZE`,
+  M6-C204). Fields:
   `tenant_id`, `device_id`, `session_id`, `epoch`, `stream_id`,
   `operation_id` (`unmatched` unless it equals the relay's own record),
   `rotation_phase` (`none`, `active`, `preparing`, `quiescing`, `draining`,
   `committing`, `retiring`, `aborting`, `recovering` or `closed`), `matched`
   (`unary`, `stream` or `none`), `connector_code`, `reason_category`,
   `connector_code_len`, `reason_len`, `relay_code` (what the consumer was
-  told, `stream_closed` or `none`), and `session_suppressed`,
+  told: for a unary echo `DEVICE_REJECTED`, `RESOURCE_EXHAUSTED` or
+  `ROTATION_FREEZE`; otherwise `stream_closed` or `none`), and `session_suppressed`,
   `tenant_suppressed` and `suppressed` (lines each budget dropped since its
   last written line).
   The code and reason come from the device, so neither is written: a code or
