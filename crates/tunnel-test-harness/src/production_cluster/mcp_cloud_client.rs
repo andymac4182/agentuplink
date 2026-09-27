@@ -127,7 +127,7 @@ pub const NOT_COVERED: [&str; 6] = [
     "sampling/createMessage and elicitation/create server requests (M3-13)",
     "2026-07-28 MRTR input requests and subscriptions/listen (M3-13)",
     "resources and prompts (M3-13)",
-    "Last-Event-ID resume of an interrupted stream (M3-10)",
+    "Last-Event-ID resume across the cluster: by decision the stdio export offers none, and the Streamable HTTP export forwards the header to its backend; both are pinned by tunnel-mcp-fixture tests, not by this gate (M3-10)",
     "process-group kill for a Streamable HTTP backend, which the device does not own",
     "session isolation, concurrent correlation, lost acknowledgements and revocation: covered by verify-m3-mcp-isolation (M3-04), not by this gate",
 ];

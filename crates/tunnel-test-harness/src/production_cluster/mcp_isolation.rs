@@ -192,7 +192,7 @@ const MEMBERSHIP_RESIGN_SPACING: Duration = Duration::from_secs(15);
 pub const NOT_COVERED: [&str; 4] = [
     "server-to-client JSON-RPC requests (sampling/createMessage, elicitation/create, MRTR input): the pinned fixture issues none, so colliding server-to-client request IDs are unproven (M3-13)",
     "Origin validation and the MCP authorization profile, including token audience checks at the export (M3-11)",
-    "Last-Event-ID resume of an interrupted legacy stream (M3-10)",
+    "Last-Event-ID resume across the cluster: by decision the stdio export offers none, and the Streamable HTTP export forwards the header to its backend; both are pinned by tunnel-mcp-fixture tests, not by this gate (M3-10)",
     "concurrent colliding request IDs through one shared backend process: the streamable-binding case drives the shared Streamable HTTP backend for session separation, but the correlation case's colliding IDs and progress tokens are driven on the stdio exports only (M3-13)",
 ];
 

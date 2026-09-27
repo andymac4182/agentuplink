@@ -16,7 +16,9 @@ scripts/demo-mcp.sh
 
 **What has been run.** On 2026-09-25, on macOS arm64, `scripts/demo-mcp.sh`
 passed with both profiles (`mcp-2025-11-25` and `mcp-2026-07-28`) and printed
-the output shown below. No hosted agent (Claude or any other) has been
+the output shown below. On 2026-09-28 it passed again with both profiles, with
+`DEMO_PLAIN_REDIS` because this host's Docker could not start containers, and
+the `m3-acceptance` CI job now runs it for both profiles the same way. No hosted agent (Claude or any other) has been
 connected to a relay in this repository. The section
 [Connecting a hosted agent](#connecting-a-hosted-agent) says what that needs,
 and what is not yet proven.
@@ -27,8 +29,14 @@ and what is not yet proven.
 - `openssl`, `python3` (3.11 or later, for `tomllib`) and `xxd`.
 - Docker, and the `redis:8.4.0-alpine` image (`docker pull redis:8.4.0-alpine`).
   The relay refuses a Redis catalog without TLS, so the demo starts its own
-  Redis container, with TLS, on a free loopback port. It never uses any other
-  Redis you have running, and it removes the container when it finishes.
+  Redis container, with TLS, on a free loopback port, and removes it when it
+  finishes.
+- **Or**, without Docker, a plaintext test Redis you already run:
+  `DEMO_PLAIN_REDIS=127.0.0.1:6379 scripts/demo-mcp.sh`. The script puts a TLS
+  front (`tests/mcp-sdk-conformance/redis_tls_proxy.py`) before it, keeps
+  every key under the namespace `mcp-demo-<nonce>`, and deletes those keys
+  when it finishes (`purged_keys=<n>`). Use a test Redis, never a production
+  one.
 
 ## What the script does
 
@@ -144,7 +152,8 @@ notifications/resources/updated=received`.
 | --- | --- |
 | `DEMO_PROFILE` | `mcp-2025-11-25` (default; sessions and `initialize`) or `mcp-2026-07-28` (stateless, `server/discover`). |
 | `DEMO_KEEP=1` | Leave the relay, the device and the Redis container running after a successful run. The script prints the endpoint, the server CA path and the token file, so you can point another client at it. It also prints the `kill` and `docker rm` commands that stop everything. |
-| `DEMO_DIR` | The work directory (default: a new directory under `$TMPDIR`). Docker must be able to bind-mount it. It is removed after a successful run and kept after a failure. |
+| `DEMO_DIR` | The work directory (default: a new directory under `$TMPDIR`). Docker must be able to bind-mount it. The script works from its physical path, because the relay refuses TLS material under a symlinked path (on macOS `$TMPDIR` is under `/var`, a symlink to `/private/var`; M3-51). It is removed after a successful run and kept after a failure. |
+| `DEMO_PLAIN_REDIS` | `host:port` of a plaintext test Redis to use, TLS-fronted, instead of a Docker container (see [What you need](#what-you-need)). |
 | `CARGO_TARGET_DIR` | Honoured when building and when locating the binaries. |
 
 To use your own client against a kept demo, point it at the printed endpoint.
@@ -161,6 +170,9 @@ AGENTUPLINK_TOKEN=$(cat "$DEMO_DIR/consumer-token") \
 
 ## When it fails
 
+- **`tunnel-relay: Redis root CA path contains a symlink`**: the work
+  directory is under a symlink. The script resolves its own work directory to
+  the physical path (M3-51); if you set `DEMO_DIR`, use a physical path too.
 - **`docker: … Unable to find image`**: run `docker pull redis:8.4.0-alpine`
   first. The script does not pull images for you.
 - **`docker run did not return within 60 s`**: Docker could not start the
@@ -254,12 +266,14 @@ registered with it, and the tokens it issues must meet the rules above.
 
 - **Protocol version.** Each service speaks exactly one MCP revision: its
   catalog `http_forward_profile`, `2025-11-25` or `2026-07-28`. The relay
-  refuses any other `MCP-Protocol-Version` header. A client that negotiates
-  an older revision, such as `2025-06-18`, fails at its first request after
-  `initialize`, even though the MCP server may accept that revision
-  (task row M3-38).
+  refuses any other `MCP-Protocol-Version` header. On a `2025-11-25` service,
+  an `initialize` that offers another revision, such as `2025-06-18`, is
+  rewritten to offer `2025-11-25`, as the lifecycle requires, so the server
+  answers `2025-11-25`. A client that supports that revision continues on it;
+  one that does not disconnects at `initialize` (task row M3-38).
 - **Browsers.** A request with an `Origin` header is refused. Browser-based
-  clients are not supported (M3-11).
+  clients are not supported, by decision (M3-11): no endpoint is
+  browser-capable.
 - **Not proven with a hosted agent.** No hosted agent has been connected in
   this repository. The discovery and the token rules above are proven only
   by the local demo and by the relay's tests.

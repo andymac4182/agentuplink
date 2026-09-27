@@ -6,7 +6,7 @@ mod common;
 
 use std::time::Duration;
 
-use common::{connect, count_lines, gateway, stdio_export, wait_for_file, within};
+use common::{connect, connect_pinned, count_lines, gateway, stdio_export, wait_for_file, within};
 use rmcp::model::{CallToolRequestParams, ClientRequest, Request, RequestMetaObject};
 use rmcp::service::PeerRequestOptions;
 use tunnel_mcp_fixture::{IMAGE_PNG_BASE64, STDERR_MARKER};
@@ -218,4 +218,31 @@ async fn current_profile_child_crash_is_a_scoped_interruption() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn legacy_profile_child_crash_ends_the_session_without_replay() {
     crash_is_interrupted_not_replayed_or_leaked("mcp-2025-11-25", true).await;
+}
+
+/// M3-38: a `mcp-2025-11-25` service speaks exactly that revision.  The
+/// 2025-11-25 lifecycle says a server that does not support the offered
+/// version MUST answer with one it supports, so the export rewrites an
+/// offered `2025-06-18` to `2025-11-25` before dispatch.  rmcp's server
+/// supports `2025-06-18` and would have echoed it, so a `2025-11-25` answer
+/// proves the child received the rewritten offer.  The client then continues
+/// on `2025-11-25` (or could disconnect, per the spec), instead of failing on
+/// its first request as it did before.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn legacy_profile_answers_an_older_offer_with_its_own_revision() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let export = stdio_export("mcp-2025-11-25", workspace.path(), 8);
+    let gateway = gateway(export.clone(), workspace.path());
+    let client = connect_pinned(&gateway, rmcp::model::ProtocolVersion::V_2025_06_18)
+        .await
+        .expect("initialize offering 2025-06-18 is answered");
+    let negotiated = client
+        .peer_info()
+        .expect("server info")
+        .protocol_version
+        .clone();
+    assert_eq!(negotiated, rmcp::model::ProtocolVersion::V_2025_11_25);
+    let tools = within(client.list_all_tools()).await.expect("tools/list");
+    assert!(!tools.is_empty(), "the session continues on 2025-11-25");
+    let _ = within(client.cancel()).await;
 }

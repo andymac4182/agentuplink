@@ -72,12 +72,12 @@ m3-sdk-conformance: fixture stack up: relay :53323, device connected, backend st
   sdk=python mode=auto case=prompts/get result=pass messages=1+1
   sdk=python mode=legacy case=initialize-known-m3-47 result=pass backend_error=-32020 upstream_row=M3-47
   sdk=python mode=legacy case=cancellation result=pass client_outcome=cancelled server_marker=cancelled
-  sdk=python mode=legacy case=close-cancel result=known row=M3-48 late_post_502=1
+  sdk=python mode=legacy case=close-cancel result=pass closed=true late_post_502=0
   sdk=curl case=origin-refused result=pass status=400 header=origin
   conformance scenario=tools-call-with-progress direct=pass(2/2) relay=pass(2/2)
   conformance scenario=dns-rebinding-protection direct=pass(2/2) relay=fail(0/2) ... expected_failure_row=M3-49
   conformance scenarios direct=31 relay=31 relay_pass=30 verdict=pass
-m3-sdk-conformance: summary nonce=... sdk_cases_pass=72 sdk_cases_fail=0 sdk_cases_known=... elapsed_s=...
+m3-sdk-conformance: summary nonce=... sdk_cases_pass=76 sdk_cases_fail=0 sdk_cases_known=0 elapsed_s=...
 m3-sdk-conformance: ok: the pinned TypeScript and Python MCP SDKs and the conformance suite work through the relay
 ```
 
@@ -90,11 +90,12 @@ The script exits 0 only if all of these hold:
   Each listed scenario must still fail, so a stale entry also turns the run
   red.
 
-A `result=known` line is neither a pass nor a failure. It names the open row
-that explains it, and is printed only for that row's exact signature: the
-Python SDK's close raising only `ClosedResourceError`, with a POST answered
-`502` after the session `DELETE` on the wire. More than two known results
-(one per Python mode) fails the run.
+No case is excused. The only one that ever was, M3-48 (the Python SDK's
+close after a cancel raising `ClosedResourceError`, with a POST answered
+`502` after the session `DELETE`), is fixed: the stdio export now ends a
+cancelled request's POST at once with an empty event stream. The Python
+`close` cases pass only with `late_post_502=0`, and any `result=known` line
+fails the run.
 
 ## Point your own client at the relay
 

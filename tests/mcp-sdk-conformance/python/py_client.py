@@ -109,8 +109,9 @@ async def main() -> int:
         logs.append(str(params.data))
 
     # M3-48's signature, observed on the wire: a POST answered 502 only
-    # after this client sent its session DELETE.  Only methods and statuses
-    # are recorded, never bodies or headers.
+    # after this client sent its session DELETE.  The stdio export now closes
+    # a cancelled request's POST at once, so any such POST fails the close.
+    # Only methods and statuses are recorded, never bodies or headers.
     wire = {"delete_sent": False, "late_post_502": 0}
 
     async def on_request(request: httpx2.Request) -> None:
@@ -150,7 +151,7 @@ async def main() -> int:
         await check(sdk_mode, "initialize-known-m3-47", refused)
         return 0 if FAILURES == 0 else 1
 
-    async def session(suffix: str, body: Callable[[Client], Awaitable[None]], known_close_row: str | None = None) -> None:
+    async def session(suffix: str, body: Callable[[Client], Awaitable[None]]) -> None:
         http, client = connect()
         entered = False
 
@@ -171,23 +172,17 @@ async def main() -> int:
         finally:
             try:
                 await client.__aexit__(None, None, None)
-                report(sdk_mode, "close" + suffix, True, "closed=true")
+                late = wire["late_post_502"]
+                report(sdk_mode, "close" + suffix, late == 0, f"closed=true late_post_502={late}")
             except Exception as error:  # noqa: BLE001
-                leaves = describe(error).split("; ")
-                if (
-                    known_close_row
-                    and leaves
-                    and all(leaf.startswith("ClosedResourceError") for leaf in leaves)
-                    and wire["late_post_502"] >= 1
-                ):
-                    # Not counted as a pass or a failure: only the exact
-                    # signature -- the SDK raising ClosedResourceError and
-                    # nothing else, with a POST answered 502 after the session
-                    # DELETE on the wire -- is M3-48.  Anything else fails.
-                    print(f"sdk=python mode={sdk_mode} case=close{suffix} result=known row={known_close_row} "
-                          f"late_post_502={wire['late_post_502']}", flush=True)
-                else:
-                    report(sdk_mode, "close" + suffix, False, f"error={json.dumps(describe(error)[:400])}")
+                # M3-48 is fixed: a close that raises, including its old
+                # ClosedResourceError signature, is a failure.
+                report(
+                    sdk_mode,
+                    "close" + suffix,
+                    False,
+                    f"error={json.dumps(describe(error)[:400])} late_post_502={wire['late_post_502']}",
+                )
             await http.aclose()
 
     if scenario == "reference":
@@ -195,8 +190,9 @@ async def main() -> int:
     else:
         assert workspace is not None
         await session("", lambda client: run_fixture(sdk_mode, client, workspace))
-        # Cancellation in a session of its own, whose close may meet M3-48.
-        await session("-cancel", lambda client: run_cancel(sdk_mode, client, workspace), known_close_row="M3-48")
+        # Cancellation in a session of its own; its close must be clean
+        # (M3-48: the cancelled POST is closed by the device at once).
+        await session("-cancel", lambda client: run_cancel(sdk_mode, client, workspace))
     return 0 if FAILURES == 0 else 1
 
 

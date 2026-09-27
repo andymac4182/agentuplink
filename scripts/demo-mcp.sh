@@ -5,6 +5,8 @@
 #   scripts/demo-mcp.sh                  # run the demo end to end, then clean up
 #   DEMO_KEEP=1 scripts/demo-mcp.sh      # leave relay, device and Redis running
 #   DEMO_PROFILE=mcp-2026-07-28 scripts/demo-mcp.sh
+#   DEMO_PLAIN_REDIS=127.0.0.1:63790 scripts/demo-mcp.sh   # TLS-front an existing
+#                                        # plaintext test Redis instead of Docker
 #
 # Everything is synthetic and local: a throwaway PKI and identity issuer made
 # with openssl, a TLS Redis in a new Docker container of its own (the relay
@@ -17,7 +19,8 @@
 # WebSocket (mTLS) -> tunnel-client -> MCP server over stdio.  Nothing
 # bypasses the relay.
 #
-# Requirements: cargo, openssl, docker, and the redis:8.4.0-alpine image.
+# Requirements: cargo, openssl, python3, and either docker with the
+# redis:8.4.0-alpine image or a plaintext test Redis (DEMO_PLAIN_REDIS).
 set -eu
 
 repo=$(cd "$(dirname "$0")/.." && pwd)
@@ -55,6 +58,8 @@ PY
 
 relay_pid=
 device_pid=
+proxy_pid=
+plain_redis=${DEMO_PLAIN_REDIS:-}
 cleanup() {
   status=$?
   if [ "${DEMO_KEEP:-0}" = 1 ] && [ "$status" = 0 ]; then
@@ -66,7 +71,14 @@ cleanup() {
   [ -n "$relay_pid" ] && kill "$relay_pid" 2>/dev/null || true
   [ -n "$device_pid" ] && wait "$device_pid" 2>/dev/null || true
   [ -n "$relay_pid" ] && wait "$relay_pid" 2>/dev/null || true
-  docker rm -f "$container" >/dev/null 2>&1 || true
+  if [ -n "$plain_redis" ]; then
+    [ -n "$proxy_pid" ] && kill "$proxy_pid" 2>/dev/null || true
+    [ -n "$proxy_pid" ] && wait "$proxy_pid" 2>/dev/null || true
+    python3 "$repo/tests/mcp-sdk-conformance/redis_tls_proxy.py" purge \
+      "${plain_redis%:*}" "${plain_redis##*:}" "mcp-demo-$nonce" >&2 || true
+  else
+    docker rm -f "$container" >/dev/null 2>&1 || true
+  fi
   if [ "$status" = 0 ]; then
     rm -rf "$work"
   else
@@ -82,6 +94,9 @@ say "build tunnel-relay, tunnel-client, tunnel-mcp-fixture and tunnel-test-harne
 bin=${CARGO_TARGET_DIR:-$repo/target}/debug
 mkdir -p "$work/device" "$work/redis"
 chmod 700 "$work"
+# The relay refuses TLS material under a symlinked path, and macOS's $TMPDIR
+# is under /var -> /private/var, so work from the physical path.
+work=$(cd "$work" && pwd -P)
 say "work directory $work (profile $profile)"
 
 # 2. A synthetic server PKI: one CA and one leaf for localhost/127.0.0.1,
@@ -100,7 +115,25 @@ openssl x509 -req -in "$work/relay.csr" -CA "$work/server-ca.pem" -CAkey "$work/
   -CAcreateserial -days 1 -extfile "$work/server-ext.cnf" -out "$work/relay-cert.pem" 2>/dev/null
 cat "$work/relay-cert.pem" "$work/server-ca.pem" > "$work/relay-cert-chain.pem"
 
-# 3. A TLS Redis of the demo's own (never the shared development Redis).
+# 3. A TLS Redis of the demo's own.  With DEMO_PLAIN_REDIS=host:port, a TLS
+#    front (the conformance suite's redis_tls_proxy.py) is put before that
+#    existing plaintext test Redis instead; this run's keys, all under the
+#    namespace mcp-demo-<nonce>, are purged on exit.
+if [ -n "$plain_redis" ]; then
+  say "TLS front for the plaintext test Redis at $plain_redis (namespace mcp-demo-$nonce)"
+  python3 "$repo/tests/mcp-sdk-conformance/redis_tls_proxy.py" serve "$work/relay-cert-chain.pem" \
+    "$work/relay-key.pem" "${plain_redis%:*}" "${plain_redis##*:}" "$work/redis-port" \
+    >"$work/redis-proxy.log" 2>&1 &
+  proxy_pid=$!
+  attempt=0
+  until [ -s "$work/redis-port" ]; do
+    attempt=$((attempt + 1))
+    { [ "$attempt" -lt 80 ] && kill -0 "$proxy_pid" 2>/dev/null; } \
+      || { cat "$work/redis-proxy.log" >&2; say "redis TLS front did not start"; exit 1; }
+    sleep 0.25
+  done
+  redis_port=$(cat "$work/redis-port")
+else
 cp "$work/relay-cert.pem" "$work/redis/cert.pem"
 cp "$work/relay-key.pem" "$work/redis/key.pem"
 cp "$work/server-ca.pem" "$work/redis/ca.pem"
@@ -123,6 +156,7 @@ while kill -0 "$docker_pid" 2>/dev/null; do
   sleep 0.25
 done
 wait "$docker_pid" || { say "docker run failed"; exit 1; }
+fi
 
 # 4. A synthetic identity issuer: an RSA key published to the relay as JWKS.
 openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "$work/issuer-key.pem" 2>/dev/null

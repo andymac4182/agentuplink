@@ -417,7 +417,7 @@ The device exports three `mcp-2025-11-25` services, each on its own relay and na
 | `prompts/list`, `prompts/get` (with arguments) | reference, SDK server | SDK server |
 | Streamed `notifications/progress`, in order | reference, SDK server, fixture | SDK server, fixture |
 | Streamed `notifications/message` after `logging/setLevel` | reference, SDK server | SDK server |
-| Cancellation: an abort **after** the fixture logged the call reaches the device's server (`cancelled-<label>` marker), and the session stays usable | fixture | fixture (the close after it can meet M3-48) |
+| Cancellation: an abort **after** the fixture logged the call reaches the device's server (`cancelled-<label>` marker), and the session stays usable | fixture | fixture (and the close after it is clean: M3-48, fixed) |
 | Session `DELETE` | all | all |
 
 The **conformance suite** (`server --spec-version 2025-11-25`) passes **31 of 31 scenarios (73 checks)** directly against the reference server. Through the relay it passes **30 of 31**. The exception is `dns-rebinding-protection` (M3-49). That scenario covers only unauthenticated plain-HTTP localhost servers. Its raw request path cannot carry the bearer token, and it sends `Host: evil.example.com` as the TLS server name. The relay's own answer to a rebinding request is checked instead: a request that carries `Origin` gets `400 HTTP_INVALID_HEAD` with `header: origin`. The suite carries no credential option, so a Node `--import` preload (`preload.mjs`) adds the bearer to `fetch` calls for the relay's origin only.
@@ -428,8 +428,8 @@ The **conformance suite** (`server --spec-version 2025-11-25`) passes **31 of 31
 | --- | --- | --- |
 | M3-46 | The relay refused the Python SDK's `Cache-Control: no-store` on the standalone GET stream. | relay; **fixed** by dropping `cache-control` at the ingress, for every http-forward profile (`mcp-2025-11-25`, `mcp-2026-07-28`, `acp-http-v1`) |
 | M3-47 | The reference server refuses the Python SDK's `initialize` with `-32020 Missing MCP-Protocol-Version header`. The SDK sends `_meta: {}`, which that server reads as a 2026 request. Reproduced directly, without the relay. | upstream (conformance reference server); the harness checks that the relay forwards the refusal unchanged |
-| M3-48 | After a forwarded `notifications/cancelled`, the stdio export holds the cancelled request's POST open. It answers `502` only when the session is deleted, and the Python SDK then raises `ClosedResourceError` from `Client.__aexit__`. rmcp's own Streamable HTTP server answers such a POST at once with an empty event stream. | device bridge (stdio, 2025-11-25); open |
-| M3-49 | The conformance suite's `dns-rebinding-protection` scenario cannot run through the relay. | suite scope; the relay refuses `Origin` instead |
+| M3-48 | After a forwarded `notifications/cancelled`, the stdio export held the cancelled request's POST open. It answered `502` only when the session was deleted, and the Python SDK then raised `ClosedResourceError` from `Client.__aexit__`. rmcp's own Streamable HTTP server answers such a POST at once with an empty event stream. | device bridge (stdio, 2025-11-25); **fixed**: the export now does the same (see [Decisions and fixes](#decisions-and-fixes-branch-fix-m3-sweep)) |
+| M3-49 | The conformance suite's `dns-rebinding-protection` scenario cannot run through the relay. | suite scope; the relay refuses `Origin` instead; closed by the M3-11 Origin decision |
 
 Also observed, but not recorded as rows:
 
@@ -511,8 +511,9 @@ no challenge.
 Token validation itself is unchanged: issuer, audience, signature, expiry,
 scope, catalog identity and grant, on the ingress and again on the owner.
 Audiences are still the configured `oidc_audience` list. An issuer that puts
-the RFC 8707 `resource` value into `aud` therefore needs that URL listed
-there (M3-42). Browser `Origin` is still refused on both profiles.
+the RFC 8707 `resource` value into `aud` is therefore refused unless that URL
+is listed there (M3-42, open for the owner). Browser `Origin` is refused on
+both profiles, by decision: no endpoint is browser-capable (M3-11).
 
 Evidence:
 
@@ -522,8 +523,10 @@ Evidence:
 
 ### Revocation ends the session (M3-16)
 
-This is option (c) from the row, applied by default pending owner
-confirmation (2026-09-25).
+This is option (c) from the row. It was applied by default pending owner
+confirmation (2026-09-25) and is now **decided** under the owner's delegation
+of design trade-offs (2026-09-28); the reasoning is under
+[Decisions and fixes](#decisions-and-fixes-branch-fix-m3-sweep).
 
 The owner relay watches each consumer it admits to a session-keyed export
 (it sends the message only to connectors that advertised
@@ -562,4 +565,132 @@ Residuals are in M3-41:
   truthful but not revocation-specific (M3-44);
 - no upstream `DELETE` is sent to a Streamable HTTP backend;
 - M5-C05 does not use the message yet.
+
+## Decisions and fixes (branch `fix-m3-sweep`)
+
+Recorded 2026-09-28. The owner delegated design trade-offs ("You work through
+the trade offs and make a decision"). A decision is taken here unless it is
+irreversible, widens trust or costs money; those stay open for the owner.
+
+### Last-Event-ID (M3-10): decided, no resume on the stdio export
+
+- **`mcp-2026-07-28`**: no GET stream and no resume. `Last-Event-ID` is not in
+  the profile's allowlist and is refused (`400 HTTP_INVALID_HEAD`), as before.
+- **`mcp-2025-11-25`, stdio export**: no resume. Resumability is optional in
+  the 2025-11-25 transport, and the bridge does not offer it. It never writes
+  an SSE `id:` field, so a conforming client has no `Last-Event-ID` to send.
+  A GET that carries one anyway is a fresh standalone stream of the same
+  principal-bound session. Nothing is replayed, from that stream or any
+  other. A broken POST stream is an interrupted exchange (`execution:
+  unknown`), never a replay. Why not implement resume: it needs a bounded,
+  per-stream event cache on the device, and a client-side retry that is not
+  ambiguous about side effects. The relay already reports an interrupted
+  exchange explicitly, which AGENTS.md requires. Nothing measured needs more.
+- **`mcp-2025-11-25`, Streamable HTTP export**: the export neither emits nor
+  interprets event IDs. It forwards the backend's `id:` fields and a
+  consumer's `Last-Event-ID` unchanged, inside the session that M3-04 binds
+  to one principal, so resume is exactly the backend's.
+
+Evidence (`tunnel-mcp-fixture`):
+`session_lifecycle::the_stdio_export_emits_no_event_ids_and_replays_nothing`
+and `rmcp_http::legacy_http_export_forwards_last_event_id_to_the_backend`.
+The second resumes an abandoned POST stream through the export against
+rmcp's own server, and checks that every resumed event is from that
+request's stream. The stdio test reads standalone log messages on one GET.
+It then reconnects with `Last-Event-ID` and requires the new stream's first
+messages to be new ones. Each test was shown red by a mutation. For the HTTP
+test, stripping `last-event-id` at the export. For the stdio test, writing
+`id:` into the bridge's events, and, separately, keeping delivered standalone
+messages for the next stream. rmcp 3.4.0
+re-delivers the `Last-Event-ID` event itself on resume. That is an upstream
+duplicate, which the relay forwards unchanged (M3-52).
+
+### Browser Origin (M3-11 and M3-49): decided, no browser-capable endpoint
+
+Every `http-forward` endpoint keeps refusing a request that carries `Origin`
+(`400 HTTP_INVALID_HEAD`, `header: origin`). A browser-capable endpoint would
+need an allowlist of web origins per service, CORS preflight handling, and a
+decision on which token audiences a browser may present. Each of those widens
+trust, so none is added. MCP clients are agents and command-line tools, not
+browser pages. The conformance suite's `dns-rebinding-protection` scenario
+covers unauthenticated plain-HTTP localhost servers. Behind the relay it means
+the Origin refusal, which `scripts/m3-sdk-conformance.sh` checks
+(`sdk=curl case=origin-refused`). The scenario stays in
+`relay-expected-failures.txt`, which requires it to keep failing. The
+per-endpoint RFC 8707 audience stays open as M3-42, because accepting it
+widens the set of accepted tokens.
+
+### Revocation ends the session (M3-16): option (c) confirmed
+
+`PRINCIPAL_SESSIONS_END` stays. It is reversible: the relay sends it only to
+a connector that advertised `principal-sessions-end-v1`, so withdrawing the
+feature means no longer advertising it. It widens no trust: the device
+learns only an opaque binding it already holds. It is the only option that
+can also close M5-C05's exclusive input lease, which has no idle timeout
+beneath it. Option (a) leaves a revoked principal's child holding a
+`max_children` slot for up to 600 s. Option (b) would teach the device grant
+revisions, which it deliberately does not know. The residuals stay in M3-41.
+
+### Older revisions (M3-38): answered with `2025-11-25`
+
+A `mcp-2025-11-25` service speaks exactly that revision. The 2025-11-25
+lifecycle says that if the server does not support the version the client
+offers in `initialize`, it **MUST** respond with another version it supports.
+The export therefore rewrites an `initialize` whose `protocolVersion` is any
+other string so that it offers `2025-11-25`, before dispatch. The server
+answers `2025-11-25`, and the client continues on that revision or
+disconnects, as the lifecycle says. Only the bytes of that one string change.
+The rest of the compact message is dispatched exactly, including member
+order, numbers and escapes. Only a malformed offer (a missing or non-string
+`protocolVersion`) is refused: `400`, JSON-RPC `-32602`, `data.supported:
+["2025-11-25"]`, with nothing echoed.
+
+Before, many servers accepted the older offer. The client's first request
+after `initialize`, whose header named that revision, was then refused with
+`-32022`. The first version of this fix refused the older `initialize`
+outright. The Opus review of #238 replaced that with this spec-compliant
+answer, as the coordinator decided. A client that sends
+`MCP-Protocol-Version` with an older revision on the `initialize` itself is
+still refused by the header check (`-32022`). That header is optional on
+`initialize`, and no pinned client sends it.
+
+Evidence:
+`message::tests::the_2025_profile_rewrites_initialize_for_another_revision`
+covers the rewrite, a nested member of the same name, an escaped key and
+number fidelity, and the malformed-offer refusal. Two tests use rmcp clients
+pinned to `2025-06-18`, whose server supports that revision and would have
+echoed it:
+`rmcp_stdio::legacy_profile_answers_an_older_offer_with_its_own_revision` and
+`rmcp_http::legacy_profile_http_export_answers_an_older_offer_with_its_own_revision`.
+Each asserts a negotiated `2025-11-25` and a working session. All three
+failed against the refusing version. The HTTP test also fails when the
+export forwards the consumer's original body instead of the rewritten one.
+
+### A cancelled request's POST (M3-48): closed at once
+
+The server need not answer a cancelled request, and the rmcp fixture does not.
+The stdio export now closes the cancelled request's POST itself, once the
+client's `notifications/cancelled` has reached the child. Only a request of
+the same session that is still in flight is affected. Before any event, the
+answer is an empty event stream (`200`, `text/event-stream`, no events); on
+a stream that has already started, the stream ends cleanly. A late response
+for that ID is undeliverable, as for any unknown ID, and the export counts
+these in `cancelled_requests_closed`.
+
+The cancelled request stays registered until its own POST has ended. So an
+ID reused in that window is refused as a duplicate (`400`), not registered.
+The first version removed the entry at once. A reused ID was then registered,
+and could receive the cancelled request's late response or be torn down by
+the old POST's cleanup (Opus review of #238). A late response to a cancelled
+ID can reach another request only if the client reuses a request ID within
+the session, which the spec forbids. Evidence:
+`session_lifecycle::a_cancelled_legacy_request_closes_its_post_promptly`, red
+before the fix (the POST was still open 5 s after the cancel), and
+`…a_cancellation_for_another_id_closes_nothing` and
+`…an_id_reused_right_after_its_cancel_is_never_interrupted`. The last one
+was red 3 of 3 against the first version: the reused ID was answered `200`
+with the cancelled request's response. In
+`scripts/m3-sdk-conformance.sh` the Python `close-cancel` case is no longer
+excused. It must pass with `late_post_502=0`, and any `result=known` line
+fails the run.
 

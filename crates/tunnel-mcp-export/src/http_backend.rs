@@ -351,11 +351,17 @@ impl HttpBackendExport {
             }
             Err(CollectError::Interrupted) => return Err(ExportError),
         };
-        if parts.method == Method::POST
-            && let Err(error) = validate_post(self.profile, &parts.headers, &body)
-        {
-            return Ok(self.reject(&error));
-        }
+        // The consumer's body is forwarded as received, except an
+        // `initialize` whose offered revision was rewritten (M3-38).
+        let body = if parts.method == Method::POST {
+            match validate_post(self.profile, &parts.headers, &body) {
+                Ok(message) if message.protocol_version_rewritten => Bytes::from(message.compact),
+                Ok(_) => body,
+                Err(error) => return Ok(self.reject(&error)),
+            }
+        } else {
+            body
+        };
 
         // M3-04.  This revision's sessions belong to the backend, but which
         // principal may use one is the device's decision: a request naming a

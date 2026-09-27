@@ -79,6 +79,9 @@ pub struct ExportCounters {
     /// Protocol sessions ended because the relay reported that their
     /// consumer's authorization ended (M3-16).
     pub sessions_revoked: AtomicU64,
+    /// Legacy requests whose POST the bridge closed, with no response,
+    /// because the client cancelled them (M3-48).
+    pub cancelled_requests_closed: AtomicU64,
 }
 
 /// A snapshot of [`ExportCounters`].
@@ -107,6 +110,7 @@ pub struct ExportDiagnostics {
     pub notifications_dropped: u64,
     pub child_group_kills: u64,
     pub sessions_revoked: u64,
+    pub cancelled_requests_closed: u64,
 }
 
 impl ExportCounters {
@@ -139,6 +143,7 @@ impl ExportCounters {
             notifications_dropped: load(&self.notifications_dropped),
             child_group_kills: load(&self.children.group_kills),
             sessions_revoked: load(&self.sessions_revoked),
+            cancelled_requests_closed: load(&self.cancelled_requests_closed),
         }
     }
 }
