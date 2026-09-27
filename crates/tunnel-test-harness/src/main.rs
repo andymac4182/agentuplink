@@ -286,6 +286,18 @@ pub(crate) async fn main() -> ExitCode {
                             rotation.replay_frames,
                         );
                     }
+                    for exchange in &evidence.between_rotation_exchanges {
+                        println!(
+                            "M7 I08 partial between-rotation exchange: after_rotation={} relay={}->{} connector={}->{} settled_before_next_attempt={} checksum_matched={}",
+                            exchange.after_rotation,
+                            exchange.relay_sequence_before,
+                            exchange.relay_sequence_after,
+                            exchange.connector_sequence_before,
+                            exchange.connector_sequence_after,
+                            exchange.settled_before_next_attempt,
+                            exchange.checksum_matched,
+                        );
+                    }
                     Ok(())
                 })
         }
