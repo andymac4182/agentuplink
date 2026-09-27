@@ -324,17 +324,27 @@ impl H3PeerFixture {
         }
     }
 
-    /// Mint a consumer token whose `exp` is `lifetime_secs` from now.  The
-    /// owner derives the stream's absolute authorization deadline from that
-    /// claim, so a short lifetime bounds the stream deterministically.
-    fn mint_consumer_token(&self, lifetime_secs: i64) -> String {
-        mint_consumer_token(&self.consumer_signer, lifetime_secs)
-    }
-
     /// Mint a consumer token whose `exp` claim is exactly `exp_secs`, so a
     /// test knows the owner's absolute authorization deadline to the second.
+    /// There is deliberately no lifetime-only variant here: a short
+    /// whole-second lifetime hides a sub-second window from the test (task
+    /// rows M6-C208 and M6-C209).
     fn mint_consumer_token_expiring_at(&self, exp_secs: i64) -> String {
         mint_consumer_token_expiring_at(&self.consumer_signer, exp_secs)
+    }
+
+    /// Mint a consumer token whose `exp` is the whole second
+    /// `lifetime_secs` from now and return it with that exact deadline, the
+    /// instant the owner's authentication and stream timer use (M6-C209).
+    /// Its life at mint is `(lifetime_secs - 1, lifetime_secs]` s.
+    fn mint_consumer_token_with_deadline(
+        &self,
+        lifetime_secs: i64,
+    ) -> (String, chrono::DateTime<Utc>) {
+        let exp_secs = Utc::now().timestamp() + lifetime_secs;
+        let deadline =
+            chrono::DateTime::<Utc>::from_timestamp(exp_secs, 0).expect("consumer deadline");
+        (self.mint_consumer_token_expiring_at(exp_secs), deadline)
     }
 
     async fn stop_server(&mut self) {
@@ -1713,6 +1723,18 @@ async fn peer_consumer_idle_deadline_closes_exact_stream_and_preserves_sibling()
     fixture.shutdown().await;
 }
 
+/// Assert that more than `margin` of the consumer's authorization remains,
+/// so the assertion that follows is not decided by the consumer deadline
+/// (M6-C209).  A run that fails here is a setup overrun, not a product
+/// defect; its message says so instead of blaming the property under test.
+fn assert_consumer_margin(deadline: chrono::DateTime<Utc>, margin: Duration, what: &str) {
+    let left = (deadline - Utc::now()).to_std().unwrap_or_default();
+    assert!(
+        left > margin,
+        "setup overran the consumer deadline before {what}: {left:?} left, {margin:?} needed"
+    );
+}
+
 /// Whole seconds from mint to the consumer token's `exp` in
 /// [`peer_consumer_outstanding_write_is_bounded_by_consumer_expiry`].  `exp`
 /// is a whole second and strict, so the life left at mint is `(4, 5]` s and
@@ -1768,6 +1790,37 @@ fn outstanding_target_terminal(
                     && candidate.terminal
             })
     })
+}
+
+/// Sleep until `offset` before the consumer deadline, then prove the parked
+/// stream is still live: nothing earlier than the consumer deadline ended it
+/// (M6-C208; lower bound added to the idle test by M6-C209).  The clock is
+/// read before the snapshot is requested, so a snapshot that is served
+/// slowly cannot fail a run whose stream was live when it was asked for.
+async fn assert_parked_until_deadline(
+    fixture: &H3PeerFixture,
+    deadline: chrono::DateTime<Utc>,
+    offset: Duration,
+    session_id: &str,
+    epoch: u64,
+    stream: &RelayStreamSnapshot,
+) {
+    let probe_at = deadline - ChronoDuration::from_std(offset).expect("probe offset");
+    tokio::time::sleep((probe_at - Utc::now()).to_std().unwrap_or_default()).await;
+    let requested_at = Utc::now();
+    let early = fixture
+        .handle
+        .snapshot()
+        .await
+        .expect("pre-deadline probe snapshot");
+    assert!(
+        requested_at < deadline,
+        "the pre-deadline probe must be requested before the consumer deadline"
+    );
+    assert!(
+        !outstanding_target_terminal(&early, session_id, epoch, stream),
+        "the outstanding write must stay parked until the consumer deadline"
+    );
 }
 
 #[tokio::test]
@@ -1893,25 +1946,15 @@ async fn peer_consumer_outstanding_write_is_bounded_by_consumer_expiry() {
 
     // Shortly before the deadline the write is still parked: nothing earlier
     // than the consumer deadline ended it.
-    tokio::time::sleep((early_probe_at - Utc::now()).to_std().unwrap_or_default()).await;
-    let early = fixture
-        .handle
-        .snapshot()
-        .await
-        .expect("outstanding-write early probe snapshot");
-    assert!(
-        Utc::now() < consumer_deadline,
-        "the early probe must be taken before the consumer deadline"
-    );
-    assert!(
-        !outstanding_target_terminal(
-            &early,
-            &target_session_id,
-            target_epoch,
-            &target_stream_before
-        ),
-        "the outstanding write must stay parked until the consumer deadline"
-    );
+    assert_parked_until_deadline(
+        &fixture,
+        consumer_deadline,
+        OUTSTANDING_WRITE_EARLY_PROBE,
+        &target_session_id,
+        target_epoch,
+        &target_stream_before,
+    )
+    .await;
 
     let wait_bound = (consumer_deadline - Utc::now())
         .to_std()
@@ -1945,16 +1988,41 @@ async fn peer_consumer_outstanding_write_is_bounded_by_consumer_expiry() {
     fixture.shutdown().await;
 }
 
+/// Whole seconds from mint to the consumer token's `exp` in
+/// [`peer_consumer_outstanding_write_outlives_the_receive_idle_timeout`]; its
+/// life at mint is `(7, 8]` s (task row M6-C209).
+const PARKED_PAST_IDLE_TOKEN_SECS: i64 = 8;
+/// When that test probes liveness: well past the fixture's 2 s receive idle
+/// deadline.
+const PARKED_PAST_IDLE_PROBE: Duration = Duration::from_millis(3_200);
+/// Consumer authorization that must remain after the liveness probe, so the
+/// probe cannot land on or after the deadline.  With the life above, setup
+/// has more than 2.8 s.
+const PARKED_PAST_IDLE_PROBE_MARGIN: Duration = Duration::from_secs(1);
+/// Scheduling slack after the consumer deadline within which the owner must
+/// have terminalized the stream.
+const PARKED_PAST_IDLE_DEADLINE_SLACK: Duration = Duration::from_secs(3);
+/// How long before the consumer deadline that test proves the stream is still
+/// parked, so an early end is caught, not only a late one.
+const PARKED_PAST_IDLE_EARLY_PROBE: Duration = Duration::from_millis(500);
+
 #[tokio::test]
 async fn peer_consumer_outstanding_write_outlives_the_receive_idle_timeout() {
     // Regression for the queue-saturation gate: a parked actor write must not
     // be ended by the transport's two-second receive idle timeout.  The
     // ingress peer is legitimately silent while it waits for this response,
     // so the serviced receive direction (EC-045) is bounded by the consumer's
-    // absolute deadline only.  With a five-second consumer deadline the
-    // stream must still be live and unfaulted after the idle window has
-    // passed, then end at the consumer deadline with no owner receive
-    // outcome recorded.
+    // absolute deadline only.  With a consumer deadline well past the idle
+    // window the stream must still be live and unfaulted after that window
+    // has passed, still live 500 ms before the consumer deadline, and then
+    // terminal within the slack after it, with no owner receive outcome
+    // recorded.
+    //
+    // M6-C209: the token used to have `exp` five whole seconds out, so its
+    // life was `(4, 5]` s and only about 0.8 s was left for setup before the
+    // 3.2 s liveness probe could land after the deadline.  It now carries an
+    // exact deadline whose life at mint is `(7, 8]` s; the test requires more
+    // than 4.2 s of it left before the probe, so setup has more than 2.8 s.
     let fixture = H3PeerFixture::new().await;
     let target = register_control(
         &fixture,
@@ -1992,8 +2060,9 @@ async fn peer_consumer_outstanding_write_outlives_the_receive_idle_timeout() {
     let _sibling_rx = sibling.rx;
 
     let owner = current_target_owner(&fixture).await;
-    let short_lived_token = fixture.mint_consumer_token(5);
     let mut stream = open_raw(&fixture, InternalRoute::ConsumerStreams).await;
+    let (short_lived_token, consumer_deadline) =
+        fixture.mint_consumer_token_with_deadline(PARKED_PAST_IDLE_TOKEN_SECS);
     admit_consumer(
         &mut stream,
         &owner.token,
@@ -2039,9 +2108,9 @@ async fn peer_consumer_outstanding_write_outlives_the_receive_idle_timeout() {
         .await
         .expect("send parked consumer record");
 
-    // Keep the client stream open: only the consumer's one-second absolute
-    // deadline may end the outstanding write.  A stranded handler would keep
-    // this stream live far beyond the bound below.
+    // Keep the client stream open: only the consumer's absolute deadline may
+    // end the outstanding write.  A stranded handler would keep this stream
+    // live far beyond the bound below.
     let owner_receive_before = fixture
         .handle
         .snapshot()
@@ -2049,15 +2118,26 @@ async fn peer_consumer_outstanding_write_outlives_the_receive_idle_timeout() {
         .expect("outstanding-write baseline snapshot")
         .peer_consumer_diagnostics
         .owner_receive_count;
-    let started = tokio::time::Instant::now();
+    // The liveness probe below must land before the consumer deadline, or a
+    // terminal stream would say nothing about the idle timeout.
+    assert_consumer_margin(
+        consumer_deadline,
+        PARKED_PAST_IDLE_PROBE + PARKED_PAST_IDLE_PROBE_MARGIN,
+        "the idle-window liveness probe",
+    );
     // Well past the two-second receive idle timeout, the parked stream is
     // still live and no receive outcome has been recorded against it.
-    tokio::time::sleep(Duration::from_millis(3200)).await;
+    tokio::time::sleep(PARKED_PAST_IDLE_PROBE).await;
+    let probe_requested_at = Utc::now();
     let parked_snapshot = fixture
         .handle
         .snapshot()
         .await
         .expect("parked-past-idle snapshot");
+    assert!(
+        probe_requested_at < consumer_deadline,
+        "the idle-window liveness probe must be requested before the consumer deadline"
+    );
     let parked_stream = find_session(&parked_snapshot, device_id())
         .expect("parked-past-idle target session after the idle window")
         .streams
@@ -2076,31 +2156,39 @@ async fn peer_consumer_outstanding_write_outlives_the_receive_idle_timeout() {
         owner_receive_before,
         "no owner receive outcome may be recorded while the peer waits on the parked write"
     );
-    let terminal_snapshot =
-        wait_snapshot_for(&fixture.handle, Duration::from_secs(8), &mut |snapshot| {
-            find_session(snapshot, device_id()).is_some_and(|session| {
-                session.session_id == target_session_id
-                    && session.epoch == target_epoch
-                    && session.streams.iter().any(|stream| {
-                        stream.stream_id == target_stream_before.stream_id
-                            && stream.operation_id == target_stream_before.operation_id
-                            && stream.terminal
-                    })
-            }) && find_session(snapshot, sibling_device_id()).is_some_and(|session| {
-                session.session_id == sibling_before.session_id
-                    && session.epoch == sibling_before.epoch
-            })
+    // Lower bound: the write is still parked 500 ms before the consumer
+    // deadline, so nothing earlier than that deadline ended it.
+    assert_parked_until_deadline(
+        &fixture,
+        consumer_deadline,
+        PARKED_PAST_IDLE_EARLY_PROBE,
+        &target_session_id,
+        target_epoch,
+        &target_stream_before,
+    )
+    .await;
+    // Upper bound: the consumer deadline is known exactly, so the stream must
+    // be terminal within the slack after it; a stranded handler would time
+    // this wait out.
+    let wait_bound = (consumer_deadline - Utc::now())
+        .to_std()
+        .unwrap_or_default()
+        + PARKED_PAST_IDLE_DEADLINE_SLACK;
+    let terminal_snapshot = wait_snapshot_for(&fixture.handle, wait_bound, &mut |snapshot| {
+        outstanding_target_terminal(
+            snapshot,
+            &target_session_id,
+            target_epoch,
+            &target_stream_before,
+        ) && find_session(snapshot, sibling_device_id()).is_some_and(|session| {
+            session.session_id == sibling_before.session_id && session.epoch == sibling_before.epoch
         })
-        .await;
-    // The 3.2 s liveness check above is the lower bound that matters: it is
-    // measured on a real clock and is well past the 2 s receive idle deadline
-    // the parked read must outlive.  The consumer's own deadline runs from
-    // token issue rather than from this instant, so no lower bound on the
-    // total elapsed time here would be meaningful under load.
-    assert!(
-        started.elapsed() < Duration::from_secs(8),
-        "the parked write must still end at the consumer's absolute deadline"
-    );
+    })
+    .await;
+    // The 3.2 s liveness check above shows the 2 s receive idle deadline did
+    // not end the parked read; the pre-deadline probe and the bounded wait
+    // show the consumer deadline did, within 500 ms before and the slack
+    // after.
     assert_eq!(
         terminal_snapshot
             .peer_consumer_diagnostics
@@ -2903,6 +2991,20 @@ fn assert_stream_closed_event(snapshot: &RelaySnapshot, admitted: &AdmittedConsu
     );
 }
 
+/// Whole seconds from mint to the consumer token's `exp` in the EC-045 and
+/// EC-046 duplex tests; the life at mint is `(11, 12]` s (task row M6-C209).
+/// EC-046 needs more than 7 s of it left at its decode step, so setup has
+/// more than 4 s.
+const DUPLEX_CONSUMER_TOKEN_SECS: i64 = 12;
+/// EC-046's bounded decode step: `wait_handler_error` (3 s) then
+/// `wait_snapshot` (3 s).
+const EC046_DECODE_STEP_BOUND: Duration = Duration::from_secs(6);
+/// How promptly the owner must honour EC-045's receive-direction cancel.
+const EC045_PROMPT_BOUND: Duration = Duration::from_millis(1_500);
+/// Consumer authorization that must remain beyond a duplex test's bounded
+/// step, so the deadline cannot decide that step.
+const DUPLEX_DEADLINE_MARGIN: Duration = Duration::from_secs(1);
+
 /// EC-045: a cancellation on the receive direction while the send direction is
 /// parked on an actor write.  The parked write can never complete because the
 /// connector never answers the stream's authorization challenge, so only the
@@ -2913,7 +3015,10 @@ async fn peer_consumer_receive_cancel_releases_parked_send_direction_before_dead
     let fixture = H3PeerFixture::new().await;
     // The consumer deadline is deliberately far beyond the prompt bound below;
     // a handler that only honours the cancel at that deadline fails the case.
-    let token = fixture.mint_consumer_token(8);
+    // M6-C209: the deadline is exact and checked just before the cancel, so
+    // a slow setup cannot let the deadline itself satisfy the prompt bound.
+    let (token, consumer_deadline) =
+        fixture.mint_consumer_token_with_deadline(DUPLEX_CONSUMER_TOKEN_SECS);
     let mut admitted = admit_consumer_with_open(&fixture, &token, "ec045").await;
     let before = fixture
         .handle
@@ -2958,11 +3063,17 @@ async fn peer_consumer_receive_cancel_releases_parked_send_direction_before_dead
         .take()
         .expect("client stream is still whole")
         .split();
+    assert_consumer_margin(
+        consumer_deadline,
+        EC045_PROMPT_BOUND + DUPLEX_DEADLINE_MARGIN,
+        "the receive-direction cancel",
+    );
     let cancelled_at = tokio::time::Instant::now();
     client_send.cancel();
 
     // The parked direction is released: the handler exits, the exact stream
-    // is terminal, and both happen well below the eight-second deadline.
+    // is terminal, and both happen well below the consumer deadline (the
+    // 12 s duplex token).
     wait_handler_error(&fixture, returned_before).await;
     let terminal_snapshot = wait_snapshot(&fixture.handle, |snapshot| {
         find_session(snapshot, device_id()).is_some_and(|session| {
@@ -2978,7 +3089,7 @@ async fn peer_consumer_receive_cancel_releases_parked_send_direction_before_dead
     .await;
     let honoured_after = cancelled_at.elapsed();
     assert!(
-        honoured_after < Duration::from_millis(1500),
+        honoured_after < EC045_PROMPT_BOUND,
         "the receive-direction cancel must be honoured promptly, not at the deadline; observed {honoured_after:?}"
     );
 
@@ -3050,7 +3161,12 @@ async fn peer_consumer_receive_cancel_releases_parked_send_direction_before_dead
 #[tokio::test]
 async fn peer_consumer_decode_failure_drains_safe_events_and_cancels_both_halves() {
     let fixture = H3PeerFixture::new().await;
-    let token = fixture.mint_consumer_token(8);
+    // M6-C209: an exact deadline, with enough of it checked to remain before
+    // the malformed record is sent to cover that send and both bounded waits
+    // after it, so a slow setup is reported as a setup overrun instead of as
+    // a wrong terminal cause.
+    let (token, consumer_deadline) =
+        fixture.mint_consumer_token_with_deadline(DUPLEX_CONSUMER_TOKEN_SECS);
     let mut admitted = admit_consumer_with_open(&fixture, &token, "ec046").await;
     let before = fixture
         .handle
@@ -3127,6 +3243,14 @@ async fn peer_consumer_decode_failure_drains_safe_events_and_cancels_both_halves
     assert_eq!(
         fixture.returned_errors.load(Ordering::Acquire),
         returned_before
+    );
+
+    // The send below and the two 3 s waits after it (`wait_handler_error`,
+    // `wait_snapshot`) must all finish before the consumer deadline.
+    assert_consumer_margin(
+        consumer_deadline,
+        EC046_DECODE_STEP_BOUND + DUPLEX_DEADLINE_MARGIN,
+        "the malformed record",
     );
 
     // 3. A malformed record (unassigned kind byte) followed, in the same
