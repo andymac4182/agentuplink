@@ -90,6 +90,7 @@ fn cancel_fixture(
         dispatched: true,
         authorization_in_flight: false,
         deferred_authorization: None,
+        freeze_authorization: super::FreezeAuthorization::NotHeld,
         abandon: super::UnaryAbandon::default(),
     };
     actor
