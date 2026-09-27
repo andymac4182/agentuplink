@@ -867,66 +867,92 @@ in place (it was running), and the device reconnected by itself each time.
   removes a service: to withdraw the demo service, `revoke-grant` it (section
   6.6, "Revocation").
 
-**Upgrade to `a8f105d` (2026-09-27, measured).** Times are `+10:00`; logs
-with a nonce and `head=a8f105de` on their first line are in
-`/private/tmp/claude-501/fly-upgrade-logs/` on the coordinator's Mac. The
+**Upgrade to `a8f105d` (2026-09-27, measured).** Times are `+10:00`. Each
+claim names its evidence: a log in `/private/tmp/claude-501/fly-upgrade-logs/`
+on the coordinator's Mac (first line: a nonce and `head=a8f105de`), or
+**observed in session, no log kept**. `recapture.log` (nonce `216815148`,
+10:00:23 to 10:00:38) was taken after the fact without touching the relay: the
+refusal calls, `config check` and `shasum` were re-run then, and the relay
+lines were copied from `fly logs --no-tail` (lifecycle, one-off and rotation
+lines only; session IDs redacted). Percentiles are nearest-rank (the value at
+rank ceil(p x n) of the sorted times), recomputed in `percentiles.log`. The
 relay machine `185e264a927d58` was running and was updated in place; its ID
-did not change.
+did not change (`recapture.log`, `fly machine list`).
 - **Config check before building.** Between `6830ba7` and `a8f105d` the
   Fly files changed only by the `[http_forward]` table, now on `main`, and
   the entrypoint's command list is unchanged. `ServeConfig` gained only
   optional keys with defaults (`listener_max_connections`,
   `listener_refusal_margin`, the peer rekey keys, `[http_forward]
   public_url`), so the Fly `relay.toml` needed no edit; see section 1 for
-  what the new listener cap means here. No commit subject in the range
-  mentions a catalog schema or key change (checked by subject only), and the
-  new relay served the existing namespace without re-provisioning. The device profile needed no edit either (`config
-  check` with the new client: `valid`).
+  what the new listener cap means here (source reading; no log). No commit
+  subject in the range mentions a catalog schema or key change (checked by
+  subject only), and the new relay served the existing namespace without
+  re-provisioning. The device profile needed no edit either: `config check`
+  with the new client answers `valid`, exit `0` (`recapture.log`; the
+  pre-restart run at 09:44 was observed in session, no log kept).
 - **Image (09:40:27 to 09:42:39).** Section 6.1 with `--image-label
   main-a8f105d` from a clean checkout of `main` at `a8f105d`, remote only;
-  digest in section 6.1.
+  digest in section 6.1 (`fly-build.log`).
 - **One-off `check-serve-config` (09:42:55 to 09:44:06)** with section 6.6's
   helper: `Relay serving configuration is valid: consumer_bind=0.0.0.0:8443
-  device_bind=0.0.0.0:9443 cluster=absent recovery=absent`, `exit_code=0`
-  (flyctl again printed `failed to reach desired start state` for the fast
-  exit), machine destroyed; `fly machine list` then showed only the relay.
+  device_bind=0.0.0.0:9443 cluster=absent recovery=absent` and `Main child
+  exited normally with code: 0` from machine `683dd10da3e0d8`, which `fly
+  machine status` shows `destroyed` at 09:44:06 (`recapture.log`). flyctl
+  again printed `failed to reach desired start state` for the fast exit, and
+  its `exit_code=0` status line was observed in session, no log kept.
 - **Deploy (09:44:14 to 09:44:21).** `fly deploy . --config
   deploy/fly/relay/fly.toml --image
-  registry.fly.io/agentuplink-relay:main-a8f105d --ha=false`. The log showed
-  `stopping: signal=SIGTERM`, `stopped: signal=SIGTERM`, then `listening` and
-  `Redis restart continuity: interval_seconds=5` at 09:44:24; both checks
-  passing; `/readyz` `200`.
+  registry.fly.io/agentuplink-relay:main-a8f105d --ha=false`. The relay
+  logged `stopping: signal=SIGTERM` and `stopped: signal=SIGTERM` at
+  09:44:22, then `listening` and `Redis restart continuity:
+  interval_seconds=5` at 09:44:24 (`recapture.log`). Both checks passing and
+  `/readyz` `200` right after the deploy were observed in session, no log
+  kept; both checks show passing in `recapture.log` at 10:00:38.
 - **Old client across the upgrade.** The demo device, still on the `6830ba7`
-  `tunnel-client`, went `TRANSPORT_ERROR`, backoff, `DEADLINE_EXCEEDED`,
-  `reconnecting`, `reconnected`, `ready`, `active` without a restart; echoes
-  and a `tools/call demo_page` then returned `200`.
-- **New client.** A release build of `tunnel-client` from `a8f105d`
-  (sha256 `465af0cb…`) replaced the device process with the same profile
-  and flags (`connect --config ~/agentuplink-fly/device/client.toml --json`),
-  stopped with SIGTERM (orderly `stopped` in about 1 s) and started at
-  09:45; `ready`, `active`.
+  `tunnel-client`, logged `disconnected TRANSPORT_ERROR`, backoff 756 ms,
+  `disconnected DEADLINE_EXCEEDED`, backoff 1,159 ms, `reconnecting`,
+  `reconnected`, `ready` without a restart (its `connect-http.log` lines
+  2862 to 2869, extracted into `recapture.log`; that log has no timestamps,
+  and these are the last transitions before its `stopped` at line 2871, which
+  is the SIGTERM that replaced it). The echoes and the `tools/call
+  demo_page` returning `200` on that client were observed in session, no log
+  kept.
+- **New client.** A release build of `tunnel-client` from `a8f105d`, sha256
+  `465af0cb551d7847493bc3fc5b93d529e99f0a6ec924e22716e7c38ad42a5e79`
+  (`recapture.log`), replaced the device process with the same profile and
+  flags (`connect --config ~/agentuplink-fly/device/client.toml --json`). The
+  old one stopped on SIGTERM in about 1 s (observed in session, no log kept)
+  and the new one reached `ready` (`connect-a8f105d.log` line 1).
 - **Verification with the new client (09:45 to 09:52).** 150 of 150
-  sequential echoes `200` with the canary (p50 0.129 s, p95 0.193 s, max
-  0.293 s). 13 of 13 HTTP forward calls `200`: 10 `tools/call demo_page`
-  with the page, plus `tools/list`, `server/discover` and `resources/read`
-  (the page). A token with only `http:invoke` got `403 FORBIDDEN` on the
-  echo, one with only `echo:invoke` `403` on the MCP route, no token `401`.
+  sequential echoes `200` with the canary, p50 0.129 s, p95 0.203 s, max
+  0.293 s (`echo150.log`, `percentiles.log`). 13 of 13 HTTP forward calls
+  `200`: 10 `tools/call demo_page` with the page, plus `tools/list`,
+  `server/discover` and `resources/read` (`http13.log`). The refusals were
+  first observed in session at 09:45:51 with no log kept, and re-run into
+  `recapture.log` at 10:00:24 with the same answers: a token with only
+  `http:invoke` got `403 FORBIDDEN` on the echo, one with only `echo:invoke`
+  `403` on the MCP route, no token `401`.
 - **SIGTERM restart (09:45:57).** `fly machine restart 185e264a927d58 -a
-  agentuplink-relay --signal SIGTERM` returned at 09:46:01; the relay logged
-  `stopped: signal=SIGTERM` at 09:45:58 and `listening` at 09:46:00. The
-  device logged two backoffs (530 and 1,923 ms), then `reconnected`, `ready`,
-  `active` by itself; the first echo after the command returned was `200`,
-  and so was the next MCP call.
+  agentuplink-relay --signal SIGTERM` returned at 09:46:01 (observed in
+  session, no log kept). The relay logged `stopping` and `stopped:
+  signal=SIGTERM` at 09:45:58 and `listening` at 09:46:00 (`recapture.log`).
+  The device logged `disconnected TRANSPORT_ERROR`, backoffs of 530 and
+  1,923 ms, then `reconnected` and `ready` by itself (`connect-a8f105d.log`
+  lines 4 to 11, extracted into `recapture.log`). The first echo after the
+  command returned being `200`, and the next MCP call `200`, were observed in
+  session, no log kept.
 - **Burst (09:46:13).** 8 concurrent echo loops of 25 and 4 concurrent MCP
-  loops of 10: 240 of 240 `200` (p50 0.216 s, p95 0.332 s, max 0.340 s).
+  loops of 10: 240 of 240 `200`, p50 0.216 s, p95 0.332 s, max 0.340 s
+  (`burst.log`, `percentiles.log`).
 - **Five and a half minutes across a rotation (09:46:24 to 09:51:54), 0
   non-200.** `soak.sh 330` (sequential, alternating an echo and a
   `tools/call demo_page`), with the Mac's 1-minute load at 13: **765 of 765
   `200`** with the expected body (383 echoes, 382 MCP calls), p50 0.134 s,
-  p95 0.278 s, max 0.476 s. The relay logged the scheduled rotation
-  (`policy_timer`, `rotation_prepare`, generation 2) at 09:51:01.326 and
-  `data_attached` at 09:51:01.410; the slowest request, an echo of 0.476 s,
-  finished in that second.
+  p95 0.278 s, max 0.476 s (`soak330.log`, `percentiles.log`). The relay
+  logged the scheduled rotation (`policy_timer`, `rotation_prepare`,
+  generation 2) at 09:51:01.326 and `data_attached` at 09:51:01.410
+  (`recapture.log`); the slowest request, an echo of 0.476 s, finished at
+  09:51:01.957 (`soak330.log`).
 - **Rollback**, not needed: `fly deploy . --config deploy/fly/relay/fly.toml
   --image registry.fly.io/agentuplink-relay:fly-upgrade-b59db9a --ha=false`
   onto the **running** relay (M6-C104), then an echo. That image serves the
