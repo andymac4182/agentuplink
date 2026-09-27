@@ -270,7 +270,7 @@ Translate Linux `.L` errno to stable codes including `ENOENT`, `EACCES`, `EROFS`
 
 Do not automatically retry mutations, reads, or reconnect the shared client in the baseline. Retrying a read can also change a caller's observation; callers choose to start a new read explicitly. Transport-layer duplicate suppression within a live session remains permitted and does not replay a 9P request into the provider twice. SDK retry wrappers must be disabled or classify partial/unknown mutation errors as permanently nonretryable. Cancellation after dispatch never promises no side effect.
 
-After upgrade use 9P errors for valid failed requests. Protocol violations close with WS 1002, authorization invalidation with 1008, shutdown with 1012, overload with 1013, and unexpected server failure with 1011. Close reasons contain only bounded sanitized identifiers. A close code alone cannot encode whether a mutation applied; the shared client classifies in-flight operations conservatively from its dispatch/reply history.
+After upgrade use 9P errors for valid failed requests. Protocol violations close with WS 1002, authorization invalidation with 1008, shutdown with 1012, overload with 1013, and unexpected server failure with 1011. A session whose OPEN the device's connector refused closes before any 9P message reached the device: 1013 with reason `ROTATION_FREEZE` or `RESOURCE_EXHAUSTED` (retryable), or 1011 with reason `DEVICE_REJECTED` (read as `SESSION_LOST`; task rows M6-C210 and M6-C215). Close reasons contain only bounded sanitized identifiers. A close code alone cannot encode whether a mutation applied; the shared client classifies in-flight operations conservatively from its dispatch/reply history.
 
 ## Initial enforced limits
 

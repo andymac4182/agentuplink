@@ -3475,9 +3475,11 @@ mod tests {
             pair.receiver_reader.next().await,
             CarrierEvent::Data(_)
         ));
+        // Bounded: a reader that accepted the late refusal would wait for
+        // an event that never comes.
         assert!(matches!(
-            pair.receiver_reader.next().await,
-            CarrierEvent::Closed
+            tokio::time::timeout(Duration::from_secs(2), pair.receiver_reader.next()).await,
+            Ok(CarrierEvent::Closed)
         ));
         assert_eq!(pair._receiver.open_refusal_handle().get(), None);
     }

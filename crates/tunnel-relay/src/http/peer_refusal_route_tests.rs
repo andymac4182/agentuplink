@@ -464,3 +464,42 @@ async fn m6c213_route_forwarded_http_forward_refused_outside_a_freeze_keeps_its_
         relays.shutdown().await;
     }
 }
+
+/// M6-C213: a record the ingress's consumer wrote before the refusal, parked
+/// at the owner behind the pending OPEN, does not turn the owner's answer
+/// into a bare reset: the actor answers that write `not_dispatched`, and the
+/// ingress's consumer still gets the coded close.
+#[tokio::test]
+async fn m6c213_route_forwarded_echo_stream_with_a_parked_record_still_gets_the_coded_close() {
+    let mut relays = TwoRelays::start("m6c213-echo-parked").await;
+    let mut socket = relays.echo_stream().await;
+    let body = b"m6c213-synthetic";
+    let mut record = u32::try_from(body.len())
+        .expect("record length")
+        .to_be_bytes()
+        .to_vec();
+    record.extend_from_slice(body);
+    futures_util::SinkExt::send(&mut socket, WsMessage::Binary(record.into()))
+        .await
+        .expect("send the record");
+    // The record is parked at the owner (charged to the stream's queue)
+    // before the connector refuses the OPEN.
+    let parked = wait_snapshot(&relays.fixture.handle, |snapshot| {
+        find_session(snapshot, device_id()).is_some_and(|session| {
+            session
+                .streams
+                .iter()
+                .any(|stream| !stream.terminal && stream.queue_bytes > 0)
+        })
+    })
+    .await;
+    assert!(find_session(&parked, device_id()).is_some());
+    relays
+        .refuse_open(tunnel_protocol::open_refusal::EXPORT_NOT_ALLOWLISTED, false)
+        .await;
+    assert_eq!(
+        close_of(socket).await,
+        Some((1011, "DEVICE_REJECTED".to_owned()))
+    );
+    relays.shutdown().await;
+}

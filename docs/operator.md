@@ -1667,8 +1667,10 @@ refused` lines come after authentication and are not limited:
   line per connector `REJECTED` for a live session, which is what a consumer
   sees as `503 DEVICE_REJECTED` (or `RESOURCE_EXHAUSTED`, or for a unary
   echo refused `GOAWAY` during a frozen rotation attempt `ROTATION_FREEZE`,
-  M6-C204; a refused stream is answered the same way, M6-C210, although its
-  `relay_code` stays `stream_closed`). Fields:
+  M6-C204; a refused stream is answered the same way, M6-C210 and M6-C215,
+  also across a peer hop, M6-C213, although its `relay_code` stays
+  `stream_closed`; a refused echo stream or filesystem session closes 1013
+  `ROTATION_FREEZE` or `RESOURCE_EXHAUSTED`, or 1011 `DEVICE_REJECTED`). Fields:
   `tenant_id`, `device_id`, `session_id`, `epoch`, `stream_id`,
   `operation_id` (`unmatched` unless it equals the relay's own record),
   `rotation_phase` (`none`, `active`, `preparing`, `quiescing`, `draining`,
