@@ -2949,8 +2949,7 @@ mod tests {
             &CancellationToken::new(),
         )
         .await
-        .err()
-        .expect("the upgrade over the limit was not refused");
+        .expect_err("the upgrade over the limit was not refused");
         assert!(
             matches!(
                 error,

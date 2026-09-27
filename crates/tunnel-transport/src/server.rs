@@ -635,7 +635,6 @@ pub async fn serve_with_listener_options(
                 let pressure = pressure.clone();
                 let diagnostics = socket_options.diagnostics.clone();
                 tasks.spawn(async move {
-                    let mut refusal = Some(refusal);
                     if let Some((policy, permits)) = handoff {
                         let permit = tokio::select! {
                             biased;
@@ -643,7 +642,8 @@ pub async fn serve_with_listener_options(
                             permit = timeout(crate::HANDOFF_WAIT, permits.acquire_owned()) => permit,
                         };
                         if let Ok(Ok(permit)) = permit {
-                            refusal = None;
+                            // The refusal slot is not needed any more.
+                            drop(refusal);
                             pressure.record_handoff();
                             let turnover =
                                 crate::fairness::ConnectionTurnover::new(policy, pressure);

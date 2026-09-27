@@ -188,6 +188,14 @@ fn listener_label(name: &str) -> Option<&'static str> {
     }
 }
 
+/// One listener series: name, type, help, and its value from a snapshot.
+type ListenerFamily = (
+    &'static str,
+    &'static str,
+    &'static str,
+    fn(&tunnel_transport::ListenerFairnessSnapshot) -> u64,
+);
+
 /// Public listener pressure and connection turnover (task row M6-C193), one
 /// sample per listener in the closed set `consumer`, `device`.
 fn render_listener_fairness(
@@ -198,12 +206,7 @@ fn render_listener_fairness(
         .iter()
         .filter_map(|listener| listener_label(listener.listener).map(|label| (label, listener)))
         .collect();
-    let families: [(
-        &str,
-        &str,
-        &str,
-        fn(&tunnel_transport::ListenerFairnessSnapshot) -> u64,
-    ); 5] = [
+    let families: [ListenerFamily; 5] = [
         (
             "tunnel_relay_listener_under_pressure",
             "gauge",
