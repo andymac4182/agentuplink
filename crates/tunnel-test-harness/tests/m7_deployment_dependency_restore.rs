@@ -58,10 +58,10 @@ use uuid::Uuid;
 #[path = "common/m7_deployment.rs"]
 mod common;
 use common::{
-    AUXILIARY_CONNECTION_DEADLINE, AUXILIARY_CONNECTION_LIMIT, AUXILIARY_SHUTDOWN_DEADLINE,
-    CheckpointServer, FixtureFiles, ProcessConfigFixture, free_tcp_addr, health_request,
-    hex_encode, jwks_json, parse_plaintext_upstream, process_diagnostic, relay_binary_path,
-    send_sigint, truncate, wait_for_exit, wait_for_ports_released, wait_for_ready,
+    AUXILIARY_CONNECTION_DEADLINE, AUXILIARY_SHUTDOWN_DEADLINE, CheckpointServer, FixtureFiles,
+    ProcessConfigFixture, REDIS_PROXY_CONNECTION_LIMIT, free_tcp_addr, health_request, hex_encode,
+    jwks_json, parse_plaintext_upstream, process_diagnostic, relay_binary_path, send_sigint,
+    truncate, wait_for_exit, wait_for_ports_released, wait_for_ready,
 };
 
 const PROCESS_DEADLINE: Duration = Duration::from_secs(8);
@@ -1382,7 +1382,7 @@ async fn run_restorable_proxy(
             }
             accepted = listener.accept() => {
                 let (stream, _) = accepted.map_err(|error| HarnessError::Proxy(format!("restorable Redis accept: {error}")))?;
-                if active_connections >= AUXILIARY_CONNECTION_LIMIT {
+                if active_connections >= REDIS_PROXY_CONNECTION_LIMIT {
                     drop(stream);
                     continue;
                 }
