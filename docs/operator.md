@@ -1565,7 +1565,8 @@ the whole process, plus stage `rotation_freeze`: a request this relay, as the
 device's owner, refused `ROTATION_FREEZE` on the `echo`, `stream`,
 `http-forward` or `fs` route, counted without a log line, including a unary
 echo whose roster OPEN the connector refused `GOAWAY` during the freeze
-(M6-C204); a freeze refusal for
+(M6-C204) and a local echo stream or `http-forward/1` stream refused that
+way (M6-C210); a freeze refusal for
 a request that reached the owner through a peer hop is a peer fault with cause
 `rotation_freeze` instead), `peer_faults_total{stage}` and
 `peer_fault_causes_total{cause}`. The single relay actor, which every device
@@ -1666,7 +1667,8 @@ refused` lines come after authentication and are not limited:
   line per connector `REJECTED` for a live session, which is what a consumer
   sees as `503 DEVICE_REJECTED` (or `RESOURCE_EXHAUSTED`, or for a unary
   echo refused `GOAWAY` during a frozen rotation attempt `ROTATION_FREEZE`,
-  M6-C204). Fields:
+  M6-C204; a refused stream is answered the same way, M6-C210, although its
+  `relay_code` stays `stream_closed`). Fields:
   `tenant_id`, `device_id`, `session_id`, `epoch`, `stream_id`,
   `operation_id` (`unmatched` unless it equals the relay's own record),
   `rotation_phase` (`none`, `active`, `preparing`, `quiescing`, `draining`,

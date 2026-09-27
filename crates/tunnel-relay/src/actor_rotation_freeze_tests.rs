@@ -5076,7 +5076,6 @@ async fn m6c207_a_held_result_with_only_its_challenge_window_lapsed_is_read_agai
     )));
 }
 
-
 // Task row M6-C210: a consumer stream OPEN in the frozen roster that the
 // connector refused.  Nothing on the stream ran, so its consumer is answered
 // at once, with the unary echo's mapping, while the roster entry and its
@@ -5163,7 +5162,10 @@ async fn m6c210_a_roster_stream_open_refused_goaway_during_a_freeze_is_answered_
             Some(super::freeze_hold::ROTATION_FREEZE_ECHO_CODE),
             "{label}"
         );
-        assert!(closed.is_cancelled(), "{label}: the consumer is released now");
+        assert!(
+            closed.is_cancelled(),
+            "{label}: the consumer is released now"
+        );
         if http {
             // A read issued after the release ends at once rather than
             // parking until the FORGET.
@@ -5172,7 +5174,10 @@ async fn m6c210_a_roster_stream_open_refused_goaway_during_a_freeze_is_answered_
             fixture
                 .actor
                 .read_http_stream(&key, STREAM_ID, OPERATION_ID, reply);
-            assert!(matches!(read.try_recv(), Ok(super::HttpRead::Closed)), "{label}");
+            assert!(
+                matches!(read.try_recv(), Ok(super::HttpRead::Closed)),
+                "{label}"
+            );
         }
         assert!(
             fixture.session().streams.contains_key(&STREAM_ID),
@@ -5195,7 +5200,10 @@ async fn m6c210_a_roster_stream_open_refused_goaway_during_a_freeze_is_answered_
             )),
             "{label}: reclaimed once the roster is released"
         );
-        assert!(!fixture.session().streams.contains_key(&STREAM_ID), "{label}");
+        assert!(
+            !fixture.session().streams.contains_key(&STREAM_ID),
+            "{label}"
+        );
         assert!(
             sequenced(&drain_data(&mut fixture.old_rx)).is_empty()
                 && sequenced(&drain_data(&mut fixture.candidate_rx)).is_empty(),
@@ -5252,9 +5260,16 @@ async fn m6c210_other_stream_open_refusals_keep_their_answers() {
         );
         assert!(closed.is_cancelled(), "{label}");
         if let Some(stream) = fixture.session().streams.get(&STREAM_ID) {
-            assert_eq!(stream.open_refusal.get().copied(), Some(expected), "{label}");
+            assert_eq!(
+                stream.open_refusal.get().copied(),
+                Some(expected),
+                "{label}"
+            );
         } else {
-            assert!(!freeze, "{label}: only an unfrozen refusal is forgotten at once");
+            assert!(
+                !freeze,
+                "{label}: only an unfrozen refusal is forgotten at once"
+            );
         }
     }
 }
@@ -5285,7 +5300,11 @@ async fn m6c210_a_rejected_for_an_admitted_stream_answers_nothing() {
 #[tokio::test]
 async fn m6c211_a_catalog_error_is_unavailable_not_revoked() {
     for held in [false, true] {
-        let label = if held { "m6c211-catalog-held" } else { "m6c211-catalog" };
+        let label = if held {
+            "m6c211-catalog-held"
+        } else {
+            "m6c211-catalog"
+        };
         let mut fixture = FreezeFixture::new(label, false);
         let (stream_id, _, _, mut receiver) = fixture.admit_unary_echo(UNARY_BODY).await;
         if held {
