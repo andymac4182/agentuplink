@@ -959,7 +959,10 @@ mod tests {
         let read = tokio::time::timeout(IPC_IO_TIMEOUT, stream.read_to_end(&mut answer))
             .await
             .expect("answer within the IPC timeout");
-        assert!(read.is_ok(), "a refused peer must see a clean close: {read:?}");
+        assert!(
+            read.is_ok(),
+            "a refused peer must see a clean close: {read:?}"
+        );
         assert!(answer.is_empty(), "a refused peer is not answered");
         drop(stream);
         cancel.cancel();
