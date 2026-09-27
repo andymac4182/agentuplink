@@ -1463,3 +1463,46 @@ async fn freshness_allows_the_clock_skew() {
     );
     fixture.shutdown().await;
 }
+
+/// **Control (M7-C185, hosted M7 on #230).** The pre-filter skips only
+/// records below their node's minimum or for nodes the checkpoint omits. A
+/// record *at* its minimum whose contents conflict with the version this
+/// relay already verified -- an equal-version conflict -- still fails the
+/// pass as `MembershipRejected`; it is never downgraded to a missing record.
+/// Red if the pre-filter also skips records at their minimum.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_equal_version_conflict_at_the_minimum_stays_fatal() {
+    let fixture = Fixture::new().await;
+    let _control = fixture.register().await;
+    // Version 1 was verified at bootstrap; a different version-1 record
+    // (another key, other timestamps) conflicts with it.
+    let now = Utc::now();
+    fixture
+        .set_records(vec![fixture.signed(
+            NODE_ID,
+            1,
+            OTHER_SPKI,
+            now - ChronoDuration::seconds(2),
+            now + ChronoDuration::seconds(20),
+        )])
+        .await;
+    let error = fixture
+        .membership
+        .reconcile_once()
+        .await
+        .expect_err("a conflicting record at the minimum is fatal");
+    assert!(
+        matches!(
+            error,
+            crate::MembershipRuntimeError::Membership(
+                tunnel_cluster::membership::MembershipError::EqualVersionConflict { .. }
+            )
+        ),
+        "expected an equal-version conflict, got {error:?}"
+    );
+    assert_eq!(
+        fixture.membership.readiness(),
+        MembershipReadiness::Unready(MembershipUnreadyReason::MembershipRejected)
+    );
+    fixture.shutdown().await;
+}
