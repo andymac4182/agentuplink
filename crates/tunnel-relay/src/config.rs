@@ -763,6 +763,19 @@ pub struct ServeConfig {
     /// the limit.
     #[serde(default = "default_listener_refusal_margin")]
     pub listener_refusal_margin: usize,
+    /// Task row M6-C193: while the public consumer listener is full (it
+    /// refused a connection for capacity within the last second), a served
+    /// keep-alive connection is closed after its current response once it
+    /// has lived, since that pressure began, an age drawn per connection
+    /// uniformly between 50% and 100% of this many seconds (so 5 -- 10 s by
+    /// default), so waiting clients get a permit.  `1..=3600`, default 10.
+    /// Not applied to the device listener.
+    #[serde(default = "default_listener_turnover_max_age_seconds")]
+    pub listener_turnover_max_age_seconds: u64,
+    /// Task row M6-C193: the same turnover after this many requests served
+    /// since the pressure began.  `1..=1000000`, default 1000.
+    #[serde(default = "default_listener_turnover_max_requests")]
+    pub listener_turnover_max_requests: u64,
 }
 
 /// Whether `address` may carry the unauthenticated metrics listener: a
@@ -1056,6 +1069,21 @@ impl ServeConfig {
                 "listener_refusal_margin must be 0..=256",
             ));
         }
+        if !(tunnel_transport::MIN_TURNOVER_MAX_AGE.as_secs()
+            ..=tunnel_transport::MAX_TURNOVER_MAX_AGE.as_secs())
+            .contains(&self.listener_turnover_max_age_seconds)
+        {
+            return Err(ConfigError::Invalid(
+                "listener_turnover_max_age_seconds must be 1..=3600",
+            ));
+        }
+        if !(1..=tunnel_transport::MAX_TURNOVER_MAX_REQUESTS)
+            .contains(&self.listener_turnover_max_requests)
+        {
+            return Err(ConfigError::Invalid(
+                "listener_turnover_max_requests must be 1..=1000000",
+            ));
+        }
         Ok(())
     }
 
@@ -1095,6 +1123,15 @@ impl ServeConfig {
         }
     }
 
+    /// The consumer listener's connection turnover under pressure (task row
+    /// M6-C193).
+    pub fn listener_turnover(&self) -> tunnel_transport::ListenerTurnover {
+        tunnel_transport::ListenerTurnover {
+            max_age: std::time::Duration::from_secs(self.listener_turnover_max_age_seconds),
+            max_requests: self.listener_turnover_max_requests,
+        }
+    }
+
     /// The listener options `serve` uses: default socket options plus the
     /// configured `http-forward/1` profiles.  No fixture interposer can be
     /// expressed in configuration.
@@ -1104,8 +1141,11 @@ impl ServeConfig {
     pub fn listener_options(&self) -> Result<crate::ListenerSocketOptions, ConfigError> {
         let capacity = self.listener_capacity();
         Ok(crate::ListenerSocketOptions {
+            // M6-C193: only consumer HTTP connections turn over; device
+            // control and data sockets never do.
             consumer: tunnel_transport::AcceptedSocketOptions {
                 capacity,
+                turnover: Some(self.listener_turnover()),
                 ..tunnel_transport::AcceptedSocketOptions::default()
             },
             device: tunnel_transport::AcceptedSocketOptions {
@@ -1281,6 +1321,14 @@ fn default_listener_max_connections() -> usize {
 
 fn default_listener_refusal_margin() -> usize {
     tunnel_transport::DEFAULT_REFUSAL_MARGIN
+}
+
+fn default_listener_turnover_max_age_seconds() -> u64 {
+    tunnel_transport::DEFAULT_TURNOVER_MAX_AGE.as_secs()
+}
+
+fn default_listener_turnover_max_requests() -> u64 {
+    tunnel_transport::DEFAULT_TURNOVER_MAX_REQUESTS
 }
 
 fn default_max_queue_bytes() -> usize {
@@ -1712,10 +1760,37 @@ consumer_tls_private_key = "consumer-key.pem"
         let capacity = tuned.listener_options().expect("options").consumer.capacity;
         assert_eq!(capacity.max_connections, 128);
         assert_eq!(capacity.refusal_margin, 0);
+        // M6-C193: turnover defaults to 10 s / 1,000 requests, is
+        // configurable, and reaches the consumer listener only.
+        assert_eq!(
+            options.consumer.turnover,
+            Some(tunnel_transport::ListenerTurnover::default())
+        );
+        assert_eq!(options.device.turnover, None);
+        let turned = ServeConfig::parse(&format!(
+            "listener_turnover_max_age_seconds = 30\nlistener_turnover_max_requests = 50\n{}",
+            valid_toml()
+        ))
+        .expect("turnover");
+        assert_eq!(
+            turned
+                .listener_options()
+                .expect("options")
+                .consumer
+                .turnover,
+            Some(tunnel_transport::ListenerTurnover {
+                max_age: std::time::Duration::from_secs(30),
+                max_requests: 50,
+            })
+        );
         for refused in [
             "listener_max_connections = 0",
             "listener_max_connections = 4097",
             "listener_refusal_margin = 257",
+            "listener_turnover_max_age_seconds = 0",
+            "listener_turnover_max_age_seconds = 3601",
+            "listener_turnover_max_requests = 0",
+            "listener_turnover_max_requests = 1000001",
         ] {
             ServeConfig::parse(&format!("{refused}\n{}", valid_toml()))
                 .expect_err(&format!("accepted {refused}"));

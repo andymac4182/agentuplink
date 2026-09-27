@@ -690,7 +690,13 @@ METRIC_SERIES = ("tunnel_relay_device_sessions", "tunnel_relay_device_sockets",
                  "tunnel_relay_consumer_refusals_total", "tunnel_relay_consumer_write_timeouts_total",
                  "tunnel_relay_http_writer_parks_total", "tunnel_relay_http_writer_reparks_total",
                  "tunnel_relay_ready", "tunnel_relay_actor_commands_total",
-                 "tunnel_relay_actor_busy_microseconds_total", "tunnel_relay_actor_queue_depth")
+                 "tunnel_relay_actor_busy_microseconds_total", "tunnel_relay_actor_queue_depth",
+                 # M6-C193: listener pressure and turnover (summed over the
+                 # consumer and device listeners; only the consumer turns over).
+                 "tunnel_relay_listener_capacity_refusals_total",
+                 "tunnel_relay_listener_fairness_handoffs_total",
+                 "tunnel_relay_listener_fairness_recycled_total",
+                 "tunnel_relay_listener_under_pressure")
 
 
 def scrape_metrics(port: int) -> dict[str, float]:
@@ -1193,6 +1199,11 @@ def cpu_snapshot(stack: Stack) -> tuple[float, dict[str, float]]:
     if "tunnel_relay_actor_busy_microseconds_total" in metrics:
         out["relay_actor"] = metrics["tunnel_relay_actor_busy_microseconds_total"] / 1e6
         out["relay_actor_commands"] = metrics.get("tunnel_relay_actor_commands_total", 0.0)
+    for series, key in (("tunnel_relay_listener_capacity_refusals_total", "listener_refusals"),
+                        ("tunnel_relay_listener_fairness_handoffs_total", "listener_handoffs"),
+                        ("tunnel_relay_listener_fairness_recycled_total", "listener_recycled")):
+        if series in metrics:
+            out[key] = metrics[series]
     return time.perf_counter(), out
 
 
@@ -1229,7 +1240,8 @@ def cpu_percent(before: tuple[float, dict[str, float]],
     delta = {name: after[1][name] - before[1][name] for name in after[1] if name in before[1]}
     out = {}
     for name, value in delta.items():
-        if name in ("redis_commands", "redis_script_calls", "relay_actor_commands"):
+        if name in ("redis_commands", "redis_script_calls", "relay_actor_commands",
+                    "listener_refusals", "listener_handoffs", "listener_recycled"):
             out[f"{name}_per_s"] = round(value / span, 1)
         elif name != "redis_script_usec":
             out[name] = round(value / span * 100, 1)
@@ -1290,6 +1302,10 @@ async def client_main_async(cfg: dict) -> dict:
         for w in workers:
             await asyncio.wait_for(w.conn.ensure(), 30)
     print(json.dumps({"ready": True}), flush=True)
+    if cfg.get("start_delay"):
+        # M6-C193: a client that connects only once the flood holds the
+        # listener's permits.
+        await asyncio.sleep(cfg["start_delay"])
     lag = LoopLag()
     until = cfg["until"]
     loops = [w.loop_rate(cfg["rate"], until) if cfg["rate"] else w.loop_closed(until)
@@ -1314,7 +1330,7 @@ def client_main() -> None:
 async def start_clients(stack: Stack, rec: Recorder, user: str, device: str, prefix: str,
                         workers: int, processes: int, until: float, rate: float = 0.0,
                         payload: int = 1024, preconnect: bool = False,
-                        honor_retry_after: bool = False):
+                        honor_retry_after: bool = False, start_delay: float = 0.0):
     """Start `workers` echo workers split across `processes` `client`
     subprocesses, running until `until`, and return once every process is
     ready (with `preconnect`, once its connections are open).  Await the
@@ -1335,7 +1351,7 @@ async def start_clients(stack: Stack, rec: Recorder, user: str, device: str, pre
                "echo": dev["echo"], "token": token, "csv": str(csv_path), "nonce": stack.nonce,
                "phase": rec.phase, "prefix": f"{prefix}-p{index}", "workers": share,
                "rate": rate, "payload": payload, "until": until, "preconnect": preconnect,
-               "honor_retry_after": honor_retry_after}
+               "honor_retry_after": honor_retry_after, "start_delay": start_delay}
         proc = await asyncio.create_subprocess_exec(
             sys.executable, str(Path(__file__).resolve()), "client",
             stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
@@ -1630,6 +1646,29 @@ async def load(args: argparse.Namespace) -> None:
                             "processes": summarize_samples(run_dir / "samples.csv")})
 
 
+async def late_start(delay: float, work):
+    """Run `work` after `delay` seconds (M6-C193: B connects mid-flood)."""
+    if delay:
+        await asyncio.sleep(delay)
+    return await work
+
+
+def first_ok_seconds(rows: list[tuple]) -> dict:
+    """Per B worker, seconds from its first request to its first success
+    (`None`: never served), and the worst of them (M6-C193)."""
+    by_worker: dict[str, list[tuple]] = {}
+    for r in rows:
+        by_worker.setdefault(r[2], []).append(r)
+    out = {}
+    for worker, own in sorted(by_worker.items()):
+        own.sort(key=lambda r: r[0])
+        oks = [r[0] for r in own if r[8] == 1]
+        out[worker] = round(oks[0] - own[0][0], 3) if oks else None
+    served = [v for v in out.values() if v is not None]
+    return {"workers": out, "all_served": bool(out) and len(served) == len(out),
+            "max": max(served) if served and len(served) == len(out) else None}
+
+
 async def fairness(args: argparse.Namespace) -> None:
     run_dir, nonce = make_run(args, "fairness")
     stack = base_stack(args, run_dir, nonce, "m6-03-fair", mcp=False)
@@ -1666,14 +1705,18 @@ async def fairness(args: argparse.Namespace) -> None:
                     w.honor_retry_after = args.honor_retry_after
                 # M6-C183: the same quiet workload again, timed on its own
                 # event loop in a separate process, beside the in-loop one.
-                # Both of B's clients open their keep-alive connections before
-                # the flood starts: a B that connects during the flood competes
-                # with A for the listener's connection permits instead.
-                for w in quiet:
-                    await asyncio.wait_for(w.conn.ensure(), 30)
+                # By default both of B's clients open their keep-alive
+                # connections before the flood starts.  With
+                # `--quiet-late-seconds S` (M6-C193's acceptance) B connects
+                # only S seconds into a flood phase, so it competes with A for
+                # the listener's connection permits.
+                late = args.quiet_late_seconds if flood > 0 else 0.0
+                if not late:
+                    for w in quiet:
+                        await asyncio.wait_for(w.conn.ensure(), 30)
                 off_loop = await start_clients(stack, rec, "b", target, f"offloop-{target}-{phase}",
                                                args.quiet_workers, 1, until, rate=args.quiet_rate,
-                                               preconnect=True)
+                                               preconnect=not late, start_delay=late)
                 flood_clients = (await start_clients(
                     stack, rec, "a", "a", f"flood-{target}", flood, args.flood_processes, until,
                     honor_retry_after=args.honor_retry_after)
@@ -1684,7 +1727,7 @@ async def fairness(args: argparse.Namespace) -> None:
                     off_loop,
                     flood_clients,
                     lag.run(until),
-                    *(w.loop_rate(args.quiet_rate, until) for w in quiet),
+                    *(late_start(late, w.loop_rate(args.quiet_rate, until)) for w in quiet),
                     *(w.loop_closed(until) for w in flooders))
                 attribution[rec.phase] = {"driver_loop_lag_ms": lag.summary(),
                                           "cpu_percent": cpu_percent(cpu_before, cpu_snapshot(stack)),
@@ -1707,13 +1750,15 @@ async def fairness(args: argparse.Namespace) -> None:
             flood_rows = [r for r in rec.rows if r[3] == name and r[2].startswith("flood")]
             report[name] = {"quiet_user_b": summarize_rows(quiet_rows),
                             "quiet_user_b_off_loop": summarize_rows(off_rows),
+                            "quiet_user_b_first_ok_s": first_ok_seconds(quiet_rows + off_rows),
                             "flooding_user_a": summarize_rows(flood_rows),
                             **attribution.get(name, {})}
     write_summary(run_dir, {"experiment": "fairness", "nonce": nonce, "head": head_sha(),
                             "flood_workers": args.flood_workers, "quiet_workers": args.quiet_workers,
                             "quiet_rate_per_worker": args.quiet_rate,
                             "flood_processes": args.flood_processes,
-                            "honor_retry_after": args.honor_retry_after, "phases": report,
+                            "honor_retry_after": args.honor_retry_after,
+                            "quiet_late_seconds": args.quiet_late_seconds, "phases": report,
                             "processes": summarize_samples(run_dir / "samples.csv")})
 
 
@@ -2032,6 +2077,10 @@ def main() -> None:
                                 "(M6-C183); 0 keeps it on the driver's loop")
             p.add_argument("--honor-retry-after", action="store_true",
                            help="flood workers refused CONNECTION_LIMIT wait its retry_after_ms")
+            p.add_argument("--quiet-late-seconds", type=float, default=0.0,
+                           help="in a flood phase, user B connects only this many seconds after "
+                                "the flood starts, instead of before it (M6-C193); 0 keeps B "
+                                "connected before the flood")
     sub.add_parser("client", help="internal: echo workers on their own event loop; "
                                   "configuration on stdin")
     args = parser.parse_args()

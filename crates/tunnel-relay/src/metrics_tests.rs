@@ -131,7 +131,42 @@ fn rendered() -> String {
             queue_depth: 3,
             queue_capacity: 64,
         },
+        listeners: vec![
+            tunnel_transport::ListenerFairnessSnapshot {
+                listener: "consumer",
+                under_pressure: true,
+                pressure_episodes: 2,
+                capacity_refusals: 31,
+                handoffs: 9,
+                recycled: 17,
+            },
+            tunnel_transport::ListenerFairnessSnapshot {
+                listener: "a-fixture-name-canary",
+                under_pressure: true,
+                pressure_episodes: 5,
+                capacity_refusals: 5,
+                handoffs: 5,
+                recycled: 5,
+            },
+        ],
     })
+}
+
+/// M6-C193: the consumer listener's pressure and turnover are scraped under
+/// the fixed `listener` label; a name outside the closed set is not rendered.
+#[test]
+fn m6c193_listener_pressure_and_turnover_are_scraped() {
+    let text = rendered();
+    for line in [
+        "tunnel_relay_listener_under_pressure{listener=\"consumer\"} 1",
+        "tunnel_relay_listener_pressure_episodes_total{listener=\"consumer\"} 2",
+        "tunnel_relay_listener_capacity_refusals_total{listener=\"consumer\"} 31",
+        "tunnel_relay_listener_fairness_handoffs_total{listener=\"consumer\"} 9",
+        "tunnel_relay_listener_fairness_recycled_total{listener=\"consumer\"} 17",
+    ] {
+        assert!(text.lines().any(|l| l == line), "missing {line}:\n{text}");
+    }
+    assert!(!text.contains("a-fixture-name-canary"), "{text}");
 }
 
 #[test]
