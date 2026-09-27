@@ -596,8 +596,12 @@ Evidence (`tunnel-mcp-fixture`):
 and `rmcp_http::legacy_http_export_forwards_last_event_id_to_the_backend`.
 The second resumes an abandoned POST stream through the export against
 rmcp's own server, and checks that every resumed event is from that
-request's stream. Each was shown red by a mutation: stripping `last-event-id`
-at the export, and writing `id:` in the stdio bridge's events. rmcp 3.4.0
+request's stream. The stdio test reads standalone log messages on one GET.
+It then reconnects with `Last-Event-ID` and requires the new stream's first
+messages to be new ones. Each test was shown red by a mutation. For the HTTP
+test, stripping `last-event-id` at the export. For the stdio test, writing
+`id:` into the bridge's events, and, separately, keeping delivered standalone
+messages for the next stream. rmcp 3.4.0
 re-delivers the `Last-Event-ID` event itself on resume. That is an upstream
 duplicate, which the relay forwards unchanged (M3-52).
 
@@ -627,25 +631,40 @@ beneath it. Option (a) leaves a revoked principal's child holding a
 `max_children` slot for up to 600 s. Option (b) would teach the device grant
 revisions, which it deliberately does not know. The residuals stay in M3-41.
 
-### Older revisions (M3-38): refused at `initialize`
+### Older revisions (M3-38): answered with `2025-11-25`
 
-A `mcp-2025-11-25` service speaks exactly that revision. An `initialize` whose
-`protocolVersion` is anything else is now refused by the export before
-dispatch: `400`, JSON-RPC `-32602` "Unsupported protocol version",
-`data.supported: ["2025-11-25"]`. The requested value is consumer data and is
-not echoed. The 2025-11-25 lifecycle lists this error for a version the
-server does not support. Before, many servers accepted the older revision,
-and the client's first request after `initialize` was refused (`-32022`),
-with a child already spawned. Admitting `2025-06-18` instead would add a
-second, unpinned revision to a profile that promises one, with header rules
-nobody has tested, so it was not chosen. The change is reversible. Evidence:
-`message::tests::the_2025_profile_refuses_initialize_for_another_revision`.
-Two tests use rmcp clients pinned to `2025-06-18`, one per export kind:
-`rmcp_stdio::legacy_profile_refuses_an_older_revision_at_initialize` (no
-child spawned) and
-`rmcp_http::legacy_profile_http_export_refuses_an_older_revision_at_initialize`
-(nothing dispatched). All three were red before the change. The conformance
-suite still passes 31 of 31 scenarios directly and 30 of 31 through the relay.
+A `mcp-2025-11-25` service speaks exactly that revision. The 2025-11-25
+lifecycle says that if the server does not support the version the client
+offers in `initialize`, it **MUST** respond with another version it supports.
+The export therefore rewrites an `initialize` whose `protocolVersion` is any
+other string so that it offers `2025-11-25`, before dispatch. The server
+answers `2025-11-25`, and the client continues on that revision or
+disconnects, as the lifecycle says. Only the bytes of that one string change.
+The rest of the compact message is dispatched exactly, including member
+order, numbers and escapes. Only a malformed offer (a missing or non-string
+`protocolVersion`) is refused: `400`, JSON-RPC `-32602`, `data.supported:
+["2025-11-25"]`, with nothing echoed.
+
+Before, many servers accepted the older offer. The client's first request
+after `initialize`, whose header named that revision, was then refused with
+`-32022`. The first version of this fix refused the older `initialize`
+outright. The Opus review of #238 replaced that with this spec-compliant
+answer, as the coordinator decided. A client that sends
+`MCP-Protocol-Version` with an older revision on the `initialize` itself is
+still refused by the header check (`-32022`). That header is optional on
+`initialize`, and no pinned client sends it.
+
+Evidence:
+`message::tests::the_2025_profile_rewrites_initialize_for_another_revision`
+covers the rewrite, a nested member of the same name, an escaped key and
+number fidelity, and the malformed-offer refusal. Two tests use rmcp clients
+pinned to `2025-06-18`, whose server supports that revision and would have
+echoed it:
+`rmcp_stdio::legacy_profile_answers_an_older_offer_with_its_own_revision` and
+`rmcp_http::legacy_profile_http_export_answers_an_older_offer_with_its_own_revision`.
+Each asserts a negotiated `2025-11-25` and a working session. All three
+failed against the refusing version. The HTTP test also fails when the
+export forwards the consumer's original body instead of the rewritten one.
 
 ### A cancelled request's POST (M3-48): closed at once
 
@@ -656,10 +675,21 @@ the same session that is still in flight is affected. Before any event, the
 answer is an empty event stream (`200`, `text/event-stream`, no events); on
 a stream that has already started, the stream ends cleanly. A late response
 for that ID is undeliverable, as for any unknown ID, and the export counts
-these in `cancelled_requests_closed`. Evidence:
+these in `cancelled_requests_closed`.
+
+The cancelled request stays registered until its own POST has ended. So an
+ID reused in that window is refused as a duplicate (`400`), not registered.
+The first version removed the entry at once. A reused ID was then registered,
+and could receive the cancelled request's late response or be torn down by
+the old POST's cleanup (Opus review of #238). A late response to a cancelled
+ID can reach another request only if the client reuses a request ID within
+the session, which the spec forbids. Evidence:
 `session_lifecycle::a_cancelled_legacy_request_closes_its_post_promptly`, red
 before the fix (the POST was still open 5 s after the cancel), and
-`…a_cancellation_for_another_id_closes_nothing`. In
+`…a_cancellation_for_another_id_closes_nothing` and
+`…an_id_reused_right_after_its_cancel_is_never_interrupted`. The last one
+was red 3 of 3 against the first version: the reused ID was answered `200`
+with the cancelled request's response. In
 `scripts/m3-sdk-conformance.sh` the Python `close-cancel` case is no longer
 excused. It must pass with `late_post_502=0`, and any `result=known` line
 fails the run.

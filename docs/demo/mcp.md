@@ -268,10 +268,9 @@ registered with it, and the tokens it issues must meet the rules above.
   catalog `http_forward_profile`, `2025-11-25` or `2026-07-28`. The relay
   refuses any other `MCP-Protocol-Version` header. On a `2025-11-25` service,
   an `initialize` that offers another revision, such as `2025-06-18`, is
-  refused before it reaches the MCP server: `400` with JSON-RPC error
-  `-32602` "Unsupported protocol version" and `data.supported:
-  ["2025-11-25"]`. The client learns this at `initialize`, not at its first
-  request (task row M3-38).
+  rewritten to offer `2025-11-25`, as the lifecycle requires, so the server
+  answers `2025-11-25`. A client that supports that revision continues on it;
+  one that does not disconnects at `initialize` (task row M3-38).
 - **Browsers.** A request with an `Origin` header is refused. Browser-based
   clients are not supported, by decision (M3-11): no endpoint is
   browser-capable.
