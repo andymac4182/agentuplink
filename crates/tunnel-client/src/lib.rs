@@ -3008,7 +3008,9 @@ mod tests {
             )))
         }
         let flat = r#"{"code":"CONNECTION_LIMIT"}"#;
-        let cases: &[(u16, Option<&str>, Option<&str>, Option<u64>)] = &[
+        /// Status, body, `Retry-After`, expected hint.
+        type Case<'a> = (u16, Option<&'a str>, Option<&'a str>, Option<u64>);
+        let cases: &[Case<'_>] = &[
             (
                 503,
                 Some(tunnel_transport::CONNECTION_LIMIT_BODY),
