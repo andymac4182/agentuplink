@@ -3072,7 +3072,8 @@ async fn peer_consumer_receive_cancel_releases_parked_send_direction_before_dead
     client_send.cancel();
 
     // The parked direction is released: the handler exits, the exact stream
-    // is terminal, and both happen well below the eight-second deadline.
+    // is terminal, and both happen well below the consumer deadline (the
+    // 12 s duplex token).
     wait_handler_error(&fixture, returned_before).await;
     let terminal_snapshot = wait_snapshot(&fixture.handle, |snapshot| {
         find_session(snapshot, device_id()).is_some_and(|session| {
