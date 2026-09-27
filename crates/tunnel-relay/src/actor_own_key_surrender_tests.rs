@@ -1532,10 +1532,13 @@ async fn a_lapsed_revision_superseding_a_live_peer_record_stays_fatal() {
 }
 
 /// **Red first (M7-C187).** Only *another* node's lapsed record is absent:
-/// this relay's own record past its lifetime plus skew is still verified and
-/// fails the pass as `MembershipRejected` (`Expired`), which accrues toward
-/// M7-C184 while relay-b's fresh record shows the publisher is alive. Red if
-/// the pre-filter also skipped this relay's own lapsed record.
+/// this relay's own record, aged past its lifetime plus skew, keeps its
+/// current meaning -- it is still verified, the pass fails on it (`Expired`),
+/// readiness reports `CheckpointExpired`, and that accrues toward M7-C184
+/// while relay-b's fresh record shows the publisher is alive. Red if the
+/// pre-filter also skipped this relay's own lapsed record (the pass then
+/// fails later, on the retained record's lapsed key, as `CheckpointExpired`
+/// without judging the record).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn this_relays_own_lapsed_record_stays_fatal_beside_a_fresh_peer() {
     let fixture = Fixture::new().await;
@@ -1585,9 +1588,11 @@ async fn this_relays_own_lapsed_record_stays_fatal_beside_a_fresh_peer() {
             ),
             "expected an expired own record, got {error:?}"
         );
+        // Its current meaning: the pass fails on the record itself
+        // (`Expired`), and readiness reports the lapsed trust window.
         assert_eq!(
             fixture.membership.readiness(),
-            MembershipReadiness::Unready(MembershipUnreadyReason::MembershipRejected)
+            MembershipReadiness::Unready(MembershipUnreadyReason::CheckpointExpired)
         );
         tokio::time::sleep(SHORT_BOUND + Duration::from_millis(50)).await;
     }
