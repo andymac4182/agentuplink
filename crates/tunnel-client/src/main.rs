@@ -535,19 +535,50 @@ async fn run_disconnect(
     timeout: std::time::Duration,
 ) -> Result<(), CliError> {
     use tunnel_client::supervisor_ipc::{IpcError, query_status, request_disconnect};
+    // No `disconnect` failure is retryable: nothing running needs no retry,
+    // and after a request that may have been delivered a second one is a
+    // second stop request, which abandons the orderly stop (exit `130`).
+    let not_retryable = |mut error: CliError| {
+        error.retryable = false;
+        error
+    };
     let config = load_runtime_config(path)?;
     let socket = config.supervisor_socket_path();
     let started = tokio::time::Instant::now();
     let accepted = request_disconnect(&socket)
         .await
-        .map_err(CliError::from_ipc)?;
+        .map_err(|error| not_retryable(CliError::from_ipc(error)))?;
     let deadline = started + timeout;
     loop {
-        // Anything but "absent" -- still answering, or closing a connection
-        // unanswered as its server shuts down -- is still stopping: keep
-        // waiting, within the bound.
-        if let Err(IpcError::Absent) = query_status(&socket).await {
-            break;
+        match query_status(&socket).await {
+            Err(IpcError::Absent) => break,
+            // The same supervisor still answering: still stopping.
+            Ok(status) if status.pid == accepted.pid => {}
+            // Another supervisor bound the profile meanwhile (a service
+            // manager restarted it): the one asked to stop has stopped, but
+            // the profile is supervised again. Say so rather than wait on it.
+            Ok(status) => {
+                return Err(CliError {
+                    cause: Cause::SupervisorRunning,
+                    message: format!(
+                        "supervisor pid {} stopped, but pid {} now supervises this profile \
+                         (restarted by a service manager?); stop it through that manager",
+                        accepted.pid, status.pid
+                    ),
+                    retryable: false,
+                });
+            }
+            // An authorized supervisor closing a connection unanswered as
+            // its server shuts down: still stopping.
+            Err(IpcError::Unauthorized(reason))
+                if reason == tunnel_client::supervisor_ipc::CLOSED_UNANSWERED => {}
+            // Any other refusal of the socket is not a supervisor stopping.
+            Err(error @ IpcError::Unauthorized(_)) => {
+                return Err(not_retryable(CliError::from_ipc(error)));
+            }
+            // A slow or failed read of a supervisor mid-stop: keep waiting,
+            // within the bound.
+            Err(_) => {}
         }
         if tokio::time::Instant::now() >= deadline {
             return Err(CliError {
@@ -555,11 +586,13 @@ async fn run_disconnect(
                 message: format!(
                     "supervisor pid {} accepted the disconnect request but had not stopped \
                      within {} s; it is still stopping (its drain is bounded by the profile's \
-                     rotation handshake timeout plus overlap)",
+                     rotation handshake timeout plus overlap). Running disconnect again sends \
+                     a second stop request, which forces an immediate stop and abandons the \
+                     drain",
                     accepted.pid,
                     timeout.as_secs()
                 ),
-                retryable: true,
+                retryable: false,
             });
         }
         tokio::time::sleep(DISCONNECT_POLL).await;

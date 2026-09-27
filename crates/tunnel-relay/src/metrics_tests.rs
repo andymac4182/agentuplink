@@ -277,18 +277,27 @@ fn m0_03_the_membership_readiness_cause_is_scraped_under_a_closed_label() {
 #[test]
 fn m0_03_every_membership_readiness_state_has_a_fixed_label() {
     use crate::{MembershipReadiness as R, MembershipUnreadyReason as U};
-    let states = [
-        R::Starting,
-        R::Ready,
-        R::Unready(U::UnknownAuthority),
-        R::Unready(U::CheckpointExpired),
-        R::Unready(U::CatalogUnavailable),
-        R::Unready(U::MembershipRejected),
-        R::Unready(U::MissingLocalMembership),
-        R::Unready(U::MissingLocalKey),
-        R::Unready(U::PersistenceUnavailable),
-        R::Unready(U::Cancelled),
-    ];
+    // An exhaustive successor chain over the reasons: a new reason does not
+    // compile until it is placed here, and so in the list checked below.
+    const fn next(reason: Option<U>) -> Option<U> {
+        match reason {
+            None => Some(U::UnknownAuthority),
+            Some(U::UnknownAuthority) => Some(U::CheckpointExpired),
+            Some(U::CheckpointExpired) => Some(U::CatalogUnavailable),
+            Some(U::CatalogUnavailable) => Some(U::MembershipRejected),
+            Some(U::MembershipRejected) => Some(U::MissingLocalMembership),
+            Some(U::MissingLocalMembership) => Some(U::MissingLocalKey),
+            Some(U::MissingLocalKey) => Some(U::PersistenceUnavailable),
+            Some(U::PersistenceUnavailable) => Some(U::Cancelled),
+            Some(U::Cancelled) => None,
+        }
+    }
+    let mut states = vec![R::Starting, R::Ready];
+    let mut reason = next(None);
+    while let Some(current) = reason {
+        states.push(R::Unready(current));
+        reason = next(Some(current));
+    }
     let codes: Vec<&str> = states.iter().map(R::code).collect();
     assert_eq!(
         codes,

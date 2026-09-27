@@ -7,8 +7,9 @@
 //! one stop request to the supervisor, which then takes **the same orderly
 //! stop path SIGTERM takes**, with the same bounds; it is answered with the
 //! snapshot as it stood. That is the only request that changes anything, and
-//! it grants nothing new: a peer that passes the same-user check below could
-//! already send the supervisor SIGTERM. `credentials renew` remains
+//! it grants nothing new: the socket sits in the owner-only (`0700`)
+//! credential directory and admits only this UID, so anyone who can reach
+//! it can already read the client's private key. `credentials renew` remains
 //! unimplemented.
 //!
 //! **Authorization is the same user, checked three ways.** The socket is
@@ -645,7 +646,9 @@ mod unix {
         }
     }
 
-    const CLOSED_UNANSWERED: &str = "the supervisor closed the connection without answering";
+    /// The reason an authorized supervisor that closed without answering is
+    /// reported with. `disconnect` reads it as a supervisor shutting down.
+    pub const CLOSED_UNANSWERED: &str = "the supervisor closed the connection without answering";
 
     /// A reset or broken pipe from an authorized supervisor is the same
     /// refusal as a clean close without an answer: the supervisor dropped
@@ -832,8 +835,8 @@ mod unix {
 
 #[cfg(unix)]
 pub use unix::{
-    ProfileLock, SupervisorIpc, effective_uid, lock_path, query_status, query_status_for_uid,
-    request_disconnect,
+    CLOSED_UNANSWERED, ProfileLock, SupervisorIpc, effective_uid, lock_path, query_status,
+    query_status_for_uid, request_disconnect,
 };
 
 /// Read the supervisor's status; this platform has no supervisor IPC.
