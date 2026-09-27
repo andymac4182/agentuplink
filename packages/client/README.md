@@ -331,6 +331,16 @@ this client's own socket path would not be.
   is tested for its schemas, bounds, abort propagation and model-visible
   outcomes, and driven by the real `generateText` with a scripted model; what a
   real model does with a `retrySafe: false` result is untested.
+* **Honouring a relay's `CONNECTION_LIMIT` retry hint (task rows M6-C194,
+  M6-C200).** A relay listener at its connection limit answers `503` with body
+  code `CONNECTION_LIMIT` and `retry_after_ms` (and `Retry-After`), and every
+  client must wait at least that long before its next attempt
+  ([operator.md](../../docs/operator.md#32-health-endpoints-and-load-balancers)).
+  This client retries nothing itself, so it cannot retry too soon, but today
+  it reports that refusal as `BACKEND_UNAVAILABLE` and drops the hint, so a
+  caller that retries cannot honour it. Surfacing `retryAfterMs`, and
+  honouring it in any retry this client or an SDK wrapper adds, is required
+  and not yet done.
 * **Aggregate budgets across borrowers.** The demo lends one client to all four
   adapters in sequence; no test closes one borrower while another has live fids,
   or drives two at once against the shared budget.
