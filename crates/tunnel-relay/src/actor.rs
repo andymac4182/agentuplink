@@ -25463,10 +25463,12 @@ mod stream_identity_tests {
     }
 
     /// The exception is narrow: a scheduled request (no `data_loss` reason)
-    /// still starts an ordinary rotation, and a `data_loss` request that does
-    /// not name the owner's active carrier never releases it.
+    /// naming the same, consistent active carrier still starts an ordinary
+    /// rotation and never releases the carrier.  Stale-generation and
+    /// candidate-naming loss reports are covered mid-rotation in
+    /// `actor_rotation_freeze_tests.rs` (`m7c178_*`).
     #[tokio::test]
-    async fn only_a_loss_report_naming_the_active_carrier_releases_it() {
+    async fn a_scheduled_request_naming_the_active_carrier_does_not_release_it() {
         let now_ms = super::monotonic_millis();
         let (fixture, device_id, tenant_id, _tenant_b, spki, _spki_b) = shared_device_fixture();
         let catalog = MemoryCatalog::new();
@@ -25479,10 +25481,8 @@ mod stream_identity_tests {
             .await
             .expect("resolve narrow-loss identity")
             .expect("narrow-loss identity present");
-        for (name, reason, carrier_generation) in [
-            ("scheduled-request", None, 1),
-            ("stale-carrier-loss", Some("data_loss"), 7),
-        ] {
+        {
+            let name = "scheduled-request";
             let key = SessionKey {
                 tenant_id,
                 device_id,
@@ -25510,7 +25510,7 @@ mod stream_identity_tests {
                     context: CarrierContext::new(
                         key.session_id.clone(),
                         key.epoch,
-                        carrier_generation,
+                        1,
                         old_connection_id.clone(),
                     ),
                     tx: data_tx,
@@ -25528,7 +25528,7 @@ mod stream_identity_tests {
                 generation: 1,
                 connection_id: old_connection_id,
                 desired_interval_ms: None,
-                reason: reason.map(str::to_owned),
+                reason: None,
             };
             actor
                 .inbound_control(key.clone(), ControlMessage::RotateRequest(request))
@@ -25548,6 +25548,13 @@ mod stream_identity_tests {
                     .map(|rotation| rotation.state.phase()),
                 Some(RotationPhase::Recovering),
                 "{name}: no recovery episode may start"
+            );
+            assert!(
+                session
+                    .rotation
+                    .as_ref()
+                    .is_some_and(|rotation| rotation.pending_ticket.is_some()),
+                "{name}: a scheduled request still starts an ordinary rotation"
             );
         }
     }
