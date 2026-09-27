@@ -4,10 +4,12 @@
 //! connection, and a busy keep-alive connection never closed, so while one
 //! client's keep-alive flood held every permit, a client that connected later
 //! was refused `503 CONNECTION_LIMIT` for the whole flood.  Under pressure (a
-//! capacity refusal within the last second) a served connection that has used
-//! its budget is now closed after its current response: `Connection: close`
-//! on HTTP/1.1, GOAWAY on HTTP/2.  These tests use real TCP sockets and real
-//! TLS 1.3 handshakes.
+//! connection arriving with every permit held within the last second) a
+//! served connection that has used its budget is now closed after its current
+//! response: `Connection: close` on HTTP/1.1, GOAWAY on HTTP/2; and a
+//! connection over the limit waits briefly for a freed permit before it is
+//! refused, so the permit reaches a waiting client.  These tests use real TCP
+//! sockets and real TLS 1.3 handshakes.
 
 use std::{
     net::SocketAddr,
@@ -410,7 +412,7 @@ async fn under_pressure_a_late_client_is_served_while_a_flood_holds_every_permit
     // The late client: one request per attempt, a new connection after each
     // refusal, 20 ms apart.
     let started = Instant::now();
-    let bound = Duration::from_secs(20);
+    let bound = Duration::from_secs(10);
     let mut refusals = 0_usize;
     let served_after = loop {
         assert!(
@@ -661,5 +663,61 @@ async fn http2_turnover_sends_goaway_and_lets_streams_finish() -> TestResult {
     let _ = timeout(Duration::from_secs(10), pressure).await;
     let _ = driver.await;
     drop(other);
+    fixture.shutdown().await
+}
+
+/// The hand-off: a connection accepted over the limit waits (before TLS) for
+/// a freed permit and is then served, not refused; one that waits longer than
+/// the hand-off bound is refused `503` exactly as before.
+///
+/// Red without the hand-off: the waiting connection was answered `503` at
+/// once, and a permit freed by turnover went to whichever connection the
+/// listener accepted next -- in the flood test above, 80 of 80 recycled
+/// permits in 20 s went back to flood workers and the late client was refused
+/// 855 times out of 855 (`red-no-handoff` before this test existed).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_connection_over_the_limit_gets_a_permit_freed_while_it_waits() -> TestResult {
+    let fixture = Fixture::start(
+        ListenerCapacity {
+            max_connections: 1,
+            refusal_margin: 2,
+            ..ListenerCapacity::default()
+        },
+        Some(ListenerTurnover::default()),
+    )
+    .await?;
+    let mut holder = fixture.connect().await?;
+    assert_eq!(get_http1(&mut holder, "/quick").await?.status, 200);
+
+    // Past the hand-off bound with the permit still held: the documented 503.
+    let started = Instant::now();
+    let mut refused = fixture.connect().await?;
+    let response = get_http1(&mut refused, "/quick").await?;
+    assert_eq!(response.status, 503, "{}", response.head);
+    assert!(
+        started.elapsed() >= tunnel_transport::HANDOFF_WAIT - Duration::from_millis(50),
+        "refused before the hand-off wait: {:?}",
+        started.elapsed()
+    );
+    assert_eq!(fixture.diagnostics.capacity_refusals(), 1);
+
+    // A connection that arrives while full, then a permit frees within the
+    // wait: it is served.
+    let (address, config) = (fixture.address, fixture.http1.clone());
+    let waiting = tokio::spawn(async move {
+        let mut stream = connect(address, config).await?;
+        get_http1(&mut stream, "/quick").await
+    });
+    tokio::time::sleep(tunnel_transport::HANDOFF_WAIT / 3).await;
+    assert!(
+        !waiting.is_finished(),
+        "the waiting connection was answered"
+    );
+    drop(holder);
+    let response = timeout(Duration::from_secs(10), waiting).await???;
+    assert_eq!(response.status, 200, "{}", response.head);
+    assert_eq!(response.body, QUICK_BODY.as_bytes());
+    assert_eq!(fixture.diagnostics.fairness_handoffs(), 1);
+    assert_eq!(fixture.diagnostics.capacity_refusals(), 1);
     fixture.shutdown().await
 }

@@ -201,7 +201,9 @@ impl Cause {
             ClientError::Credential(_) => Self::CredentialError,
             ClientError::Invalid(_) => Self::InvalidInvocation,
             ClientError::Protocol(_) => Self::ProtocolError,
-            ClientError::Transport { .. } => Self::TransportError,
+            ClientError::Transport { .. } | ClientError::ConnectionLimit { .. } => {
+                Self::TransportError
+            }
             ClientError::OwnerBusy => Self::OwnerBusy,
             ClientError::TlsRefused(_) => Self::CredentialError,
             ClientError::HandshakeTimeout => Self::DeadlineExceeded,
@@ -838,6 +840,9 @@ enum SessionEnd {
         error: CliError,
         /// The session that was ready, if one was, and for how long.
         ready: Option<(String, std::time::Duration)>,
+        /// The least wait the relay asked for before a retry: a
+        /// `CONNECTION_LIMIT` refusal's `retry_after_ms` (M6-C194).
+        retry_after: Option<std::time::Duration>,
     },
 }
 
@@ -1079,6 +1084,21 @@ enum ReconnectDecision {
         attempt: u32,
         delay: std::time::Duration,
     },
+}
+
+impl ReconnectDecision {
+    /// Never retry sooner than the relay asked (task row M6-C194): a
+    /// `CONNECTION_LIMIT` refusal's `retry_after_ms` is a floor on the
+    /// backoff delay.  The hint is already capped by the library.
+    fn honouring(self, retry_after: Option<std::time::Duration>) -> Self {
+        match (self, retry_after) {
+            (Self::Retry { attempt, delay }, Some(floor)) => Self::Retry {
+                attempt,
+                delay: delay.max(floor),
+            },
+            (decision, _) => decision,
+        }
+    }
 }
 
 /// The loop's memory between sessions.
@@ -1340,9 +1360,13 @@ async fn run_supervised(
             publisher,
         )
         .await?;
-        let (error, ready) = match end {
+        let (error, ready, retry_after) = match end {
             SessionEnd::Stopped => return Ok(()),
-            SessionEnd::Failed { error, ready } => (error, ready),
+            SessionEnd::Failed {
+                error,
+                ready,
+                retry_after,
+            } => (error, ready, retry_after),
         };
         let decision = state.decide(
             &policy,
@@ -1351,6 +1375,7 @@ async fn run_supervised(
             tokio::time::Instant::now(),
             jitter_random(),
         );
+        let decision = decision.honouring(retry_after);
         let ReconnectDecision::Retry { attempt, delay } = decision else {
             if policy.enabled && policy.max_attempts != 0 && state.failures > policy.max_attempts {
                 return Err(CliError {
@@ -1508,7 +1533,12 @@ async fn run_one_session(
             // The attempt failed before a session was ready; the handlers
             // went with it, and no child was started.
             Err(error) => {
-                return Ok(SessionEnd::Failed { error: attempt_error(error, config, unix_now()), ready: None });
+                let retry_after = error.retry_after();
+                return Ok(SessionEnd::Failed {
+                    error: attempt_error(error, config, unix_now()),
+                    ready: None,
+                    retry_after,
+                });
             }
         },
         signal = stop.recv() => {
@@ -1601,6 +1631,7 @@ async fn run_one_session(
             Ok(SessionEnd::Failed {
                 error,
                 ready: Some((session_id.unwrap_or_default(), lasted)),
+                retry_after: None,
             })
         }
     }
@@ -3177,6 +3208,9 @@ mod tests {
             ClientError::OpenRetentionFull,
             ClientError::Cancelled,
             ClientError::SupervisorPanicked,
+            ClientError::ConnectionLimit {
+                retry_after_ms: 1_000,
+            },
         ]
     }
 
@@ -3439,6 +3473,55 @@ mod tests {
     /// Consecutive failures double the ceiling; a session that stayed ready
     /// for `max_delay` resets it, a shorter one does not (a relay that
     /// accepts and drops at once still backs off).
+    #[test]
+    fn a_connection_limit_retry_hint_is_a_floor_on_the_backoff() {
+        // M6-C194 (a): the default policy's first delay is 500..=1000 ms; a
+        // relay at its connection limit asks for 1000 ms, so the retry never
+        // comes sooner, and a longer hint wins over a shorter backoff.
+        let policy = ReconnectPolicy::new(&tunnel_client::ReconnectConfig::default(), false);
+        let now = tokio::time::Instant::now();
+        let error = CliError::from_client(ClientError::ConnectionLimit {
+            retry_after_ms: 1_000,
+        });
+        assert_eq!(error.cause, Cause::TransportError);
+        assert!(error.retryable);
+        for random in [0, 1, 250, u64::MAX] {
+            let mut state = ReconnectState::default();
+            let decision = state
+                .decide(&policy, error.cause, None, now, random)
+                .honouring(
+                    ClientError::ConnectionLimit {
+                        retry_after_ms: 1_000,
+                    }
+                    .retry_after(),
+                );
+            let ReconnectDecision::Retry { delay, .. } = decision else {
+                panic!("a CONNECTION_LIMIT refusal was not retried");
+            };
+            assert!(
+                delay >= std::time::Duration::from_millis(1_000),
+                "{delay:?}"
+            );
+        }
+        let mut state = ReconnectState::default();
+        let ReconnectDecision::Retry { delay, .. } = state
+            .decide(&policy, error.cause, None, now, 0)
+            .honouring(Some(std::time::Duration::from_secs(7)))
+        else {
+            panic!("not retried");
+        };
+        assert_eq!(delay, std::time::Duration::from_secs(7));
+        // No hint, no change.
+        let mut state = ReconnectState::default();
+        let ReconnectDecision::Retry { delay, .. } = state
+            .decide(&policy, error.cause, None, now, 0)
+            .honouring(None)
+        else {
+            panic!("not retried");
+        };
+        assert_eq!(delay, std::time::Duration::from_millis(500));
+    }
+
     #[test]
     fn backoff_grows_is_capped_and_resets_only_after_a_stable_session() {
         let policy = policy(1_000, 60_000, 0);

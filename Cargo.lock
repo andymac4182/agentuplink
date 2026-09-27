@@ -3516,6 +3516,7 @@ dependencies = [
 name = "tunnel-client"
 version = "0.1.0"
 dependencies = [
+ "axum",
  "bytes",
  "futures-util",
  "http",
