@@ -29,17 +29,20 @@
 //! **Hand-off.** A freed permit must reach a client that was waiting, not the
 //! recycled client's own immediate reconnect, which is usually already in the
 //! listen backlog when the permit frees.  So on a listener with turnover, a
-//! connection accepted over the limit while one of
-//! [`ListenerTurnover::handoff_queue`] hand-off slots is free first waits up
-//! to [`HANDOFF_WAIT`], before any TLS work, in the permit semaphore's FIFO
-//! queue.  If a permit frees in that time it is served; otherwise it is
-//! refused `503 CONNECTION_LIMIT` exactly as before (M6-C153).  The hand-off
-//! slots are separate from the refusal margin: while they are all taken, a
-//! further connection over the limit is refused at once through the margin,
-//! so the explicit `503` stays the overload signal and refusal throughput is
-//! what it was before the hand-off (coordinator decision, 2026-09-27).
-//! Waiting clients get permits in arrival order, in proportion to how many
-//! connections each has waiting.  Measured before the hand-off existed (M6-C193 test at small
+//! connection accepted over the limit first waits up to [`HANDOFF_WAIT`],
+//! before any TLS work, in the permit semaphore's FIFO queue, holding the
+//! refusal-margin slot it was accepted with.  If a permit frees in that time
+//! it is served; otherwise it is refused `503 CONNECTION_LIMIT` exactly as
+//! before (M6-C153).  Waiting clients get permits in arrival order, in
+//! proportion to how many connections each has waiting.  Because each margin
+//! slot now refuses at most about twice a second, a flood that does not back
+//! off is slowed: arrivals beyond about `2 x refusal_margin` per second wait
+//! in the kernel backlog, and beyond the backlog can see a connect timeout
+//! instead of a `503`.  A separate hand-off queue with an instant `503` when
+//! full was tried and rejected (coordinator decision under the owner's
+//! delegation, 2026-09-27): the flood kept the queue full, refusals returned
+//! to about 560 -- 1,330/s and a late client went unserved (hosted runs
+//! 36283563574, 36284228822).  Measured before the hand-off existed (M6-C193 test at small
 //! scale): 80 recycled permits in 20 s all went back to flood workers, and a
 //! client connecting every 20 ms was refused 855 times out of 855.
 //!
@@ -78,18 +81,12 @@ pub const MAX_TURNOVER_MAX_AGE: Duration = Duration::from_secs(3_600);
 /// Largest accepted [`ListenerTurnover::max_requests`].
 pub const MAX_TURNOVER_MAX_REQUESTS: u64 = 1_000_000;
 
-/// How long a connection accepted over the limit into a hand-off slot waits
-/// for a freed permit, before TLS, before it is refused.  Half the refusal's
-/// `retry_after_ms`.  The refusal's own deadline
+/// How long a connection accepted over the limit on a listener with turnover
+/// waits for a freed permit, before TLS, before it is refused.  Half the
+/// refusal's `retry_after_ms`.  The refusal's own deadline
 /// ([`crate::ListenerCapacity::refusal_timeout`]) starts only after this
 /// wait, so a hand-off connection that is refused is bounded by the sum.
 pub const HANDOFF_WAIT: Duration = Duration::from_millis(500);
-
-/// Default [`ListenerTurnover::handoff_queue`].
-pub const DEFAULT_HANDOFF_QUEUE: usize = 16;
-
-/// Largest accepted [`ListenerTurnover::handoff_queue`].
-pub const MAX_HANDOFF_QUEUE: usize = 256;
 
 /// When a served keep-alive connection is recycled while its listener is
 /// under pressure (task row M6-C193).  Set only on the public consumer
@@ -104,11 +101,6 @@ pub struct ListenerTurnover {
     /// connection is recycled.  Default [`DEFAULT_TURNOVER_MAX_REQUESTS`];
     /// accepts 1..=1,000,000.
     pub max_requests: u64,
-    /// Connections over the limit that may wait at once for a freed permit
-    /// ([`HANDOFF_WAIT`]).  Default [`DEFAULT_HANDOFF_QUEUE`]; accepts
-    /// 0..=256, where 0 disables the hand-off.  Separate from the refusal
-    /// margin.
-    pub handoff_queue: usize,
 }
 
 impl Default for ListenerTurnover {
@@ -116,7 +108,6 @@ impl Default for ListenerTurnover {
         Self {
             max_age: DEFAULT_TURNOVER_MAX_AGE,
             max_requests: DEFAULT_TURNOVER_MAX_REQUESTS,
-            handoff_queue: DEFAULT_HANDOFF_QUEUE,
         }
     }
 }
@@ -134,12 +125,6 @@ impl ListenerTurnover {
             return Err(TransportError::InvalidListenerTurnover {
                 field: "max_requests",
                 reason: "must be 1..=1000000",
-            });
-        }
-        if self.handoff_queue > MAX_HANDOFF_QUEUE {
-            return Err(TransportError::InvalidListenerTurnover {
-                field: "handoff_queue",
-                reason: "must be 0..=256",
             });
         }
         Ok(())
@@ -407,10 +392,6 @@ mod tests {
             },
             ListenerTurnover {
                 max_requests: 1_000_001,
-                ..ListenerTurnover::default()
-            },
-            ListenerTurnover {
-                handoff_queue: 257,
                 ..ListenerTurnover::default()
             },
         ] {

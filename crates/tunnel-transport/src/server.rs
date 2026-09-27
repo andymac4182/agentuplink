@@ -514,11 +514,6 @@ pub async fn serve_with_listener_options(
     let acceptor = TlsAcceptor::from(config);
     let permits = Arc::new(tokio::sync::Semaphore::new(capacity.max_connections));
     let refusals = Arc::new(tokio::sync::Semaphore::new(capacity.refusal_margin));
-    // M6-C193 review (N2): the hand-off has its own bounded slots, separate
-    // from the refusal margin, so waiting never slows the explicit `503`.
-    let handoffs = Arc::new(tokio::sync::Semaphore::new(
-        turnover.map_or(0, |turnover| turnover.handoff_queue),
-    ));
     let mut tasks = JoinSet::new();
     let child_cancel = cancel.child_token();
     let mut first_error = None;
@@ -543,7 +538,7 @@ pub async fn serve_with_listener_options(
                 }
                 continue;
             }
-            slot = next_slot(&permits, &handoffs, &refusals) => slot,
+            slot = next_slot(&permits, &refusals) => slot,
         };
         let Some(slot) = slot else { break };
         let (stream, remote_addr) = tokio::select! {
@@ -591,14 +586,14 @@ pub async fn serve_with_listener_options(
         };
         // A permit may have been released while this slot waited in accept.
         let slot = match slot {
-            Slot::Serve(permit) => Slot::Serve(permit),
-            waiting => match permits.clone().try_acquire_owned() {
+            Slot::Refuse(refusal) => match permits.clone().try_acquire_owned() {
                 Ok(permit) => {
-                    drop(waiting);
+                    drop(refusal);
                     Slot::Serve(permit)
                 }
-                Err(_) => waiting,
+                Err(_) => Slot::Refuse(refusal),
             },
+            serve => serve,
         };
         if let Err(error) = configure_accepted_socket(&stream, &socket_options, remote_addr) {
             first_error = Some(error);
@@ -630,75 +625,67 @@ pub async fn serve_with_listener_options(
                     Ok::<(), TransportError>(())
                 });
             }
-            Slot::Handoff(handoff) => {
+            Slot::Refuse(refusal) => {
                 pressure.record_full();
-                // M6-C193 hand-off: wait briefly (before any TLS work) in the
-                // permit queue, so a permit freed by turnover reaches a
-                // connection that was already waiting.  Refused with the same
-                // `503` if none frees; the hand-off slot, not the refusal
-                // margin, bounds that refusal's TLS work.
-                let policy = turnover.unwrap_or_default();
-                let permits = permits.clone();
+                // M6-C193 hand-off: on a listener with turnover, wait briefly
+                // (before any TLS work) in the permit queue, so a permit freed
+                // by turnover reaches a connection that was already waiting.
+                let handoff = turnover.map(|policy| (policy, permits.clone()));
                 let router = router.clone();
                 let pressure = pressure.clone();
                 let diagnostics = socket_options.diagnostics.clone();
                 tasks.spawn(async move {
-                    let permit = tokio::select! {
-                        biased;
-                        _ = connection_cancel.cancelled() => return Ok(()),
-                        permit = timeout(crate::HANDOFF_WAIT, permits.acquire_owned()) => permit,
-                    };
-                    if let Ok(Ok(permit)) = permit {
-                        // The hand-off slot is free for the next waiter.
-                        drop(handoff);
-                        pressure.record_handoff();
-                        let turnover = crate::fairness::ConnectionTurnover::new(policy, pressure);
-                        let _permit = permit;
-                        if let Err(error) = serve_connection(
-                            stream,
-                            acceptor,
-                            router,
-                            connection_cancel,
-                            timeouts,
-                            listener_name,
-                            Some(turnover),
-                        )
-                        .await
-                        {
-                            tracing::debug!(%remote_addr, ?error, "TLS/HTTP connection closed");
+                    if let Some((policy, permits)) = handoff {
+                        let permit = tokio::select! {
+                            biased;
+                            _ = connection_cancel.cancelled() => return Ok(()),
+                            permit = timeout(crate::HANDOFF_WAIT, permits.acquire_owned()) => permit,
+                        };
+                        if let Ok(Ok(permit)) = permit {
+                            // The refusal slot is not needed any more.
+                            drop(refusal);
+                            pressure.record_handoff();
+                            let turnover =
+                                crate::fairness::ConnectionTurnover::new(policy, pressure);
+                            let _permit = permit;
+                            if let Err(error) = serve_connection(
+                                stream,
+                                acceptor,
+                                router,
+                                connection_cancel,
+                                timeouts,
+                                listener_name,
+                                Some(turnover),
+                            )
+                            .await
+                            {
+                                tracing::debug!(%remote_addr, ?error, "TLS/HTTP connection closed");
+                            }
+                            return Ok(());
                         }
-                        return Ok(());
                     }
-                    let _handoff = handoff;
-                    refuse_over_capacity(
-                        stream,
-                        acceptor,
-                        connection_cancel,
-                        capacity,
-                        timeouts,
-                        listener_name,
-                        &pressure,
-                        diagnostics.as_ref(),
-                    )
-                    .await;
-                    Ok::<(), TransportError>(())
-                });
-            }
-            Slot::Refuse(refusal) => {
-                pressure.record_full();
-                let pressure = pressure.clone();
-                let diagnostics = socket_options.diagnostics.clone();
-                tasks.spawn(async move {
                     let _refusal = refusal;
-                    refuse_over_capacity(
+                    if let Some(diagnostics) = &diagnostics {
+                        diagnostics.record_capacity_refusal();
+                    }
+                    pressure.record_refusal();
+                    if let Some(suppressed) = CAPACITY_REFUSAL_LOG.admit(listener_name) {
+                        tracing::info!(
+                            phase = "listener_capacity",
+                            listener = listener_name,
+                            max_connections = capacity.max_connections,
+                            suppressed,
+                            "refusing connection over the listener connection limit"
+                        );
+                    }
+                    refuse_connection(
                         stream,
                         acceptor,
                         connection_cancel,
-                        capacity,
+                        capacity.refusal_timeout,
                         timeouts,
                         listener_name,
-                        &pressure,
-                        diagnostics.as_ref(),
+                        &TLS_REFUSAL_LOG,
                     )
                     .await;
                     Ok::<(), TransportError>(())
@@ -723,28 +710,21 @@ pub async fn serve_with_listener_options(
     first_error.map_or(Ok(()), Err)
 }
 
-/// A connection permit, a hand-off slot (M6-C193) to wait for one, or a slot
-/// to answer one connection over the limit.
+/// A connection permit, or a slot to answer one connection over the limit.
 enum Slot {
     Serve(tokio::sync::OwnedSemaphorePermit),
-    Handoff(tokio::sync::OwnedSemaphorePermit),
     Refuse(tokio::sync::OwnedSemaphorePermit),
 }
 
-/// Wait for a connection permit, or failing that a hand-off slot, or failing
-/// that a refusal slot, in that order of preference.  A listener without
-/// turnover has no hand-off slots.  `None` only if a semaphore was closed,
-/// which this module never does.
+/// Wait for a connection permit, or failing that a refusal slot, preferring a
+/// permit.  `None` only if a semaphore was closed, which this module never
+/// does.
 async fn next_slot(
     permits: &Arc<tokio::sync::Semaphore>,
-    handoffs: &Arc<tokio::sync::Semaphore>,
     refusals: &Arc<tokio::sync::Semaphore>,
 ) -> Option<Slot> {
     if let Ok(permit) = permits.clone().try_acquire_owned() {
         return Some(Slot::Serve(permit));
-    }
-    if let Ok(handoff) = handoffs.clone().try_acquire_owned() {
-        return Some(Slot::Handoff(handoff));
     }
     if let Ok(refusal) = refusals.clone().try_acquire_owned() {
         return Some(Slot::Refuse(refusal));
@@ -752,47 +732,8 @@ async fn next_slot(
     tokio::select! {
         biased;
         permit = permits.clone().acquire_owned() => permit.ok().map(Slot::Serve),
-        handoff = handoffs.clone().acquire_owned() => handoff.ok().map(Slot::Handoff),
         refusal = refusals.clone().acquire_owned() => refusal.ok().map(Slot::Refuse),
     }
-}
-
-/// Count, log and answer one connection over the limit with
-/// `503 CONNECTION_LIMIT` (M6-C153).
-#[allow(clippy::too_many_arguments)]
-async fn refuse_over_capacity(
-    stream: TcpStream,
-    acceptor: TlsAcceptor,
-    cancel: CancellationToken,
-    capacity: ListenerCapacity,
-    timeouts: ListenerTimeouts,
-    listener_name: &'static str,
-    pressure: &crate::fairness::ListenerPressure,
-    diagnostics: Option<&AcceptedSocketDiagnostics>,
-) {
-    if let Some(diagnostics) = diagnostics {
-        diagnostics.record_capacity_refusal();
-    }
-    pressure.record_refusal();
-    if let Some(suppressed) = CAPACITY_REFUSAL_LOG.admit(listener_name) {
-        tracing::info!(
-            phase = "listener_capacity",
-            listener = listener_name,
-            max_connections = capacity.max_connections,
-            suppressed,
-            "refusing connection over the listener connection limit"
-        );
-    }
-    refuse_connection(
-        stream,
-        acceptor,
-        cancel,
-        capacity.refusal_timeout,
-        timeouts,
-        listener_name,
-        &TLS_REFUSAL_LOG,
-    )
-    .await;
 }
 
 fn joined_result(

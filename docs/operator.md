@@ -1107,12 +1107,19 @@ client.
 **Turnover while full (M6-C193).** While the consumer listener is full (a
 connection arrived with every permit held within the last second), a served
 keep-alive connection is closed after its current response once it has lived
-`listener_turnover_max_age_seconds` (default 10, `1..=3600`) or served
-`listener_turnover_max_requests` (default 1000, `1..=1000000`) since that
-pressure began: `Connection: close` on HTTP/1.1, a graceful GOAWAY on HTTP/2.
-No response or upgraded connection is cut. A connection over the limit first
-waits up to 500 ms for a freed permit before it is refused, so the freed
-permit goes to a client that was waiting. Clients must therefore expect a
+between half and all of `listener_turnover_max_age_seconds` (default 10,
+`1..=3600`; drawn per connection) or served `listener_turnover_max_requests`
+(default 1000, `1..=1000000`) since that pressure began: `Connection: close` on HTTP/1.1, a graceful GOAWAY on HTTP/2.
+No response or upgraded connection is cut. Each connection's age limit is
+drawn between 50% and 100% of `listener_turnover_max_age_seconds`, so
+connections are recycled continuously rather than in bursts. A connection over
+the limit first waits up to 500 ms for a freed permit before it is refused, so
+the freed permit goes to a client that was waiting. That wait also slows a
+flood that ignores `retry_after_ms`: beyond about `2 x
+listener_refusal_margin` new connections a second, excess connections wait in
+the kernel backlog and can time out connecting instead of getting the `503`.
+Limit connections per source at the edge (deploy-fly.md section 1) or raise
+`listener_refusal_margin` if that matters to you. Clients must therefore expect a
 keep-alive connection to be closed after a complete response while the relay
 is busy, and reconnect; every HTTP client library does. The device listener
 never does this. Outside pressure nothing changes. This bounds how long a
@@ -1124,8 +1131,7 @@ cheaper for clients that resume.
 
 **Open-file limit (M6-C155).** Every connection is a file descriptor. The two
 public listeners alone can hold `2 x (listener_max_connections +
-listener_refusal_margin) + listener_turnover_handoff_queue` at once (176 with
-the defaults; the hand-off queue is M6-C193's); Redis, peer and
+listener_refusal_margin)` at once (160 with the defaults); Redis, peer and
 metrics connections come on top. At startup the relay prints `tunnel-relay
 warning: open-file soft limit N is below the M descriptors ...` when the soft
 `RLIMIT_NOFILE` is lower. Raise it before raising `listener_max_connections`:

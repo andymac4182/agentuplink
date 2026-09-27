@@ -5871,7 +5871,6 @@ async fn start_relay(
         listener_refusal_margin: tunnel_transport::DEFAULT_REFUSAL_MARGIN,
         listener_turnover_max_age_seconds: tunnel_transport::DEFAULT_TURNOVER_MAX_AGE.as_secs(),
         listener_turnover_max_requests: tunnel_transport::DEFAULT_TURNOVER_MAX_REQUESTS,
-        listener_turnover_handoff_queue: tunnel_transport::DEFAULT_HANDOFF_QUEUE,
     };
     let mut options = RelayOptions::new(harness.production_oidc_verifier()?);
     options.node_id = node.node_id.clone();

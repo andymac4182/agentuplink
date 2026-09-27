@@ -775,13 +775,6 @@ pub struct ServeConfig {
     /// since the pressure began.  `1..=1000000`, default 1000.
     #[serde(default = "default_listener_turnover_max_requests")]
     pub listener_turnover_max_requests: u64,
-    /// Task row M6-C193 (review N2): connections over the consumer
-    /// listener's limit that may wait at once, up to 500 ms before TLS, for
-    /// a permit freed by turnover.  Separate from `listener_refusal_margin`:
-    /// while these are all taken, a further connection is refused `503` at
-    /// once.  `0..=256`, default 16; `0` disables the hand-off.
-    #[serde(default = "default_listener_turnover_handoff_queue")]
-    pub listener_turnover_handoff_queue: usize,
 }
 
 /// Whether `address` may carry the unauthenticated metrics listener: a
@@ -1090,23 +1083,15 @@ impl ServeConfig {
                 "listener_turnover_max_requests must be 1..=1000000",
             ));
         }
-        if self.listener_turnover_handoff_queue > tunnel_transport::MAX_HANDOFF_QUEUE {
-            return Err(ConfigError::Invalid(
-                "listener_turnover_handoff_queue must be 0..=256",
-            ));
-        }
         Ok(())
     }
 
     /// File descriptors the two public listeners alone can hold at once
     /// (task row M6-C155): each serves `listener_max_connections` and
-    /// refuses up to `listener_refusal_margin` more, and the consumer
-    /// listener holds up to `listener_turnover_handoff_queue` more waiting
-    /// for a freed permit (M6-C193).  Redis, peer, metrics and file
-    /// descriptors come on top, so this is a floor, not a budget.
+    /// refuses up to `listener_refusal_margin` more.  Redis, peer, metrics
+    /// and file descriptors come on top, so this is a floor, not a budget.
     pub fn listener_descriptor_demand(&self) -> u64 {
         2 * (self.listener_max_connections as u64 + self.listener_refusal_margin as u64)
-            + self.listener_turnover_handoff_queue as u64
     }
 
     /// The startup warning for a soft `RLIMIT_NOFILE` (`None`: unlimited)
@@ -1119,12 +1104,9 @@ impl ServeConfig {
             format!(
                 "tunnel-relay warning: open-file soft limit {soft} is below the {demand} descriptors \
                  the public listeners can hold (2 x (listener_max_connections {} + \
-                 listener_refusal_margin {}) + listener_turnover_handoff_queue {}); accept will \
-                 fail with EMFILE under load. \
+                 listener_refusal_margin {})); accept will fail with EMFILE under load. \
                  Raise it (ulimit -n, LimitNOFILE=) or lower listener_max_connections.",
-                self.listener_max_connections,
-                self.listener_refusal_margin,
-                self.listener_turnover_handoff_queue
+                self.listener_max_connections, self.listener_refusal_margin
             )
         })
     }
@@ -1146,7 +1128,6 @@ impl ServeConfig {
         tunnel_transport::ListenerTurnover {
             max_age: std::time::Duration::from_secs(self.listener_turnover_max_age_seconds),
             max_requests: self.listener_turnover_max_requests,
-            handoff_queue: self.listener_turnover_handoff_queue,
         }
     }
 
@@ -1345,10 +1326,6 @@ fn default_listener_turnover_max_age_seconds() -> u64 {
 
 fn default_listener_turnover_max_requests() -> u64 {
     tunnel_transport::DEFAULT_TURNOVER_MAX_REQUESTS
-}
-
-fn default_listener_turnover_handoff_queue() -> usize {
-    tunnel_transport::DEFAULT_HANDOFF_QUEUE
 }
 
 fn default_max_queue_bytes() -> usize {
@@ -1736,16 +1713,15 @@ consumer_tls_private_key = "consumer-key.pem"
     #[test]
     fn descriptor_limit_warning_follows_listener_capacity() {
         let config = ServeConfig::parse(valid_toml()).expect("valid");
-        // 2 x (64 + 16) + the 16-connection turnover hand-off (M6-C193).
-        assert_eq!(config.listener_descriptor_demand(), 176);
+        assert_eq!(config.listener_descriptor_demand(), 160);
         assert!(config.descriptor_limit_warning(None).is_none());
-        assert!(config.descriptor_limit_warning(Some(176)).is_none());
+        assert!(config.descriptor_limit_warning(Some(160)).is_none());
         assert!(config.descriptor_limit_warning(Some(1_048_576)).is_none());
         let warning = config
-            .descriptor_limit_warning(Some(175))
+            .descriptor_limit_warning(Some(159))
             .expect("a limit below demand warns");
         assert!(
-            warning.contains("175") && warning.contains("176"),
+            warning.contains("159") && warning.contains("160"),
             "{warning}"
         );
         let large = ServeConfig::parse(&format!(
@@ -1753,7 +1729,7 @@ consumer_tls_private_key = "consumer-key.pem"
             valid_toml()
         ))
         .expect("large");
-        assert_eq!(large.listener_descriptor_demand(), 8_240);
+        assert_eq!(large.listener_descriptor_demand(), 8_224);
         assert!(large.descriptor_limit_warning(Some(256)).is_some());
     }
 
@@ -1786,7 +1762,7 @@ consumer_tls_private_key = "consumer-key.pem"
         );
         assert_eq!(options.device.turnover, None);
         let turned = ServeConfig::parse(&format!(
-            "listener_turnover_max_age_seconds = 30\nlistener_turnover_max_requests = 50\nlistener_turnover_handoff_queue = 4\n{}",
+            "listener_turnover_max_age_seconds = 30\nlistener_turnover_max_requests = 50\n{}",
             valid_toml()
         ))
         .expect("turnover");
@@ -1799,7 +1775,6 @@ consumer_tls_private_key = "consumer-key.pem"
             Some(tunnel_transport::ListenerTurnover {
                 max_age: std::time::Duration::from_secs(30),
                 max_requests: 50,
-                handoff_queue: 4,
             })
         );
         for refused in [
@@ -1810,7 +1785,6 @@ consumer_tls_private_key = "consumer-key.pem"
             "listener_turnover_max_age_seconds = 3601",
             "listener_turnover_max_requests = 0",
             "listener_turnover_max_requests = 1000001",
-            "listener_turnover_handoff_queue = 257",
         ] {
             ServeConfig::parse(&format!("{refused}\n{}", valid_toml()))
                 .expect_err(&format!("accepted {refused}"));

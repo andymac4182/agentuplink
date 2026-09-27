@@ -59,7 +59,8 @@ Before M6-C193, in `requests.csv` 64 workers held the 64 served keep-alive
 connections for the whole run and the other 64 got `CONNECTION_LIMIT` on
 every attempt. Since M6-C193 the consumer listener turns its permits over
 while it is full (below), so served workers change over the run: each served
-connection is closed after a response once it has lived 10 s under pressure,
+connection is closed after a response once it has lived 5 -- 10 s (drawn
+per connection) under pressure,
 and a waiting connection takes its permit. Some `CONNECTION_LIMIT` refusals
 remain, because 128 workers still want 64 permits.
 
@@ -98,7 +99,8 @@ flood served 31843, connections recycled 4, capacity refusals 2`. Before the
 fix the late client was refused on every attempt. Other tests in the file
 check that nothing is recycled without pressure, that a streaming response and
 a `101` upgrade are never cut, that HTTP/2 closes with GOAWAY after its
-in-flight streams finish, and the 500 ms hand-off.
+in-flight streams finish, the 500 ms hand-off, and that turnover of
+connections open before pressure is spread out.
 
 Through a real relay, user B connects 10 s into user A's 128-worker flood:
 
@@ -147,5 +149,5 @@ returned `Accept(Too many open files)`, and the relay exited.
 
 To see the startup check, run `ulimit -n 100` in a shell, then start
 `tunnel-relay serve` from it. Before it prints `tunnel-relay listening`, it
-prints `tunnel-relay warning: open-file soft limit 100 is below the 176
+prints `tunnel-relay warning: open-file soft limit 100 is below the 160
 descriptors ...`.
