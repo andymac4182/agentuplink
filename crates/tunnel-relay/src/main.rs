@@ -1432,33 +1432,26 @@ fn membership_bootstrap_error(
 fn membership_readiness_code(
     readiness: &MembershipReadiness,
 ) -> (&'static str, &'static str, &'static str) {
+    // The reason word is the library's `code()`, shared with the metrics
+    // listener's `tunnel_relay_membership_readiness` label (M0-03), so the
+    // bootstrap diagnostic and the scrape cannot name one cause two ways.
     match readiness {
-        MembershipReadiness::Starting => ("starting", "starting", "bootstrap"),
-        MembershipReadiness::Ready => ("ready", "ready", "bootstrap"),
-        MembershipReadiness::Unready(reason) => match reason {
-            MembershipUnreadyReason::UnknownAuthority => {
-                ("unready", "unknown_authority", "authority")
-            }
-            MembershipUnreadyReason::CheckpointExpired => {
-                ("unready", "checkpoint_expired", "checkpoint")
-            }
-            MembershipUnreadyReason::CatalogUnavailable => {
-                ("unready", "catalog_unavailable", "catalog")
-            }
-            MembershipUnreadyReason::MembershipRejected => {
-                ("unready", "membership_rejected", "membership")
-            }
-            MembershipUnreadyReason::MissingLocalMembership => {
-                ("unready", "missing_local_membership", "membership")
-            }
-            MembershipUnreadyReason::MissingLocalKey => {
-                ("unready", "missing_local_key", "membership")
-            }
-            MembershipUnreadyReason::PersistenceUnavailable => {
-                ("unready", "persistence_unavailable", "persistence")
-            }
-            MembershipUnreadyReason::Cancelled => ("unready", "cancelled", "lifecycle"),
-        },
+        MembershipReadiness::Starting => ("starting", readiness.code(), "bootstrap"),
+        MembershipReadiness::Ready => ("ready", readiness.code(), "bootstrap"),
+        MembershipReadiness::Unready(reason) => (
+            "unready",
+            reason.code(),
+            match reason {
+                MembershipUnreadyReason::UnknownAuthority => "authority",
+                MembershipUnreadyReason::CheckpointExpired => "checkpoint",
+                MembershipUnreadyReason::CatalogUnavailable => "catalog",
+                MembershipUnreadyReason::MembershipRejected
+                | MembershipUnreadyReason::MissingLocalMembership
+                | MembershipUnreadyReason::MissingLocalKey => "membership",
+                MembershipUnreadyReason::PersistenceUnavailable => "persistence",
+                MembershipUnreadyReason::Cancelled => "lifecycle",
+            },
+        ),
     }
 }
 

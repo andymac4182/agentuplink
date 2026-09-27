@@ -799,6 +799,116 @@ impl Fixture {
     }
 }
 
+/// M0-03: the runtime's post-bootstrap readiness reaches the peer binding
+/// provider the metrics listener reads, and follows it both ways.
+#[tokio::test]
+async fn m0_03_the_membership_readiness_reaches_the_peer_binding_provider() {
+    let fixture = Fixture::new().await;
+    let provider: Arc<dyn crate::PeerBindingProvider> = fixture.membership.clone();
+    assert_eq!(
+        provider.membership_readiness(),
+        Some(MembershipReadiness::Ready)
+    );
+    fixture.catalog_unavailable_pass().await;
+    assert_eq!(
+        provider
+            .membership_readiness()
+            .map(|readiness| readiness.code()),
+        Some("catalog_unavailable")
+    );
+    fixture.unknown_authority_pass().await;
+    assert_eq!(
+        provider
+            .membership_readiness()
+            .map(|readiness| readiness.code()),
+        Some("unknown_authority")
+    );
+    fixture.ready_pass().await;
+    assert_eq!(
+        provider.membership_readiness(),
+        Some(MembershipReadiness::Ready)
+    );
+    fixture.shutdown().await;
+}
+
+/// M0-03, end to end below the process: a `GET /metrics` on the private
+/// listener's router, over a peer runtime whose bindings are this membership
+/// runtime, reports the post-bootstrap cause and follows it back to ready.
+#[tokio::test]
+async fn m0_03_a_scrape_names_the_post_bootstrap_unready_cause() {
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+    let fixture = Fixture::new().await;
+    let directory: Arc<dyn tunnel_catalog::Catalog> = Arc::new(fixture.catalog.clone());
+    let router = Arc::new(
+        crate::routing::OwnerRouter::new(
+            directory,
+            crate::routing::RelayIdentity::new(DEPLOYMENT_INCARNATION, NODE_ID, "boot-a")
+                .expect("identity"),
+        )
+        .expect("owner router"),
+    );
+    let client = tunnel_transport::PeerClient::new(
+        quinn::Endpoint::client(std::net::SocketAddr::from(([127, 0, 0, 1], 0))).expect("endpoint"),
+        tunnel_transport::ApprovedPeerPins::new([tunnel_transport::SpkiSha256::from_bytes(
+            [0xaa; 32],
+        )])
+        .expect("pins"),
+        tunnel_transport::PeerTransportLimits::default(),
+    )
+    .expect("peer client");
+    let peer = Arc::new(crate::PeerRuntime::new(
+        client,
+        router,
+        fixture.membership.clone(),
+        NODE_ID,
+        "boot-a",
+    ));
+    let app = crate::metrics::router(
+        fixture.relay.clone(),
+        Some(peer),
+        crate::health::ReadinessChecks::default(),
+    );
+    let scrape = |app: axum::Router| async move {
+        let response = app
+            .oneshot(
+                axum::http::Request::get("/metrics")
+                    .body(axum::body::Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("scrape");
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        String::from_utf8_lossy(&body).into_owned()
+    };
+    fixture.catalog_unavailable_pass().await;
+    let text = scrape(app.clone()).await;
+    assert!(
+        text.lines().any(
+            |line| line == "tunnel_relay_membership_readiness{state=\"catalog_unavailable\"} 1"
+        ),
+        "{text}"
+    );
+    assert!(
+        text.lines()
+            .any(|line| line == "tunnel_relay_membership_readiness{state=\"ready\"} 0"),
+        "{text}"
+    );
+    fixture.ready_pass().await;
+    let text = scrape(app).await;
+    assert!(
+        text.lines()
+            .any(|line| line == "tunnel_relay_membership_readiness{state=\"ready\"} 1"),
+        "{text}"
+    );
+    fixture.shutdown().await;
+}
+
 /// **Red first (M7-C182, case (a)).** A fresh signed checkpoint that no
 /// longer names this node is a signed removal. One pass never surrenders;
 /// the confirming pass does, with `LOCAL_MEMBERSHIP_WITHDRAWN`, and the
