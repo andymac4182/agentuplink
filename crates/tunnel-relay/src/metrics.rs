@@ -170,6 +170,9 @@ pub(crate) struct MetricsInput<'a> {
     pub(crate) authority: Option<AuthorityMetrics>,
     /// `None` on a relay without the clock-offset check (a library relay).
     pub(crate) clock: Option<ClockOffsetMetrics>,
+    /// The signed-membership readiness of a cluster relay (task row M0-03);
+    /// `None` on a relay without membership.
+    pub(crate) membership: Option<crate::MembershipReadiness>,
     pub(crate) snapshot: &'a RelaySnapshot,
     pub(crate) consumer_refusals: BTreeMap<(&'static str, &'static str), u64>,
     /// The single relay actor's load (M6-C182, M6-C183).
@@ -413,6 +416,23 @@ pub(crate) fn render(input: &MetricsInput<'_>) -> String {
         "1 while /readyz answers ready, else 0.",
         u64::from(input.ready),
     );
+    if let Some(membership) = &input.membership {
+        // M0-03: the post-bootstrap cause `/readyz` deliberately does not
+        // carry. Every fixed code, zeros included, so the series never vary.
+        out.family(
+            "tunnel_relay_membership_readiness",
+            "gauge",
+            "1 for the cluster relay's current signed-membership readiness state, else 0.",
+        );
+        let current = membership.code();
+        for code in crate::MembershipReadiness::CODES {
+            out.sample(
+                "tunnel_relay_membership_readiness",
+                &[("state", code)],
+                u64::from(code == current),
+            );
+        }
+    }
     if let Some(authority) = &input.authority {
         gauge(
             &mut out,
@@ -686,10 +706,15 @@ async fn scrape(State(state): State<MetricsState>) -> Response {
             checks: authority.checks(),
             failures: authority.failures(),
         });
+    let membership = state
+        .peer
+        .as_ref()
+        .and_then(|peer| peer.membership_readiness());
     let body = render(&MetricsInput {
         ready,
         authority,
         clock,
+        membership,
         snapshot: &snapshot,
         consumer_refusals: consumer_refusals(),
         actor_load: state.handle.actor_load(),

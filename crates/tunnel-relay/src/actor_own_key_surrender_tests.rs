@@ -799,6 +799,38 @@ impl Fixture {
     }
 }
 
+/// M0-03: the runtime's post-bootstrap readiness reaches the peer binding
+/// provider the metrics listener reads, and follows it both ways.
+#[tokio::test]
+async fn m0_03_the_membership_readiness_reaches_the_peer_binding_provider() {
+    let fixture = Fixture::new().await;
+    let provider: Arc<dyn crate::PeerBindingProvider> = fixture.membership.clone();
+    assert_eq!(
+        provider.membership_readiness(),
+        Some(MembershipReadiness::Ready)
+    );
+    fixture.catalog_unavailable_pass().await;
+    assert_eq!(
+        provider
+            .membership_readiness()
+            .map(|readiness| readiness.code()),
+        Some("catalog_unavailable")
+    );
+    fixture.unknown_authority_pass().await;
+    assert_eq!(
+        provider
+            .membership_readiness()
+            .map(|readiness| readiness.code()),
+        Some("unknown_authority")
+    );
+    fixture.ready_pass().await;
+    assert_eq!(
+        provider.membership_readiness(),
+        Some(MembershipReadiness::Ready)
+    );
+    fixture.shutdown().await;
+}
+
 /// **Red first (M7-C182, case (a)).** A fresh signed checkpoint that no
 /// longer names this node is a signed removal. One pass never surrenders;
 /// the confirming pass does, with `LOCAL_MEMBERSHIP_WITHDRAWN`, and the

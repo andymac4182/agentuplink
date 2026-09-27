@@ -98,6 +98,10 @@ impl PeerBindingProvider for crate::MembershipRuntime {
         matches!(self.readiness(), crate::MembershipReadiness::Ready)
     }
 
+    fn membership_readiness(&self) -> Option<crate::MembershipReadiness> {
+        Some(self.readiness())
+    }
+
     fn binding_for_certificate<'a>(
         &'a self,
         node_id: &'a str,
@@ -224,6 +228,13 @@ pub trait PeerBindingProvider: Send + Sync + 'static {
     /// current signed-checkpoint/catalog readiness.
     fn is_ready(&self) -> bool {
         true
+    }
+
+    /// The membership readiness behind [`Self::is_ready`], for the private
+    /// metrics listener (task row M0-03). `None` for a provider without
+    /// signed membership (standalone fixtures, the M1/M2 profile).
+    fn membership_readiness(&self) -> Option<crate::MembershipReadiness> {
+        None
     }
 
     /// Return the cancellation edge for an active membership admission.
@@ -991,6 +1002,13 @@ impl PeerRuntime {
                 .readiness
                 .as_ref()
                 .is_none_or(|readiness| readiness.is_ready())
+    }
+
+    /// The signed-membership readiness behind [`Self::is_ready`], when the
+    /// binding provider has one (task row M0-03).
+    #[must_use]
+    pub fn membership_readiness(&self) -> Option<crate::MembershipReadiness> {
+        self.bindings.membership_readiness()
     }
 
     /// Return the optional process-local peer readiness state.
