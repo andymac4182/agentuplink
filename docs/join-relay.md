@@ -249,7 +249,7 @@ Australia, including a fresh TLS handshake. Other answers:
 | `503` `RESOURCE_EXHAUSTED`, `"execution":"not_dispatched"` | Seen for about half a second at a data-socket rotation, every 300 seconds. The request never ran; repeat it (M6-C103) |
 | `503` `REVERSE_CHANNEL_INTERRUPTED`, `"execution":"unknown"` | The connection broke with the request in flight, so it may or may not have run. Repeating an echo is harmless; for any service with side effects, check before repeating |
 | `503` `REVERSE_CHANNEL_INTERRUPTED`, `"execution":"not_dispatched"` | The wait ended (the operation timeout, or the device session ended) before the relay sent the request to the device, so it did not run; repeat it (M6-C205) |
-| `503` `ROTATION_FREEZE`, `"execution":"not_dispatched"` | A data-socket rotation outlasted the relay's short admission hold, or the device refused the request because the rotation stopped its admission. The request never ran; repeat it after `retry_after_ms` (M3-15, M6-C204) |
+| `503` `ROTATION_FREEZE`, `"execution":"not_dispatched"` | A data-socket rotation outlasted the relay's short admission hold, or the device refused the request because the rotation stopped its admission. The request never ran; repeat it after `retry_after_ms` (M3-15, M6-C204; a stream refused this way after its upgrade: an `http-forward/1` request gets this body, an echo stream or filesystem WebSocket closes 1013 with reason `ROTATION_FREEZE`, M6-C210) |
 | curl error `60` | `--cacert` is missing or names the wrong CA |
 
 ## 7. When you are done

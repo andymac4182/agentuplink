@@ -2547,6 +2547,38 @@ struct M2Stream {
     authorization_failure_code: Option<&'static str>,
     /// Present only for an `http-forward/1` stream; see `actor_http_stream`.
     http: Option<HttpStreamState>,
+    /// The consumer-facing code of the connector's exact refusal of this
+    /// stream's OPEN, shared with the consumer registration and set once,
+    /// before `closed` is cancelled (task row M6-C210).
+    open_refusal: StreamOpenRefusal,
+}
+
+/// The consumer-facing code of a connector refusal of a stream's OPEN
+/// (task row M6-C210): set once by the actor, read by the consumer adapter
+/// after the stream's `closed` token fires.  Payload-free.
+pub(crate) type StreamOpenRefusal = Arc<std::sync::OnceLock<&'static str>>;
+
+/// The consumer answer for a connector's refusal of an OPEN it never admitted
+/// (a `REJECTED` answering that OPEN's own message ID), for a unary echo and
+/// for a stream alike.  Nothing ran, so every answer is `not_dispatched`.
+///
+/// The connector's own capacity refusal is a per-request, retryable capacity
+/// answer, not a device fault (task row M6-C120).  So is its `GOAWAY` while a
+/// scheduled rotation attempt freezes admission (task rows M6-C204 and
+/// M6-C210): the owner sent the OPEN before QUIESCE, the connector dequeued it
+/// from its deferred-OPEN queue after QUIESCE stopped its admission, and
+/// nothing ran.  It gets the answer a new request gets during the same
+/// freeze, `ROTATION_FREEZE` with its retry hint.  A `GOAWAY` outside a
+/// freeze (the connector shutting down) and every other refusal stay
+/// `DEVICE_REJECTED`.
+fn connector_open_refusal_code(code: &str, attempt_frozen: bool) -> &'static str {
+    if code == "RESOURCE_EXHAUSTED" {
+        "RESOURCE_EXHAUSTED"
+    } else if code == tunnel_protocol::open_refusal::CONNECTOR_DRAINING.code() && attempt_frozen {
+        freeze_hold::ROTATION_FREEZE_ECHO_CODE
+    } else {
+        "DEVICE_REJECTED"
+    }
 }
 
 /// The reply channel of one consumer stream admission.
@@ -3124,11 +3156,26 @@ pub(crate) struct ConsumerStreamRegistration {
     pub(crate) operation_id: String,
     pub(crate) closed: CancellationToken,
     admission_lease: CancellationToken,
+    open_refusal: StreamOpenRefusal,
 }
 
 impl ConsumerStreamRegistration {
     pub(crate) fn claim_admission(&self) {
         self.admission_lease.cancel();
+    }
+
+    /// The consumer-facing code of the connector's refusal of this stream's
+    /// OPEN, once the actor has recorded one (task row M6-C210).  It is set
+    /// before `closed` is cancelled, so an adapter that saw `closed` fire
+    /// reads it here.
+    pub(crate) fn open_refusal(&self) -> Option<&'static str> {
+        self.open_refusal.get().copied()
+    }
+
+    /// A shared handle on [`Self::open_refusal`] for an adapter that hands
+    /// the registration itself to its carriers.
+    pub(crate) fn open_refusal_handle(&self) -> StreamOpenRefusal {
+        Arc::clone(&self.open_refusal)
     }
 }
 
@@ -3251,6 +3298,20 @@ impl RelayHandle {
             }
         });
         (handle, ops_rx)
+    }
+
+    /// Route-test hook (task row M6-C210): put `key`'s session into a frozen
+    /// scheduled rotation attempt on the live actor, and wait until it is.
+    pub(crate) async fn enter_rotation_freeze_for_test(&self, key: SessionKey) {
+        let (done_tx, done_rx) = oneshot::channel();
+        self.tx
+            .send(Command::TestMutate(Box::new(move |actor| {
+                actor.enter_rotation_freeze_for_test(&key);
+                let _ = done_tx.send(());
+            })))
+            .await
+            .expect("actor accepts the test mutation");
+        done_rx.await.expect("the freeze was entered");
     }
 }
 
@@ -6481,6 +6542,7 @@ impl RelayActor {
         };
         let closed = CancellationToken::new();
         let admission_lease = CancellationToken::new();
+        let open_refusal = StreamOpenRefusal::default();
         let admission_deadline = Instant::now() + self.options.limits.operation_timeout;
         let registration_key = session.key.clone();
         let (http_state, http_watchers) = if http {
@@ -6528,6 +6590,7 @@ impl RelayActor {
                 admission_deadline,
                 authorization_failure_code: None,
                 http: http_state,
+                open_refusal: Arc::clone(&open_refusal),
             },
         );
         let registration = ConsumerStreamRegistration {
@@ -6536,6 +6599,7 @@ impl RelayActor {
             operation_id: operation_id.clone(),
             closed,
             admission_lease,
+            open_refusal,
         };
         match (response, http_watchers) {
             (
@@ -7619,7 +7683,14 @@ impl RelayActor {
                 http.local_terminal()
             }
         });
-        if stream.operation_id != operation_id || stream.terminal || locally_ended {
+        // A released stream (its `closed` fired: a refused OPEN, M6-C210, or
+        // a consumer close of a pending OPEN) takes no new record, as its
+        // read side delivers nothing more.
+        if stream.operation_id != operation_id
+            || stream.terminal
+            || locally_ended
+            || stream.closed.is_cancelled()
+        {
             let _ = response.send(Err(EchoOutcome::Failure {
                 code: "STREAM_NOT_FOUND",
                 execution: "not_dispatched",
@@ -12469,29 +12540,14 @@ impl RelayActor {
                         );
                         unary_rejected = true;
                     }
-                    // The connector's own capacity refusal is a per-request,
-                    // retryable capacity answer, not a device fault (task row
-                    // M6-C120).  So is its `GOAWAY` while a scheduled rotation
-                    // attempt freezes admission (task row M6-C204): the owner
-                    // sent the OPEN before QUIESCE, the connector dequeued it
-                    // from its deferred-OPEN queue after QUIESCE stopped its
-                    // admission, and nothing ran.  It gets the answer a new
-                    // request gets during the same freeze, `ROTATION_FREEZE`
-                    // with its retry hint.  (In recovery the loss of the
-                    // active carrier has already answered every pending
-                    // echo.)  A `GOAWAY` outside a freeze (the connector
-                    // shutting down) and every other refusal stay
-                    // DEVICE_REJECTED.
-                    let code = if rejected.code == "RESOURCE_EXHAUSTED" {
-                        "RESOURCE_EXHAUSTED"
-                    } else if rejected.code
-                        == tunnel_protocol::open_refusal::CONNECTOR_DRAINING.code()
-                        && freeze_hold::attempt_frozen(session)
-                    {
-                        freeze_hold::ROTATION_FREEZE_ECHO_CODE
-                    } else {
-                        "DEVICE_REJECTED"
-                    };
+                    // One mapping for a unary echo and a stream alike
+                    // (`connector_open_refusal_code`, task rows M6-C120,
+                    // M6-C204 and M6-C210).  In recovery the loss of the
+                    // active carrier has already answered every pending echo.
+                    let code = connector_open_refusal_code(
+                        &rejected.code,
+                        freeze_hold::attempt_frozen(session),
+                    );
                     matched = "unary";
                     relay_code = code;
                     let _ = pending.response.send(EchoOutcome::Failure {
@@ -12526,6 +12582,36 @@ impl RelayActor {
                         });
                     if pending {
                         relay_code = "stream_closed";
+                        // The connector refused this exact OPEN, so nothing
+                        // on the stream ran: answer its consumer now, with
+                        // the unary echo's mapping (task row M6-C210).  The
+                        // roster entry and its no-stream FORGET are
+                        // unchanged; during a freeze the FORGET still waits
+                        // for the attempt, but the consumer no longer does.
+                        // Before M6-C210 the consumer heard nothing until the
+                        // FORGET was published, and then each parked record
+                        // was answered `REVERSE_CHANNEL_INTERRUPTED`/`unknown`
+                        // and the stream closed with no cause.
+                        if let Some(session) = self.session_mut(&key) {
+                            let code = connector_open_refusal_code(
+                                &rejected.code,
+                                freeze_hold::attempt_frozen(session),
+                            );
+                            let queue_budget = session.queue_budget.clone();
+                            if let Some(stream) = session.streams.get_mut(&rejected.stream_id) {
+                                let _ = stream.open_refusal.set(code);
+                                for (_, waiter) in stream.pending_records.drain(..) {
+                                    let _ = waiter.send(Err(EchoOutcome::Failure {
+                                        code,
+                                        execution: "not_dispatched",
+                                    }));
+                                }
+                                // As a consumer close of a pending OPEN does
+                                // (`close_echo_stream_with_cause`): the budget
+                                // charge stays until the FORGET removes it.
+                                Self::release_echo_stream_state(stream, &queue_budget, false);
+                            }
+                        }
                         let final_state = ResumeDirectionState {
                             stream_id: rejected.stream_id,
                             ..ResumeDirectionState::default()
@@ -13180,11 +13266,17 @@ impl RelayActor {
         let (current, owner, identity, owner_deadline) = match result {
             Ok(value) => value,
             Err(_) => {
-                self.invalidate_pending(
+                // A failed catalog read says nothing about the principal's
+                // authorization (task row M6-C211): the consumer gets the
+                // answer admission gives a catalog outage, the retryable
+                // `AUTHORIZATION_UNAVAILABLE`/`not_dispatched`, not
+                // `AUTHORIZATION_REVOKED`.  The connector is told as before.
+                self.invalidate_pending_with(
                     &key,
                     challenge.stream_id,
                     &challenge,
                     "authorization unavailable",
+                    "AUTHORIZATION_UNAVAILABLE",
                 );
                 return;
             }
@@ -13264,16 +13356,26 @@ impl RelayActor {
             // challenge can no longer be confirmed, nothing was dispatched,
             // and the consumer gets the retryable answer a request refused by
             // the same freeze gets.  The connector is told as before.
-            let freeze_lapsed = freeze_authorization != FreezeAuthorization::NotHeld
-                && challenge_remaining.is_zero()
+            //
+            // Outside a freeze the same lapse -- a catalog read slower than
+            // the challenge window, with every other bound open -- is not a
+            // revocation either (task row M6-C211): the read above has just
+            // authorized, only the window to confirm it has passed, so the
+            // consumer gets the retryable `AUTHORIZATION_UNAVAILABLE`/
+            // `not_dispatched` a catalog outage gets.  Every revocation the
+            // read shows was refused above, and a lapsed consumer token,
+            // owner lease or device credential stays `AUTHORIZATION_REVOKED`.
+            let window_lapsed = challenge_remaining.is_zero()
                 && !snapshot_remaining.is_zero()
                 && !token_remaining.is_zero()
                 && !owner_remaining.is_zero()
                 && !credential_remaining.is_zero();
-            let code = if freeze_lapsed {
+            let code = if !window_lapsed {
+                "AUTHORIZATION_REVOKED"
+            } else if freeze_authorization != FreezeAuthorization::NotHeld {
                 freeze_hold::ROTATION_FREEZE_ECHO_CODE
             } else {
-                "AUTHORIZATION_REVOKED"
+                "AUTHORIZATION_UNAVAILABLE"
             };
             self.invalidate_pending_with(
                 &key,
@@ -18242,6 +18344,7 @@ mod stream_identity_tests {
                         + std::time::Duration::from_secs(60),
                     authorization_failure_code: None,
                     http: None,
+                    open_refusal: Default::default(),
                 },
             );
         }
@@ -18402,6 +18505,7 @@ mod stream_identity_tests {
                         + std::time::Duration::from_secs(60),
                     authorization_failure_code: None,
                     http: None,
+                    open_refusal: Default::default(),
                 },
             );
         }

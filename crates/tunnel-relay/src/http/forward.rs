@@ -1964,6 +1964,7 @@ pub(crate) async fn http_forward_route(
                 state
                     .handle
                     .echo_cleanup_guard(key.clone(), stream_id, operation_id.clone(), None);
+            let open_refusal = registration.base.open_refusal_handle();
             let (writer, reader, signal_task, freeze) = actor_carriers(&state.handle, registration);
             let outbound = tokio::spawn(pump_outbound(to_device_rx, writer));
             let inbound = tokio::spawn(pump_inbound(reader, from_device_tx));
@@ -2022,9 +2023,28 @@ pub(crate) async fn http_forward_route(
             });
             let response = head.await;
             let _ = body_stats_tx.send(response.body().stats());
+            if let Some(refused) = refused_open_response(open_refusal.get().copied()) {
+                return refused;
+            }
             response.map(axum::body::Body::new)
         }
     }
+}
+
+/// The local `http-forward/1` answer for a stream whose OPEN the connector
+/// refused (task row M6-C210), replacing the bridge's own failure.  No device
+/// byte can precede OPENED, so a refused stream's head is always the
+/// bridge's failure, and it would say `HTTP_STREAM_INTERRUPTED`/`unknown`
+/// because the request head had already entered the bridge.  An OPEN refused
+/// `GOAWAY` inside a scheduled rotation freeze never ran, so the consumer
+/// gets the retryable `503 ROTATION_FREEZE`/`not_dispatched` with its retry
+/// hint instead, as a new request refused by the same freeze does.  Every
+/// other refusal keeps the bridge's answer.
+fn refused_open_response(open_refusal: Option<&'static str>) -> Option<Response> {
+    (open_refusal == Some(crate::actor::ROTATION_FREEZE_ECHO_CODE)).then(|| {
+        crate::metrics::count_local_rotation_freeze("http-forward");
+        rotation_freeze_response(crate::actor::ROTATION_FREEZE_RETRY_AFTER_MS)
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2449,6 +2469,36 @@ pub(crate) async fn handle_peer_http_stream(
 mod tests {
     use super::*;
     use tunnel_cluster::peer_frame::StreamBudget;
+
+    /// M6-C210: a local `http-forward/1` stream whose OPEN the connector
+    /// refused `GOAWAY` during a rotation freeze is answered the retryable
+    /// `503 ROTATION_FREEZE`/`not_dispatched` with its retry hint, not the
+    /// bridge's `502 HTTP_STREAM_INTERRUPTED`/`unknown`.  Any other refusal,
+    /// or none, keeps the bridge's answer.
+    #[tokio::test]
+    async fn m6c210_an_open_refused_by_a_rotation_freeze_is_a_retryable_rotation_answer() {
+        let response = refused_open_response(Some(crate::actor::ROTATION_FREEZE_ECHO_CODE))
+            .expect("a rotation refusal replaces the bridge answer");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+            Some("1")
+        );
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .expect("bounded body");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("JSON body");
+        assert_eq!(body["code"], "ROTATION_FREEZE");
+        assert_eq!(body["execution"], "not_dispatched");
+        assert_eq!(body["retryable"], true);
+        assert_eq!(body["retry_after_ms"], 250);
+        for other in [None, Some("DEVICE_REJECTED"), Some("RESOURCE_EXHAUSTED")] {
+            assert!(refused_open_response(other).is_none(), "{other:?}");
+        }
+    }
 
     /// M6-C190: a chunk the owner actor refuses must not end the outbound
     /// pump silently.  Before this, the ingress's pump returned

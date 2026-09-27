@@ -160,6 +160,7 @@ impl LateFixture {
                     admission_deadline: Instant::now() + StdDuration::from_secs(60),
                     authorization_failure_code: None,
                     http: None,
+                    open_refusal: Default::default(),
                 },
             );
         }
