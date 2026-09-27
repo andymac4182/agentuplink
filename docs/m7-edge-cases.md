@@ -360,7 +360,7 @@ rows, and the 98-row matrix count is unchanged.
 - **M7-C153** (verified local): staging is refused mid-rotation (including mid-switch), for a retired key, and for any certificate that is not the same relay under the same CA and names.
 - **M7-C154** (verified local): the outbound drain set is bounded at four, and a full set keeps a destination on its still-approved predecessor.
 
-## Own served key retirement and ownership surrender task rows (M7-C181, M7-C182, M7-C184, M7-C185, M7-C186)
+## Own served key retirement and ownership surrender task rows (M7-C181, M7-C182, M7-C184, M7-C185, M7-C186, M7-C187)
 
 These rows are tracked in [tasks.md](tasks.md). They extend EC-019 (a peer
 certificate or lease changes mid-connection) and EC-011 (readiness becomes
@@ -373,7 +373,8 @@ are task rows, not new matrix rows, and the 98-row matrix count is unchanged.
 - **M7-C182** (verified local): `MissingLocalMembership` is split. A fresh checkpoint that omits the node surrenders on the same two passes (`LOCAL_MEMBERSHIP_WITHDRAWN`); a record below the checkpoint's minimum -- the publish race -- never surrenders on passes, only after it persists for one record lifetime plus skew (65 s), measured between passes. The actor re-checks the cause before collecting sessions, so a re-sign that lands while the request is queued closes nothing.
 - **M7-C184** (verified local): membership unready for any reason except an unreachable catalog, confirmed by passes for longer than the owner lease plus that margin (95 s), surrenders with `MEMBERSHIP_UNREADY_PROLONGED`; unreachable-catalog intervals never count and a `Ready` pass resets it.
 - **M7-C185** (verified local): the catalog never deletes a removed node's record, and such a record failed every relay's pass as `MembershipRejected`. Records the checkpoint omits, or that sit below their node's minimum, are now skipped before verification (never signature-checked; they grant nothing), so a node removal leaves the other relays `Ready` and the removed relay concludes M7-C182 (a).
-- **M7-C186** (verified local): a shared control-plane outage -- the checkpoint authority unreachable, or no record for any named node still inside its lifetime (the publisher stopped) -- never accrues toward M7-C184 or M7-C182 (b), so an outage that leaves every relay unready does not trigger a cluster-wide reconnect storm. A single partitioned relay keeps its sessions until its leases or the other rules resolve it.
+- **M7-C186** (verified local): a shared control-plane outage -- the checkpoint authority unreachable, or no record for any named node still inside its lifetime (the publisher stopped) -- never accrues toward M7-C184 or M7-C182 (b), so an outage that leaves every relay unready does not trigger a cluster-wide reconnect storm. A single partitioned relay keeps its sessions until its leases or the other rules resolve it. Authority `4xx` refusals other than `408`/`429` are about this relay and still count.
+- **M7-C187** (planned): an expired record for another *named* node stays fatal, so one lapsed record makes every relay unready and, after M7-C184, surrenders the cluster at 95 s; the option is to treat it as absent for that node only.
 
 ## M7 completion rule
 
