@@ -20,20 +20,22 @@ Redis client allowed 1 s for the whole connection including the lookup, so
 cold machine with a connection timeout (M6-C72, M6-C73; measured on Fly with a
 diagnostic build). Resolving the name first with `getent hosts` does not help:
 nothing caches the lookup across processes. Since M6-C73 each startup
-connection gets 10 s. **The relay now runs `fly-upgrade-b59db9a`**
-(2026-09-26, section 6.3, "Upgrade to `6830ba7` and HTTP forwarding"). Its
-`tunnel-relay` binary is built from `main` at `6830ba7`, the commit of
-pre-release `v0.1.0-main.36139324781.6830ba79bdf6`, and its only difference
-from `main-6830ba7` is the `[http_forward]` table in
-`deploy/fly/relay/relay.toml`. It has M6-C53 (`403` for a missing scope),
+connection gets 10 s. **The relay now runs `main-a8f105d`**
+(2026-09-27, section 6.3, "Upgrade to `a8f105d`"), built from `main` at
+`a8f105d` with no local change: `main` carries the `[http_forward]` table in
+`deploy/fly/relay/relay.toml` since the `6830ba7` upgrade merged. Besides
+everything `fly-upgrade-b59db9a` had -- M6-C53 (`403` for a missing scope),
 M3-15 (the rotation-freeze hold), M6-C67 (`/readyz` follows Redis) and M6-C74
-(a lane reconnect gets the full 10 s outside the lane lock). It replaced
-`main-77bfd28` in place, which had replaced `main-af23c2f` on 2026-09-24,
-with no re-provisioning; M6-C65 continuity is on (section 6.6 for the day-2
-proof). **Do not add `metrics_bind` to the Fly `relay.toml`.** The deployed
-image accepts it (M6-C24), but `main-77bfd28`, a rollback target, refuses it
-as an unknown field; remove it before rolling back to `main-77bfd28` or any
-older image.
+(a lane reconnect gets the full 10 s outside the lane lock) -- it has the
+relay fixes merged between `6830ba7` and `a8f105d` (PRs #164 to #219, among
+them TCP `NODELAY`, the listener connection cap, the MCP deadline and load
+fixes, owner cleanup and the membership race). It replaced
+`fly-upgrade-b59db9a` in place, which had replaced `main-77bfd28` on
+2026-09-26, with no re-provisioning; M6-C65 continuity is on (section 6.6 for
+the day-2 proof). The rollback chain is in section 6.1. **Do not add
+`metrics_bind` to the Fly `relay.toml`.** The deployed image accepts it
+(M6-C24), but `main-77bfd28`, a rollback target, refuses it as an unknown
+field; remove it before rolling back to `main-77bfd28` or any older image.
 
 Every `fly` command below is one the owner runs, in
 order, and each one that costs money is marked **Costs money**. The prices are
@@ -92,12 +94,26 @@ The decisions, and what each rests on:
   The settings are explicit so that neither default can apply. A stopped relay
   drops every device session and owner lease. (`fly launch` is not used here:
   it would rewrite `fly.toml`.)
-- **No per-machine connection cap below the relay's own.** A service's
-  `concurrency.type = "connections"` is the default, and Fly stops sending new
+- **Capacity: 64 connections per listener, about 21 to 32 devices.** The
+  relay's own limit is `listener_max_connections` (M6-C153), default 64 per
+  listener, applied to the consumer and device listeners separately. The Fly
+  `relay.toml` does not set it, so the deployed relay (`main-a8f105d`) serves
+  at most 64 device connections at once -- each device holds two, three
+  during a data rotation, so **about 21 to 32 devices** -- and 64 consumer
+  connections, and answers `503 CONNECTION_LIMIT` above that. (The relay's
+  separate admission limit of 1,024 devices never binds here.) Fly's
+  `concurrency.type = "connections"` is the default and Fly stops sending new
   connections to a machine at `hard_limit`
-  (<https://fly.io/docs/reference/configuration/>). The relay admits at most
-  1,024 devices by default and each device holds more than one connection, so
-  both services set `hard_limit = 1000` per listener.
+  (<https://fly.io/docs/reference/configuration/>); both services set
+  `hard_limit = 1000`, far above the relay's cap, so Fly never limits first.
+  **Decision (M6-C198, decided by the coordinator under the owner's
+  delegation, 2026-09-27): keep the default 64.** It covers the current
+  testers and protects the 256 MB machine. Before onboarding more than about
+  15 testers, measure per-device RSS on the machine and its open-file limit
+  (operator.md, M6-C155), then raise `listener_max_connections` in
+  `deploy/fly/relay/relay.toml` and check it with `check-serve-config`. An
+  image older than M6-C153 refuses that key, so remove it before any such
+  rollback.
 - **Health checks.** The consumer service checks `GET /readyz` over HTTPS on
   the private network (`tls_skip_verify`, because the relay's certificate names
   its public host). The device service has a bare TCP check; the local proof
@@ -109,7 +125,7 @@ The decisions, and what each rests on:
   ([operator.md section 3.2](operator.md#32-health-endpoints-and-load-balancers)),
   so this check then fails and Fly Proxy stops routing consumer traffic to
   it until Redis serves again. The fix is deployed on Fly since 2026-09-26
-  (`fly-upgrade-b59db9a`), where `/readyz` answered `200` with Redis up; the
+  (`fly-upgrade-b59db9a`, now `main-a8f105d`), where `/readyz` answered `200` with Redis up; the
   `503` with Redis down is measured locally only, not on Fly.
 - **Stopping.** `kill_signal = "SIGTERM"`, `kill_timeout = 60`. Fly's default
   signal is SIGINT and its default timeout 5 s, at most 300 s
@@ -401,15 +417,22 @@ fly deploy . --config deploy/fly/relay/fly.toml \
   --build-only --push --image-label fly-1
 ```
 
-Build from a checkout of `main` at or after `6830ba7`, and prefer a commit
+Build from a checkout of `main` at or after `a8f105d`, and prefer a commit
 that has a pre-release, so devices can run the relay's exact version. The
-live relay's image, `fly-upgrade-b59db9a`
+live relay's image, `main-a8f105d`
+(`registry.fly.io/agentuplink-relay:main-a8f105d@sha256:348cfd9a3afd803e93753d2350212114b5f234e76f498c4723c1df62d3924798`,
+33 MB), was built on 2026-09-27 (09:40:27 to 09:42:39 +10:00, about 2
+minutes on Fly's remote builder) from `main` at `a8f105d` with `--image-label
+main-a8f105d`; `main` already holds the `[http_forward]` table, so no
+Fly-only branch was needed. The first rollback target is the image it
+replaced, `fly-upgrade-b59db9a`
 (`registry.fly.io/agentuplink-relay:fly-upgrade-b59db9a@sha256:96e3d9ab6cd058121438f870f5308a7bd8fdbedfee4cee80eb0fb7f9be87e39a`),
-was built on 2026-09-26 from branch `fly-upgrade-2026-09-25` at `b59db9a`,
-which is `main` at `6830ba7` plus the `[http_forward]` table. The same tree
+built on 2026-09-26 from branch `fly-upgrade-2026-09-25` at `b59db9a`,
+which is `main` at `6830ba7` plus the `[http_forward]` table; it serves the
+same namespace and the HTTP forwarding route. The same tree
 without that table is `main-6830ba7`
 (`@sha256:1e358240b0c40d3a6ce8ca57f3f899f816054f5f7a80e08603d2e8f956ed6332`),
-the first rollback target: it serves the echo but answers `404` on the HTTP
+the next rollback target: it serves the echo but answers `404` on the HTTP
 forwarding route. Images built from `cb94dc3` had the same two digests; the
 commits between it and `6830ba7` change only `site/`. The image before
 those, `main-77bfd28`
@@ -422,9 +445,17 @@ commands of section 6.6 are refused. The image before it, `main-721ed2a`
 (`@sha256:decd4e56b8fc8d1fe190428fa2d3ce8f410bd0299cc652fe2921d4fba29d18b7`),
 has no M6-C65 either (section 6.4).
 
-**Devices should run `v0.1.0-main.36139324781.6830ba79bdf6`.** Its
-`tunnel-client` is built from the same commit as the relay's binary, so
-device and relay run the same version (demo-smoke defect D12, M6-C103). The
+**Devices should run a pre-release built from `a8f105d` or later.** None
+was published when the relay was upgraded (2026-09-27 09:44 +10:00); the
+newest, `v0.1.0-main.36276174369.628dcb0edc35`, has the same relay code but
+lacks M6-C196 in `tunnel-client` (the M7-C95 give-up clock at the live-stream
+limit). The demo Mac's device runs a `tunnel-client` release build from
+`a8f105d` itself (section 6.3). Until 2026-09-27 the pairing was
+`v0.1.0-main.36139324781.6830ba79bdf6` with `fly-upgrade-b59db9a`: device and
+relay built from the same commit (demo-smoke defect D12, M6-C103). An older
+client still works with `main-a8f105d`: the `6830ba7` client reconnected
+by itself across the upgrade and echoed and forwarded MCP calls before it
+was replaced. The
 relay it replaced, `main-77bfd28`, had no release of its own; the
 2026-09-25 smoke check ran clients from the `5c2d907` and `f9f7abf`
 pre-releases against it (echo, rotation, reconnect and an orderly stop all
@@ -836,6 +867,99 @@ in place (it was running), and the device reconnected by itself each time.
   removes a service: to withdraw the demo service, `revoke-grant` it (section
   6.6, "Revocation").
 
+**Upgrade to `a8f105d` (2026-09-27, measured).** Times are `+10:00`. Each
+claim names its evidence: a log in `/private/tmp/claude-501/fly-upgrade-logs/`
+on the coordinator's Mac (first line: a nonce and `head=a8f105de`), or
+**observed in session, no log kept**. `recapture.log` (nonce `216815148`,
+10:00:23 to 10:00:38) was taken after the fact without touching the relay: the
+refusal calls, `config check` and `shasum` were re-run then, and the relay
+lines were copied from `fly logs --no-tail` (lifecycle, one-off and rotation
+lines only; session IDs redacted). Percentiles are nearest-rank (the value at
+rank ceil(p x n) of the sorted times), recomputed in `percentiles.log`. The
+relay machine `185e264a927d58` was running and was updated in place; its ID
+did not change (`recapture.log`, `fly machine list`).
+- **Config check before building.** Between `6830ba7` and `a8f105d` the
+  Fly files changed only by the `[http_forward]` table, now on `main`, and
+  the entrypoint's command list is unchanged. `ServeConfig` gained only
+  optional keys with defaults (`listener_max_connections`,
+  `listener_refusal_margin`, the peer rekey keys, `[http_forward]
+  public_url`), so the Fly `relay.toml` needed no edit; see section 1 for
+  what the new listener cap means here (source reading; no log). No commit
+  subject in the range mentions a catalog schema or key change (checked by
+  subject only), and the new relay served the existing namespace without
+  re-provisioning. The device profile needed no edit either: `config check`
+  with the new client answers `valid`, exit `0` (`recapture.log`; the
+  pre-restart run at 09:44 was observed in session, no log kept).
+- **Image (09:40:27 to 09:42:39).** Section 6.1 with `--image-label
+  main-a8f105d` from a clean checkout of `main` at `a8f105d`, remote only;
+  digest in section 6.1 (`fly-build.log`).
+- **One-off `check-serve-config` (09:42:55 to 09:44:06)** with section 6.6's
+  helper: `Relay serving configuration is valid: consumer_bind=0.0.0.0:8443
+  device_bind=0.0.0.0:9443 cluster=absent recovery=absent` and `Main child
+  exited normally with code: 0` from machine `683dd10da3e0d8`, which `fly
+  machine status` shows `destroyed` at 09:44:06 (`recapture.log`). flyctl
+  again printed `failed to reach desired start state` for the fast exit, and
+  its `exit_code=0` status line was observed in session, no log kept.
+- **Deploy (09:44:14 to 09:44:21).** `fly deploy . --config
+  deploy/fly/relay/fly.toml --image
+  registry.fly.io/agentuplink-relay:main-a8f105d --ha=false`. The relay
+  logged `stopping: signal=SIGTERM` and `stopped: signal=SIGTERM` at
+  09:44:22, then `listening` and `Redis restart continuity:
+  interval_seconds=5` at 09:44:24 (`recapture.log`). Both checks passing and
+  `/readyz` `200` right after the deploy were observed in session, no log
+  kept; both checks show passing in `recapture.log` at 10:00:38.
+- **Old client across the upgrade.** The demo device, still on the `6830ba7`
+  `tunnel-client`, logged `disconnected TRANSPORT_ERROR`, backoff 756 ms,
+  `disconnected DEADLINE_EXCEEDED`, backoff 1,159 ms, `reconnecting`,
+  `reconnected`, `ready` without a restart (its `connect-http.log` lines
+  2862 to 2869, extracted into `recapture.log`; that log has no timestamps,
+  and these are the last transitions before its `stopped` at line 2871, which
+  is the SIGTERM that replaced it). The echoes and the `tools/call
+  demo_page` returning `200` on that client were observed in session, no log
+  kept.
+- **New client.** A release build of `tunnel-client` from `a8f105d`, sha256
+  `465af0cb551d7847493bc3fc5b93d529e99f0a6ec924e22716e7c38ad42a5e79`
+  (`recapture.log`), replaced the device process with the same profile and
+  flags (`connect --config ~/agentuplink-fly/device/client.toml --json`). The
+  old one stopped on SIGTERM in about 1 s (observed in session, no log kept)
+  and the new one reached `ready` (`connect-a8f105d.log` line 1).
+- **Verification with the new client (09:45 to 09:52).** 150 of 150
+  sequential echoes `200` with the canary, p50 0.129 s, p95 0.203 s, max
+  0.293 s (`echo150.log`, `percentiles.log`). 13 of 13 HTTP forward calls
+  `200`: 10 `tools/call demo_page` with the page, plus `tools/list`,
+  `server/discover` and `resources/read` (`http13.log`). The refusals were
+  first observed in session at 09:45:51 with no log kept, and re-run into
+  `recapture.log` at 10:00:24 with the same answers: a token with only
+  `http:invoke` got `403 FORBIDDEN` on the echo, one with only `echo:invoke`
+  `403` on the MCP route, no token `401`.
+- **SIGTERM restart (09:45:57).** `fly machine restart 185e264a927d58 -a
+  agentuplink-relay --signal SIGTERM` returned at 09:46:01 (observed in
+  session, no log kept). The relay logged `stopping` and `stopped:
+  signal=SIGTERM` at 09:45:58 and `listening` at 09:46:00 (`recapture.log`).
+  The device logged `disconnected TRANSPORT_ERROR`, backoffs of 530 and
+  1,923 ms, then `reconnected` and `ready` by itself (`connect-a8f105d.log`
+  lines 4 to 11, extracted into `recapture.log`). The first echo after the
+  command returned being `200`, and the next MCP call `200`, were observed in
+  session, no log kept.
+- **Burst (09:46:13).** 8 concurrent echo loops of 25 and 4 concurrent MCP
+  loops of 10: 240 of 240 `200`, p50 0.216 s, p95 0.332 s, max 0.340 s
+  (`burst.log`, `percentiles.log`).
+- **Five and a half minutes across a rotation (09:46:24 to 09:51:54), 0
+  non-200.** `soak.sh 330` (sequential, alternating an echo and a
+  `tools/call demo_page`), with the Mac's 1-minute load at 13: **765 of 765
+  `200`** with the expected body (383 echoes, 382 MCP calls), p50 0.134 s,
+  p95 0.278 s, max 0.476 s (`soak330.log`, `percentiles.log`). The relay
+  logged the scheduled rotation (`policy_timer`, `rotation_prepare`,
+  generation 2) at 09:51:01.326 and `data_attached` at 09:51:01.410
+  (`recapture.log`); the slowest request, an echo of 0.476 s, finished at
+  09:51:01.957 (`soak330.log`).
+- **Rollback**, not needed: `fly deploy . --config deploy/fly/relay/fly.toml
+  --image registry.fly.io/agentuplink-relay:fly-upgrade-b59db9a --ha=false`
+  onto the **running** relay (M6-C104), then an echo. That image serves the
+  same namespace and the HTTP forwarding route; the `a8f105d` device client
+  was not run against it. After it, `main-6830ba7` and `main-77bfd28`
+  (section 6.1).
+
 **Restarting the relay.** Use `--signal SIGTERM`, which is the signal Fly
 sends on a deploy or a stop (`kill_signal` in `fly.toml`):
 
@@ -1184,7 +1308,7 @@ rewrite the secrets directory the running relay reads.
 `redis_namespace` and `deployment_incarnation` baked into it are what the
 command writes to; a command run with another image's values is refused
 (`the relay configuration's incarnation is not active`) or goes to another
-namespace. The relay now serves `fly-upgrade-b59db9a`, which has M6-C91
+namespace. The relay now serves `main-a8f105d`, which has M6-C91
 and the `[http_forward]` profiles an `http-forward` service's dry run checks
 against; use that label here. An image built before M6-C91, such as `main-af23c2f`, refuses these
 commands. The catalog code did not change
