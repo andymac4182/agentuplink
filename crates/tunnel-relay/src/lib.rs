@@ -23,7 +23,7 @@ pub mod http_forward_diagnostics;
 pub mod membership_runtime;
 pub mod membership_version_state;
 mod metrics;
-pub mod own_key_surrender;
+pub mod ownership_surrender;
 mod peer_consumer_transport_diagnostics;
 pub mod peer_fault_diagnostics;
 pub mod peer_rekey;
@@ -37,7 +37,8 @@ mod runtime;
 mod wire;
 
 pub use actor::{
-    ListenerSocketOptions, PeerListenerConfig, Relay, RelayError, RelayHandle, RunningRelay,
+    ListenerSocketOptions, OwnershipSurrenderCheck, PeerListenerConfig, Relay, RelayError,
+    RelayHandle, RunningRelay,
 };
 pub use config::{
     ClusterConfig, DEFAULT_MAX_PENDING_OPERATIONS_PER_OWNER, HttpForwardServeConfig,

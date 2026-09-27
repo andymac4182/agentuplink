@@ -180,7 +180,7 @@ impl RelayOptions {
                 "challenge_interval must be <= 5 seconds",
             ));
         }
-        if self.owner_lease < MIN_OWNER_LEASE || self.owner_lease > Duration::from_secs(30) {
+        if self.owner_lease < MIN_OWNER_LEASE || self.owner_lease > MAX_OWNER_LEASE {
             return Err(ConfigError::Invalid("owner_lease must be 18..=30 seconds"));
         }
         self.limits.validate()?;
@@ -1342,6 +1342,10 @@ fn default_max_queue_bytes() -> usize {
 /// (2 s). Otherwise a renewal that lands late opens a window in which ticket
 /// issuance is refused. It was 6 s while the margin was 5 s.
 pub(crate) const MIN_OWNER_LEASE: Duration = Duration::from_secs(18);
+/// The longest owner lease a relay may be configured with. A relay that
+/// stops renewing loses every device it owns within this bound; the
+/// prolonged-unready ownership surrender (M7-C184) is derived from it.
+pub(crate) const MAX_OWNER_LEASE: Duration = Duration::from_secs(30);
 const _: () = assert!(
     MIN_OWNER_LEASE.as_millis() * 2 / 3
         > crate::actor::OWNER_LEASE_SAFETY_MARGIN.as_millis()

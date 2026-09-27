@@ -881,6 +881,9 @@ async fn m8c45_a_switch_to_an_unapproved_key_is_refused_before_anything_is_insta
 
 mod rekey {
     use super::*;
+    use tunnel_relay::membership_runtime::{
+        OWN_KEY_SURRENDER_CONFIRMATIONS, OwnershipSurrenderCause,
+    };
     use tunnel_relay::peer_rekey::{
         PeerRekey, PeerRekeyConfig, PeerRekeyError, PeerRekeyPhase, PeerRekeyRetirement,
     };
@@ -1319,6 +1322,172 @@ mod rekey {
         rekey
             .stage_pem(fresh.chain.as_bytes(), fresh.key.as_bytes())
             .expect("a fresh key stages");
+    }
+
+    /// **Red first (M8-C65).** The publisher withdraws the predecessor
+    /// before the convergence hold has elapsed. Before M8-C65 the relay went
+    /// `MissingLocalKey`, `local_key_approval` answered `NotReady` for the
+    /// staged successor in every unready state, so the hold could never
+    /// complete and the relay stayed unready for good (and with M7-C181 it
+    /// surrendered its devices). Now the successor the same verified record
+    /// approves is switched to on the next tick, and the relay is Ready on
+    /// the next pass without surrendering anything.
+    #[tokio::test(start_paused = true)]
+    async fn m8c65_a_predecessor_withdrawn_before_the_hold_switches_instead_of_deadlocking() {
+        let pki = Pki::new();
+        let current = pki.peer(NODE_ID);
+        let next = pki.peer(NODE_ID);
+        let fixture = RuntimeFixture::new_with_local_spki(true, &current.spki);
+        fixture
+            .source
+            .replace(vec![record(&fixture, 1, &[&current.spki], &[])])
+            .await;
+        fixture.runtime.bootstrap().await.expect("ready");
+        let rekey = machine(&fixture, &pki, &current);
+        rekey
+            .stage_pem(next.chain.as_bytes(), next.key.as_bytes())
+            .expect("staged");
+        fixture
+            .source
+            .replace(vec![record(&fixture, 2, &[&current.spki, &next.spki], &[])])
+            .await;
+        fixture.runtime.reconcile_once().await.expect("overlap");
+        assert_eq!(rekey.tick().await.phase, PeerRekeyPhase::Staged);
+
+        // Withdrawn early: the served key is gone well inside the hold.
+        tokio::time::sleep(HOLD / 4).await;
+        fixture
+            .source
+            .replace(vec![record(&fixture, 3, &[&next.spki], &[])])
+            .await;
+        assert!(matches!(
+            fixture.runtime.reconcile_once().await,
+            Err(MembershipRuntimeError::PeerRejected)
+        ));
+        assert_eq!(
+            fixture.runtime.readiness(),
+            MembershipReadiness::Unready(MembershipUnreadyReason::MissingLocalKey)
+        );
+        let switched = rekey.tick().await;
+        assert_eq!(
+            switched.phase,
+            PeerRekeyPhase::Overlap,
+            "the staged successor must be switched to, not held behind an unready relay \
+             (staged approval {:?})",
+            switched.staged_approval
+        );
+        assert_eq!(switched.serving_spki, next.spki);
+
+        fixture
+            .runtime
+            .reconcile_once()
+            .await
+            .expect("the relay serves the approved successor");
+        assert_eq!(fixture.runtime.readiness(), MembershipReadiness::Ready);
+        assert_eq!(fixture.runtime.ownership_surrender_cause(), None);
+        let retired = rekey.tick().await;
+        assert_eq!(retired.phase, PeerRekeyPhase::Stable);
+        assert_eq!(
+            retired.last_retirement,
+            Some(PeerRekeyRetirement::Withdrawn)
+        );
+    }
+
+    /// **Control (M8-C65).** The widened approval is for `MissingLocalKey`
+    /// only. With the staged key approved by the retained record and the hold
+    /// long served, a pass that concludes `MembershipRejected` (a malformed
+    /// catalog record) still answers `NotReady` and nothing switches. Red if
+    /// the approval guard admits other unready states.
+    #[tokio::test(start_paused = true)]
+    async fn m8c65_a_rejected_membership_never_switches_to_the_staged_key() {
+        let pki = Pki::new();
+        let current = pki.peer(NODE_ID);
+        let next = pki.peer(NODE_ID);
+        let fixture = RuntimeFixture::new_with_local_spki(true, &current.spki);
+        let rekey = staged_and_approved(&fixture, &pki, &current, &next).await;
+        // The malformed envelope comes first, so it is what fails the pass.
+        let mut malformed = record(&fixture, 2, &[&current.spki, &next.spki], &[]);
+        malformed.version = 0;
+        fixture.source.replace(vec![malformed]).await;
+        assert!(fixture.runtime.reconcile_once().await.is_err());
+        assert_eq!(
+            fixture.runtime.readiness(),
+            MembershipReadiness::Unready(MembershipUnreadyReason::MembershipRejected)
+        );
+        let snapshot = rekey.tick().await;
+        assert_eq!(
+            snapshot.phase,
+            PeerRekeyPhase::Staged,
+            "a relay whose membership evidence was rejected switched keys"
+        );
+        assert_eq!(snapshot.staged_approval, Some("not_ready"));
+        assert_eq!(snapshot.serving_spki, current.spki);
+    }
+
+    /// **Red first (M8-C65).** Two own-key passes judged the predecessor and
+    /// confirmed its retirement before the rekey tick ran. The switch binds
+    /// readiness to a different key, so those passes are no evidence about
+    /// it any more: the switch clears them and nothing is surrendered.
+    #[tokio::test(start_paused = true)]
+    async fn m8c65_a_switch_clears_own_key_passes_counted_against_the_predecessor() {
+        let pki = Pki::new();
+        let current = pki.peer(NODE_ID);
+        let next = pki.peer(NODE_ID);
+        let fixture = RuntimeFixture::new_with_local_spki(true, &current.spki);
+        let rekey = staged_and_approved(&fixture, &pki, &current, &next).await;
+        // The hold has elapsed but no tick has run since: the publisher
+        // withdraws the predecessor and two passes land before the tick.
+        fixture
+            .source
+            .replace(vec![record(&fixture, 2, &[&next.spki], &[])])
+            .await;
+        for _ in 0..OWN_KEY_SURRENDER_CONFIRMATIONS {
+            let _ = fixture.runtime.reconcile_once().await;
+        }
+        assert_eq!(
+            fixture.runtime.ownership_surrender_cause(),
+            Some(OwnershipSurrenderCause::OwnKeyRetired)
+        );
+        assert_eq!(rekey.tick().await.phase, PeerRekeyPhase::Overlap);
+        assert_eq!(fixture.runtime.own_key_missing_passes(), 0);
+        assert_eq!(
+            fixture.runtime.ownership_surrender_cause(),
+            None,
+            "own-key passes against the predecessor still demanded a surrender after the switch"
+        );
+    }
+
+    /// **Control (review of #228).** A routine rekey -- switch to the
+    /// successor after the hold, then the publisher withdraws the
+    /// predecessor -- never produces an own-key pass or a surrender cause:
+    /// readiness is bound to the key actually served.
+    #[tokio::test(start_paused = true)]
+    async fn a_routine_rekey_never_demands_an_ownership_surrender() {
+        let pki = Pki::new();
+        let current = pki.peer(NODE_ID);
+        let next = pki.peer(NODE_ID);
+        let fixture = RuntimeFixture::new_with_local_spki(true, &current.spki);
+        let rekey = staged_and_approved(&fixture, &pki, &current, &next).await;
+        assert_eq!(rekey.tick().await.phase, PeerRekeyPhase::Overlap);
+        fixture
+            .source
+            .replace(vec![record(&fixture, 2, &[&next.spki], &[])])
+            .await;
+        for _ in 0..OWN_KEY_SURRENDER_CONFIRMATIONS + 2 {
+            fixture
+                .runtime
+                .reconcile_once()
+                .await
+                .expect("the relay serves the successor");
+            assert_eq!(fixture.runtime.readiness(), MembershipReadiness::Ready);
+            assert_eq!(fixture.runtime.own_key_missing_passes(), 0);
+            assert_eq!(fixture.runtime.ownership_surrender_cause(), None);
+        }
+        let retired = rekey.tick().await;
+        assert_eq!(
+            retired.last_retirement,
+            Some(PeerRekeyRetirement::Withdrawn)
+        );
     }
 
     #[tokio::test(start_paused = true)]
