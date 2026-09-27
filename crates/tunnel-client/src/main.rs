@@ -520,15 +520,21 @@ async fn run_status(path: &Path, json: bool) -> Result<(), CliError> {
         None => println!("Session: none"),
     }
     if let Some(session) = &status.session {
-        let sent: Vec<String> = session
-            .open_refusals_sent
-            .0
-            .iter()
-            .filter(|(_, count)| *count > 0)
-            .map(|(code, count)| format!("{code}={count}"))
-            .collect();
-        if !sent.is_empty() {
-            println!("OPEN refusals sent: {}", sent.join(" "));
+        match &session.open_refusals_sent {
+            // A supervisor from before M7-C168 does not report the counts;
+            // saying so keeps its silence from reading as "none sent".
+            None => println!("OPEN refusals sent: not reported by this supervisor"),
+            Some(sent) => {
+                let sent: Vec<String> = sent
+                    .0
+                    .iter()
+                    .filter(|(_, count)| *count > 0)
+                    .map(|(code, count)| format!("{code}={count}"))
+                    .collect();
+                if !sent.is_empty() {
+                    println!("OPEN refusals sent: {}", sent.join(" "));
+                }
+            }
         }
     }
     if let Some(code) = &status.last_error_code {

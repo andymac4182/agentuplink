@@ -123,6 +123,23 @@ describe('a relay listener at its connection limit (M6-C200)', () => {
       300_000,
     ],
     [
+      'a body hint above 2^53 is still a hint, and capped at 300 s',
+      { status: 503, rawBody: '{"code":"CONNECTION_LIMIT","retry_after_ms":9007199254740993}', headers: { 'Retry-After': '2' } },
+      300_000,
+    ],
+    ['a zero body hint is zero', { status: 503, rawBody: '{"code":"CONNECTION_LIMIT","retry_after_ms":0}', headers: { 'Retry-After': '2' } }, 0],
+    ['a zero header hint is zero', { status: 503, rawBody: '{"code":"CONNECTION_LIMIT"}', headers: { 'Retry-After': '0' } }, 0],
+    ['a signed header +5 is not delay-seconds', { status: 503, rawBody: '{"code":"CONNECTION_LIMIT"}', headers: { 'Retry-After': '+5' } }, 1000],
+    ['a negative header -5 is not delay-seconds', { status: 503, rawBody: '{"code":"CONNECTION_LIMIT"}', headers: { 'Retry-After': '-5' } }, 1000],
+    ['a fractional header 1.5 is not delay-seconds', { status: 503, rawBody: '{"code":"CONNECTION_LIMIT"}', headers: { 'Retry-After': '1.5' } }, 1000],
+    ['a list header "1, 2" is not delay-seconds', { status: 503, rawBody: '{"code":"CONNECTION_LIMIT"}', headers: { 'Retry-After': '1, 2' } }, 1000],
+    ['a string body hint is not a hint', { status: 503, rawBody: '{"code":"CONNECTION_LIMIT","retry_after_ms":"5"}', headers: { 'Retry-After': '2' } }, 2000],
+    [
+      'the contract-shaped body naming CONNECTION_LIMIT is read too',
+      { status: 503, body: { error: { code: 'CONNECTION_LIMIT' } }, headers: { 'Retry-After': '4' } },
+      4000,
+    ],
+    [
       'a huge header hint is capped at 300 s',
       { status: 503, rawBody: '', headers: { 'Retry-After': '86400' } },
       300_000,
@@ -152,6 +169,11 @@ describe('a relay listener at its connection limit (M6-C200)', () => {
     [
       'a flat body naming another code is that other refusal',
       { status: 503, rawBody: '{"code":"BACKEND_UNAVAILABLE"}', headers: { 'Retry-After': '1' } },
+      'BACKEND_UNAVAILABLE',
+    ],
+    [
+      'a 503 with no body and an unreadable Retry-After (+5) is not a connection limit',
+      { status: 503, rawBody: '', headers: { 'Retry-After': '+5' } },
       'BACKEND_UNAVAILABLE',
     ],
     [

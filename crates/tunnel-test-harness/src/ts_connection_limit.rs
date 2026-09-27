@@ -71,12 +71,14 @@ struct DriverReport {
     upgrade: Option<StageReport>,
 }
 
-/// The evidence the command validates and prints.
+/// The evidence the command validates and prints.  Two things are
+/// preconditions rather than evidence, because neither can be observed false
+/// in a finished run: the held connection was served (else `hold_one`
+/// fails), and the driver ran this package's own client (else the run fails
+/// before any evidence exists).
 #[derive(Clone, Debug)]
 pub struct TsConnectionLimitEvidence {
     pub listener_max_connections: usize,
-    pub held_connection_served: bool,
-    pub client_module_is_the_package: bool,
     pub descriptor: StageReport,
     pub upgrade: StageReport,
     pub waited_ms: u64,
@@ -188,12 +190,17 @@ pub async fn verify_ts_connection_limit() -> Result<TsConnectionLimitEvidence, H
             .unwrap_or(CONNECTION_LIMIT_RETRY_AFTER_MS);
         tokio::time::sleep(Duration::from_millis(waited_ms)).await;
         let control = run_driver(&driver, &ca_path, &endpoint, "control").await?;
+        // Precondition: the driver ran this package's own client.
         let package = root.join("packages/client/src/index.ts");
+        if !(same_file(&limited.client_module, &package)
+            && same_file(&control.client_module, &package))
+        {
+            return Err(HarnessError::Process(
+                "the driver did not run this package's own client".into(),
+            ));
+        }
         Ok::<_, HarnessError>(TsConnectionLimitEvidence {
             listener_max_connections,
-            held_connection_served: true,
-            client_module_is_the_package: same_file(&limited.client_module, &package)
-                && same_file(&control.client_module, &package),
             descriptor: limited.descriptor,
             upgrade,
             waited_ms,
@@ -219,11 +226,8 @@ pub fn validate_ts_connection_limit(
     evidence: &TsConnectionLimitEvidence,
 ) -> Result<(), HarnessError> {
     let fail = |message: String| Err(HarnessError::Process(message));
-    if evidence.listener_max_connections != 1 || !evidence.held_connection_served {
-        return fail("the listener was not filled by one served connection".into());
-    }
-    if !evidence.client_module_is_the_package {
-        return fail("the driver did not run this package's own client".into());
+    if evidence.listener_max_connections != 1 {
+        return fail("the listener was not limited to one connection".into());
     }
     let expected = StageReport {
         code: "CONNECTION_LIMIT".into(),
@@ -390,8 +394,6 @@ mod tests {
         };
         TsConnectionLimitEvidence {
             listener_max_connections: 1,
-            held_connection_served: true,
-            client_module_is_the_package: true,
             descriptor: limit.clone(),
             upgrade: limit,
             waited_ms: CONNECTION_LIMIT_RETRY_AFTER_MS,
@@ -423,9 +425,9 @@ mod tests {
         tls_refused.control_descriptor.code = "INSECURE_ENDPOINT".into();
         assert!(validate_ts_connection_limit(&tls_refused).is_err());
 
-        let mut other_module = passing();
-        other_module.client_module_is_the_package = false;
-        assert!(validate_ts_connection_limit(&other_module).is_err());
+        let mut wider = passing();
+        wider.listener_max_connections = 2;
+        assert!(validate_ts_connection_limit(&wider).is_err());
 
         let mut impatient = passing();
         impatient.waited_ms = 0;

@@ -339,12 +339,14 @@ export const MAX_HONOURED_RETRY_AFTER_MS = 300_000;
  * {@link DEFAULT_CONNECTION_LIMIT_RETRY_AFTER_MS}, capped at
  * {@link MAX_HONOURED_RETRY_AFTER_MS}. `undefined` for any other response.
  *
- * The same reading as the Rust `connect` (`connection_limit_retry_after_ms`),
- * with one deliberate difference: a body naming any other code, flat or in the
+ * The same reading as the Rust `connect` (`connection_limit_retry_after_ms`,
+ * aligned in M7-C176): a body naming any other code, flat or in the
  * contract's `error` object, is that other refusal even when it carries a
- * `Retry-After`. The listener's refusal body is flat; a body with no code at all
- * (the refusal's head arrived without it) is still identified by a readable
- * `Retry-After`, as in Rust. Reads a status, one header and two fixed fields;
+ * `Retry-After`; a body with no code at all (the refusal's head arrived without
+ * it) is identified by a readable `Retry-After`, which is RFC 9110
+ * `delay-seconds`, digits only. One residual difference: a body hint too large
+ * for a `u64` is absent to Rust and capped here. Reads a status, one header and
+ * two fixed fields;
  * nothing from the response reaches an error message.
  */
 export function connectionLimitRetryAfterMs(
@@ -364,7 +366,9 @@ export function connectionLimitRetryAfterMs(
   }
   const bodyHint = isObject(body) ? body['retry_after_ms'] : undefined;
   const hinted =
-    typeof bodyHint === 'number' && Number.isSafeInteger(bodyHint) && bodyHint >= 0
+    // Any non-negative integer, however large, so the cap applies to it
+    // rather than a hint above 2^53 reading as absent.
+    typeof bodyHint === 'number' && Number.isInteger(bodyHint) && bodyHint >= 0
       ? bodyHint
       : (headerMs ?? DEFAULT_CONNECTION_LIMIT_RETRY_AFTER_MS);
   return Math.min(hinted, MAX_HONOURED_RETRY_AFTER_MS);

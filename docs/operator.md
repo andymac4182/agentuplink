@@ -1094,7 +1094,7 @@ client must wait at least the refusal's `retry_after_ms` (or `Retry-After`,
 in seconds) before its next attempt. The shipped clients: `tunnel-client
 connect` treats a `CONNECTION_LIMIT` refusal of its WebSocket upgrade as a
 retryable transport failure and never retries sooner than the hint (it floors
-its own backoff at `retry_after_ms`, capped at 300 s). The Rust demo clients
+its own backoff at `retry_after_ms`, capped at 300 s; since M7-C176 it reads `Retry-After` as digits only and takes a body's code from either a flat `code` or the filesystem contract's `error.code`, so a contract-shaped `503` such as `ROTATION_FREEZE` is never mistaken for a connection limit). The Rust demo clients
 (`mcp-demo-client`, `acp-demo-client`) have no retry loop of their own: a
 refusal ends the demo with an error. The TypeScript
 client (`packages/client`) retries nothing itself; since M6-C200 it reports

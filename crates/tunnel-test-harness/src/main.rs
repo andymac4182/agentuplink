@@ -2563,10 +2563,8 @@ pub(crate) async fn main() -> ExitCode {
                         &evidence,
                     )?;
                     println!(
-                        "M6-C200 TypeScript client over-limit listener passed: listener_max_connections={} held_connection_served={} client_module_is_the_package={} descriptor_code={} descriptor_retry_after_ms={:?} descriptor_retryable={} descriptor_outcome={} upgrade_code={} upgrade_retry_after_ms={:?} upgrade_retryable={} upgrade_outcome={} waited_ms={} control_code={}",
+                        "M6-C200 TypeScript client over-limit listener passed: preconditions=held_connection_served,client_module_is_the_package listener_max_connections={} descriptor_code={} descriptor_retry_after_ms={:?} descriptor_retryable={} descriptor_outcome={} upgrade_code={} upgrade_retry_after_ms={:?} upgrade_retryable={} upgrade_outcome={} waited_ms={} control_code={}",
                         evidence.listener_max_connections,
-                        evidence.held_connection_served,
-                        evidence.client_module_is_the_package,
                         evidence.descriptor.code,
                         evidence.descriptor.retry_after_ms,
                         evidence.descriptor.retryable,

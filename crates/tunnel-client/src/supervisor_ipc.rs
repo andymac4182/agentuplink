@@ -187,11 +187,14 @@ pub struct SessionStatus {
     pub recovery_episode_deadline_ms: Option<u64>,
     /// OPEN refusals this session sent, one key per fixed code in
     /// `tunnel_protocol::open_refusal::CODES`, zeros included (M7-C167,
-    /// M7-C168).  Added within schema version 1: absent from an older
-    /// supervisor's answer, it reads as all zeros, and a code this reader
-    /// does not know is ignored rather than refusing the snapshot.
-    #[serde(default)]
-    pub open_refusals_sent: OpenRefusalsSent,
+    /// M7-C168).  Added within schema version 1, so `None` means "not
+    /// reported": a supervisor from before M7-C168 omits it, and this reader
+    /// keeps it omitted rather than printing zeros that would read as "no
+    /// refusals".  A code this reader does not know is dropped, not kept and
+    /// not an error: the label set is fixed, and a newer supervisor's extra
+    /// code is reported by a reader of that version.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub open_refusals_sent: Option<OpenRefusalsSent>,
 }
 
 /// [`crate::OpenRefusalCounts`] on the wire: `{"GOAWAY": n, ...}` with every
@@ -256,7 +259,7 @@ impl From<&crate::ConnectionStatus> for SessionStatus {
             recovery_attempt: status.recovery_attempt,
             recovery_attempt_deadline_ms: status.recovery_attempt_deadline_ms,
             recovery_episode_deadline_ms: status.recovery_episode_deadline_ms,
-            open_refusals_sent: OpenRefusalsSent(status.open_refusals_sent),
+            open_refusals_sent: Some(OpenRefusalsSent(status.open_refusals_sent)),
         }
     }
 }
@@ -1139,13 +1142,14 @@ mod m7c168_tests {
         session.remove("open_refusals_sent");
         let older: IpcResponse = serde_json::from_value(value.clone()).expect("older parses");
         let older = serde_json::to_value(&older).expect("value");
-        for code in open_refusal::CODES {
-            assert_eq!(
-                older["result"]["session"]["open_refusals_sent"][code].as_u64(),
-                Some(0),
-                "an older supervisor reads as zero {code}"
-            );
-        }
+        // Absent stays absent: an older supervisor's silence must not be
+        // re-printed as eight zeros, which would read as "no refusals".
+        assert!(
+            older["result"]["session"]
+                .get("open_refusals_sent")
+                .is_none(),
+            "an absent field was re-serialized: {older}"
+        );
         value["result"]["session"]["open_refusals_sent"] =
             serde_json::json!({"GOAWAY": 4, "SOME_FUTURE_CODE": 9});
         let newer: IpcResponse = serde_json::from_value(value).expect("newer parses");
