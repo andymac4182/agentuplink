@@ -18999,7 +18999,12 @@ mod tests {
         );
         actor
             .rotation
-            .frozen(&attempt, local_fence.clone(), Direction::ConnectorToRelay, now)
+            .frozen(
+                &attempt,
+                local_fence.clone(),
+                Direction::ConnectorToRelay,
+                now,
+            )
             .expect("local fence is accepted");
         actor.local_fence = Some(local_fence);
         actor.local_frozen_message_id = Some("connector-frozen".to_owned());
