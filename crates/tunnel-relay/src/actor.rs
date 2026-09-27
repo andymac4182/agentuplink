@@ -12692,7 +12692,16 @@ impl RelayActor {
                 Some((
                     pending.consumer.clone(),
                     pending.service_id,
-                    pending.grant.read_started_at,
+                    // The dispatch authorization is a fresh read, exactly as
+                    // for a streaming challenge below.  Reusing the
+                    // admission read's start made the catalog's five-second
+                    // read bound expire for any challenge arriving more than
+                    // 5 s after admission -- a stopped or slow device -- and
+                    // the unrevoked request was refused
+                    // `AUTHORIZATION_REVOKED` (task row M6-C180).  The
+                    // admission snapshot still fixes the revision and digest
+                    // the challenge must match above.
+                    Utc::now(),
                     session.identity.spki_fingerprint.clone(),
                 ))
             }
@@ -26330,6 +26339,10 @@ mod admission_race_tests;
 #[cfg(test)]
 #[path = "actor_challenge_mismatch_tests.rs"]
 mod challenge_mismatch_tests;
+
+#[cfg(test)]
+#[path = "actor_unary_challenge_freshness_tests.rs"]
+mod unary_challenge_freshness_tests;
 
 #[cfg(test)]
 #[path = "actor_rotation_freeze_tests.rs"]

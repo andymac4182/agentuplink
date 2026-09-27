@@ -248,6 +248,13 @@ pub struct ConnectionStatus {
     pub received_sequences: u64,
     pub drain_fences: usize,
     pub drain_acks: usize,
+    /// While draining, before this connector has sent its drain proof: the
+    /// owner fence's entries naming a stream this connector holds no state
+    /// for, and entries whose received cursor is still below the fence.
+    /// Zero otherwise.  Counts only, never stream contents (M6-C195).
+    pub drain_wait_unknown_streams: usize,
+    pub drain_wait_unknown_nonzero_streams: usize,
+    pub drain_wait_below_fence_streams: usize,
     pub replay_frames: usize,
     pub replay_bytes: usize,
     pub queue_frames: usize,
@@ -448,6 +455,9 @@ impl Default for ConnectionStatus {
             received_sequences: 0,
             drain_fences: 0,
             drain_acks: 0,
+            drain_wait_unknown_streams: 0,
+            drain_wait_unknown_nonzero_streams: 0,
+            drain_wait_below_fence_streams: 0,
             replay_frames: 0,
             replay_bytes: 0,
             queue_frames: 0,
