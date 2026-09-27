@@ -313,3 +313,32 @@ fn the_2025_profile_requires_its_version_except_on_initialize() {
         405
     );
 }
+
+/// M3-38: the legacy profile speaks exactly 2025-11-25, so an `initialize`
+/// offering another revision is refused before dispatch with the lifecycle's
+/// unsupported-version error (`-32602`), naming the supported revision and
+/// never echoing the requested one.
+#[test]
+fn the_2025_profile_refuses_initialize_for_another_revision() {
+    let profile = McpProfile::V2025_11_25;
+    for offered in ["2025-06-18", "2025-03-26", "2026-07-28", "v999"] {
+        let init = format!(
+            r#"{{"jsonrpc":"2.0","id":0,"method":"initialize","params":{{"protocolVersion":"{offered}"}}}}"#
+        );
+        let rejection = validate_post(profile, &map(BASE), init.as_bytes()).unwrap_err();
+        assert_eq!(rejection.status, 400, "{offered}");
+        assert_eq!(rejection.code, codes::INVALID_PARAMS, "{offered}");
+        assert_eq!(rejection.supported, Some("2025-11-25"), "{offered}");
+        assert_eq!(rejection.id, Some(serde_json::json!(0)), "{offered}");
+        assert!(
+            !String::from_utf8_lossy(&rejection.body()).contains(offered),
+            "{offered} is not echoed"
+        );
+    }
+    // The pinned revision, with or without the optional header, is admitted.
+    let init = br#"{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-11-25"}}"#;
+    assert!(validate_post(profile, &map(BASE), init).is_ok());
+    let mut with_version = BASE.to_vec();
+    with_version.push(("mcp-protocol-version", "2025-11-25"));
+    assert!(validate_post(profile, &map(&with_version), init).is_ok());
+}

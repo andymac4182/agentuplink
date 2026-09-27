@@ -8,7 +8,8 @@ mod common;
 use std::time::Duration;
 
 use common::{
-    connect, count_lines, gateway, http_export, rmcp_http_backend, wait_for_file, within,
+    connect, connect_pinned, count_lines, gateway, http_export, rmcp_http_backend, wait_for_file,
+    within,
 };
 use rmcp::model::{CallToolRequestParams, ClientRequest, Request, RequestMetaObject};
 use rmcp::service::PeerRequestOptions;
@@ -110,4 +111,27 @@ async fn current_profile_http_export_round_trip_and_cancellation() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn legacy_profile_http_export_round_trip_and_cancellation() {
     http_export_round_trip("mcp-2025-11-25", true).await;
+}
+
+/// M3-38 for the Streamable HTTP export kind: an `initialize` offering an
+/// older revision is refused by the export before anything is dispatched to
+/// the backend, which would otherwise have accepted it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn legacy_profile_http_export_refuses_an_older_revision_at_initialize() {
+    let dir = tempfile::tempdir().expect("dir");
+    let (url, shutdown) = rmcp_http_backend(true, dir.path()).await;
+    let export = http_export("mcp-2025-11-25", &url, None);
+    let gateway = gateway(export.clone(), dir.path());
+    let outcome = connect_pinned(&gateway, rmcp::model::ProtocolVersion::V_2025_06_18).await;
+    assert!(
+        outcome.is_err(),
+        "initialize offering 2025-06-18 must fail at initialize"
+    );
+    let diagnostics = export.diagnostics();
+    assert_eq!(diagnostics.dispatched, 0, "{diagnostics:?}");
+    let current = connect_pinned(&gateway, rmcp::model::ProtocolVersion::V_2025_11_25)
+        .await
+        .expect("2025-11-25 initialize");
+    let _ = within(current.cancel()).await;
+    shutdown.cancel();
 }

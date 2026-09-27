@@ -6,7 +6,9 @@ mod common;
 
 use std::time::Duration;
 
-use common::{connect, count_lines, gateway, stdio_export, wait_for_file, within};
+use common::{
+    connect, connect_pinned, count_lines, gateway, stdio_export, wait_for_file, within,
+};
 use rmcp::model::{CallToolRequestParams, ClientRequest, Request, RequestMetaObject};
 use rmcp::service::PeerRequestOptions;
 use tunnel_mcp_fixture::{IMAGE_PNG_BASE64, STDERR_MARKER};
@@ -218,4 +220,32 @@ async fn current_profile_child_crash_is_a_scoped_interruption() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn legacy_profile_child_crash_ends_the_session_without_replay() {
     crash_is_interrupted_not_replayed_or_leaked("mcp-2025-11-25", true).await;
+}
+
+/// M3-38: a `mcp-2025-11-25` service speaks exactly that revision.  A client
+/// that offers an older one used to get a successful `initialize` (the
+/// server accepted the older revision) and then a `-32022` refusal on its
+/// first request, when its `MCP-Protocol-Version` header named that older
+/// revision.  The export now refuses the `initialize` itself, before a child
+/// is spawned, so the failure comes first and names the supported revision.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn legacy_profile_refuses_an_older_revision_at_initialize() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let export = stdio_export("mcp-2025-11-25", workspace.path(), 8);
+    let gateway = gateway(export.clone(), workspace.path());
+    let outcome = connect_pinned(&gateway, rmcp::model::ProtocolVersion::V_2025_06_18).await;
+    assert!(
+        outcome.is_err(),
+        "initialize offering 2025-06-18 must fail at initialize"
+    );
+    let diagnostics = export.diagnostics();
+    assert_eq!(diagnostics.children_spawned, 0, "{diagnostics:?}");
+    assert_eq!(diagnostics.sessions_opened, 0, "{diagnostics:?}");
+    // The supported revision still works on the same export.
+    let current = connect_pinned(&gateway, rmcp::model::ProtocolVersion::V_2025_11_25)
+        .await
+        .expect("2025-11-25 initialize");
+    let tools = within(current.list_all_tools()).await.expect("tools/list");
+    assert!(!tools.is_empty());
+    let _ = within(current.cancel()).await;
 }

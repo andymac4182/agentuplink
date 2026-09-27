@@ -26,7 +26,10 @@
 //! other server message (logging, list changes, server requests) goes to the
 //! single standalone GET stream, or waits in a bounded backlog until one
 //! opens.  A disconnect is not cancellation in this revision: the client
-//! POSTs `notifications/cancelled`, which is forwarded unchanged.  DELETE
+//! POSTs `notifications/cancelled`, which is forwarded unchanged; the
+//! cancelled request's own POST, which the server need not answer, then ends
+//! at once as an empty event stream (M3-48) instead of waiting for the
+//! session to end.  DELETE
 //! kills the child.  A session idle for the configured `session_idle_seconds`
 //! (no POST, no newly opened GET, no request in flight; an open GET stream
 //! alone does not count) ends the same way, and a request whose consumer
@@ -82,10 +85,30 @@ enum Routed {
     Interim(Bytes),
     Final(Bytes),
     Ended,
+    /// The client cancelled this legacy request (`notifications/cancelled`,
+    /// M3-48).  The server need not answer it, so the bridge ends the
+    /// response cleanly with no JSON-RPC response instead of holding the
+    /// POST open until the session ends.
+    Cancelled,
 }
 
 fn id_key(id: &Value) -> String {
     serde_json::to_string(id).unwrap_or_default()
+}
+
+/// The routing key of the request a client `notifications/cancelled` names.
+fn cancelled_request(message: &McpMessage) -> Option<String> {
+    if message.kind != MessageKind::Notification
+        || message.method.as_deref() != Some("notifications/cancelled")
+    {
+        return None;
+    }
+    message
+        .value
+        .get("params")?
+        .get("requestId")
+        .filter(|id| id.is_string() || id.is_i64() || id.is_u64())
+        .map(id_key)
 }
 
 fn cancelled_notification(id: &Value) -> Vec<u8> {
@@ -390,6 +413,14 @@ impl StdioExport {
                 self.counters.interrupted.fetch_add(1, Ordering::Relaxed);
                 Err(ExportError)
             }
+            Some(Routed::Cancelled) => {
+                // An empty event stream that ends cleanly: what rmcp's own
+                // Streamable HTTP server answers for a cancelled request.
+                guard.complete();
+                let mut response = Response::new(crate::body::empty());
+                sse_head(&mut response);
+                Ok(with_session(response))
+            }
             Some(Routed::Final(bytes)) => {
                 guard.complete();
                 self.counters.json_responses.fetch_add(1, Ordering::Relaxed);
@@ -424,6 +455,11 @@ impl StdioExport {
                                     if sender.send(sse_event(&bytes)).await.is_ok() {
                                         guard.complete();
                                     }
+                                    return;
+                                }
+                                // Dropping the sender ends the body cleanly.
+                                Some(Routed::Cancelled) => {
+                                    guard.complete();
                                     return;
                                 }
                                 None | Some(Routed::Ended) => {
@@ -536,6 +572,20 @@ impl StdioExport {
                 if session.child.send(&message.compact).await.is_err() {
                     return Err(ExportError);
                 }
+                // M3-48: once the cancellation has reached the child, close
+                // the cancelled request's POST.  Only a request of this
+                // session, still in flight, is affected; a late response
+                // for it is then undeliverable, as for any unknown ID.
+                if let Some(sender) =
+                    cancelled_request(&message).and_then(|key| session.take_pending(&key))
+                {
+                    self.counters
+                        .cancelled_requests_closed
+                        .fetch_add(1, Ordering::Relaxed);
+                    // A full queue closes when this sender drops, which
+                    // interrupts that stream instead: still not held open.
+                    let _ = sender.try_send(Routed::Cancelled);
+                }
                 Ok(no_body(StatusCode::ACCEPTED))
             }
         }
@@ -614,7 +664,8 @@ impl StdioExport {
         let failed = match &first {
             Some(Routed::Final(bytes)) => serde_json::from_slice::<Value>(bytes)
                 .map_or(true, |value| value.get("result").is_none()),
-            None | Some(Routed::Ended) => true,
+            // `initialize` must not be cancelled; if it is, no session.
+            None | Some(Routed::Ended | Routed::Cancelled) => true,
             Some(Routed::Interim(_)) => false,
         };
         let header = if failed {
@@ -683,7 +734,8 @@ impl StdioExport {
                                 break;
                             }
                         }
-                        None | Some(Routed::Ended) => {
+                        // The standalone stream is never a cancelled request.
+                        None | Some(Routed::Ended | Routed::Cancelled) => {
                             sender.fail(StreamFailure::Interrupted).await;
                             break;
                         }
@@ -922,6 +974,13 @@ impl Session {
         let mut router = self.router();
         router.pending.remove(key);
         router.progress.retain(|_, request| request != key);
+    }
+
+    /// Remove an in-flight request and return its stream's sender.
+    fn take_pending(&self, key: &str) -> Option<mpsc::Sender<Routed>> {
+        let mut router = self.router();
+        router.progress.retain(|_, request| request != key);
+        router.pending.remove(key)
     }
 
     fn open_standalone(&self, stream: &mpsc::Sender<Routed>) -> bool {

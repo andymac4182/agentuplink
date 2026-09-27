@@ -9,7 +9,9 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use bytes::Bytes;
-use common::{body_bytes, count_lines, exchange, fixture_binary, stdio_export_with, within};
+use common::{
+    body_bytes, count_lines, exchange, fixture_binary, stdio_export_with, wait_for_file, within,
+};
 use http::{Request, StatusCode};
 use http_body_util::{BodyExt, Full};
 use tunnel_http_bridge::ChannelBody;
@@ -271,6 +273,104 @@ async fn a_duplicate_in_flight_progress_token_is_rejected() {
     assert!(String::from_utf8_lossy(&body).contains("progress token"));
     assert_eq!(count_lines(&log, "sleep"), 1, "the duplicate never ran");
     first.abort();
+}
+
+/// M3-48: a request the client cancelled with `notifications/cancelled` must
+/// not hold its POST open until the session is deleted.  The server need not
+/// answer a cancelled request (2025-11-25), and rmcp's fixture does not, so
+/// the bridge closes that POST itself: promptly, cleanly (not interrupted)
+/// and with no JSON-RPC response it did not receive.  The session stays
+/// usable and its DELETE is clean.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cancelled_legacy_request_closes_its_post_promptly() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let export = stdio_export_with(LEGACY, workspace.path(), 1, &fixture_binary(), "");
+    let session = open_session(&export).await;
+    let headers = legacy_headers(Some(&session));
+    let cancelled_export = export.clone();
+    let cancelled_headers = headers.clone();
+    let cancelled = tokio::spawn(async move {
+        let response = exchange(
+            &cancelled_export,
+            post(
+                &cancelled_headers,
+                r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"sleep","arguments":{"label":"m348"}}}"#,
+            ),
+        )
+        .await;
+        let status = response.status();
+        (status, body_bytes(response).await)
+    });
+    let log = workspace.path().join("invocations.log");
+    for _ in 0..400 {
+        if count_lines(&log, "sleep") == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(count_lines(&log, "sleep"), 1, "sleep started");
+    let cancel = within(exchange(
+        &export,
+        post(
+            &headers,
+            r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":7,"reason":"synthetic"}}"#,
+        ),
+    ))
+    .await;
+    assert_eq!(cancel.status(), StatusCode::ACCEPTED);
+    assert!(
+        wait_for_file(&workspace.path().join("cancelled-m348")).await,
+        "the child observed notifications/cancelled"
+    );
+    // Well inside the session's lifetime: nothing deletes it before this.
+    let (status, body) = tokio::time::timeout(Duration::from_secs(5), cancelled)
+        .await
+        .expect("the cancelled POST closed without waiting for DELETE")
+        .expect("task");
+    assert_eq!(status, StatusCode::OK);
+    let body = body.expect("the cancelled POST ends cleanly, not interrupted");
+    assert!(
+        !String::from_utf8_lossy(&body).contains(r#""id":7"#),
+        "no response for the cancelled request"
+    );
+    assert_eq!(export.diagnostics().cancelled_requests_closed, 1);
+    // The session is still usable, and ending it is clean.
+    let response = within(exchange(&export, post(&headers, &tools_list(8)))).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = body_bytes(response).await;
+    let mut delete_headers = headers.clone();
+    delete_headers.retain(|(name, _)| *name != "content-type");
+    let deleted = within(exchange(
+        &export,
+        build("DELETE", &delete_headers, Full::new(Bytes::new())),
+    ))
+    .await;
+    assert_eq!(deleted.status(), StatusCode::NO_CONTENT);
+}
+
+/// M3-48's limit: a cancellation names a request of **this** session only.
+/// A `requestId` that is not in flight closes nothing and is still
+/// forwarded (202), and the in-flight request with another ID is untouched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cancellation_for_another_id_closes_nothing() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let export = stdio_export_with(LEGACY, workspace.path(), 1, &fixture_binary(), "");
+    let session = open_session(&export).await;
+    let headers = legacy_headers(Some(&session));
+    let cancel = within(exchange(
+        &export,
+        post(
+            &headers,
+            r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":99}}"#,
+        ),
+    ))
+    .await;
+    assert_eq!(cancel.status(), StatusCode::ACCEPTED);
+    let response = within(exchange(&export, post(&headers, &tools_list(99)))).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_bytes(response).await.expect("body");
+    assert!(String::from_utf8_lossy(&body).contains(r#""id":99"#));
+    assert_eq!(export.diagnostics().cancelled_requests_closed, 0);
 }
 
 fn wrapper_script(dir: &Path) -> PathBuf {

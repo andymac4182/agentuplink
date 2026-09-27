@@ -35,6 +35,9 @@ use crate::{McpProfile, PROTOCOL_2025_11_25, PROTOCOL_2026_07_28, headers};
 pub mod codes {
     pub const PARSE_ERROR: i64 = -32700;
     pub const INVALID_REQUEST: i64 = -32600;
+    /// The lifecycle's error for an `initialize` offering a revision the
+    /// server does not support (M3-38).
+    pub const INVALID_PARAMS: i64 = -32602;
     pub const INTERNAL_ERROR: i64 = -32603;
     pub const HEADER_MISMATCH: i64 = -32020;
     pub const UNSUPPORTED_PROTOCOL_VERSION: i64 = -32022;
@@ -323,6 +326,30 @@ pub fn check_message_headers(
                     rejection.supported = Some(PROTOCOL_2025_11_25);
                     return Err(rejection);
                 }
+            }
+            // M3-38: this profile speaks exactly one revision.  An
+            // `initialize` offering another would be accepted by many
+            // servers, and the client's next request, whose header names
+            // that revision, refused above.  Refuse the `initialize` itself,
+            // before dispatch, with the lifecycle's unsupported-version
+            // error, so the failure comes first.  The offered value is
+            // consumer data and is not echoed.
+            if message.is_initialize()
+                && let Some(offered) = message
+                    .value
+                    .get("params")
+                    .and_then(|params| params.get("protocolVersion"))
+                    .and_then(Value::as_str)
+                && offered != PROTOCOL_2025_11_25
+            {
+                let mut rejection = McpRejection::new(
+                    400,
+                    codes::INVALID_PARAMS,
+                    "Unsupported protocol version",
+                )
+                .with_id(id);
+                rejection.supported = Some(PROTOCOL_2025_11_25);
+                return Err(rejection);
             }
             Ok(())
         }
