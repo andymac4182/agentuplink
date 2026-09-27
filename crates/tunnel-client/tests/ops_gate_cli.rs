@@ -536,6 +536,20 @@ fn every_subcommand_exits_by_the_published_table() {
         (vec!["status", "--config", &config, "--network"], 2),
         (vec!["connect"], 2),
         (vec!["connect", "--config", &missing], 2),
+        // M0-03: `disconnect` (coordinator decision, 2026-09-28).
+        (vec!["disconnect"], 2),
+        (vec!["disconnect", "--config", &missing], 2),
+        (vec!["disconnect", "--config", &config], 8),
+        (vec!["disconnect", "--config", &config, "--timeout"], 2),
+        (
+            vec!["disconnect", "--config", &config, "--timeout", "soon"],
+            2,
+        ),
+        (vec!["disconnect", "--config", &config, "--timeout", "0"], 2),
+        (
+            vec!["disconnect", "--config", &config, "--timeout", "30s"],
+            8,
+        ),
     ];
     for (args, expected) in cases {
         let output = run(&args);
@@ -624,5 +638,64 @@ fn a_lock_that_cannot_be_trusted_stops_connect_before_it_starts() {
     assert!(
         fs::symlink_metadata(profile.socket()).is_err(),
         "no socket may be bound without the lock"
+    );
+}
+
+/// M0-03, `disconnect` (coordinator decision under the owner's delegation,
+/// 2026-09-28): the same-user supervisor is asked over its socket to stop,
+/// and stops through the **same** orderly path SIGTERM takes -- here, in the
+/// reconnect wait, exit `130` naming the request -- while `disconnect`
+/// itself waits until the supervisor has stopped answering and exits `0`.
+#[test]
+fn disconnect_stops_a_live_supervisor_through_its_orderly_stop() {
+    let profile = Profile::new();
+    let supervisor = Supervisor::start(&profile);
+    let pid = supervisor.pid();
+    let output = run_bounded(&[
+        "disconnect",
+        "--config",
+        &profile.config_arg(),
+        "--timeout",
+        "10",
+        "--json",
+    ]);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output));
+    let report = json(&output);
+    assert_eq!(report["command"], "disconnect");
+    assert_eq!(report["ok"], true);
+    assert_eq!(report["result"]["pid"], pid);
+    assert_eq!(report["result"]["state"], "stopped");
+    let (status, streams) = supervisor.wait();
+    assert_eq!(status.code(), Some(130), "{streams}");
+    assert!(
+        streams.contains("disconnect received while waiting to reconnect"),
+        "the supervisor must name the stop request it acted on: {streams}"
+    );
+    assert!(
+        !profile.socket().exists(),
+        "an orderly stop must remove the supervisor socket"
+    );
+    let after = run(&["status", "--config", &profile.config_arg(), "--json"]);
+    assert_eq!(after.status.code(), Some(8), "{}", text(&after));
+    assert_no_canary(&profile.canaries, "disconnect", &text(&output));
+}
+
+/// `disconnect` with nothing to stop is `SUPERVISOR_ABSENT`, exit `8`, in
+/// both output modes -- the same answer `status` gives.
+#[test]
+fn disconnect_without_a_supervisor_exits_eight_and_says_so() {
+    let profile = Profile::new();
+    let output = run(&["disconnect", "--config", &profile.config_arg(), "--json"]);
+    assert_eq!(output.status.code(), Some(8), "{}", text(&output));
+    let report = json(&output);
+    assert_eq!(report["command"], "disconnect");
+    assert_eq!(report["ok"], false);
+    assert_eq!(report["error"]["code"], "SUPERVISOR_ABSENT");
+    let human = run(&["disconnect", "--config", &profile.config_arg()]);
+    assert_eq!(human.status.code(), Some(8));
+    assert!(
+        text(&human).contains("no supervisor is running"),
+        "{}",
+        text(&human)
     );
 }

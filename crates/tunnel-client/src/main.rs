@@ -50,6 +50,12 @@ enum Command {
         path: PathBuf,
         json: bool,
     },
+    /// Ask the profile's supervisor to stop (M0-03).
+    Disconnect {
+        path: PathBuf,
+        json: bool,
+        timeout: std::time::Duration,
+    },
 }
 
 /// Every terminal cause `tunnel-client` can report, as a closed set.
@@ -487,7 +493,95 @@ async fn run(command: Command) -> Result<(), CliError> {
         }
         Command::Doctor { .. } => unreachable!("doctor is handled before the async command runner"),
         Command::Status { path, json } => run_status(&path, json).await,
+        Command::Disconnect {
+            path,
+            json,
+            timeout,
+        } => run_disconnect(&path, json, timeout).await,
     }
+}
+
+/// What `disconnect --json` reports on success.
+#[derive(Serialize)]
+struct DisconnectResult {
+    /// The supervisor that was asked to stop.
+    pid: u32,
+    /// Always `stopped`: the supervisor finished its orderly stop and no
+    /// longer answers on the profile's socket.
+    state: &'static str,
+    /// The supervisor's state when it accepted the request.
+    state_at_request: String,
+    /// How long the stop took, as seen from here.
+    waited_ms: u64,
+}
+
+/// How often `disconnect` checks whether the supervisor has stopped.
+const DISCONNECT_POLL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// `tunnel-client disconnect` (task row M0-03; coordinator decision under the
+/// owner's delegation, 2026-09-28): ask the profile's same-user supervisor,
+/// over its socket, to stop, then wait up to `timeout` until it has.
+///
+/// The supervisor treats the request exactly as SIGTERM -- the orderly stop
+/// in `docs/runtime.md` ("Stopping `connect` and `serve`"), with its own
+/// bounds -- so this command adds no second drain policy; `timeout` bounds
+/// only how long this command waits. "Stopped" means the supervisor no
+/// longer answers on its socket, which it stops doing only after its drain
+/// and child reap have finished. A timeout is `DEADLINE_EXCEEDED`, exit `5`,
+/// and leaves the supervisor stopping: it is not undone.
+async fn run_disconnect(
+    path: &Path,
+    json: bool,
+    timeout: std::time::Duration,
+) -> Result<(), CliError> {
+    use tunnel_client::supervisor_ipc::{IpcError, query_status, request_disconnect};
+    let config = load_runtime_config(path)?;
+    let socket = config.supervisor_socket_path();
+    let started = tokio::time::Instant::now();
+    let accepted = request_disconnect(&socket)
+        .await
+        .map_err(CliError::from_ipc)?;
+    let deadline = started + timeout;
+    loop {
+        match query_status(&socket).await {
+            Err(IpcError::Absent) => break,
+            // Still stopping -- answering, or closing a connection unanswered
+            // as its server shuts down: keep waiting, within the bound.
+            Ok(_) | Err(_) => {}
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(CliError {
+                cause: Cause::DeadlineExceeded,
+                message: format!(
+                    "supervisor pid {} accepted the disconnect request but had not stopped \
+                     within {} s; it is still stopping (its drain is bounded by the profile's \
+                     rotation handshake timeout plus overlap)",
+                    accepted.pid,
+                    timeout.as_secs()
+                ),
+                retryable: true,
+            });
+        }
+        tokio::time::sleep(DISCONNECT_POLL).await;
+    }
+    let waited_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    if json {
+        print_ok_json(
+            "disconnect",
+            DisconnectResult {
+                pid: accepted.pid,
+                state: "stopped",
+                state_at_request: accepted.state,
+                waited_ms,
+            },
+        );
+    } else {
+        println!(
+            "Supervisor pid={} stopped ({} ms; it was {}).",
+            accepted.pid, waited_ms, accepted.state
+        );
+    }
+    Ok(())
 }
 
 /// `tunnel-client status`: read the running supervisor's redacted snapshot
@@ -630,12 +724,20 @@ fn run_legacy_check_config(path: Option<PathBuf>) -> Result<(), CliError> {
 /// terminal sends the first, and a service manager (systemd, launchd) sends
 /// the second by default. Both take the same orderly path below; the name is
 /// kept only so the diagnostic can say which one arrived.
+///
+/// **`tunnel-client disconnect` is a third spelling of the same request**
+/// (task row M0-03, coordinator decision 2026-09-28): the same-user peer on
+/// the supervisor socket asks, and the request enters this path exactly as
+/// SIGTERM would, with the same bounds and the same second-request rule.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum StopSignal {
     Interrupt,
     // SIGTERM has no Windows counterpart here: Ctrl-C arrives as `Interrupt`.
     #[cfg_attr(not(unix), allow(dead_code))]
     Terminate,
+    /// A `disconnect` request on the supervisor socket (Unix only).
+    #[cfg_attr(not(unix), allow(dead_code))]
+    Disconnect,
 }
 
 impl StopSignal {
@@ -643,6 +745,7 @@ impl StopSignal {
         match self {
             Self::Interrupt => "SIGINT",
             Self::Terminate => "SIGTERM",
+            Self::Disconnect => "disconnect",
         }
     }
 }
@@ -675,6 +778,8 @@ struct StopSignals {
     terminate: tokio::signal::unix::Signal,
     #[cfg(windows)]
     ctrl_c: tokio::signal::windows::CtrlC,
+    /// `disconnect` requests from the supervisor socket, once it is bound.
+    disconnect: Option<tokio::sync::mpsc::Receiver<()>>,
 }
 
 impl StopSignals {
@@ -690,12 +795,14 @@ impl StopSignals {
             Ok(Self {
                 interrupt: signal(SignalKind::interrupt()).map_err(signal_error)?,
                 terminate: signal(SignalKind::terminate()).map_err(signal_error)?,
+                disconnect: None,
             })
         }
         #[cfg(windows)]
         {
             Ok(Self {
                 ctrl_c: tokio::signal::windows::ctrl_c().map_err(signal_error)?,
+                disconnect: None,
             })
         }
     }
@@ -710,9 +817,11 @@ impl StopSignals {
         };
         #[cfg(unix)]
         {
+            let disconnect = &mut self.disconnect;
             tokio::select! {
                 received = self.interrupt.recv() => received.map(|()| StopSignal::Interrupt).ok_or_else(closed),
                 received = self.terminate.recv() => received.map(|()| StopSignal::Terminate).ok_or_else(closed),
+                () = next_disconnect(disconnect) => Ok(StopSignal::Disconnect),
             }
         }
         #[cfg(windows)]
@@ -724,6 +833,28 @@ impl StopSignals {
                 .ok_or_else(closed)
         }
     }
+}
+
+impl StopSignals {
+    /// Deliver the supervisor socket's `disconnect` requests as stop
+    /// requests from now on.
+    fn attach_disconnect(&mut self, receiver: Option<tokio::sync::mpsc::Receiver<()>>) {
+        self.disconnect = receiver;
+    }
+}
+
+/// The next `disconnect` request, or never. Cancel-safe (`mpsc::recv` is).
+/// A closed channel -- the IPC server has stopped -- is not a stop request
+/// and not an error: the signals still stop the process.
+#[cfg_attr(not(unix), allow(dead_code))]
+async fn next_disconnect(receiver: &mut Option<tokio::sync::mpsc::Receiver<()>>) {
+    if let Some(channel) = receiver.as_mut()
+        && channel.recv().await.is_some()
+    {
+        return;
+    }
+    *receiver = None;
+    std::future::pending::<()>().await;
 }
 
 /// How long a cancelled connect attempt may take to unwind before it is
@@ -1216,6 +1347,9 @@ fn interrupted_during_backoff(signal: StopSignal, attempt: u32, last: &CliError)
 struct SupervisorPublisher {
     status: tokio::sync::watch::Sender<tunnel_client::supervisor_ipc::SupervisorStatus>,
     server: Option<(CancellationToken, tokio::task::JoinHandle<()>)>,
+    /// `disconnect` requests (M0-03), until `run_connect` hands them to the
+    /// stop signals.
+    disconnect: Option<tokio::sync::mpsc::Receiver<()>>,
     /// The profile lock, held until the publisher is dropped at the end of
     /// `run_connect` (and released by the kernel on any exit).
     _lock: ProfileLockHold,
@@ -1229,7 +1363,11 @@ type ProfileLockHold = Option<tunnel_client::supervisor_ipc::ProfileLock>;
 #[cfg(not(unix))]
 type ProfileLockHold = Option<()>;
 
-type IpcServer = Option<(CancellationToken, tokio::task::JoinHandle<()>)>;
+type IpcServer = Option<(
+    CancellationToken,
+    tokio::task::JoinHandle<()>,
+    tokio::sync::mpsc::Receiver<()>,
+)>;
 
 impl SupervisorPublisher {
     /// Take the profile lock, then bind the profile's supervisor socket.
@@ -1274,9 +1412,14 @@ impl SupervisorPublisher {
         };
         let (status, receiver) = tokio::sync::watch::channel(initial);
         let (server, lock) = start_ipc_server(config, receiver)?;
+        let (server, disconnect) = match server {
+            Some((cancel, task, disconnect)) => (Some((cancel, task)), Some(disconnect)),
+            None => (None, None),
+        };
         Ok(Self {
             status,
             server,
+            disconnect,
             _lock: lock,
         })
     }
@@ -1309,8 +1452,14 @@ fn start_ipc_server(
     match SupervisorIpc::bind(&socket, &lock) {
         Ok(ipc) => {
             let cancel = CancellationToken::new();
-            let task = tokio::spawn(ipc.serve(receiver, cancel.clone()));
-            Ok((Some((cancel, task)), Some(lock)))
+            // One slot: a request is a stop request, and a second one while
+            // the first is undelivered is the same request.
+            let (disconnect, requests) = tokio::sync::mpsc::channel(1);
+            let task = tokio::spawn(
+                ipc.with_disconnect(disconnect)
+                    .serve(receiver, cancel.clone()),
+            );
+            Ok((Some((cancel, task, requests)), Some(lock)))
         }
         Err(IpcError::Busy) => Err(CliError::from_ipc(IpcError::Busy)),
         Err(error) => {
@@ -1338,7 +1487,8 @@ async fn run_connect(path: PathBuf, json: bool, no_reconnect: bool) -> Result<()
     // inherited disposition.
     let mut stop = StopSignals::install()?;
     let config = load_runtime_config(&path)?;
-    let publisher = SupervisorPublisher::start(&config)?;
+    let mut publisher = SupervisorPublisher::start(&config)?;
+    stop.attach_disconnect(publisher.disconnect.take());
     let result = run_supervised(&config, &mut stop, &publisher, json, no_reconnect).await;
     publisher.update(|status| {
         status.state = "stopping".to_owned();
@@ -2163,6 +2313,7 @@ fn diagnostic_command(command: &Command) -> Option<&'static str> {
         Command::CheckRuntimeConfig { json: true, .. } => Some("config check"),
         Command::Connect { json: true, .. } => Some("connect"),
         Command::Status { json: true, .. } => Some("status"),
+        Command::Disconnect { json: true, .. } => Some("disconnect"),
         _ => None,
     }
 }
@@ -2209,7 +2360,7 @@ fn parse_command(args: &[OsString]) -> Result<Command, CliError> {
         // exited 2). It prints the one usage text every subcommand shares
         // and exits 0, wherever the flag sits among the subcommand's
         // arguments -- except as the value of a flag that takes a PATH.
-        "check-config" | "config" | "connect" | "credentials" | "doctor"
+        "check-config" | "config" | "connect" | "credentials" | "doctor" | "disconnect"
             if asks_for_help(&args[1..]) =>
         {
             Ok(Command::Help)
@@ -2231,12 +2382,63 @@ fn parse_command(args: &[OsString]) -> Result<Command, CliError> {
             let (path, json) = parse_path_and_json(&args[1..], "status")?;
             Ok(Command::Status { path, json })
         }
+        "disconnect" => parse_disconnect_command(args),
         _ => Err(CliError::usage("unknown command")),
     }
 }
 
-/// Flags whose next argument is a value, so a `--help` there is a PATH.
-const VALUE_FLAGS: [&str; 4] = ["--config", "--csr-out", "--certificate", "--server-ca"];
+/// Flags whose next argument is a value, so a `--help` there is a value.
+const VALUE_FLAGS: [&str; 5] = [
+    "--config",
+    "--csr-out",
+    "--certificate",
+    "--server-ca",
+    "--timeout",
+];
+
+/// `disconnect`'s default wait, `docs/runtime.md`'s `--timeout 30s`.
+const DISCONNECT_DEFAULT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// The longest `disconnect --timeout` accepted.
+const DISCONNECT_MAX_TIMEOUT_SECONDS: u64 = 3600;
+
+fn parse_disconnect_command(args: &[OsString]) -> Result<Command, CliError> {
+    // `--timeout SECONDS` (a trailing `s` is accepted, as in `30s`) is
+    // `disconnect`'s own flag; the rest is the shared grammar.
+    let mut timeout = DISCONNECT_DEFAULT_TIMEOUT;
+    let mut rest = Vec::new();
+    let mut index = 1;
+    while index < args.len() {
+        if args[index].to_str() == Some("--timeout") {
+            let value = args
+                .get(index + 1)
+                .and_then(|value| value.to_str())
+                .ok_or_else(|| CliError::usage("disconnect: --timeout requires SECONDS"))?;
+            let seconds = value
+                .strip_suffix('s')
+                .unwrap_or(value)
+                .parse::<u64>()
+                .ok()
+                .filter(|seconds| (1..=DISCONNECT_MAX_TIMEOUT_SECONDS).contains(seconds))
+                .ok_or_else(|| {
+                    CliError::usage(format!(
+                        "disconnect: --timeout takes whole seconds from 1 to \
+                         {DISCONNECT_MAX_TIMEOUT_SECONDS}"
+                    ))
+                })?;
+            timeout = std::time::Duration::from_secs(seconds);
+            index += 2;
+        } else {
+            rest.push(args[index].clone());
+            index += 1;
+        }
+    }
+    let (path, json) = parse_path_and_json(&rest, "disconnect")?;
+    Ok(Command::Disconnect {
+        path,
+        json,
+        timeout,
+    })
+}
 
 /// Whether a subcommand's arguments ask for help: a `--help` or `-h` in a
 /// flag position (not the value of one of [`VALUE_FLAGS`]).
@@ -2413,6 +2615,7 @@ Usage:\n\
   tunnel-client config check --config PATH [--json]\n\
   tunnel-client doctor --config PATH [--json]\n\
   tunnel-client status --config PATH [--json]\n\
+  tunnel-client disconnect --config PATH [--json] [--timeout SECONDS]\n\
   tunnel-client connect --config PATH [--json] [--no-reconnect]\n\
   tunnel-client credentials create --config PATH --csr-out PATH\n\
   tunnel-client credentials import --config PATH --certificate PATH --server-ca PATH\n\n\
@@ -2915,7 +3118,13 @@ mod tests {
         let argv = |words: &[&str]| -> Vec<OsString> {
             words
                 .iter()
-                .map(|word| OsString::from(if *word == "PATH" { "p.toml" } else { word }))
+                .map(|word| {
+                    OsString::from(match *word {
+                        "PATH" => "p.toml",
+                        "SECONDS" => "30",
+                        _ => word,
+                    })
+                })
                 .collect()
         };
         let mut optional_seen = 0;
@@ -2936,8 +3145,10 @@ mod tests {
                     continue;
                 }
                 // A flag followed by `PATH` is removed with its value.
-                let takes_value =
-                    words.get(index + 1).map(|next| next.trim_end_matches(']')) == Some("PATH");
+                let takes_value = matches!(
+                    words.get(index + 1).map(|next| next.trim_end_matches(']')),
+                    Some("PATH" | "SECONDS")
+                );
                 let without: Vec<&str> = full
                     .iter()
                     .enumerate()
