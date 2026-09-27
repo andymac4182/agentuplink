@@ -5,6 +5,7 @@
 //! buffers, or adapter state. Every record is tenant-qualified in the
 //! authoritative Redis namespace.
 
+pub mod clock;
 mod cluster;
 mod error;
 mod memory;
@@ -19,7 +20,8 @@ pub use error::{
 };
 pub use memory::MemoryCatalog;
 pub use oidc::{
-    ApprovedJwk, OidcConfig, OidcError, OidcVerifier, ValidatedAccessToken, ValidatedClaims,
+    ApprovedJwk, DEFAULT_OIDC_LEEWAY_SECONDS, MAX_OIDC_LEEWAY_SECONDS, OidcConfig, OidcError,
+    OidcVerifier, ValidatedAccessToken, ValidatedClaims,
 };
 pub use recovery::{
     RecoveryApproval, RecoveryApprovalIssuer, RecoveryApprovalVerifier, RecoveryError,
@@ -231,6 +233,16 @@ pub trait Catalog: Send + Sync {
     /// has no external authority and is always available.
     async fn check_authority(&self) -> Result<(), CatalogError> {
         Ok(())
+    }
+
+    /// The authority's own wall clock, read now (task row M7-C175).  The
+    /// relay compares it with its local clock to publish its clock offset.
+    ///
+    /// The Redis catalog answers Redis `TIME` on its ordinary lane, one
+    /// bounded read-only command.  A process-local catalog has no separate
+    /// clock and answers `None`.
+    async fn authority_time(&self) -> Result<Option<DateTime<Utc>>, CatalogError> {
+        Ok(None)
     }
 }
 

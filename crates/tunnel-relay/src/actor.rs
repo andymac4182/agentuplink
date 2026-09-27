@@ -17144,9 +17144,9 @@ pub struct RunningRelay {
     peer_runtime: Option<Arc<crate::PeerRuntime>>,
     peer_diagnostics: Option<Arc<PeerServerDiagnostics>>,
     peer_planned_cancel: Option<CancellationToken>,
-    /// A single relay's Redis authority state (M6-C67), for the private
-    /// metrics listener.
-    authority: Option<Arc<crate::authority_readiness::AuthorityReadiness>>,
+    /// A single relay's Redis authority state (M6-C67) and the clock-offset
+    /// state (M7-C175), for the private metrics listener.
+    readiness: crate::health::ReadinessChecks,
     pub consumer_addr: std::net::SocketAddr,
     pub device_addr: std::net::SocketAddr,
 }
@@ -17172,7 +17172,7 @@ impl RunningRelay {
         let router = crate::metrics::router(
             self.handle.clone(),
             self.peer_runtime.clone(),
-            self.authority.clone(),
+            self.readiness.clone(),
         );
         let cancel = self.cancel.child_token();
         tokio::spawn(crate::metrics::serve_bounded(listener, router, cancel))
@@ -17332,6 +17332,13 @@ pub struct ListenerSocketOptions {
     /// `[cluster]`; a relay with a peer runtime ignores it, so cluster
     /// readiness is unchanged.  Library callers default to `false`.
     pub authority_readiness: bool,
+    /// Task row M7-C175: measure this relay's wall-clock offset from the
+    /// Redis server clock in the background ([`crate::clock_offset`]),
+    /// publish it on the metrics listener, warn above 2 s and answer
+    /// `/readyz` not ready above the cluster clock-skew bound.  `ServeConfig`
+    /// sets it for every relay, with or without `[cluster]`.  Library callers
+    /// default to `false`.
+    pub clock_offset_health: bool,
 }
 
 impl Relay {
@@ -17553,6 +17560,10 @@ impl Relay {
                     cancel.child_token(),
                 )
             });
+        let clock = listener_options.clock_offset_health.then(|| {
+            crate::clock_offset::ClockOffsetHealth::spawn(catalog.clone(), cancel.child_token())
+        });
+        let readiness = crate::health::ReadinessChecks { authority, clock };
         let consumer_router = http::consumer_router_with_peer_and_barriers(
             handle.clone(),
             catalog.clone(),
@@ -17562,7 +17573,7 @@ impl Relay {
             listener_options.consumer_upgrade_barrier.clone(),
             listener_options.consumer_peer_admission_barrier.clone(),
             listener_options.http_forward.clone(),
-            authority.clone(),
+            readiness.clone(),
         );
         let device_router = http::device_router_with_peer_and_barrier(
             handle.clone(),
@@ -17606,7 +17617,7 @@ impl Relay {
             peer_runtime,
             peer_diagnostics,
             peer_planned_cancel,
-            authority,
+            readiness,
             consumer_addr,
             device_addr,
         })

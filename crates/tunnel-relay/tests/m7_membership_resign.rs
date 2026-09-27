@@ -18,8 +18,8 @@ use chrono::Utc;
 use tokio::sync::RwLock;
 use tunnel_catalog::SignedMembershipRecord;
 use tunnel_cluster::membership::{
-    MEMBERSHIP_SCHEMA_VERSION, MembershipCheckpoint, MembershipIssuer, MembershipRecord,
-    PrivateEndpointPolicy, RELAY_PEER_ROLE, RelayKey, TrustedPublisherKey,
+    MEMBERSHIP_SCHEMA_VERSION, MembershipCheckpoint, MembershipError, MembershipIssuer,
+    MembershipRecord, PrivateEndpointPolicy, RELAY_PEER_ROLE, RelayKey, TrustedPublisherKey,
 };
 use tunnel_relay::{
     CheckpointAuthority, CheckpointAuthorityError, CheckpointRequest, CheckpointResponse,
@@ -178,7 +178,8 @@ impl Fixture {
             Duration::from_secs(20),
             Duration::from_secs(1),
             Duration::from_secs(1),
-            Duration::from_secs(1),
+            // The deployed default: the one cluster clock-skew bound (M7-C173).
+            tunnel_catalog::clock::MAX_CLUSTER_CLOCK_SKEW,
         )
         .expect("bounded membership configuration")
         .with_local_spki_sha256(SPKI_SHA256)
@@ -817,7 +818,7 @@ async fn back_to_back_resigns_end_ready_and_keep_a_live_admission() {
 /// **M7-C170.** A same-key re-sign published *after* the relay fetched its
 /// checkpoint but *before* it read the records carries a signing instant
 /// later than the checkpoint's receipt. The verifier accepts such a record
-/// (it is inside the one-second clock-skew allowance), so it must also be
+/// (it is inside the clock-skew allowance), so it must also be
 /// usable: evaluating its key window at the earlier checkpoint-receipt
 /// instant found no active local key, reported `PeerRejected`, took the
 /// relay out of Ready and cancelled every admission as `MembershipRevoked`
@@ -919,21 +920,46 @@ async fn racing_same_key_resigns_never_reject_the_local_key() {
     );
 }
 
-/// **M7-C171, current behaviour.** A same-key re-sign from a signer whose
-/// clock leads this relay's by 500 ms -- inside the one-second skew the
-/// verifier accepts -- is still judged strictly at the record-read instant:
-/// the local key is not yet active, so the reconcile reports `PeerRejected`
-/// (`MissingLocalKey`) and revokes the admission. This pins that the M7-C170
-/// fix did not widen key activation by the skew allowance; changing it is
-/// M7-C171's open owner decision, and must change this test with it.
+/// **M7-C171, decided as option (a)** (coordinator decision under the
+/// owner's delegation, 2026-09-27). A same-key re-sign from a signer whose
+/// clock leads this relay's by less than the cluster clock-skew bound is
+/// accepted: the verifier already accepts such a record, and key activation
+/// now honours the same allowance, so the local key stays active, the relay
+/// stays Ready and neither the local nor a peer admission is revoked. A
+/// re-sign from a signer ahead by more than the bound is still refused and
+/// fails closed.
 #[tokio::test]
-async fn a_resign_from_a_signer_ahead_inside_the_skew_is_still_rejected() {
+async fn a_resign_from_a_signer_ahead_is_accepted_inside_the_skew_and_rejected_beyond_it() {
+    let skew = tunnel_catalog::clock::MAX_CLUSTER_CLOCK_SKEW_WALL;
+    let inside = skew - chrono::Duration::seconds(1);
+    let beyond = skew + chrono::Duration::seconds(1);
     let fixture = Fixture::ready().await;
-    let admission = fixture
+    let local = fixture
         .runtime
         .admit_peer(Fixture::identity())
-        .expect("an active admission");
-    let stream = admission.cancellation();
+        .expect("an active local admission");
+    let peer = fixture
+        .runtime
+        .admit_peer(MembershipPeerIdentity::new(
+            PEER_NODE_ID,
+            "boot-peer",
+            PEER_SPKI_SHA256,
+        ))
+        .expect("an active peer admission");
+    let local_stream = local.cancellation();
+    let peer_stream = peer.cancellation();
+
+    // Inside the skew: both records re-signed by a signer ahead by skew - 1 s.
+    fixture
+        .set_peer_record(sign_record_signed_ahead(
+            &fixture.issuer,
+            PEER_NODE_ID,
+            2,
+            "peer-key-1",
+            PEER_SPKI_SHA256,
+            inside,
+        ))
+        .await;
     fixture
         .publish(sign_record_signed_ahead(
             &fixture.issuer,
@@ -941,7 +967,149 @@ async fn a_resign_from_a_signer_ahead_inside_the_skew_is_still_rejected() {
             2,
             "key-1",
             SPKI_SHA256,
-            chrono::Duration::milliseconds(500),
+            inside,
+        ))
+        .await;
+    let result = fixture.runtime.reconcile_once().await;
+    assert!(
+        result.is_ok(),
+        "M7-C171: a re-sign from a signer ahead inside the skew must be accepted, got {:?}",
+        result.as_ref().map(|_| ())
+    );
+    assert_eq!(fixture.runtime.readiness(), MembershipReadiness::Ready);
+    assert!(
+        !local_stream.is_cancelled() && !peer_stream.is_cancelled(),
+        "M7-C171: a re-sign inside the skew revoked an admission (local {:?}, peer {:?})",
+        local_stream.reason(),
+        peer_stream.reason()
+    );
+    fixture
+        .runtime
+        .admit_peer(MembershipPeerIdentity::new(
+            PEER_NODE_ID,
+            "boot-peer",
+            PEER_SPKI_SHA256,
+        ))
+        .expect("a new peer admission binds the record signed ahead inside the skew");
+
+    // Beyond the skew: the signer is ahead by skew + 1 s. Refused, fail closed.
+    fixture
+        .publish(sign_record_signed_ahead(
+            &fixture.issuer,
+            NODE_ID,
+            3,
+            "key-1",
+            SPKI_SHA256,
+            beyond,
+        ))
+        .await;
+    let result = fixture.runtime.reconcile_once().await;
+    assert!(
+        matches!(
+            result,
+            Err(tunnel_relay::MembershipRuntimeError::Membership(
+                MembershipError::IssuedInFuture
+            ))
+        ),
+        "M7-C171: a re-sign from a signer ahead beyond the skew must be refused, got {:?}",
+        result.as_ref().map(|_| ())
+    );
+    assert_eq!(
+        fixture.runtime.readiness(),
+        MembershipReadiness::Unready(MembershipUnreadyReason::MembershipRejected)
+    );
+    assert!(
+        local_stream.is_cancelled(),
+        "a refusal beyond the skew must revoke the admission"
+    );
+    assert_eq!(
+        local_stream.reason(),
+        Some(PeerInvalidationReason::MembershipRevoked)
+    );
+}
+
+/// A record whose served key alone activates `lead` from now, next to a
+/// current key the relay does not serve, so the record itself verifies and
+/// only the own-key activation check decides.
+fn sign_record_with_served_key_activating_in(
+    issuer: &MembershipIssuer,
+    version: u64,
+    lead: chrono::Duration,
+) -> SignedMembershipRecord {
+    let now = Utc::now();
+    let record = MembershipRecord {
+        schema_version: MEMBERSHIP_SCHEMA_VERSION,
+        deployment_id: DEPLOYMENT_ID.to_owned(),
+        deployment_incarnation: DEPLOYMENT_INCARNATION.to_owned(),
+        node_id: NODE_ID.to_owned(),
+        record_version: version,
+        roles: vec![RELAY_PEER_ROLE.to_owned()],
+        peer_endpoint: "10.0.0.1:8443".to_owned(),
+        server_name: "10.0.0.1".to_owned(),
+        keys: vec![
+            RelayKey {
+                key_id: "key-other".to_owned(),
+                spki_sha256: OTHER_SPKI_SHA256.to_owned(),
+                not_before: now - chrono::Duration::seconds(1),
+                expires_at: now + chrono::Duration::seconds(30),
+                revoked: false,
+            },
+            RelayKey {
+                key_id: "key-1".to_owned(),
+                spki_sha256: SPKI_SHA256.to_owned(),
+                not_before: now + lead,
+                expires_at: now + chrono::Duration::seconds(30),
+                revoked: false,
+            },
+        ],
+        issued_at: now,
+        not_before: now,
+        expires_at: now + chrono::Duration::seconds(30),
+    };
+    SignedMembershipRecord {
+        version,
+        bytes: issuer
+            .sign_membership_bytes(record)
+            .expect("signed membership record"),
+    }
+}
+
+/// **M7-C171, option (a), at the own-key activation check itself.** The
+/// record verifies (another key is current); the relay's served key
+/// activates `skew - 1 s` from now, which is active, and then `skew + 1 s`
+/// from now, which is not: `PeerRejected`, `MissingLocalKey`, and the
+/// admission revoked as `MembershipRevoked`.
+#[tokio::test]
+async fn the_served_key_is_active_inside_the_skew_and_not_beyond_it() {
+    let skew = tunnel_catalog::clock::MAX_CLUSTER_CLOCK_SKEW_WALL;
+    let fixture = Fixture::ready().await;
+    let admission = fixture
+        .runtime
+        .admit_peer(Fixture::identity())
+        .expect("an active admission");
+    let stream = admission.cancellation();
+
+    fixture
+        .publish(sign_record_with_served_key_activating_in(
+            &fixture.issuer,
+            2,
+            skew - chrono::Duration::seconds(1),
+        ))
+        .await;
+    let result = fixture.runtime.reconcile_once().await;
+    assert!(
+        result.is_ok(),
+        "M7-C171: a served key activating inside the skew must be active, got {:?}",
+        result.as_ref().map(|_| ())
+    );
+    assert_eq!(fixture.runtime.readiness(), MembershipReadiness::Ready);
+    assert!(!stream.is_cancelled(), "{:?}", stream.reason());
+
+    fixture
+        .publish(sign_record_with_served_key_activating_in(
+            &fixture.issuer,
+            3,
+            skew + chrono::Duration::seconds(1),
         ))
         .await;
     let result = fixture.runtime.reconcile_once().await;
@@ -950,7 +1118,7 @@ async fn a_resign_from_a_signer_ahead_inside_the_skew_is_still_rejected() {
             result,
             Err(tunnel_relay::MembershipRuntimeError::PeerRejected)
         ),
-        "M7-C171: a local key not yet active at the read instant must be rejected, got {:?}",
+        "M7-C171: a served key activating beyond the skew must not be active, got {:?}",
         result.as_ref().map(|_| ())
     );
     assert_eq!(

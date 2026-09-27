@@ -113,6 +113,12 @@ fn rendered() -> String {
             checks: 12,
             failures: BTreeMap::from([("run_changed", 2), ("timeout", 1)]),
         }),
+        clock: Some(ClockOffsetMetrics {
+            ready: true,
+            offset_ms: Some(-2_345),
+            measurements: 7,
+            failures: 1,
+        }),
         snapshot: &snapshot,
         consumer_refusals: BTreeMap::from([
             (("echo", "identity"), 6),
@@ -153,6 +159,10 @@ fn m6c24_a_scrape_reports_the_aggregates() {
         "tunnel_relay_authority_checks_total 12",
         "tunnel_relay_authority_check_failures_total{class=\"run_changed\"} 2",
         "tunnel_relay_authority_check_failures_total{class=\"timeout\"} 1",
+        "tunnel_relay_clock_offset_ready 1",
+        "tunnel_relay_clock_offset_milliseconds -2345",
+        "tunnel_relay_clock_offset_measurements_total 7",
+        "tunnel_relay_clock_offset_measurement_failures_total 1",
         "tunnel_relay_device_sessions 2",
         "tunnel_relay_device_sockets 4",
         "tunnel_relay_streams 2",
@@ -237,7 +247,13 @@ fn m6c24_every_line_is_a_comment_or_a_well_formed_sample() {
         }
         let (series, value) = line.rsplit_once(' ').expect("sample");
         assert!(series.starts_with("tunnel_relay_"), "{line}");
-        assert!(value.parse::<u64>().is_ok(), "{line}");
+        // Every sample is an unsigned count or flag, except the one signed
+        // gauge, the clock offset (M7-C175).
+        if series == "tunnel_relay_clock_offset_milliseconds" {
+            assert!(value.parse::<i64>().is_ok(), "{line}");
+        } else {
+            assert!(value.parse::<u64>().is_ok(), "{line}");
+        }
         // Label values are fixed words: lowercase, digits, `_`, `-`, `.`.
         if let Some((_, labels)) = series.split_once('{') {
             for value in labels.trim_end_matches('}').split(',').filter_map(|pair| {

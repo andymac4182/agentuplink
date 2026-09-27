@@ -5635,7 +5635,7 @@ async fn start_relay(
         peer_idle_timeout_seconds: 60,
         peer_drain_timeout_seconds: 5,
         checkpoint_timeout_seconds: 2,
-        max_clock_skew_seconds: 1,
+        max_clock_skew_seconds: tunnel_catalog::clock::MAX_CLUSTER_CLOCK_SKEW_SECONDS,
         peer_tls_next_cert_chain: None,
         peer_tls_next_private_key: None,
         peer_rekey_convergence_seconds: Some(FIXTURE_PEER_REKEY.convergence_hold.as_secs()),
@@ -5952,6 +5952,8 @@ async fn start_relay(
                 device_control_attach_barrier,
                 http_forward: harness.http_forward.clone(),
                 authority_readiness: false,
+                // As `serve` does (M7-C175).
+                clock_offset_health: true,
             },
         )
         .await
