@@ -736,7 +736,10 @@ async fn a_checkpoint_that_omits_this_node_surrenders_after_two_passes() {
 async fn a_record_below_the_checkpoint_minimum_does_not_surrender_on_two_passes() {
     let fixture = Fixture::new().await;
     let _control = fixture.register().await;
-    fixture.authority.minimum_version.store(5, Ordering::Release);
+    fixture
+        .authority
+        .minimum_version
+        .store(5, Ordering::Release);
     fixture.clear_records().await;
     for _ in 0..OWN_KEY_SURRENDER_CONFIRMATIONS + 2 {
         fixture.missing_membership_pass().await;
@@ -763,7 +766,10 @@ async fn a_record_below_the_minimum_surrenders_once_it_outlasts_the_publish_race
     let fixture = Fixture::new().await;
     let mut control = fixture.register().await;
     fixture.set_bounds(SHORT_BOUND, LONG_BOUND);
-    fixture.authority.minimum_version.store(5, Ordering::Release);
+    fixture
+        .authority
+        .minimum_version
+        .store(5, Ordering::Release);
     fixture.clear_records().await;
 
     fixture.missing_membership_pass().await;
@@ -799,7 +805,10 @@ async fn a_different_conclusion_restarts_the_below_minimum_run() {
     let fixture = Fixture::new().await;
     let _control = fixture.register().await;
     fixture.set_bounds(SHORT_BOUND, LONG_BOUND);
-    fixture.authority.minimum_version.store(5, Ordering::Release);
+    fixture
+        .authority
+        .minimum_version
+        .store(5, Ordering::Release);
     fixture.clear_records().await;
     fixture.missing_membership_pass().await;
     tokio::time::sleep(SHORT_BOUND * 3 / 4).await;
@@ -963,10 +972,12 @@ async fn a_surrender_queued_before_a_re_sign_closes_nothing() {
     // The watcher's request: its pre-check passes and the command queues.
     let membership = Arc::clone(&fixture.membership);
     let relay = fixture.relay.clone();
-    let queued =
-        tokio::spawn(async move { surrender_if_required(&membership, &relay).await });
+    let queued = tokio::spawn(async move { surrender_if_required(&membership, &relay).await });
     tokio::time::sleep(Duration::from_millis(100)).await;
-    assert!(!queued.is_finished(), "the request waits behind the parked actor");
+    assert!(
+        !queued.is_finished(),
+        "the request waits behind the parked actor"
+    );
 
     // The re-sign lands while the request is queued.
     fixture.publish(3, SERVED_SPKI).await;
@@ -977,8 +988,14 @@ async fn a_surrender_queued_before_a_re_sign_closes_nothing() {
         .await
         .expect("the request task")
         .expect("the actor answered");
-    assert_eq!(outcome, None, "the actor's re-check found nothing to surrender");
-    assert!(fixture.owned().await, "the re-approved relay kept its lease");
+    assert_eq!(
+        outcome, None,
+        "the actor's re-check found nothing to surrender"
+    );
+    assert!(
+        fixture.owned().await,
+        "the re-approved relay kept its lease"
+    );
     assert_eq!(fixture.live_sessions().await, 1);
     fixture.shutdown().await;
 }

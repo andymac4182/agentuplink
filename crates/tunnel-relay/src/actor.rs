@@ -2930,9 +2930,8 @@ enum Command {
     /// closed, or `None` when the re-check no longer requires a surrender.
     SurrenderOwnership {
         check: OwnershipSurrenderCheck,
-        response: oneshot::Sender<
-            Option<(crate::membership_runtime::OwnershipSurrenderCause, usize)>,
-        >,
+        response:
+            oneshot::Sender<Option<(crate::membership_runtime::OwnershipSurrenderCause, usize)>>,
     },
     /// Test hook: run a closure against the live actor between commands.
     #[cfg(test)]
