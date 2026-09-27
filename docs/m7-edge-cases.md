@@ -360,7 +360,7 @@ rows, and the 98-row matrix count is unchanged.
 - **M7-C153** (verified local): staging is refused mid-rotation (including mid-switch), for a retired key, and for any certificate that is not the same relay under the same CA and names.
 - **M7-C154** (verified local): the outbound drain set is bounded at four, and a full set keeps a destination on its still-approved predecessor.
 
-## Own served key retirement and ownership surrender task rows (M7-C181, M7-C182, M7-C184, M7-C185)
+## Own served key retirement and ownership surrender task rows (M7-C181, M7-C182, M7-C184, M7-C185, M7-C186)
 
 These rows are tracked in [tasks.md](tasks.md). They extend EC-019 (a peer
 certificate or lease changes mid-connection) and EC-011 (readiness becomes
@@ -372,7 +372,8 @@ are task rows, not new matrix rows, and the 98-row matrix count is unchanged.
 - **M7-C181** (verified local): after two consecutive reconcile passes concluding `MissingLocalKey`, every owned device session closes with `LOCAL_IDENTITY_RETIRED` and its lease is released by exact compare-and-release; transient reconcile failures and clock-offset not-ready never trigger it.
 - **M7-C182** (verified local): `MissingLocalMembership` is split. A fresh checkpoint that omits the node surrenders on the same two passes (`LOCAL_MEMBERSHIP_WITHDRAWN`); a record below the checkpoint's minimum -- the publish race -- never surrenders on passes, only after it persists for one record lifetime plus skew (65 s), measured between passes. The actor re-checks the cause before collecting sessions, so a re-sign that lands while the request is queued closes nothing.
 - **M7-C184** (verified local): membership unready for any reason except an unreachable catalog, confirmed by passes for longer than the owner lease plus that margin (95 s), surrenders with `MEMBERSHIP_UNREADY_PROLONGED`; unreachable-catalog intervals never count and a `Ready` pass resets it.
-- **M7-C185** (planned): one catalog record that the checkpoint omits or places below its minimum fails every relay's whole pass as `MembershipRejected`; with M7-C184 a blackout past 95 s now surrenders devices cluster-wide. Recorded from source with options.
+- **M7-C185** (verified local): the catalog never deletes a removed node's record, and such a record failed every relay's pass as `MembershipRejected`. Records the checkpoint omits, or that sit below their node's minimum, are now skipped before verification (never signature-checked; they grant nothing), so a node removal leaves the other relays `Ready` and the removed relay concludes M7-C182 (a).
+- **M7-C186** (verified local): a shared control-plane outage -- the checkpoint authority unreachable, or no record for any named node still inside its lifetime (the publisher stopped) -- never accrues toward M7-C184 or M7-C182 (b), so an outage that leaves every relay unready does not trigger a cluster-wide reconnect storm. A single partitioned relay keeps its sessions until its leases or the other rules resolve it.
 
 ## M7 completion rule
 
@@ -491,3 +492,4 @@ re-verification event times must match the row's `Completed at` timestamp.
 - 2026-09-27T19:20:04+10:00: Added coverage, no status change, for EC-057 and EC-058 ([M7-C178](tasks.md)). A connector's `data_loss` report that reaches the owner before the peer-hop carrier close now enters retained recovery at once instead of starting a scheduled rotation whose doomed extra candidate carrier shifted the recovery-attempts fixture's routes (hosted main run 36306342690). Red-first relay test; `verify-m7-i08-recovery-attempts` 40/40 locally with the fix. Hosted M7 on the PR pending.
 - 2026-09-27T19:37:01+10:00: New task-row links M7-C181 and M7-C182 (own served key retirement), extending EC-019 and EC-011 to the owner side; the matrix count and row statuses are unchanged. M7-C181 first completion (local) is recorded in [tasks.md](tasks.md#completion-history); M7-C182 is open.
 - 2026-09-27T21:43:02+10:00: Task-row links M7-C184 and M7-C185 added and M7-C182 closed (local), extending EC-019 and EC-011 on the owner side; the matrix count and row statuses are unchanged. M7-C182 and M7-C184 first completions (local) are recorded in [tasks.md](tasks.md#completion-history); M7-C185 is planned.
+- 2026-09-27T22:20:24+10:00: Task-row links M7-C185 (now verified local) and M7-C186 (new, verified local) updated after the review of #230; M7-C182 and M7-C184 re-verified with new scope. EC-019 and EC-011 coverage extended to stale records of removed nodes and shared control-plane outages; the matrix count and row statuses are unchanged. Completions are recorded in [tasks.md](tasks.md#completion-history).
