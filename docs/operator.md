@@ -1124,7 +1124,8 @@ cheaper for clients that resume.
 
 **Open-file limit (M6-C155).** Every connection is a file descriptor. The two
 public listeners alone can hold `2 x (listener_max_connections +
-listener_refusal_margin)` at once (160 with the defaults); Redis, peer and
+listener_refusal_margin) + listener_turnover_handoff_queue` at once (176 with
+the defaults; the hand-off queue is M6-C193's); Redis, peer and
 metrics connections come on top. At startup the relay prints `tunnel-relay
 warning: open-file soft limit N is below the M descriptors ...` when the soft
 `RLIMIT_NOFILE` is lower. Raise it before raising `listener_max_connections`:

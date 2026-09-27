@@ -14,9 +14,14 @@
 //! episode begins with the first such arrival after at least one quiet window.
 //!
 //! **Turnover.** Under pressure, a served connection that has lived at least
-//! [`ListenerTurnover::max_age`], or served at least
+//! its own age budget -- drawn once per connection, uniformly between 50% and
+//! 100% of [`ListenerTurnover::max_age`] -- or served at least
 //! [`ListenerTurnover::max_requests`] requests, *since the episode began* is
-//! closed after its current response: HTTP/1.1 by `Connection: close` on that
+//! closed after its current response.  The per-connection draw keeps permits
+//! freeing continuously: with one fixed age, every replacement started at the
+//! same burst instant and the bursts repeated every `max_age` for the whole
+//! flood (hosted runs 36281427390 / 36281441437, before the jitter).  It is
+//! closed HTTP/1.1 by `Connection: close` on that
 //! response, HTTP/2 by a graceful GOAWAY that lets in-flight streams finish.
 //! A `101 Switching Protocols` response never carries the close, and nothing
 //! is ever cut mid-response.  Outside pressure nothing changes.
@@ -24,13 +29,17 @@
 //! **Hand-off.** A freed permit must reach a client that was waiting, not the
 //! recycled client's own immediate reconnect, which is usually already in the
 //! listen backlog when the permit frees.  So on a listener with turnover, a
-//! connection accepted over the limit first waits up to [`HANDOFF_WAIT`],
-//! before any TLS work, in the permit semaphore's FIFO queue.  If a permit
-//! frees in that time it is served; otherwise it is refused
-//! `503 CONNECTION_LIMIT` exactly as before (M6-C153).  The wait holds only a
-//! TCP socket in one of the bounded refusal slots.  Waiting clients therefore
-//! get permits in arrival order, in proportion to how many connections each
-//! has waiting.  Measured before the hand-off existed (M6-C193 test at small
+//! connection accepted over the limit while one of
+//! [`ListenerTurnover::handoff_queue`] hand-off slots is free first waits up
+//! to [`HANDOFF_WAIT`], before any TLS work, in the permit semaphore's FIFO
+//! queue.  If a permit frees in that time it is served; otherwise it is
+//! refused `503 CONNECTION_LIMIT` exactly as before (M6-C153).  The hand-off
+//! slots are separate from the refusal margin: while they are all taken, a
+//! further connection over the limit is refused at once through the margin,
+//! so the explicit `503` stays the overload signal and refusal throughput is
+//! what it was before the hand-off (coordinator decision, 2026-09-27).
+//! Waiting clients get permits in arrival order, in proportion to how many
+//! connections each has waiting.  Measured before the hand-off existed (M6-C193 test at small
 //! scale): 80 recycled permits in 20 s all went back to flood workers, and a
 //! client connecting every 20 ms was refused 855 times out of 855.
 //!
@@ -69,10 +78,18 @@ pub const MAX_TURNOVER_MAX_AGE: Duration = Duration::from_secs(3_600);
 /// Largest accepted [`ListenerTurnover::max_requests`].
 pub const MAX_TURNOVER_MAX_REQUESTS: u64 = 1_000_000;
 
-/// How long a connection accepted over the limit on a listener with turnover
-/// waits for a freed permit, before TLS, before it is refused.  Half the
-/// refusal's `retry_after_ms`, and well inside the refusal deadline.
+/// How long a connection accepted over the limit into a hand-off slot waits
+/// for a freed permit, before TLS, before it is refused.  Half the refusal's
+/// `retry_after_ms`.  The refusal's own deadline
+/// ([`crate::ListenerCapacity::refusal_timeout`]) starts only after this
+/// wait, so a hand-off connection that is refused is bounded by the sum.
 pub const HANDOFF_WAIT: Duration = Duration::from_millis(500);
+
+/// Default [`ListenerTurnover::handoff_queue`].
+pub const DEFAULT_HANDOFF_QUEUE: usize = 16;
+
+/// Largest accepted [`ListenerTurnover::handoff_queue`].
+pub const MAX_HANDOFF_QUEUE: usize = 256;
 
 /// When a served keep-alive connection is recycled while its listener is
 /// under pressure (task row M6-C193).  Set only on the public consumer
@@ -87,6 +104,11 @@ pub struct ListenerTurnover {
     /// connection is recycled.  Default [`DEFAULT_TURNOVER_MAX_REQUESTS`];
     /// accepts 1..=1,000,000.
     pub max_requests: u64,
+    /// Connections over the limit that may wait at once for a freed permit
+    /// ([`HANDOFF_WAIT`]).  Default [`DEFAULT_HANDOFF_QUEUE`]; accepts
+    /// 0..=256, where 0 disables the hand-off.  Separate from the refusal
+    /// margin.
+    pub handoff_queue: usize,
 }
 
 impl Default for ListenerTurnover {
@@ -94,6 +116,7 @@ impl Default for ListenerTurnover {
         Self {
             max_age: DEFAULT_TURNOVER_MAX_AGE,
             max_requests: DEFAULT_TURNOVER_MAX_REQUESTS,
+            handoff_queue: DEFAULT_HANDOFF_QUEUE,
         }
     }
 }
@@ -111,6 +134,12 @@ impl ListenerTurnover {
             return Err(TransportError::InvalidListenerTurnover {
                 field: "max_requests",
                 reason: "must be 1..=1000000",
+            });
+        }
+        if self.handoff_queue > MAX_HANDOFF_QUEUE {
+            return Err(TransportError::InvalidListenerTurnover {
+                field: "handoff_queue",
+                reason: "must be 0..=256",
             });
         }
         Ok(())
@@ -267,6 +296,24 @@ impl ListenerPressure {
     }
 }
 
+/// A per-connection age budget, uniform in `[max_age / 2, max_age]` at
+/// millisecond resolution, from `random`.
+pub(crate) fn jittered_age(max_age: Duration, random: u64) -> Duration {
+    let max_ms = u64::try_from(max_age.as_millis()).unwrap_or(u64::MAX);
+    let half = max_ms / 2;
+    let spread = max_ms - half;
+    Duration::from_millis(half + random % spread.saturating_add(1))
+}
+
+/// A random `u64` from the standard library's per-instance random hasher
+/// keys; enough to spread turnover, not for anything secret.
+fn random_u64() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    let mut hasher = std::hash::RandomState::new().build_hasher();
+    hasher.write_u64(now_mark());
+    hasher.finish()
+}
+
 #[derive(Debug, Default)]
 struct TurnoverCounts {
     requests: u64,
@@ -279,6 +326,8 @@ struct TurnoverCounts {
 #[derive(Debug)]
 pub(crate) struct ConnectionTurnover {
     policy: ListenerTurnover,
+    /// This connection's age budget: uniform in `[max_age / 2, max_age]`.
+    age_budget: Duration,
     pressure: Arc<ListenerPressure>,
     started_ms: u64,
     counts: Mutex<TurnoverCounts>,
@@ -290,6 +339,7 @@ impl ConnectionTurnover {
     pub(crate) fn new(policy: ListenerTurnover, pressure: Arc<ListenerPressure>) -> Arc<Self> {
         Arc::new(Self {
             policy,
+            age_budget: jittered_age(policy.max_age, random_u64()),
             pressure,
             started_ms: now_mark(),
             counts: Mutex::new(TurnoverCounts::default()),
@@ -325,7 +375,7 @@ impl ConnectionTurnover {
         let served = counts
             .requests
             .saturating_sub(counts.requests_before_episode);
-        if age < self.policy.max_age && served < self.policy.max_requests {
+        if age < self.age_budget && served < self.policy.max_requests {
             return false;
         }
         counts.recycled = true;
@@ -359,6 +409,10 @@ mod tests {
                 max_requests: 1_000_001,
                 ..ListenerTurnover::default()
             },
+            ListenerTurnover {
+                handoff_queue: 257,
+                ..ListenerTurnover::default()
+            },
         ] {
             invalid.validate().expect_err("out of range");
         }
@@ -371,6 +425,7 @@ mod tests {
             ListenerTurnover {
                 max_age: Duration::from_secs(3_600),
                 max_requests: 3,
+                ..ListenerTurnover::default()
             },
             pressure.clone(),
         );
@@ -388,5 +443,30 @@ mod tests {
         assert!(turnover.recycle_now(), "the third request in the episode");
         turnover.on_request();
         assert!(!turnover.recycle_now(), "recycled twice");
+    }
+
+    /// M6-C193 review (B2): each connection's age budget is drawn uniformly
+    /// in `[max_age / 2, max_age]`, so budgets differ between connections.
+    #[test]
+    fn age_budgets_are_jittered_between_half_and_full_max_age() {
+        let max_age = Duration::from_secs(10);
+        assert_eq!(jittered_age(max_age, 0), Duration::from_secs(5));
+        assert_eq!(jittered_age(max_age, 5_000), Duration::from_secs(10));
+        let budgets: Vec<Duration> = (0..200)
+            .map(|_| jittered_age(max_age, random_u64()))
+            .collect();
+        assert!(
+            budgets
+                .iter()
+                .all(|b| (Duration::from_secs(5)..=max_age).contains(b))
+        );
+        let low = budgets
+            .iter()
+            .filter(|b| **b < Duration::from_millis(7_500))
+            .count();
+        assert!(
+            (40..=160).contains(&low),
+            "not spread: {low} of 200 below the midpoint"
+        );
     }
 }

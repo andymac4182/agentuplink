@@ -411,7 +411,9 @@ pub fn load_consumer_server_config_from_pem(
     let mut config = Arc::unwrap_or_clone(config);
     config.ticketer = rustls::crypto::ring::Ticketer::new().map_err(TlsConfigError::Rustls)?;
     config.send_tls13_tickets = CONSUMER_TLS13_TICKETS;
-    debug_assert_eq!(config.max_early_data_size, 0, "0-RTT stays disabled");
+    // 0-RTT stays off: a resumed connection must not replay a request.
+    config.max_early_data_size = 0;
+    config.send_half_rtt_data = false;
     Ok(Arc::new(config))
 }
 

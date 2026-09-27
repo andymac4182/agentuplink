@@ -357,6 +357,7 @@ async fn under_pressure_a_late_client_is_served_while_a_flood_holds_every_permit
         Some(ListenerTurnover {
             max_age: Duration::from_secs(1),
             max_requests: 1_000_000,
+            ..ListenerTurnover::default()
         }),
     )
     .await?;
@@ -470,6 +471,7 @@ async fn without_pressure_nothing_is_recycled() -> TestResult {
         Some(ListenerTurnover {
             max_age: Duration::from_secs(1),
             max_requests: 5,
+            ..ListenerTurnover::default()
         }),
     )
     .await?;
@@ -511,6 +513,7 @@ async fn http1_turnover_never_cuts_a_response_or_an_upgrade() -> TestResult {
         Some(ListenerTurnover {
             max_age: Duration::from_secs(1),
             max_requests: 1_000_000,
+            ..ListenerTurnover::default()
         }),
     )
     .await?;
@@ -588,6 +591,7 @@ async fn http2_turnover_sends_goaway_and_lets_streams_finish() -> TestResult {
         Some(ListenerTurnover {
             max_age: Duration::from_secs(1),
             max_requests: 1_000_000,
+            ..ListenerTurnover::default()
         }),
     )
     .await?;
@@ -719,5 +723,129 @@ async fn a_connection_over_the_limit_gets_a_permit_freed_while_it_waits() -> Tes
     assert_eq!(response.body, QUICK_BODY.as_bytes());
     assert_eq!(fixture.diagnostics.fairness_handoffs(), 1);
     assert_eq!(fixture.diagnostics.capacity_refusals(), 1);
+    fixture.shutdown().await
+}
+
+/// M6-C193 review (N2): the hand-off has its own bounded queue, separate from
+/// the refusal margin.  With that queue full, a further connection over the
+/// limit is refused `503` at once through the margin, not held for the
+/// hand-off wait, so the explicit refusal stays the overload signal.
+///
+/// Red while waiting shared the refusal margin: every refusal first waited
+/// for the hand-off, so the second connection was answered only after about
+/// 500 ms.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn with_the_handoff_queue_full_further_connections_are_refused_at_once() -> TestResult {
+    let fixture = Fixture::start(
+        ListenerCapacity {
+            max_connections: 1,
+            refusal_margin: 2,
+            ..ListenerCapacity::default()
+        },
+        Some(ListenerTurnover {
+            handoff_queue: 1,
+            ..ListenerTurnover::default()
+        }),
+    )
+    .await?;
+    let mut holder = fixture.connect().await?;
+    assert_eq!(get_http1(&mut holder, "/quick").await?.status, 200);
+
+    // A silent connection takes the only hand-off slot for the whole wait.
+    let _waiting = TcpStream::connect(fixture.address).await?;
+    wait_for(
+        "the waiting connection's accept",
+        Duration::from_secs(5),
+        || fixture.diagnostics.nodelay_counts().0 >= 2,
+    )
+    .await?;
+
+    let started = Instant::now();
+    let mut refused = fixture.connect().await?;
+    let response = get_http1(&mut refused, "/quick").await?;
+    let elapsed = started.elapsed();
+    assert_eq!(response.status, 503, "{}", response.head);
+    assert!(
+        elapsed < tunnel_transport::HANDOFF_WAIT * 3 / 5,
+        "with the hand-off queue full the refusal waited {elapsed:?}"
+    );
+    assert_eq!(fixture.diagnostics.fairness_handoffs(), 0);
+    drop(holder);
+    fixture.shutdown().await
+}
+
+/// M6-C193 review (B2): each connection's turnover age is drawn between 50%
+/// and 100% of `max_age`, so connections that were all open when pressure
+/// began are recycled spread over that range, not in one burst.
+///
+/// Red with a fixed age: all eight first recycles landed within one request
+/// interval of each other.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn turnover_of_connections_open_before_pressure_is_spread_out() -> TestResult {
+    const HOLDERS: usize = 8;
+    let max_age = Duration::from_secs(2);
+    let fixture = Fixture::start(
+        ListenerCapacity {
+            max_connections: HOLDERS,
+            refusal_margin: 2,
+            ..ListenerCapacity::default()
+        },
+        Some(ListenerTurnover {
+            max_age,
+            max_requests: 1_000_000,
+            // No hand-off, so the pressure connections never take a permit.
+            handoff_queue: 0,
+        }),
+    )
+    .await?;
+    let mut held = Vec::new();
+    for _ in 0..HOLDERS {
+        let mut stream = fixture.connect().await?;
+        assert_eq!(get_http1(&mut stream, "/quick").await?.status, 200);
+        held.push(stream);
+    }
+    let stop = CancellationToken::new();
+    let pressure = keep_pressure(&fixture, stop.clone());
+    wait_for("pressure", Duration::from_secs(10), || {
+        fixture.diagnostics.capacity_refusals() > 0
+    })
+    .await?;
+    let pressure_began = Instant::now();
+
+    // Each holder keeps requesting until its connection is marked; the time
+    // it is marked is its first recycle.
+    let mut workers = Vec::new();
+    for mut stream in held {
+        workers.push(tokio::spawn(async move {
+            loop {
+                let response = get_http1(&mut stream, "/quick").await?;
+                if response.closes() {
+                    return Ok::<_, std::io::Error>(Instant::now());
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }));
+    }
+    let mut recycled_at = Vec::new();
+    for worker in workers {
+        let at = timeout(max_age * 3, worker)
+            .await
+            .map_err(|_| "a holder was never recycled under pressure")???;
+        recycled_at.push(at.saturating_duration_since(pressure_began));
+    }
+    recycled_at.sort();
+    let spread = recycled_at[HOLDERS - 1] - recycled_at[0];
+    eprintln!("M6-C193 first recycles after pressure began: {recycled_at:?}; spread {spread:?}");
+    assert!(
+        spread >= max_age / 5,
+        "first recycles were not spread out: {recycled_at:?}"
+    );
+    assert!(
+        recycled_at[0] >= max_age / 2 - Duration::from_millis(300),
+        "a connection recycled before half its max age: {recycled_at:?}"
+    );
+
+    stop.cancel();
+    let _ = timeout(Duration::from_secs(10), pressure).await;
     fixture.shutdown().await
 }

@@ -2341,35 +2341,6 @@ enum TlsFailure {
     },
 }
 
-/// The certificate-verification failures of a handshake, classified **by
-/// rustls variant and never by message text** (task row M6-C23, reconnect).
-///
-/// Every handshake failure is otherwise one opaque `websocket handshake
-/// failed`, so a reconnecting `connect` could not tell a wrong `server_ca`
-/// from a relay that is still restarting. Three outcomes:
-///
-/// * **Terminal** (`TlsFailure::Refused`): this client refused the relay's
-///   certificate as from an unknown issuer (the wrong `server_ca`), badly
-///   signed, revoked, not valid for the relay's name, or not for server
-///   authentication; or the relay refused this device's certificate with an
-///   unknown-CA, bad, unsupported, revoked, unknown or required-but-absent
-///   certificate alert. These are properties of the identities, not of time
-///   or the network.
-/// * **Retryable with its reason** (`TlsFailure::NotCurrent`): a certificate
-///   that is expired or not yet valid **on somebody's clock** -- the relay's
-///   certificate on ours, or ours on the relay's (the `certificate_expired`
-///   alert). Clock skew between a CA, a relay and a device is ordinary, and a
-///   relay certificate can be renewed; `connect` settles the device side
-///   against its own certificate (see `DEVICE_CERTIFICATE_NOT_CURRENT_SCOPE`).
-/// * **Opaque and retryable** (`None`): a reset, an EOF, an I/O error, a
-///   timeout, a middlebox dropping the connection, an unclassified alert such
-///   as `handshake_failure`, `decrypt_error` or `access_denied`, and
-///   certificate errors outside the lists (`BadEncoding`, `Other`, variants a
-///   later rustls adds). Those are what a laptop waking from sleep or a flaky
-///   network produce.
-///
-/// Every reason is a string written here; nothing from the peer or its
-/// certificate is carried.
 /// The retry hint assumed for a `CONNECTION_LIMIT` refusal that carried
 /// none readable (task row M6-C194): the relay's documented value.
 pub const DEFAULT_CONNECTION_LIMIT_RETRY_AFTER_MS: u64 = 1_000;
@@ -2423,6 +2394,35 @@ fn connection_limit_retry_after_ms(error: &tokio_tungstenite::tungstenite::Error
     Some(hinted.min(MAX_HONOURED_RETRY_AFTER_MS))
 }
 
+/// The certificate-verification failures of a handshake, classified **by
+/// rustls variant and never by message text** (task row M6-C23, reconnect).
+///
+/// Every handshake failure is otherwise one opaque `websocket handshake
+/// failed`, so a reconnecting `connect` could not tell a wrong `server_ca`
+/// from a relay that is still restarting. Three outcomes:
+///
+/// * **Terminal** (`TlsFailure::Refused`): this client refused the relay's
+///   certificate as from an unknown issuer (the wrong `server_ca`), badly
+///   signed, revoked, not valid for the relay's name, or not for server
+///   authentication; or the relay refused this device's certificate with an
+///   unknown-CA, bad, unsupported, revoked, unknown or required-but-absent
+///   certificate alert. These are properties of the identities, not of time
+///   or the network.
+/// * **Retryable with its reason** (`TlsFailure::NotCurrent`): a certificate
+///   that is expired or not yet valid **on somebody's clock** -- the relay's
+///   certificate on ours, or ours on the relay's (the `certificate_expired`
+///   alert). Clock skew between a CA, a relay and a device is ordinary, and a
+///   relay certificate can be renewed; `connect` settles the device side
+///   against its own certificate (see `DEVICE_CERTIFICATE_NOT_CURRENT_SCOPE`).
+/// * **Opaque and retryable** (`None`): a reset, an EOF, an I/O error, a
+///   timeout, a middlebox dropping the connection, an unclassified alert such
+///   as `handshake_failure`, `decrypt_error` or `access_denied`, and
+///   certificate errors outside the lists (`BadEncoding`, `Other`, variants a
+///   later rustls adds). Those are what a laptop waking from sleep or a flaky
+///   network produce.
+///
+/// Every reason is a string written here; nothing from the peer or its
+/// certificate is carried.
 fn tls_refusal(error: &tokio_tungstenite::tungstenite::Error) -> Option<TlsFailure> {
     use tokio_tungstenite::tungstenite::{Error as WsError, error::TlsError};
     let rustls_error: &rustls::Error = match error {

@@ -147,5 +147,5 @@ returned `Accept(Too many open files)`, and the relay exited.
 
 To see the startup check, run `ulimit -n 100` in a shell, then start
 `tunnel-relay serve` from it. Before it prints `tunnel-relay listening`, it
-prints `tunnel-relay warning: open-file soft limit 100 is below the 160
+prints `tunnel-relay warning: open-file soft limit 100 is below the 176
 descriptors ...`.
