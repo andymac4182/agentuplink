@@ -3047,7 +3047,11 @@ mod tests {
             1,
             "a failed supervisor is genuinely internal"
         );
-        assert_eq!(seen.len(), 10, "ten distinct codes across thirteen variants");
+        assert_eq!(
+            seen.len(),
+            10,
+            "ten distinct codes across thirteen variants"
+        );
     }
 
     /// The point of the change: causes that need different operator actions
