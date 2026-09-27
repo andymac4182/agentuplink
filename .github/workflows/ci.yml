@@ -347,6 +347,20 @@ jobs:
           node-version: "24"
       - name: Off-the-shelf MCP SDKs and conformance suite through the relay
         run: sh scripts/m3-sdk-conformance.sh
+      # M3-39/M3-40: the demo recipe (docs/demo/mcp.md), both profiles,
+      # through a real local relay.  The job's plaintext Redis is fronted with
+      # TLS by the script (DEMO_PLAIN_REDIS); its keys are purged on exit.  A
+      # run passes only on the client's own final `mcp-demo: ok` line.
+      - name: MCP demo (both profiles) through a local relay
+        run: |
+          set -eu
+          for profile in mcp-2025-11-25 mcp-2026-07-28; do
+            DEMO_PLAIN_REDIS=127.0.0.1:6379 DEMO_PROFILE="$profile" sh scripts/demo-mcp.sh > demo.log 2>&1 \
+              || { tail -40 demo.log; exit 1; }
+            grep '^mcp-demo: ' demo.log
+            grep -q "^mcp-demo: ok profile=${profile#mcp-} " demo.log \
+              || { echo "no mcp-demo ok line for $profile"; exit 1; }
+          done
 
   # M4: the filesystem gates 4 to 14 over the three-relay cluster fixture,
   # including gate 11 (a 9P session across a failed data socket's retained

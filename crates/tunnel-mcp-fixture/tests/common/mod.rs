@@ -217,6 +217,26 @@ pub async fn connect(
     (running, handler)
 }
 
+/// Run the `initialize` lifecycle with a client pinned to `protocol`, and
+/// return its outcome instead of asserting it (M3-38).
+pub async fn connect_pinned(
+    gateway: &Gateway,
+    protocol: ProtocolVersion,
+) -> Result<RunningService<RoleClient, RecordingClient>, String> {
+    let http = UnixSocketHttpClient::new(gateway.socket.to_str().expect("utf-8 path"), URI);
+    let transport = StreamableHttpClientTransport::with_client(
+        http,
+        StreamableHttpClientTransportConfig::with_uri(URI),
+    );
+    let handler = RecordingClient {
+        protocol: Some(protocol),
+        ..RecordingClient::default()
+    };
+    within(handler.serve_with_lifecycle(transport, ClientLifecycleMode::Initialize))
+        .await
+        .map_err(|error| error.to_string())
+}
+
 /// Serve the fixture with the official rmcp Streamable HTTP server on a
 /// loopback port.  Returns the URL.
 pub async fn rmcp_http_backend(

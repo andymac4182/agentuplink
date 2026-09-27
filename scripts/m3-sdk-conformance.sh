@@ -27,8 +27,8 @@
 #              SDKs;
 #   fixture    the repository's rmcp fixture over stdio: tools, `_meta`,
 #              ordered progress, and a cancel that must reach the device's
-#              server after dispatch (the Python session's close after it
-#              may meet M3-48, reported as `result=known`).
+#              server after dispatch, and the Python session's close after
+#              it must be clean (M3-48, fixed).
 # Every client goes client -> relay consumer listener (HTTPS + bearer token)
 # -> device WebSocket (mTLS) -> tunnel-client -> MCP server.  Nothing
 # bypasses the relay.  The conformance suite also runs directly against the
@@ -484,9 +484,9 @@ echo "$summary" >> "$log"
 say "$summary"
 if [ -n "${M3SC_LOG_COPY:-}" ]; then cp "$log" "$M3SC_LOG_COPY"; fi
 # A run that reported nothing is not a pass.
-# M3-48 may be reported as `result=known` at most once per Python mode;
-# more means something else is being excused.
-[ "$sdk_known" -le 2 ] || { say "$sdk_known known results; at most 2 (M3-48, once per Python mode)"; failed=1; }
+# Nothing is excused any more: M3-48 (the only `result=known` case) is
+# fixed, so any known result means a case is being excused.
+[ "$sdk_known" -eq 0 ] || { say "$sdk_known known results; none may be excused (M3-48 is fixed)"; failed=1; }
 [ "$sdk_pass" -ge 70 ] || { say "only $sdk_pass SDK cases passed; expected at least 70"; failed=1; }
 [ "$failed" = 0 ] || fail "see $work/logs"
 say "ok: the pinned TypeScript and Python MCP SDKs and the conformance suite work through the relay"

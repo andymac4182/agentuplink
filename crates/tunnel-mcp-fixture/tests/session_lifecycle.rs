@@ -9,7 +9,9 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use bytes::Bytes;
-use common::{body_bytes, count_lines, exchange, fixture_binary, stdio_export_with, within};
+use common::{
+    body_bytes, count_lines, exchange, fixture_binary, stdio_export_with, wait_for_file, within,
+};
 use http::{Request, StatusCode};
 use http_body_util::{BodyExt, Full};
 use tunnel_http_bridge::ChannelBody;
@@ -271,6 +273,279 @@ async fn a_duplicate_in_flight_progress_token_is_rejected() {
     assert!(String::from_utf8_lossy(&body).contains("progress token"));
     assert_eq!(count_lines(&log, "sleep"), 1, "the duplicate never ran");
     first.abort();
+}
+
+/// M3-48: a request the client cancelled with `notifications/cancelled` must
+/// not hold its POST open until the session is deleted.  The server need not
+/// answer a cancelled request (2025-11-25), and rmcp's fixture does not, so
+/// the bridge closes that POST itself: promptly, cleanly (not interrupted)
+/// and with no JSON-RPC response it did not receive.  The session stays
+/// usable and its DELETE is clean.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cancelled_legacy_request_closes_its_post_promptly() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let export = stdio_export_with(LEGACY, workspace.path(), 1, &fixture_binary(), "");
+    let session = open_session(&export).await;
+    let headers = legacy_headers(Some(&session));
+    let cancelled_export = export.clone();
+    let cancelled_headers = headers.clone();
+    let cancelled = tokio::spawn(async move {
+        let response = exchange(
+            &cancelled_export,
+            post(
+                &cancelled_headers,
+                r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"sleep","arguments":{"label":"m348"}}}"#,
+            ),
+        )
+        .await;
+        let status = response.status();
+        (status, body_bytes(response).await)
+    });
+    let log = workspace.path().join("invocations.log");
+    for _ in 0..400 {
+        if count_lines(&log, "sleep") == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(count_lines(&log, "sleep"), 1, "sleep started");
+    let cancel = within(exchange(
+        &export,
+        post(
+            &headers,
+            r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":7,"reason":"synthetic"}}"#,
+        ),
+    ))
+    .await;
+    assert_eq!(cancel.status(), StatusCode::ACCEPTED);
+    assert!(
+        wait_for_file(&workspace.path().join("cancelled-m348")).await,
+        "the child observed notifications/cancelled"
+    );
+    // Well inside the session's lifetime: nothing deletes it before this.
+    let (status, body) = tokio::time::timeout(Duration::from_secs(5), cancelled)
+        .await
+        .expect("the cancelled POST closed without waiting for DELETE")
+        .expect("task");
+    assert_eq!(status, StatusCode::OK);
+    let body = body.expect("the cancelled POST ends cleanly, not interrupted");
+    assert!(
+        !String::from_utf8_lossy(&body).contains(r#""id":7"#),
+        "no response for the cancelled request"
+    );
+    assert_eq!(export.diagnostics().cancelled_requests_closed, 1);
+    // The session is still usable, and ending it is clean.
+    let response = within(exchange(&export, post(&headers, &tools_list(8)))).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = body_bytes(response).await;
+    let mut delete_headers = headers.clone();
+    delete_headers.retain(|(name, _)| *name != "content-type");
+    let deleted = within(exchange(
+        &export,
+        build("DELETE", &delete_headers, Full::new(Bytes::new())),
+    ))
+    .await;
+    assert_eq!(deleted.status(), StatusCode::NO_CONTENT);
+}
+
+/// M3-48 review: closing a cancelled request's POST must not free its ID
+/// early.  The cancelled request stays registered until its own POST has
+/// ended, so a new request that reuses the ID in that window is refused as a
+/// duplicate.  Before the review fix it was registered instead: it could then
+/// receive the cancelled request's late response (rmcp's fixture answers a
+/// cancelled `sleep`), or be torn down by the old POST's cleanup, which
+/// would interrupt it.  The old POST's future is deliberately left unpolled
+/// after the cancel, which holds that window open.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_id_reused_right_after_its_cancel_is_never_interrupted() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let export = stdio_export_with(LEGACY, workspace.path(), 1, &fixture_binary(), "");
+    let session = open_session(&export).await;
+    let headers = legacy_headers(Some(&session));
+    let sleep = |label: &str| {
+        format!(
+            r#"{{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{{"name":"sleep","arguments":{{"label":"{label}"}}}}}}"#
+        )
+    };
+    // The first request, polled only until it is registered and waiting.
+    let mut first = Box::pin(export.handle(direct(&headers, &sleep("old"))));
+    let log = workspace.path().join("invocations.log");
+    for _ in 0..400 {
+        if tokio::time::timeout(Duration::from_millis(10), &mut first)
+            .await
+            .is_ok()
+        {
+            panic!("the sleep request answered before it was cancelled");
+        }
+        if count_lines(&log, "sleep") == 1 {
+            break;
+        }
+    }
+    assert_eq!(count_lines(&log, "sleep"), 1, "sleep started");
+    let cancel = within(export.handle(direct(
+        &headers,
+        r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":7}}"#,
+    )))
+    .await
+    .expect("cancel");
+    assert_eq!(cancel.status(), StatusCode::ACCEPTED);
+    // The same ID again, while the old POST has not yet run its cleanup.
+    let reuse_export = export.clone();
+    let reuse_headers = headers.clone();
+    let reuse_body = sleep("new");
+    let reuse = tokio::spawn(async move {
+        reuse_export
+            .handle(direct(&reuse_headers, &reuse_body))
+            .await
+            .map(|response| response.status())
+    });
+    // Give a registered reuse time to reach the child before the old POST's
+    // cleanup runs; a refused one has already answered.
+    for _ in 0..100 {
+        if reuse.is_finished() || count_lines(&log, "sleep") == 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    // Now let the old POST end, and its cleanup run.
+    let old = within(first)
+        .await
+        .expect("the cancelled POST ends cleanly");
+    assert_eq!(old.status(), StatusCode::OK);
+    let reuse = tokio::time::timeout(Duration::from_secs(3), reuse).await;
+    match reuse {
+        // Refused before dispatch: the ID was still in flight.
+        Ok(Ok(Ok(status))) => assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "refused as a duplicate, never answered with another request's response"
+        ),
+        Ok(Ok(Err(_))) => panic!("the reused ID's POST was interrupted"),
+        Ok(Err(error)) => panic!("task: {error}"),
+        // Registered and still waiting: not interrupted either.
+        Err(_) => {}
+    }
+}
+
+/// M3-48's limit: a cancellation names a request of **this** session only.
+/// A `requestId` that is not in flight closes nothing and is still
+/// forwarded (202), and the in-flight request with another ID is untouched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cancellation_for_another_id_closes_nothing() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let export = stdio_export_with(LEGACY, workspace.path(), 1, &fixture_binary(), "");
+    let session = open_session(&export).await;
+    let headers = legacy_headers(Some(&session));
+    let cancel = within(exchange(
+        &export,
+        post(
+            &headers,
+            r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":99}}"#,
+        ),
+    ))
+    .await;
+    assert_eq!(cancel.status(), StatusCode::ACCEPTED);
+    let response = within(exchange(&export, post(&headers, &tools_list(99)))).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_bytes(response).await.expect("body");
+    assert!(String::from_utf8_lossy(&body).contains(r#""id":99"#));
+    assert_eq!(export.diagnostics().cancelled_requests_closed, 0);
+}
+
+/// M3-10, stdio export kind: no resume, and it says so on the wire.  The
+/// bridge emits no SSE `id:` field, so a conforming client never has a
+/// `Last-Event-ID` to send.  A GET that carries one anyway is served as a
+/// fresh standalone stream of this session: nothing is replayed, from this
+/// stream or any other.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_stdio_export_emits_no_event_ids_and_replays_nothing() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let export = stdio_export_with(LEGACY, workspace.path(), 1, &fixture_binary(), "");
+    let session = open_session(&export).await;
+    let headers = legacy_headers(Some(&session));
+    let progress = within(exchange(
+        &export,
+        post(
+            &headers,
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"progress","arguments":{"steps":3},"_meta":{"progressToken":"m310"}}}"#,
+        ),
+    ))
+    .await;
+    assert_eq!(progress.status(), StatusCode::OK);
+    let body = body_bytes(progress).await.expect("progress body");
+    let text = String::from_utf8_lossy(&body);
+    assert!(text.contains("notifications/progress"), "an SSE response");
+    assert!(
+        !text.lines().any(|line| line.starts_with("id:")),
+        "no event carries an ID"
+    );
+    // The standalone stream: server messages that belong to no request.
+    let mut get_headers = legacy_headers(Some(&session));
+    get_headers.retain(|(name, _)| *name != "accept" && *name != "content-type");
+    get_headers.push(("accept", "text/event-stream".to_owned()));
+    let log = |label: &str, id: u64| {
+        format!(
+            r#"{{"jsonrpc":"2.0","id":{id},"method":"tools/call","params":{{"name":"log","arguments":{{"label":"{label}","count":3}}}}}}"#
+        )
+    };
+    let first = within(exchange(
+        &export,
+        build("GET", &get_headers, Full::new(Bytes::new())),
+    ))
+    .await;
+    assert_eq!(first.status(), StatusCode::OK);
+    let mut first = first.into_body();
+    let call = within(exchange(&export, post(&headers, &log("before", 4)))).await;
+    let _ = body_bytes(call).await;
+    let delivered = read_until(&mut first, r#""label":"before","seq":2"#).await;
+    assert!(delivered.contains(r#""label":"before","seq":0"#));
+    assert!(
+        !delivered.lines().any(|line| line.starts_with("id:")),
+        "no standalone event carries an ID"
+    );
+    drop(first);
+    // Reconnect with a Last-Event-ID, as a resuming client would.  The old
+    // stream's close is noticed asynchronously, so a GET that still meets
+    // the open stream is refused and retried, bounded.
+    get_headers.push(("last-event-id", "0".to_owned()));
+    let mut second = None;
+    for _ in 0..200 {
+        let response = within(exchange(
+            &export,
+            build("GET", &get_headers, Full::new(Bytes::new())),
+        ))
+        .await;
+        if response.status() == StatusCode::OK {
+            second = Some(response.into_body());
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let mut second = second.expect("a second standalone stream opens");
+    let call = within(exchange(&export, post(&headers, &log("after", 5)))).await;
+    let _ = body_bytes(call).await;
+    let resumed = read_until(&mut second, r#""label":"after","seq":2"#).await;
+    // A resuming bridge would deliver the messages already seen first.
+    assert!(
+        !resumed.contains(r#""label":"before""#),
+        "nothing already delivered is replayed: {resumed}"
+    );
+    assert!(resumed.contains(r#""label":"after","seq":0"#));
+}
+
+/// Read `body` until `needle` has arrived; returns everything read.
+async fn read_until(body: &mut tunnel_http_bridge::ChannelBody, needle: &str) -> String {
+    let mut text = String::new();
+    within(async {
+        while !text.contains(needle) {
+            let frame = body.frame().await.expect("stream open").expect("frame");
+            if let Ok(data) = frame.into_data() {
+                text.push_str(std::str::from_utf8(&data).expect("utf-8"));
+            }
+        }
+    })
+    .await;
+    text
 }
 
 fn wrapper_script(dir: &Path) -> PathBuf {
