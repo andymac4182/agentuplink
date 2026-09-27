@@ -58,7 +58,8 @@ const DEFAULT_MAX_LIST_ITEMS: usize = 1_024;
 const MAX_IDENTIFIER_BYTES: usize = 128;
 /// Maximum accepted length of the authoritative Redis key namespace.
 pub const MAX_REDIS_NAMESPACE_BYTES: usize = 96;
-const REDIS_OPERATION_TIMEOUT: Duration = Duration::from_secs(2);
+/// The reply deadline of one Redis authority command.
+pub const REDIS_OPERATION_TIMEOUT: Duration = Duration::from_secs(2);
 /// Placeholder for the Redis run id in a script's arguments.  The lane that
 /// runs the script replaces it with the run its connection was verified
 /// against (see `AuthorityLane::query_eval`), so a script's run fence never
@@ -109,7 +110,8 @@ const LANE_CONNECTIONS: usize = AUTHORIZATION_CONNECTIONS + MAINTENANCE_CONNECTI
 /// timestamped read is refused. This is the genuine clock-skew direction: the
 /// scripts evaluate validity at `math.max(caller_at, now)`, so a caller ahead of
 /// the authority would otherwise extend a validity window past its real expiry.
-const MAX_AUTHORITY_CLOCK_SKEW_US: i64 = 1_000_000;
+/// It is the one cluster-internal bound ([`crate::clock`], M7-C173).
+const MAX_AUTHORITY_CLOCK_SKEW_US: i64 = crate::clock::MAX_CLUSTER_CLOCK_SKEW_US;
 /// How far a caller's timestamp may lag the authority's clock before a
 /// timestamped read is refused.
 ///
@@ -126,7 +128,16 @@ const MAX_AUTHORITY_CLOCK_SKEW_US: i64 = 1_000_000;
 /// closed: validity is evaluated at `math.max(caller_at, now)` and the returned
 /// windows are translated back into the caller's frame, so a lagging caller
 /// timestamp can only shorten a window, never extend one.
-const MAX_AUTHORITY_CALLER_LAG_US: i64 = REDIS_OPERATION_TIMEOUT.as_micros() as i64;
+///
+/// M7-C173: the budget is the authority deadline **plus** the cluster
+/// clock-skew bound. Before, it was the deadline alone, so a relay whose clock
+/// ran more than about one second behind Redis (two seconds minus the command's
+/// flight time) was refused on every timestamped read although the accepted
+/// skew was symmetric. With the skew added, a lagging clock is tolerated to the
+/// same bound as a leading one, and a command in flight longer than the
+/// deadline still fails as a `timeout` first.
+const MAX_AUTHORITY_CALLER_LAG_US: i64 =
+    REDIS_OPERATION_TIMEOUT.as_micros() as i64 + crate::clock::MAX_CLUSTER_CLOCK_SKEW_US;
 const MAX_TICKET_INDEX_ITEMS: usize = crate::MAX_ATTACHMENT_TICKETS_PER_DEVICE;
 const MAX_REDIS_TLS_PEM_BYTES: usize = 1024 * 1024;
 
@@ -2681,6 +2692,24 @@ impl Catalog for RedisCatalog {
             .query::<String>(&redis::cmd("PING"))
             .await
             .map(drop)
+    }
+
+    /// Redis `TIME` on the catalog lane (M7-C175): the server clock every
+    /// authority script compares a caller's timestamp with.
+    async fn authority_time(&self) -> Result<Option<DateTime<Utc>>, CatalogError> {
+        let reply: Vec<String> = self.connection.query(&redis::cmd("TIME")).await?;
+        let invalid = || CatalogError::Serialization("invalid Redis TIME reply".into());
+        let [seconds, micros] = reply.as_slice() else {
+            return Err(invalid());
+        };
+        let seconds: i64 = seconds.parse().map_err(|_| invalid())?;
+        let micros: u32 = micros.parse().map_err(|_| invalid())?;
+        if micros >= 1_000_000 {
+            return Err(invalid());
+        }
+        DateTime::<Utc>::from_timestamp(seconds, micros * 1_000)
+            .map(Some)
+            .ok_or_else(invalid)
     }
 }
 

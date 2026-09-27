@@ -119,7 +119,7 @@ async fn start_requiring(
         None,
         None,
         exports,
-        None,
+        crate::health::ReadinessChecks::default(),
     );
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let address = listener.local_addr().expect("address");

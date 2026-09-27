@@ -924,7 +924,7 @@ impl Cause {
 
 /// How long after this process's own session ended an `OWNER_BUSY` refusal
 /// is still read as that session's lease rather than another connector.
-/// The relay bounds its owner lease to 6..=30 s (`owner_lease` in
+/// The relay bounds its owner lease to 18..=30 s (`owner_lease` in
 /// `tunnel-relay`'s config), which is how long a **dead relay's** owner
 /// record outlives it (measured about 30 s); twice the maximum covers that.
 /// It also covers a relay that is still running and still holds the old

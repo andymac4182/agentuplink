@@ -24,8 +24,9 @@ pub const RECOVERY_SCHEMA_VERSION: u16 = 1;
 pub const MAX_RECOVERY_RECORD_BYTES: usize = 16 * 1024;
 /// A recovery approval cannot authorize a window longer than one minute.
 pub const MAX_RECOVERY_LIFETIME: Duration = Duration::seconds(60);
-/// The maximum wall-clock skew accepted while checking an approval.
-pub const MAX_RECOVERY_CLOCK_SKEW: Duration = Duration::seconds(1);
+/// The maximum wall-clock skew accepted while checking an approval: the one
+/// cluster-internal bound ([`crate::clock`], M7-C173).
+pub const MAX_RECOVERY_CLOCK_SKEW: Duration = crate::clock::MAX_CLUSTER_CLOCK_SKEW_WALL;
 
 const MAX_IDENTIFIER_BYTES: usize = 128;
 const MAX_NONCE_BYTES: usize = 128;
@@ -938,7 +939,7 @@ mod tests {
         let verifier = verifier(&issuer);
 
         let mut future = approval(now(), 1);
-        future.issued_at = now() + Duration::seconds(2);
+        future.issued_at = now() + MAX_RECOVERY_CLOCK_SKEW + Duration::seconds(1);
         let signed = issuer.sign_approval(future).expect("signed approval");
         assert!(matches!(
             verifier.verify(
@@ -951,7 +952,7 @@ mod tests {
         ));
 
         let mut not_yet_valid = approval(now(), 1);
-        not_yet_valid.not_before = now() + Duration::seconds(2);
+        not_yet_valid.not_before = now() + MAX_RECOVERY_CLOCK_SKEW + Duration::seconds(1);
         let signed = issuer
             .sign_approval(not_yet_valid)
             .expect("signed approval");
@@ -968,7 +969,7 @@ mod tests {
         let mut expired = approval(now(), 1);
         expired.issued_at = now() - Duration::seconds(60);
         expired.not_before = now() - Duration::seconds(59);
-        expired.expires_at = now() - Duration::seconds(2);
+        expired.expires_at = now() - MAX_RECOVERY_CLOCK_SKEW - Duration::seconds(1);
         let signed = issuer.sign_approval(expired).expect("signed approval");
         assert!(matches!(
             verifier.verify(

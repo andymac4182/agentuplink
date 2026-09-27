@@ -180,8 +180,8 @@ impl RelayOptions {
                 "challenge_interval must be <= 5 seconds",
             ));
         }
-        if self.owner_lease < Duration::from_secs(6) || self.owner_lease > Duration::from_secs(30) {
-            return Err(ConfigError::Invalid("owner_lease must be 6..=30 seconds"));
+        if self.owner_lease < MIN_OWNER_LEASE || self.owner_lease > Duration::from_secs(30) {
+            return Err(ConfigError::Invalid("owner_lease must be 18..=30 seconds"));
         }
         self.limits.validate()?;
         self.rotation.validate().map_err(ConfigError::Rotation)?;
@@ -508,7 +508,7 @@ impl ClusterConfig {
         )?;
         if self.max_clock_skew_seconds > MAX_CLUSTER_CLOCK_SKEW_SECONDS {
             return Err(ConfigError::Invalid(
-                "cluster.max_clock_skew_seconds must be 0..=1",
+                "cluster.max_clock_skew_seconds must be 0..=5",
             ));
         }
         if self.membership_refresh_seconds > self.membership_record_lifetime_seconds {
@@ -1161,6 +1161,8 @@ impl ServeConfig {
             // authority in `/readyz`; a cluster relay's readiness is its
             // membership and peer readiness, unchanged.
             authority_readiness: self.cluster.is_none(),
+            // M7-C175: every served relay follows its clock offset from Redis.
+            clock_offset_health: true,
             ..crate::ListenerSocketOptions::default()
         })
     }
@@ -1333,6 +1335,20 @@ fn default_max_queue_bytes() -> usize {
     4 * 1024 * 1024
 }
 
+/// The shortest owner lease (coordinator decision on the Opus review of
+/// #225). A lease is renewed once a third of it has elapsed, so the two
+/// thirds left must exceed the owner safety margin (skew + 4 s = 9 s) plus a
+/// late renewal: one maintenance tick (500 ms) and one Redis reply deadline
+/// (2 s). Otherwise a renewal that lands late opens a window in which ticket
+/// issuance is refused. It was 6 s while the margin was 5 s.
+pub(crate) const MIN_OWNER_LEASE: Duration = Duration::from_secs(18);
+const _: () = assert!(
+    MIN_OWNER_LEASE.as_millis() * 2 / 3
+        > crate::actor::OWNER_LEASE_SAFETY_MARGIN.as_millis()
+            + crate::actor::MAINTENANCE_TICK.as_millis()
+            + tunnel_catalog::REDIS_OPERATION_TIMEOUT.as_millis()
+);
+const _: () = assert!(MIN_OWNER_LEASE.as_secs() == 18);
 const MAX_CLUSTER_AUTHORIZED_NODES: usize = 32;
 const MAX_CLUSTER_RECORD_LIFETIME_SECONDS: u64 = 60;
 const MAX_CLUSTER_REFRESH_SECONDS: u64 = 20;
@@ -1340,7 +1356,10 @@ const MAX_CLUSTER_RECONCILE_SECONDS: u64 = 5;
 const MAX_CLUSTER_IDLE_TIMEOUT_SECONDS: u64 = 60;
 const MAX_CLUSTER_DRAIN_SECONDS: u64 = 30;
 const MAX_CLUSTER_CHECKPOINT_TIMEOUT_SECONDS: u64 = 2;
-const MAX_CLUSTER_CLOCK_SKEW_SECONDS: u64 = 1;
+/// The one cluster-internal skew bound (M7-C173); the refusal text above
+/// names it, so a change to it must change that text.
+const MAX_CLUSTER_CLOCK_SKEW_SECONDS: u64 = tunnel_catalog::clock::MAX_CLUSTER_CLOCK_SKEW_SECONDS;
+const _: () = assert!(MAX_CLUSTER_CLOCK_SKEW_SECONDS == 5);
 const MAX_CLUSTER_REKEY_CONVERGENCE_SECONDS: u64 = 3600;
 const MAX_CLUSTER_REKEY_OVERLAP_SECONDS: u64 = 600;
 
@@ -2309,7 +2328,58 @@ consumer_tls_private_key = "consumer-key.pem"
         assert_eq!(cluster.peer_idle_timeout_seconds, 60);
         assert_eq!(cluster.peer_drain_timeout_seconds, 30);
         assert_eq!(cluster.checkpoint_timeout_seconds, 2);
-        assert_eq!(cluster.max_clock_skew_seconds, 1);
+        assert_eq!(cluster.max_clock_skew_seconds, 5);
+    }
+
+    /// Opus review of #225, B2: the owner safety margin tracks the cluster
+    /// skew (skew + 4 s), and the shortest owner lease leaves a renewed owner
+    /// more than that margin.
+    #[test]
+    fn owner_lease_safety_margin_tracks_the_cluster_skew() {
+        assert_eq!(
+            crate::actor::OWNER_LEASE_SAFETY_MARGIN,
+            tunnel_catalog::clock::MAX_CLUSTER_CLOCK_SKEW + Duration::from_secs(4)
+        );
+        assert!(
+            MIN_OWNER_LEASE * 2 / 3
+                > crate::actor::OWNER_LEASE_SAFETY_MARGIN
+                    + crate::actor::MAINTENANCE_TICK
+                    + tunnel_catalog::REDIS_OPERATION_TIMEOUT
+        );
+        let mut options = RelayOptions::new(oidc());
+        options.owner_lease = MIN_OWNER_LEASE;
+        options.validate().expect("the minimum lease is accepted");
+        options.owner_lease = MIN_OWNER_LEASE - Duration::from_secs(1);
+        assert_eq!(
+            options
+                .validate()
+                .expect_err("a lease below the minimum is refused")
+                .to_string(),
+            "owner_lease must be 18..=30 seconds"
+        );
+    }
+
+    /// M7-C173: the cluster clock-skew ceiling is the shared five-second
+    /// bound: five is accepted (and is the default), six is refused.
+    #[test]
+    fn cluster_clock_skew_is_bounded_by_the_shared_constant() {
+        let with_skew = |seconds: u64| {
+            valid_cluster_toml().replace(
+                "[cluster]\n",
+                &format!("[cluster]\nmax_clock_skew_seconds = {seconds}\n"),
+            )
+        };
+        let config = ServeConfig::parse(&with_skew(5)).expect("five seconds is accepted");
+        assert_eq!(config.cluster.expect("cluster").max_clock_skew_seconds, 5);
+        let error = ServeConfig::parse(&with_skew(6)).expect_err("six seconds is refused");
+        assert_eq!(
+            error.to_string(),
+            "cluster.max_clock_skew_seconds must be 0..=5"
+        );
+        assert_eq!(
+            MAX_CLUSTER_CLOCK_SKEW_SECONDS,
+            tunnel_catalog::clock::MAX_CLUSTER_CLOCK_SKEW_SECONDS
+        );
     }
 
     #[test]

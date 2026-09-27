@@ -62,7 +62,8 @@ const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(8);
 const CATALOG_TICKET_QUIESCENCE: Duration = Duration::from_secs(11);
 const OWNER_DEVICE_PERMISSION_LIFETIME: Duration = Duration::from_secs(30);
 const MEMBERSHIP_TRUST_LIFETIME: Duration = Duration::from_secs(60);
-const ALLOWED_MEMBERSHIP_CLOCK_SKEW: Duration = Duration::from_secs(1);
+/// The one cluster-internal skew bound (M7-C173), never a local copy.
+const ALLOWED_MEMBERSHIP_CLOCK_SKEW: Duration = tunnel_catalog::clock::MAX_CLUSTER_CLOCK_SKEW;
 const DEPLOYMENT_ID_PREFIX: &str = "m7-recovery-process-deployment";
 const INITIAL_INCARC_PREFIX: &str = "m7-recovery-process-initial";
 const CANDIDATE_INCARC_PREFIX: &str = "m7-recovery-process-candidate";
@@ -509,7 +510,7 @@ async fn run_process_recovery_gate() -> Result<ConfiguredRecoveryEvidence> {
     // happened, but the CLI cannot prove elapsed time. This fixture supplies
     // that temporal boundary explicitly: the configured relay owner/device
     // permission is 30s, signed membership trust is 60s, and the configured
-    // maximum membership clock skew is 1s. Wait for max(30s, 60s) + 1s from
+    // maximum membership clock skew is 5s. Wait for max(30s, 60s) + 5s from
     // the point at which the old relay and checkpoint are both stopped.
     let fencing_quiescence = MEMBERSHIP_TRUST_LIFETIME
         .saturating_add(ALLOWED_MEMBERSHIP_CLOCK_SKEW)

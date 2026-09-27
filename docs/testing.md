@@ -470,8 +470,10 @@ original generation and a public canary still returns the exact canary plus
 payload bytes; A's readiness stays ready for every sample across the overlap;
 the retired SPKI is refused once the replacement-only record is adopted, with
 A's readiness reflecting that pin transition while relay B is still running; the
-relay whose own key was retired surrenders its owner claim and closes its device
-session; a public request across the retired route returns
+relay whose own key was retired loses its owner claim and its device session
+(**caveat, M7-C181:** only because the gate's Redis proxy cut every connection
+after 5 s; the relay itself does not surrender them, and with the proxy fixed,
+M7-C177, this assertion fails); a public request across the retired route returns
 `503 CLUSTER_UNREADY` / `not_dispatched` and the impostor receives a connection
 from A but never a request stream; an untrusted signer naming a rogue SPKI
 leaves A unready with both the rogue and the replacement certificate refused;

@@ -442,6 +442,12 @@ impl AuthorizationDelayCatalog {
 
 #[async_trait]
 impl Catalog for AuthorizationDelayCatalog {
+    /// Forwarded, so the relay's clock-offset health (M7-C175) measures
+    /// the real Redis clock behind this wrapper.
+    async fn authority_time(&self) -> std::result::Result<Option<DateTime<Utc>>, CatalogError> {
+        self.inner.authority_time().await
+    }
+
     async fn resolve_device(
         &self,
         spki_fingerprint: &str,

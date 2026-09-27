@@ -122,19 +122,25 @@ impl PeerRouteTarget {
 
     /// Build a target from a membership record which has already passed the
     /// signed verifier.  Expired, revoked, and not-yet-active keys are
-    /// excluded from the bounded probe pin set.
+    /// excluded from the bounded probe pin set.  Activation honours the
+    /// verifier's clock-skew allowance exactly as `bind_peer` does (M7-C171,
+    /// option (a)); expiry is strict.
     #[must_use]
     pub fn from_verified_membership(
         membership: &VerifiedMembership,
         now: DateTime<Utc>,
     ) -> Option<Self> {
-        if membership.record().not_before > now || membership.record().expires_at <= now {
+        if !membership.activated(membership.record().not_before, now)
+            || membership.record().expires_at <= now
+        {
             return None;
         }
         let mut approved_spki_sha256 = membership
             .keys()
             .iter()
-            .filter(|key| !key.revoked && key.not_before <= now && key.expires_at > now)
+            .filter(|key| {
+                !key.revoked && membership.activated(key.not_before, now) && key.expires_at > now
+            })
             .map(|key| key.spki_sha256.clone())
             .collect::<Vec<_>>();
         approved_spki_sha256.sort_unstable();

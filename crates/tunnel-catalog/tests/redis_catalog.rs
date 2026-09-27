@@ -431,7 +431,8 @@ async fn redis_authority_clock_bounds_expiry_checks() {
     let service = fixture.services[0].service_id;
     // A caller clock behind the authority is tolerated up to the Redis
     // operation timeout (a slow reply must not be refused as skew), so the
-    // refusal boundary is that lag bound, not the one-second ahead bound.
+    // refusal boundary is that lag bound (deadline plus skew), not the ahead
+    // bound.
     // Thirty seconds is far beyond both and is immune to the sub-second
     // drift between the host clock and the containerised authority.
     let too_old = Utc::now() - Duration::seconds(30);
@@ -668,6 +669,12 @@ async fn redis_expired_owner_release_is_refused_while_the_key_is_still_present()
 /// rejection: every script evaluates validity at `math.max(caller_at, now)` and
 /// translates the returned windows back into the caller's frame, so a stale
 /// caller timestamp can only shorten a validity window, never extend one.
+///
+/// M7-C173: the lag budget is the authority deadline plus the cluster
+/// clock-skew bound (5 s), so a caller six seconds behind -- a clock lagging
+/// Redis inside the skew, plus a second of flight -- is honoured, and a caller
+/// ahead by three seconds (inside the skew) is too. Ahead by eight seconds is
+/// refused.
 #[tokio::test]
 #[ignore = "requires TUNNEL_CATALOG_REDIS_URL Redis primary fixture"]
 async fn redis_authority_accepts_caller_lag_inside_the_authority_deadline() {
@@ -690,9 +697,9 @@ async fn redis_authority_accepts_caller_lag_inside_the_authority_deadline() {
     let device = fixture.devices[0].device_id;
     let service = fixture.services[0].service_id;
 
-    // 1.5s is the band the relay's maintenance tick actually observed: past the
-    // 1 second skew budget, inside the 2 second authority deadline.
-    let lagging = Utc::now() - Duration::milliseconds(1_500);
+    // Six seconds: past the old two-second lag budget, inside the new
+    // deadline-plus-skew budget of seven seconds.
+    let lagging = Utc::now() - Duration::milliseconds(6_000);
 
     let identity = catalog
         .resolve_device(&fixture.credentials[0].spki_fingerprint, lagging)
@@ -720,9 +727,23 @@ async fn redis_authority_accepts_caller_lag_inside_the_authority_deadline() {
         .expect("a reply inside the authority deadline must not be a clock-skew conflict");
     assert!(devices.iter().any(|summary| summary.device_id == device));
 
-    // A caller whose clock runs ahead of the authority is genuine skew and
-    // stays refused: `math.max` would otherwise extend a validity window.
-    let ahead = Utc::now() + Duration::milliseconds(1_500);
+    // A caller ahead of the authority inside the five-second skew is
+    // honoured.
+    let ahead_inside = Utc::now() + Duration::milliseconds(3_000);
+    catalog
+        .resolve_device(&fixture.credentials[0].spki_fingerprint, ahead_inside)
+        .await
+        .expect("a caller ahead inside the skew must not be a clock-skew conflict")
+        .expect("the seeded credential remains live");
+    catalog
+        .authorize(&principal, device, service, ahead_inside, ahead_inside)
+        .await
+        .expect("a caller ahead inside the skew must not be a clock-skew conflict")
+        .expect("the seeded grant remains live");
+
+    // A caller whose clock runs ahead of the authority beyond the skew stays
+    // refused.
+    let ahead = Utc::now() + Duration::milliseconds(8_000);
     assert!(matches!(
         catalog
             .resolve_device(&fixture.credentials[0].spki_fingerprint, ahead)
@@ -776,4 +797,27 @@ async fn redis_resolve_reports_a_not_yet_valid_credential_as_a_conflict() {
         ),
         "a not-yet-valid credential must be a conflict, not a refused identity: {resolved:?}"
     );
+}
+
+/// M7-C175: `authority_time` answers the Redis server clock (`TIME`). The
+/// shared Redis runs on this host, so its clock is within a second of ours.
+#[tokio::test]
+#[ignore = "requires TUNNEL_CATALOG_REDIS_URL Redis primary fixture"]
+async fn redis_authority_time_is_the_server_clock() {
+    let url = std::env::var("TUNNEL_CATALOG_REDIS_URL")
+        .expect("M1 Redis harness must set TUNNEL_CATALOG_REDIS_URL");
+    let namespace = format!("test-time-{}", Uuid::new_v4());
+    let catalog = RedisCatalog::connect_for_recovery(&url, &namespace, "fixture-incarnation")
+        .await
+        .expect("connect Redis catalog");
+    let before = Utc::now();
+    let server = catalog
+        .authority_time()
+        .await
+        .expect("TIME")
+        .expect("Redis has a server clock");
+    let after = Utc::now();
+    let midpoint = before + (after - before) / 2;
+    let offset = (midpoint - server).num_milliseconds().abs();
+    assert!(offset < 1_000, "Redis TIME is {offset} ms from this host");
 }

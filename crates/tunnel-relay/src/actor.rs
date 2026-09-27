@@ -103,7 +103,35 @@ const CHALLENGE_MISMATCH_REASON: &str = "challenge mismatch";
 /// grant deadline expires.  It carries the existing `AUTHORIZATION_INVALIDATED`
 /// code like every other reason outside `authorization_failure_code`.
 const TERMINAL_STREAM_CHALLENGE_REASON: &str = "stream closed";
-const OWNER_LEASE_SAFETY_MARGIN: Duration = Duration::from_secs(5);
+/// How long before its Redis lease expiry an owner stops relying on it.
+///
+/// Owner leases are stamped with this relay's wall clock and expired by the
+/// Redis server clock, so up to [`MAX_CLUSTER_CLOCK_SKEW`] of the margin can
+/// be consumed by skew alone (Opus review of #225, B2). The margin is
+/// therefore derived from the one cluster skew bound plus 4 s: at the full
+/// 5 s skew it still keeps at least 4 s of real safety for the relay's own
+/// wall-clock guards, which are the ones that protect the data plane --
+/// ticket issuance, data attachment and dispatch authorization.
+///
+/// The device-side owner fence is not such a guard. Its relative budget
+/// (`remaining_ms`) bounds only the one-time `OWNER_FENCE` ->
+/// `OWNER_FENCED` ownership handshake (`tunnel-protocol`'s
+/// `owner_fencing`); ongoing dispatch freshness is the lease and
+/// authorization contract these checks enforce.
+///
+/// [`MAX_CLUSTER_CLOCK_SKEW`]: tunnel_catalog::clock::MAX_CLUSTER_CLOCK_SKEW
+pub(crate) const OWNER_LEASE_SAFETY_MARGIN: Duration =
+    tunnel_catalog::clock::MAX_CLUSTER_CLOCK_SKEW.saturating_add(Duration::from_secs(4));
+/// The relay maintenance tick, which renews owner leases.
+pub(crate) const MAINTENANCE_TICK: Duration = Duration::from_millis(500);
+/// [`OWNER_LEASE_SAFETY_MARGIN`] as a wall-clock delta.
+#[allow(clippy::cast_possible_wrap)]
+const OWNER_LEASE_SAFETY_MARGIN_WALL: ChronoDuration =
+    ChronoDuration::seconds(OWNER_LEASE_SAFETY_MARGIN.as_secs() as i64);
+const _: () = assert!(
+    OWNER_LEASE_SAFETY_MARGIN.as_secs()
+        == tunnel_catalog::clock::MAX_CLUSTER_CLOCK_SKEW_SECONDS + 4
+);
 const MAX_ECHO_RESPONSE_EXTRA_BYTES: usize = 256;
 const INITIAL_ATTACHMENT_PURPOSE: &str = "initial";
 const CLEANUP_QUEUE_CAPACITY: usize = 64;
@@ -3187,7 +3215,7 @@ impl RelayHandle {
         let maintenance_task = tokio::spawn(async move {
             let completion = maintenance_completion_for_task;
             let failed = AssertUnwindSafe(async move {
-                let mut interval = tokio::time::interval(Duration::from_millis(500));
+                let mut interval = tokio::time::interval(MAINTENANCE_TICK);
                 loop {
                     tokio::select! {
                         _ = maintenance_cancel.cancelled() => break,
@@ -5077,6 +5105,9 @@ impl RelayActor {
             }
         };
         let (owner_fence, owner_fence_deadline) = if cluster_profile {
+            // The owner fence's relative budget bounds only the one-time
+            // OWNER_FENCE -> OWNER_FENCED handshake; dispatch is guarded by
+            // the wall-clock checks `OWNER_LEASE_SAFETY_MARGIN` protects.
             let lease_budget = self
                 .options
                 .owner_lease
@@ -5621,10 +5652,7 @@ impl RelayActor {
         };
         if ticket.owner != session.owner
             || current_owner.token != session.owner
-            || current_owner.lease_expires_at
-                <= now_wall
-                    + ChronoDuration::from_std(OWNER_LEASE_SAFETY_MARGIN)
-                        .unwrap_or_else(|_| ChronoDuration::seconds(5))
+            || current_owner.lease_expires_at <= now_wall + OWNER_LEASE_SAFETY_MARGIN_WALL
         {
             return Err(RelayError::Unauthorized);
         }
@@ -12985,9 +13013,7 @@ impl RelayActor {
             return;
         }
         let dispatch_deadline = Instant::now() + Duration::from_millis(remaining_ms);
-        let owner_safe_until = owner.lease_expires_at
-            - ChronoDuration::from_std(OWNER_LEASE_SAFETY_MARGIN)
-                .unwrap_or_else(|_| ChronoDuration::seconds(5));
+        let owner_safe_until = owner.lease_expires_at - OWNER_LEASE_SAFETY_MARGIN_WALL;
         let grant_read_started_at = current.read_started_at;
         let authorization_is_live = || {
             let now = Utc::now();
@@ -17211,9 +17237,9 @@ pub struct RunningRelay {
     peer_runtime: Option<Arc<crate::PeerRuntime>>,
     peer_diagnostics: Option<Arc<PeerServerDiagnostics>>,
     peer_planned_cancel: Option<CancellationToken>,
-    /// A single relay's Redis authority state (M6-C67), for the private
-    /// metrics listener.
-    authority: Option<Arc<crate::authority_readiness::AuthorityReadiness>>,
+    /// A single relay's Redis authority state (M6-C67) and the clock-offset
+    /// state (M7-C175), for the private metrics listener.
+    readiness: crate::health::ReadinessChecks,
     pub consumer_addr: std::net::SocketAddr,
     pub device_addr: std::net::SocketAddr,
 }
@@ -17239,7 +17265,7 @@ impl RunningRelay {
         let router = crate::metrics::router(
             self.handle.clone(),
             self.peer_runtime.clone(),
-            self.authority.clone(),
+            self.readiness.clone(),
         );
         let cancel = self.cancel.child_token();
         tokio::spawn(crate::metrics::serve_bounded(listener, router, cancel))
@@ -17399,6 +17425,13 @@ pub struct ListenerSocketOptions {
     /// `[cluster]`; a relay with a peer runtime ignores it, so cluster
     /// readiness is unchanged.  Library callers default to `false`.
     pub authority_readiness: bool,
+    /// Task row M7-C175: measure this relay's wall-clock offset from the
+    /// Redis server clock in the background ([`crate::clock_offset`]),
+    /// publish it on the metrics listener, warn above 2 s and answer
+    /// `/readyz` not ready above the cluster clock-skew bound.  `ServeConfig`
+    /// sets it for every relay, with or without `[cluster]`.  Library callers
+    /// default to `false`.
+    pub clock_offset_health: bool,
 }
 
 impl Relay {
@@ -17620,6 +17653,10 @@ impl Relay {
                     cancel.child_token(),
                 )
             });
+        let clock = listener_options.clock_offset_health.then(|| {
+            crate::clock_offset::ClockOffsetHealth::spawn(catalog.clone(), cancel.child_token())
+        });
+        let readiness = crate::health::ReadinessChecks { authority, clock };
         let consumer_router = http::consumer_router_with_peer_and_barriers(
             handle.clone(),
             catalog.clone(),
@@ -17629,7 +17666,7 @@ impl Relay {
             listener_options.consumer_upgrade_barrier.clone(),
             listener_options.consumer_peer_admission_barrier.clone(),
             listener_options.http_forward.clone(),
-            authority.clone(),
+            readiness.clone(),
         );
         let device_router = http::device_router_with_peer_and_barrier(
             handle.clone(),
@@ -17673,7 +17710,7 @@ impl Relay {
             peer_runtime,
             peer_diagnostics,
             peer_planned_cancel,
-            authority,
+            readiness,
             consumer_addr,
             device_addr,
         })

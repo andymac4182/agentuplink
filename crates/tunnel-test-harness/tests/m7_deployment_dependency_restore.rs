@@ -1414,33 +1414,39 @@ async fn run_restorable_connection(
     cancellation: CancellationToken,
     handshakes: Arc<AtomicUsize>,
 ) {
-    let _ = timeout(AUXILIARY_CONNECTION_DEADLINE, async move {
-        let mut tls = tokio::select! {
-            _ = cancellation.cancelled() => return,
-            accepted = acceptor.accept(stream) => match accepted {
-                Ok(tls) => tls,
-                Err(_) => return,
-            },
+    // Only establishing a forwarded connection is bounded by the auxiliary
+    // deadline. An established connection lives until the injected fault,
+    // cancellation or either side closes it. It used to be cut after the
+    // same 5 s as well, which made every relay Redis connection die every
+    // 5 s even after "restoration": each cut surfaced as a failed membership
+    // read and a brief not-ready window (3-4 per run, on main too), and the
+    // gate's single fresh device connect failed whenever it landed in one
+    // (hosted run 36301647506; review of PR #225).
+    let established = timeout(AUXILIARY_CONNECTION_DEADLINE, async {
+        let tls = tokio::select! {
+            _ = cancellation.cancelled() => return None,
+            accepted = acceptor.accept(stream) => accepted.ok()?,
         };
         handshakes.fetch_add(1, Ordering::Release);
         if !*availability.borrow() {
-            return;
+            return None;
         }
-        let mut upstream_stream = tokio::select! {
-            _ = cancellation.cancelled() => return,
-            _ = wait_until_unavailable(&mut availability) => return,
-            connected = TcpStream::connect(upstream) => match connected {
-                Ok(stream) => stream,
-                Err(_) => return,
-            },
+        let upstream_stream = tokio::select! {
+            _ = cancellation.cancelled() => return None,
+            _ = wait_until_unavailable(&mut availability) => return None,
+            connected = TcpStream::connect(upstream) => connected.ok()?,
         };
-        tokio::select! {
-            _ = cancellation.cancelled() => {}
-            _ = wait_until_unavailable(&mut availability) => {}
-            _ = tokio::io::copy_bidirectional(&mut tls, &mut upstream_stream) => {}
-        }
+        Some((tls, upstream_stream))
     })
     .await;
+    let Ok(Some((mut tls, mut upstream_stream))) = established else {
+        return;
+    };
+    tokio::select! {
+        _ = cancellation.cancelled() => {}
+        _ = wait_until_unavailable(&mut availability) => {}
+        _ = tokio::io::copy_bidirectional(&mut tls, &mut upstream_stream) => {}
+    }
 }
 
 async fn wait_until_unavailable(availability: &mut watch::Receiver<bool>) {
