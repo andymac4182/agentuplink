@@ -348,6 +348,83 @@ async fn a_cancelled_legacy_request_closes_its_post_promptly() {
     assert_eq!(deleted.status(), StatusCode::NO_CONTENT);
 }
 
+/// M3-48 review: closing a cancelled request's POST must not free its ID
+/// early.  The cancelled request stays registered until its own POST has
+/// ended, so a new request that reuses the ID in that window is refused as a
+/// duplicate.  Before the review fix it was registered instead: it could then
+/// receive the cancelled request's late response (rmcp's fixture answers a
+/// cancelled `sleep`), or be torn down by the old POST's cleanup, which
+/// would interrupt it.  The old POST's future is deliberately left unpolled
+/// after the cancel, which holds that window open.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_id_reused_right_after_its_cancel_is_never_interrupted() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let export = stdio_export_with(LEGACY, workspace.path(), 1, &fixture_binary(), "");
+    let session = open_session(&export).await;
+    let headers = legacy_headers(Some(&session));
+    let sleep = |label: &str| {
+        format!(
+            r#"{{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{{"name":"sleep","arguments":{{"label":"{label}"}}}}}}"#
+        )
+    };
+    // The first request, polled only until it is registered and waiting.
+    let mut first = Box::pin(export.handle(direct(&headers, &sleep("old"))));
+    let log = workspace.path().join("invocations.log");
+    for _ in 0..400 {
+        if tokio::time::timeout(Duration::from_millis(10), &mut first)
+            .await
+            .is_ok()
+        {
+            panic!("the sleep request answered before it was cancelled");
+        }
+        if count_lines(&log, "sleep") == 1 {
+            break;
+        }
+    }
+    assert_eq!(count_lines(&log, "sleep"), 1, "sleep started");
+    let cancel = within(export.handle(direct(
+        &headers,
+        r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":7}}"#,
+    )))
+    .await
+    .expect("cancel");
+    assert_eq!(cancel.status(), StatusCode::ACCEPTED);
+    // The same ID again, while the old POST has not yet run its cleanup.
+    let reuse_export = export.clone();
+    let reuse_headers = headers.clone();
+    let reuse_body = sleep("new");
+    let reuse = tokio::spawn(async move {
+        reuse_export
+            .handle(direct(&reuse_headers, &reuse_body))
+            .await
+            .map(|response| response.status())
+    });
+    // Give a registered reuse time to reach the child before the old POST's
+    // cleanup runs; a refused one has already answered.
+    for _ in 0..100 {
+        if reuse.is_finished() || count_lines(&log, "sleep") == 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    // Now let the old POST end, and its cleanup run.
+    let old = within(first).await.expect("the cancelled POST ends cleanly");
+    assert_eq!(old.status(), StatusCode::OK);
+    let reuse = tokio::time::timeout(Duration::from_secs(3), reuse).await;
+    match reuse {
+        // Refused before dispatch: the ID was still in flight.
+        Ok(Ok(Ok(status))) => assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "refused as a duplicate, never answered with another request's response"
+        ),
+        Ok(Ok(Err(_))) => panic!("the reused ID's POST was interrupted"),
+        Ok(Err(error)) => panic!("task: {error}"),
+        // Registered and still waiting: not interrupted either.
+        Err(_) => {}
+    }
+}
+
 /// M3-48's limit: a cancellation names a request of **this** session only.
 /// A `requestId` that is not in flight closes nothing and is still
 /// forwarded (202), and the in-flight request with another ID is untouched.

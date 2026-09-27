@@ -574,17 +574,23 @@ impl StdioExport {
                 }
                 // M3-48: once the cancellation has reached the child, close
                 // the cancelled request's POST.  Only a request of this
-                // session, still in flight, is affected; a late response
-                // for it is then undeliverable, as for any unknown ID.
+                // session, still in flight, is affected.  Its routing entry
+                // stays until that POST's own guard removes it, so the ID
+                // stays in flight until then: a request reusing it meanwhile
+                // is refused as a duplicate rather than registered, where it
+                // could receive the cancelled request's late response or be
+                // removed by the old POST's cleanup.  A late response that
+                // arrives after the cleanup is undeliverable.
                 if let Some(sender) =
-                    cancelled_request(&message).and_then(|key| session.take_pending(&key))
+                    cancelled_request(&message).and_then(|key| session.pending_sender(&key))
                 {
-                    self.counters
-                        .cancelled_requests_closed
-                        .fetch_add(1, Ordering::Relaxed);
-                    // A full queue closes when this sender drops, which
-                    // interrupts that stream instead: still not held open.
-                    let _ = sender.try_send(Routed::Cancelled);
+                    // A full queue is a consumer that is not reading: that
+                    // stream is left to the stall detector, as before.
+                    if sender.try_send(Routed::Cancelled).is_ok() {
+                        self.counters
+                            .cancelled_requests_closed
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
                 }
                 Ok(no_body(StatusCode::ACCEPTED))
             }
@@ -976,11 +982,9 @@ impl Session {
         router.progress.retain(|_, request| request != key);
     }
 
-    /// Remove an in-flight request and return its stream's sender.
-    fn take_pending(&self, key: &str) -> Option<mpsc::Sender<Routed>> {
-        let mut router = self.router();
-        router.progress.retain(|_, request| request != key);
-        router.pending.remove(key)
+    /// The stream sender of an in-flight request, left registered.
+    fn pending_sender(&self, key: &str) -> Option<mpsc::Sender<Routed>> {
+        self.router().pending.get(key).cloned()
     }
 
     fn open_standalone(&self, stream: &mpsc::Sender<Routed>) -> bool {
