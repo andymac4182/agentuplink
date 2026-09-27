@@ -4332,3 +4332,7 @@ async fn an_unreadable_consumer_catalog_refuses_as_retryable_and_a_bad_token_sti
     assert!(denied.headers().get("x-agent-tunnel-admission").is_none());
     fixture.shutdown().await;
 }
+
+#[cfg(test)]
+#[path = "peer_refusal_route_tests.rs"]
+mod peer_refusal_route_tests;

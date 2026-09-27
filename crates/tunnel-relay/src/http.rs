@@ -1910,6 +1910,32 @@ pub(crate) fn open_refusal_close(open_refusal: Option<&str>) -> Option<(u16, &'s
     }
 }
 
+/// The body of the peer `Close` record an owner sends the ingress for a
+/// forwarded echo stream whose OPEN the connector refused (task row
+/// M6-C213): the two-byte close code and the reason, as the record kind
+/// defines it.
+fn open_refusal_close_record(open_refusal: Option<&str>) -> Option<Vec<u8>> {
+    let (code, reason) = open_refusal_close(open_refusal)?;
+    let mut body = code.to_be_bytes().to_vec();
+    body.extend_from_slice(reason.as_bytes());
+    Some(body)
+}
+
+/// The coded close an ingress sends its consumer for a peer `Close` record
+/// from the owner (task row M6-C213).  Only the exact closes an owner sends
+/// for a refused OPEN ([`open_refusal_close`]) are carried; any other body
+/// keeps the codeless close the ingress sent before M6-C213.
+fn forwarded_refusal_close(body: &[u8]) -> Option<CloseFrame> {
+    let (code, reason) = body.split_first_chunk::<2>()?;
+    let code = u16::from_be_bytes(*code);
+    let reason = std::str::from_utf8(reason).ok()?;
+    let (expected_code, expected_reason) = open_refusal_close(Some(reason))?;
+    (code == expected_code).then(|| CloseFrame {
+        code,
+        reason: expected_reason.into(),
+    })
+}
+
 /// The close a local consumer echo stream ends with (task rows M6-C210 and
 /// M6-C215).  An OPEN the connector refused never ran anything, and the
 /// stream closes with the refusal's code ([`open_refusal_close`]); a freeze
@@ -2052,6 +2078,7 @@ async fn handle_remote_consumer_stream(
     // before any byte is queued for the peer: an over-limit prefix closes the
     // public stream here and is never forwarded.
     let mut cursor = ConsumerRecordCursor::new(STREAM_RECORD_LIMIT);
+    let mut refusal_close = None;
 
     enum RemoteConsumerEvent<Inbound, Remote> {
         Expired,
@@ -2259,7 +2286,12 @@ async fn handle_remote_consumer_stream(
                             break;
                         }
                     }
-                    PeerRecordKind::Close => break,
+                    PeerRecordKind::Close => {
+                        // The owner's coded close for an OPEN its connector
+                        // refused (task row M6-C213).
+                        refusal_close = forwarded_refusal_close(record.body());
+                        break;
+                    }
                     _ => break,
                 }
             }
@@ -2271,7 +2303,12 @@ async fn handle_remote_consumer_stream(
         let _ = forwarder.await;
     }
     recv.cancel();
-    let _ = send_socket_until(&mut socket, Message::Close(None), consumer_deadline).await;
+    let _ = send_socket_until(
+        &mut socket,
+        Message::Close(refusal_close),
+        consumer_deadline,
+    )
+    .await;
 }
 
 async fn service_and_grant(
@@ -3968,6 +4005,18 @@ async fn handle_peer_consumer_stream(
                                 other => break other,
                             }
                         };
+                        // A write the actor answered because the connector
+                        // refused this stream's OPEN never reached the
+                        // device: end the loop so the refusal's coded close
+                        // is sent to the ingress below (task row M6-C213).
+                        if matches!(
+                            waited,
+                            BoundedStreamWrite::Completed(Err(_)) | BoundedStreamWrite::StreamClosed
+                        ) && registration.open_refusal().is_some()
+                        {
+                            registration_closed = true;
+                            break 'peer;
+                        }
                         let response = match waited {
                             BoundedStreamWrite::Completed(Ok(response)) => response,
                             BoundedStreamWrite::Completed(Err(error)) => {
@@ -4068,6 +4117,29 @@ async fn handle_peer_consumer_stream(
                     }
                 }
             }
+        }
+        // The connector refused this stream's OPEN, so nothing ran: tell the
+        // ingress the owner's coded close in a peer `Close` record before the
+        // request ends, so its consumer gets the answer the owner's local
+        // consumer gets (task row M6-C213, [`open_refusal_close`]).  An
+        // ingress built before M6-C213 ends its consumer's socket on any
+        // `Close` record with no code, exactly as it does on the request end
+        // this replaces, so the record is backward compatible.
+        if registration_closed
+            && let Some(body) = open_refusal_close_record(registration.open_refusal())
+            && let Err(error) = send.send_message(PeerRecordKind::Close, &body).await
+        {
+            if matches!(error, PeerRuntimeError::MembershipExpired) {
+                terminal_cause = Some(StreamTerminalCause::PeerMembershipExpired);
+            }
+            let (outcome, h3_code) = peer_consumer_diagnostic_outcome(&error);
+            handle.record_peer_consumer_diagnostic(
+                &diagnostic_context,
+                PeerConsumerDiagnosticRole::OwnerSend,
+                outcome,
+                h3_code,
+            );
+            return Err(error);
         }
         Ok(())
     }
@@ -5064,6 +5136,34 @@ mod tests {
             super::consumer_stream_close(None),
             Message::Close(None)
         ));
+    }
+
+    /// M6-C213: the owner's peer `Close` record for a refused OPEN carries
+    /// the local close exactly, and the ingress accepts only such a record:
+    /// a mismatched code, an unknown reason, a short or empty body (the
+    /// pre-M6-C213 codeless record) keeps the codeless close.
+    #[test]
+    fn m6c213_the_forwarded_refusal_close_is_exact() {
+        for refusal in ["ROTATION_FREEZE", "RESOURCE_EXHAUSTED", "DEVICE_REJECTED"] {
+            let body = super::open_refusal_close_record(Some(refusal)).expect("a refusal close");
+            let frame = super::forwarded_refusal_close(&body).expect("accepted");
+            assert_eq!(
+                Some((frame.code, frame.reason.as_str())),
+                super::open_refusal_close(Some(refusal)),
+                "{refusal}"
+            );
+        }
+        assert_eq!(super::open_refusal_close_record(None), None);
+        let mut wrong_code = 1000u16.to_be_bytes().to_vec();
+        wrong_code.extend_from_slice(b"DEVICE_REJECTED");
+        for body in [
+            wrong_code,
+            [1011u16.to_be_bytes().as_slice(), b"AUTHORIZATION_REVOKED"].concat(),
+            vec![0x03],
+            Vec::new(),
+        ] {
+            assert!(super::forwarded_refusal_close(&body).is_none(), "{body:?}");
+        }
     }
 
     /// M6-C215: a refusal outside a freeze closes with its own code: 1013
