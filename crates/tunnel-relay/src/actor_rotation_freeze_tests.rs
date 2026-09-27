@@ -169,6 +169,7 @@ fn fixture_stream(
         admission_deadline: Instant::now() + StdDuration::from_secs(60),
         authorization_failure_code: None,
         http: None,
+        open_refusal: Default::default(),
     }
 }
 
@@ -5007,8 +5008,8 @@ async fn m6c207_a_held_refusal_is_applied_without_a_second_read() {
 
 /// M6-C207 scope: the freeze answer is only for a result a freeze held.  A
 /// challenge that was never held, whose window lapsed before its result
-/// arrived, keeps the existing `AUTHORIZATION_REVOKED` answer even though the
-/// read itself still authorizes (task row M6-C211 tracks that answer).
+/// arrived, is not answered `ROTATION_FREEZE`; since M6-C211 it is the
+/// retryable `AUTHORIZATION_UNAVAILABLE`, not `AUTHORIZATION_REVOKED`.
 #[tokio::test]
 async fn m6c207_a_lapsed_challenge_never_held_by_a_freeze_is_not_a_freeze_answer() {
     let mut fixture = FreezeFixture::new("m6c207-never-held", false);
@@ -5025,7 +5026,7 @@ async fn m6c207_a_lapsed_challenge_never_held_by_a_freeze_is_not_a_freeze_answer
         .finish_device_challenge(fixture.key.clone(), challenge, fresh);
     assert_eq!(
         unary_failure(&mut receiver),
-        Some(("AUTHORIZATION_REVOKED", "not_dispatched")),
+        Some(("AUTHORIZATION_UNAVAILABLE", "not_dispatched")),
         "only a result held by a freeze may be answered ROTATION_FREEZE"
     );
 }
@@ -5073,4 +5074,367 @@ async fn m6c207_a_held_result_with_only_its_challenge_window_lapsed_is_read_agai
         ControlMessage::AuthorizationInvalidated(invalidated)
             if invalidated.stream_id == stream_id && invalidated.reason == "grant unavailable"
     )));
+}
+
+
+// Task row M6-C210: a consumer stream OPEN in the frozen roster that the
+// connector refused.  Nothing on the stream ran, so its consumer is answered
+// at once, with the unary echo's mapping, while the roster entry and its
+// no-stream FORGET still wait for the attempt.
+
+impl FreezeFixture {
+    /// Make the fixture stream a pending OPEN as admission leaves it: not yet
+    /// authorized, because the connector's challenge follows its admission.
+    fn make_pending_unauthorized(&mut self) {
+        self.actor
+            .sessions
+            .get_mut(&self.key.scope())
+            .and_then(|session| session.streams.get_mut(&STREAM_ID))
+            .expect("fixture stream")
+            .authorized_until = None;
+    }
+
+    async fn connector_rejected_stream(&mut self, code: &str, reason: &str) {
+        self.actor
+            .inbound_control(
+                self.key.clone(),
+                ControlMessage::Rejected(Rejected::new(
+                    "connector-rejected-stream",
+                    OPEN_MESSAGE_ID,
+                    self.key.session_id.clone(),
+                    self.key.epoch,
+                    STREAM_ID,
+                    OPERATION_ID,
+                    code,
+                    reason,
+                )),
+            )
+            .await;
+    }
+
+    fn open_refusal(&self) -> Option<&'static str> {
+        self.stream().open_refusal.get().copied()
+    }
+}
+
+fn record_failure(
+    receiver: &mut oneshot::Receiver<Result<Vec<u8>, EchoOutcome>>,
+) -> Option<(&'static str, &'static str)> {
+    match receiver.try_recv() {
+        Ok(Err(EchoOutcome::Failure { code, execution })) => Some((code, execution)),
+        _ => None,
+    }
+}
+
+/// M6-C210: an echo stream or `http-forward/1` stream whose roster OPEN the
+/// connector refused `GOAWAY` during a freeze is answered now: its parked
+/// record `ROTATION_FREEZE`/`not_dispatched`, its `closed` fired and the
+/// refusal published for the consumer adapter.  Before the fix nothing was
+/// answered until the attempt ended, and then the record got
+/// `REVERSE_CHANNEL_INTERRUPTED`/`unknown`.  The roster is unchanged, no
+/// FORGET is published inside the attempt, and nothing is ever sent.
+#[tokio::test]
+async fn m6c210_a_roster_stream_open_refused_goaway_during_a_freeze_is_answered_now() {
+    for http in [false, true] {
+        let label = if http { "m6c210-http" } else { "m6c210-echo" };
+        let mut fixture = FreezeFixture::new(label, true);
+        let watchers = http.then(|| attach_http(&mut fixture));
+        fixture.make_pending_unauthorized();
+        fixture.quiesce();
+        let mut record = fixture.write(b"never-sent");
+        assert_eq!(record_failure(&mut record), None, "{label}: parked");
+        let closed = fixture.stream().closed.clone();
+        fixture
+            .connector_rejected_stream(
+                tunnel_protocol::open_refusal::CONNECTOR_DRAINING.code(),
+                tunnel_protocol::open_refusal::CONNECTOR_DRAINING.reason(),
+            )
+            .await;
+        assert_eq!(
+            record_failure(&mut record),
+            Some((
+                super::freeze_hold::ROTATION_FREEZE_ECHO_CODE,
+                "not_dispatched"
+            )),
+            "{label}: the parked record is answered as the rotation's refusal"
+        );
+        assert_eq!(
+            fixture.open_refusal(),
+            Some(super::freeze_hold::ROTATION_FREEZE_ECHO_CODE),
+            "{label}"
+        );
+        assert!(closed.is_cancelled(), "{label}: the consumer is released now");
+        if http {
+            // A read issued after the release ends at once rather than
+            // parking until the FORGET.
+            let (reply, mut read) = oneshot::channel();
+            let key = fixture.key.clone();
+            fixture
+                .actor
+                .read_http_stream(&key, STREAM_ID, OPERATION_ID, reply);
+            assert!(matches!(read.try_recv(), Ok(super::HttpRead::Closed)), "{label}");
+        }
+        assert!(
+            fixture.session().streams.contains_key(&STREAM_ID),
+            "{label}: the roster entry stays until the attempt ends"
+        );
+        assert!(
+            FreezeFixture::stream_forgets(&fixture.drain_control()).is_empty(),
+            "{label}: no FORGET inside the attempt"
+        );
+        assert!(fixture.complete_barrier().is_empty());
+        fixture.connector_frozen(0).await;
+        fixture.connector_drained().await;
+        fixture.connector_committed().await;
+        fixture.retire_old_carrier().await;
+        assert!(fixture.actor.flush_owner_stream_forgets(&fixture.key));
+        assert!(
+            fixture.drain_control().iter().any(|message| matches!(
+                message,
+                ControlMessage::StreamForget(forget) if forget.stream_id == STREAM_ID
+            )),
+            "{label}: reclaimed once the roster is released"
+        );
+        assert!(!fixture.session().streams.contains_key(&STREAM_ID), "{label}");
+        assert!(
+            sequenced(&drain_data(&mut fixture.old_rx)).is_empty()
+                && sequenced(&drain_data(&mut fixture.candidate_rx)).is_empty(),
+            "{label}: nothing was ever sent on the refused stream"
+        );
+        drop(watchers);
+    }
+}
+
+/// M6-C210 control: a `GOAWAY` outside a freeze (the connector shutting down)
+/// and any other refusal during one keep `DEVICE_REJECTED`, and the
+/// connector's capacity refusal keeps `RESOURCE_EXHAUSTED`.  All of them are
+/// `not_dispatched`: the OPEN was refused, so nothing ran.
+#[tokio::test]
+async fn m6c210_other_stream_open_refusals_keep_their_answers() {
+    let goaway = tunnel_protocol::open_refusal::CONNECTOR_DRAINING;
+    for (label, freeze, code, reason, expected) in [
+        (
+            "m6c210-goaway-unfrozen",
+            false,
+            goaway.code(),
+            goaway.reason(),
+            "DEVICE_REJECTED",
+        ),
+        (
+            "m6c210-export-denied",
+            true,
+            "EXPORT_DENIED",
+            "service is not locally allowlisted",
+            "DEVICE_REJECTED",
+        ),
+        (
+            "m6c210-capacity",
+            true,
+            "RESOURCE_EXHAUSTED",
+            "stream limit reached",
+            "RESOURCE_EXHAUSTED",
+        ),
+    ] {
+        let mut fixture = FreezeFixture::new(label, true);
+        fixture.make_pending_unauthorized();
+        if freeze {
+            fixture.quiesce();
+        } else {
+            assert_eq!(fixture.phase(), RotationPhase::Preparing);
+        }
+        let mut record = fixture.write(b"never-sent");
+        let closed = fixture.stream().closed.clone();
+        fixture.connector_rejected_stream(code, reason).await;
+        assert_eq!(
+            record_failure(&mut record),
+            Some((expected, "not_dispatched")),
+            "{label}"
+        );
+        assert!(closed.is_cancelled(), "{label}");
+        if let Some(stream) = fixture.session().streams.get(&STREAM_ID) {
+            assert_eq!(stream.open_refusal.get().copied(), Some(expected), "{label}");
+        } else {
+            assert!(!freeze, "{label}: only an unfrozen refusal is forgotten at once");
+        }
+    }
+}
+
+/// M6-C210 control: a `REJECTED` for a stream the connector already admitted
+/// (not a pending OPEN) changes nothing: the consumer is not released and no
+/// refusal is published.
+#[tokio::test]
+async fn m6c210_a_rejected_for_an_admitted_stream_answers_nothing() {
+    let mut fixture = FreezeFixture::new("m6c210-admitted", false);
+    fixture.quiesce();
+    let closed = fixture.stream().closed.clone();
+    let goaway = tunnel_protocol::open_refusal::CONNECTOR_DRAINING;
+    fixture
+        .connector_rejected_stream(goaway.code(), goaway.reason())
+        .await;
+    assert!(!closed.is_cancelled());
+    assert_eq!(fixture.open_refusal(), None);
+}
+
+// Task row M6-C211: unary challenge failures that are not revocations are
+// not answered `AUTHORIZATION_REVOKED`; a read that shows a revocation still
+// is.
+
+/// M6-C211: a catalog error during the challenge read is answered as admission
+/// answers a catalog outage, `AUTHORIZATION_UNAVAILABLE`/`not_dispatched`,
+/// outside a freeze and when a freeze held it.
+#[tokio::test]
+async fn m6c211_a_catalog_error_is_unavailable_not_revoked() {
+    for held in [false, true] {
+        let label = if held { "m6c211-catalog-held" } else { "m6c211-catalog" };
+        let mut fixture = FreezeFixture::new(label, false);
+        let (stream_id, _, _, mut receiver) = fixture.admit_unary_echo(UNARY_BODY).await;
+        if held {
+            fixture.quiesce_roster(&[STREAM_ID, stream_id]);
+        }
+        let challenge = fixture.unary_challenge(
+            stream_id,
+            StdDuration::from_millis(10),
+            StdDuration::from_secs(2),
+        );
+        fixture.actor.finish_device_challenge(
+            fixture.key.clone(),
+            challenge,
+            Err("catalog unavailable".to_owned()),
+        );
+        if held {
+            assert_eq!(unary_failure(&mut receiver), None, "{label}: held");
+            fixture
+                .commit_with_roster(&[(STREAM_ID, 0), (stream_id, 0)])
+                .await;
+        }
+        assert_eq!(
+            unary_failure(&mut receiver),
+            Some(("AUTHORIZATION_UNAVAILABLE", "not_dispatched")),
+            "{label}"
+        );
+        // The commit helper drains control itself, so the connector's
+        // message is checked where it is still queued.
+        if !held {
+            assert!(
+                fixture.drain_control().iter().any(|message| matches!(
+                    message,
+                    ControlMessage::AuthorizationInvalidated(invalidated)
+                        if invalidated.stream_id == stream_id
+                            && invalidated.reason == "authorization unavailable"
+                )),
+                "{label}: the connector is told as before"
+            );
+        }
+    }
+}
+
+/// M6-C211: a challenge window that lapses outside a freeze, with the read
+/// still authorizing, is the retryable `AUTHORIZATION_UNAVAILABLE`: the
+/// challenge cannot be confirmed, nothing is dispatched, the connector is told
+/// "authorization expired", and nothing says revoked.
+#[tokio::test]
+async fn m6c211_a_lapsed_window_outside_a_freeze_is_unavailable_not_revoked() {
+    let mut fixture = FreezeFixture::new("m6c211-lapsed", false);
+    assert_eq!(fixture.phase(), RotationPhase::Preparing);
+    let (stream_id, _, _, mut receiver) = fixture.admit_unary_echo(UNARY_BODY).await;
+    let challenge = fixture.unary_challenge(
+        stream_id,
+        StdDuration::from_secs(3),
+        StdDuration::from_secs(2),
+    );
+    let fresh = fixture.authorizing_result(Duration::zero());
+    fixture
+        .actor
+        .finish_device_challenge(fixture.key.clone(), challenge, fresh);
+    assert_eq!(
+        unary_failure(&mut receiver),
+        Some(("AUTHORIZATION_UNAVAILABLE", "not_dispatched"))
+    );
+    let control = fixture.drain_control();
+    assert!(control.iter().any(|message| matches!(
+        message,
+        ControlMessage::AuthorizationInvalidated(invalidated)
+            if invalidated.stream_id == stream_id && invalidated.reason == "authorization expired"
+    )));
+    assert!(
+        !control
+            .iter()
+            .any(|message| matches!(message, ControlMessage::AuthorizationConfirmed(_))),
+        "a lapsed challenge is never confirmed"
+    );
+    assert!(
+        sequenced(&drain_data(&mut fixture.old_rx)).is_empty(),
+        "nothing is dispatched"
+    );
+}
+
+/// M6-C211 control: revocation stays strict.  A read showing the grant gone,
+/// its revision moved or the device credential gone is `AUTHORIZATION_REVOKED`
+/// -- including when the challenge window has lapsed too -- and so is a lapse
+/// of the consumer's own token, which is not only the window.
+#[tokio::test]
+async fn m6c211_a_read_showing_a_revocation_is_still_revoked() {
+    for (label, window_lapsed) in [
+        ("m6c211-no-grant", false),
+        ("m6c211-no-grant-lapsed", true),
+        ("m6c211-revision", false),
+        ("m6c211-no-device", false),
+        ("m6c211-token-lapsed", true),
+    ] {
+        let mut fixture = FreezeFixture::new(label, false);
+        let (stream_id, _, _, mut receiver) = fixture.admit_unary_echo(UNARY_BODY).await;
+        let age = if window_lapsed {
+            StdDuration::from_secs(3)
+        } else {
+            StdDuration::from_millis(10)
+        };
+        let challenge = fixture.unary_challenge(stream_id, age, StdDuration::from_secs(2));
+        let mut result = fixture.authorizing_result(Duration::zero());
+        let (expected_reason, _) = match label {
+            "m6c211-no-grant" | "m6c211-no-grant-lapsed" => {
+                if let Ok((grant, _, _, _)) = &mut result {
+                    *grant = None;
+                }
+                ("grant unavailable", ())
+            }
+            "m6c211-revision" => {
+                if let Ok((Some(grant), _, _, _)) = &mut result {
+                    grant.revision += 1;
+                }
+                ("authorization changed", ())
+            }
+            "m6c211-no-device" => {
+                if let Ok((_, _, identity, _)) = &mut result {
+                    *identity = None;
+                }
+                ("device authorization unavailable", ())
+            }
+            _ => {
+                fixture
+                    .actor
+                    .sessions
+                    .get_mut(&fixture.key.scope())
+                    .and_then(|session| session.pending.get_mut(&stream_id))
+                    .expect("finite echo is pending")
+                    .consumer_expires_at = Utc::now() - Duration::seconds(1);
+                ("authorization expired", ())
+            }
+        };
+        fixture
+            .actor
+            .finish_device_challenge(fixture.key.clone(), challenge, result);
+        assert_eq!(
+            unary_failure(&mut receiver),
+            Some(("AUTHORIZATION_REVOKED", "not_dispatched")),
+            "{label}"
+        );
+        assert!(
+            fixture.drain_control().iter().any(|message| matches!(
+                message,
+                ControlMessage::AuthorizationInvalidated(invalidated)
+                    if invalidated.stream_id == stream_id && invalidated.reason == expected_reason
+            )),
+            "{label}: {expected_reason}"
+        );
+    }
 }

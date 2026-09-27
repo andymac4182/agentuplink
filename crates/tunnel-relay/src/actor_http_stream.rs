@@ -673,7 +673,10 @@ impl RelayActor {
             let _ = response.send(HttpRead::Closed);
             return;
         }
-        let terminal = stream.terminal;
+        // A released stream (its `closed` fired: a refused OPEN, M6-C210, or
+        // a consumer close of a pending OPEN) delivers nothing more, even
+        // while its roster entry waits for its FORGET.
+        let terminal = stream.terminal || stream.closed.is_cancelled();
         let Some(http) = stream.http.as_mut() else {
             let _ = response.send(HttpRead::Closed);
             return;
