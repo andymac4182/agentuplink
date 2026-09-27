@@ -318,7 +318,81 @@ export function validateDescriptor(value: unknown): Descriptor {
   return typed;
 }
 
-/** Map an HTTP status and error body to this client's discovery code. */
+/**
+ * The retry hint assumed for a `CONNECTION_LIMIT` refusal that carried none
+ * readable: the relay's documented value. Matches the Rust client's
+ * `DEFAULT_CONNECTION_LIMIT_RETRY_AFTER_MS`.
+ */
+export const DEFAULT_CONNECTION_LIMIT_RETRY_AFTER_MS = 1_000;
+
+/**
+ * The largest retry hint this client reports; a larger one is capped so a bad
+ * value cannot park a caller indefinitely. Matches the Rust client's
+ * `MAX_HONOURED_RETRY_AFTER_MS`.
+ */
+export const MAX_HONOURED_RETRY_AFTER_MS = 300_000;
+
+/**
+ * If a response is a relay listener's connection-limit refusal (`503` whose
+ * body names `CONNECTION_LIMIT`, M6-C153), its retry hint in milliseconds: the
+ * body's `retry_after_ms`, else the `Retry-After` header in whole seconds, else
+ * {@link DEFAULT_CONNECTION_LIMIT_RETRY_AFTER_MS}, capped at
+ * {@link MAX_HONOURED_RETRY_AFTER_MS}. `undefined` for any other response.
+ *
+ * The same reading as the Rust `connect` (`connection_limit_retry_after_ms`,
+ * aligned in M7-C176): a body naming any other code, flat or in the
+ * contract's `error` object, is that other refusal even when it carries a
+ * `Retry-After`; a body with no code at all (the refusal's head arrived without
+ * it) is identified by a readable `Retry-After`, which is RFC 9110
+ * `delay-seconds`, digits only. One residual difference: a body hint too large
+ * for a `u64` is absent to Rust and capped here. Reads a status, one header and
+ * two fixed fields;
+ * nothing from the response reaches an error message.
+ */
+export function connectionLimitRetryAfterMs(
+  status: number,
+  body: unknown,
+  retryAfter: string | null | undefined,
+): number | undefined {
+  if (status !== 503) {
+    return undefined;
+  }
+  const trimmed = retryAfter?.trim();
+  const headerMs =
+    trimmed !== undefined && /^[0-9]+$/.test(trimmed) ? Number(trimmed) * 1_000 : undefined;
+  const code = namedCode(body);
+  if (code === undefined ? headerMs === undefined : code !== 'CONNECTION_LIMIT') {
+    return undefined;
+  }
+  const bodyHint = isObject(body) ? body['retry_after_ms'] : undefined;
+  const hinted =
+    // Any non-negative integer, however large, so the cap applies to it
+    // rather than a hint above 2^53 reading as absent.
+    typeof bodyHint === 'number' && Number.isInteger(bodyHint) && bodyHint >= 0
+      ? bodyHint
+      : (headerMs ?? DEFAULT_CONNECTION_LIMIT_RETRY_AFTER_MS);
+  return Math.min(hinted, MAX_HONOURED_RETRY_AFTER_MS);
+}
+
+/** The code a refusal body names: the contract's `error.code`, else a flat `code`. */
+function namedCode(body: unknown): string | undefined {
+  if (!isObject(body)) {
+    return undefined;
+  }
+  const nested = body['error'];
+  if (isObject(nested) && typeof nested['code'] === 'string') {
+    return nested['code'];
+  }
+  return typeof body['code'] === 'string' ? body['code'] : undefined;
+}
+
+/**
+ * Map an HTTP status and error body to this client's discovery code.
+ *
+ * A connection-limit refusal is recognised by
+ * {@link connectionLimitRetryAfterMs} rather than here, because it needs the
+ * `Retry-After` header this function is not given; callers check that first.
+ */
 export function discoveryCode(status: number, body: unknown): DiscoveryErrorCode {
   const named =
     isObject(body) && isObject(body['error']) && typeof body['error']['code'] === 'string'

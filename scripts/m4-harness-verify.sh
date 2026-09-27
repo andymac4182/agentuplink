@@ -33,6 +33,9 @@ gate "M4 filesystem gate 5: write grants, the hard-link write rule, an interrupt
 gate "M4 filesystem gate 6: the real TypeScript client against real relay and device sockets" \
   cargo run --locked -p tunnel-test-harness -- verify-m4-fs-client-e2e
 
+gate "M6-C200: the real TypeScript client against a real relay listener at its connection limit" \
+  cargo run --locked -p tunnel-test-harness -- verify-m6-ts-connection-limit
+
 gate "M4 filesystem gate 7: a live 9P session across a real scheduled rotation, with the exchange in flight" \
   cargo run --locked -p tunnel-test-harness -- verify-m4-fs-rotation
 

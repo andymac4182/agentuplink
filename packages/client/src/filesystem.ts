@@ -15,6 +15,7 @@
 import { constants as C } from './ninep/codec.ts';
 import type { DirEntry, Message, Qid } from './ninep/messages.ts';
 import {
+  connectionLimitRetryAfterMs,
   discoveryCode,
   GRANT_REVISION_HEADER,
   LIMIT_CEILINGS,
@@ -1233,12 +1234,7 @@ export async function fetchDescriptor(options: ConnectOptions): Promise<Descript
   }
   if (response.status !== 200) {
     const body: unknown = await response.json().catch(() => undefined);
-    throw new FilesystemError({
-      code: discoveryCode(response.status, body),
-      operation: 'descriptor',
-      outcome: 'not_started',
-      retryable: response.status === 429 || response.status === 503,
-    });
+    throw refusalError(response.status, body, response.headers.get('retry-after'), 'descriptor');
   }
   const type = response.headers.get('content-type') ?? '';
   if (!type.toLowerCase().startsWith('application/json')) {
@@ -1274,11 +1270,27 @@ export function upgradeRejectionError(rejected: UpgradeRejected): FilesystemErro
   } catch {
     body = undefined;
   }
+  return refusalError(rejected.status, body, rejected.retryAfter, 'upgrade');
+}
+
+/**
+ * One HTTP refusal, at the descriptor or the upgrade, as a `FilesystemError`.
+ * A relay listener's connection-limit refusal is `CONNECTION_LIMIT` carrying
+ * its `retryAfterMs` (M6-C200); everything else is `discoveryCode`'s.
+ */
+function refusalError(
+  status: number,
+  body: unknown,
+  retryAfter: string | null | undefined,
+  operation: string,
+): FilesystemError {
+  const retryAfterMs = connectionLimitRetryAfterMs(status, body, retryAfter);
   return new FilesystemError({
-    code: discoveryCode(rejected.status, body),
-    operation: 'upgrade',
+    code: retryAfterMs === undefined ? discoveryCode(status, body) : 'CONNECTION_LIMIT',
+    operation,
     outcome: 'not_started',
-    retryable: rejected.status === 429 || rejected.status === 503,
+    retryable: status === 429 || status === 503,
+    retryAfterMs,
   });
 }
 
