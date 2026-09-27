@@ -94,6 +94,9 @@ say "build tunnel-relay, tunnel-client, tunnel-mcp-fixture and tunnel-test-harne
 bin=${CARGO_TARGET_DIR:-$repo/target}/debug
 mkdir -p "$work/device" "$work/redis"
 chmod 700 "$work"
+# The relay refuses TLS material under a symlinked path, and macOS's $TMPDIR
+# is under /var -> /private/var, so work from the physical path.
+work=$(cd "$work" && pwd -P)
 say "work directory $work (profile $profile)"
 
 # 2. A synthetic server PKI: one CA and one leaf for localhost/127.0.0.1,
