@@ -114,6 +114,26 @@ The decisions, and what each rests on:
   `deploy/fly/relay/relay.toml` and check it with `check-serve-config`. An
   image older than M6-C153 refuses that key, so remove it before any such
   rollback.
+- **Recommended, not applied: an edge limit on consumer connections
+  (M6-C194 option (d), recorded 2026-09-27).** The relay's consumer listener
+  serves `listener_max_connections` connections (default 64) and does TLS
+  work to refuse up to `listener_refusal_margin` more (default 16); every
+  connection beyond that costs it a TLS handshake per attempt, and clients
+  that retry at once made refusals about two thirds of a relay's CPU on a
+  saturated host (M6-C182). Fly's proxy is the cheapest place to hold excess
+  connections back: on the **consumer** service, set `hard_limit` to about
+  `listener_max_connections + listener_refusal_margin` (80 with the
+  defaults) and `soft_limit` to about `listener_max_connections` (64), so
+  Fly stops sending new connections to the machine at the point where the
+  relay would only refuse them. Keep the device service at 1000: it carries
+  two sockets per device, not consumer traffic. Behind Fly's TCP passthrough
+  the relay sees Fly's proxy as the peer, so a per-source-address quota
+  (M6-C193 option (c)) can only be enforced at an edge that sees client
+  addresses, not in the relay. What Fly does with a connection that arrives
+  while the machine is at `hard_limit` (queue at the proxy or refuse), and
+  how that interacts with the relay's `503 CONNECTION_LIMIT`, is **not
+  measured**; measure it before changing the live `fly.toml`. The deployed
+  configuration is unchanged by this recommendation.
 - **Health checks.** The consumer service checks `GET /readyz` over HTTPS on
   the private network (`tls_skip_verify`, because the relay's certificate names
   its public host). The device service has a bare TCP check; the local proof
@@ -263,6 +283,26 @@ server_cert relay-server relay-ca DNS:agentuplink-relay.fly.dev 90
 server_cert redis-server redis-ca DNS:agentuplink-redis.internal 365
 openssl rand -hex 24 > redis-password.txt
 ```
+
+**Prefer an ECDSA P-256 relay server certificate (M6-C194).** A full TLS
+handshake with an RSA-2048 server key cost the relay about 605 µs of CPU,
+against about 79 µs with ECDSA P-256 (measured in memory on an M1 Pro,
+[operator.md section 2.2](operator.md#22-relay-listener-identities)), and
+every consumer connection, including each one refused `CONNECTION_LIMIT`,
+pays it. For the relay server certificate replace the key and extensions
+above with:
+
+```text
+openssl req -new -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -subj "/CN=relay-server" \
+  -keyout relay-server-key.pem -out relay-server.csr
+printf 'basicConstraints=CA:FALSE\nkeyUsage=digitalSignature\nextendedKeyUsage=serverAuth\nsubjectAltName=%s\n' \
+  DNS:agentuplink-relay.fly.dev > relay-server.ext
+openssl x509 -req -in relay-server.csr -CA relay-ca.pem -CAkey relay-ca-key.pem -CAcreateserial \
+  -days 90 -extfile relay-server.ext -out relay-server.pem
+```
+
+The CA can stay RSA. The deployed relay's certificate is not changed by this
+recommendation; the next rotation (section 6.5) is the time to switch.
 
 The relay certificate lasts 90 days and the Redis one 365, because replacing
 the Redis certificate restarts Redis (section 6.5). This uses one server

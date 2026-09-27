@@ -855,8 +855,13 @@ async fn start_serving(path: &Path) -> Result<Serving, Box<dyn Error>> {
         .as_ref()
         .map(fs::read)
         .transpose()?;
-    let consumer_tls =
-        load_server_config_from_pem(&consumer_cert, &consumer_key, consumer_ca.as_deref())?;
+    // M6-C194 (e): stateless TLS 1.3 resumption on the public consumer
+    // listener only, and only when it is not an mTLS listener.
+    let consumer_tls = tunnel_transport::load_consumer_server_config_from_pem(
+        &consumer_cert,
+        &consumer_key,
+        consumer_ca.as_deref(),
+    )?;
     let device_cert = fs::read(&config.device_tls_cert_chain)?;
     let device_key = fs::read(&config.device_tls_private_key)?;
     let device_ca = fs::read(&config.device_tls_client_ca)?;
