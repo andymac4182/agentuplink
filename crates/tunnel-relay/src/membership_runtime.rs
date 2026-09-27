@@ -662,7 +662,52 @@ pub enum MembershipUnreadyReason {
     Cancelled,
 }
 
+impl MembershipReadiness {
+    /// Every code [`Self::code`] can return, in a fixed order: the closed
+    /// label set of the private metrics listener's
+    /// `tunnel_relay_membership_readiness` series (task row M0-03).
+    pub const CODES: [&'static str; 10] = [
+        "starting",
+        "ready",
+        "unknown_authority",
+        "checkpoint_expired",
+        "catalog_unavailable",
+        "membership_rejected",
+        "missing_local_membership",
+        "missing_local_key",
+        "persistence_unavailable",
+        "cancelled",
+    ];
+
+    /// The stable, payload-free code for this readiness: `starting`,
+    /// `ready`, or the unready reason's [`MembershipUnreadyReason::code`].
+    #[must_use]
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::Starting => "starting",
+            Self::Ready => "ready",
+            Self::Unready(reason) => reason.code(),
+        }
+    }
+}
+
 impl MembershipUnreadyReason {
+    /// The stable, payload-free code for this reason, as `serve` prints it
+    /// on a failed bootstrap and the metrics listener labels it after one.
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::UnknownAuthority => "unknown_authority",
+            Self::CheckpointExpired => "checkpoint_expired",
+            Self::CatalogUnavailable => "catalog_unavailable",
+            Self::MembershipRejected => "membership_rejected",
+            Self::MissingLocalMembership => "missing_local_membership",
+            Self::MissingLocalKey => "missing_local_key",
+            Self::PersistenceUnavailable => "persistence_unavailable",
+            Self::Cancelled => "cancelled",
+        }
+    }
+
     /// Whether becoming unready for this reason must also withdraw this
     /// relay's approved peer SPKI pins (M7-C86).
     ///

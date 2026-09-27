@@ -119,6 +119,9 @@ fn rendered() -> String {
             measurements: 7,
             failures: 1,
         }),
+        membership: Some(crate::MembershipReadiness::Unready(
+            crate::MembershipUnreadyReason::CatalogUnavailable,
+        )),
         snapshot: &snapshot,
         consumer_refusals: BTreeMap::from([
             (("echo", "identity"), 6),
@@ -241,6 +244,92 @@ fn m6c24_a_scrape_reports_the_aggregates() {
             "missing `{line}`:\n{text}"
         );
     }
+}
+
+/// M0-03 (coordinator decision under the owner's delegation, 2026-09-28):
+/// a cluster relay's post-bootstrap readiness cause is administrative data on
+/// the private listener, not a `/readyz` body. One sample per fixed code,
+/// zeros included, so the series set never varies and exactly one is `1`.
+#[test]
+fn m0_03_the_membership_readiness_cause_is_scraped_under_a_closed_label() {
+    let text = rendered();
+    let samples: Vec<&str> = text
+        .lines()
+        .filter(|line| line.starts_with("tunnel_relay_membership_readiness{"))
+        .collect();
+    assert_eq!(
+        samples.len(),
+        crate::MembershipReadiness::CODES.len(),
+        "one sample per fixed code:\n{text}"
+    );
+    for code in crate::MembershipReadiness::CODES {
+        let value = u8::from(code == "catalog_unavailable");
+        let line = format!("tunnel_relay_membership_readiness{{state=\"{code}\"}} {value}");
+        assert!(
+            samples.contains(&line.as_str()),
+            "missing `{line}`:\n{text}"
+        );
+    }
+    assert!(text.contains("# TYPE tunnel_relay_membership_readiness gauge"));
+}
+
+/// Every readiness state has a code in the closed label set, exactly once.
+#[test]
+fn m0_03_every_membership_readiness_state_has_a_fixed_label() {
+    use crate::{MembershipReadiness as R, MembershipUnreadyReason as U};
+    // An exhaustive successor chain over the reasons: a new reason does not
+    // compile until it is placed here, and so in the list checked below.
+    const fn next(reason: Option<U>) -> Option<U> {
+        match reason {
+            None => Some(U::UnknownAuthority),
+            Some(U::UnknownAuthority) => Some(U::CheckpointExpired),
+            Some(U::CheckpointExpired) => Some(U::CatalogUnavailable),
+            Some(U::CatalogUnavailable) => Some(U::MembershipRejected),
+            Some(U::MembershipRejected) => Some(U::MissingLocalMembership),
+            Some(U::MissingLocalMembership) => Some(U::MissingLocalKey),
+            Some(U::MissingLocalKey) => Some(U::PersistenceUnavailable),
+            Some(U::PersistenceUnavailable) => Some(U::Cancelled),
+            Some(U::Cancelled) => None,
+        }
+    }
+    let mut states = vec![R::Starting, R::Ready];
+    let mut reason = next(None);
+    while let Some(current) = reason {
+        states.push(R::Unready(current));
+        reason = next(Some(current));
+    }
+    let codes: Vec<&str> = states.iter().map(R::code).collect();
+    assert_eq!(
+        codes,
+        R::CODES,
+        "CODES must list every state's code in order"
+    );
+}
+
+/// A relay without signed membership renders no membership series at all,
+/// rather than a `starting` that would never change.
+#[test]
+fn m0_03_a_relay_without_membership_renders_no_membership_series() {
+    let snapshot = canary_snapshot();
+    let text = render(&MetricsInput {
+        ready: true,
+        authority: None,
+        clock: None,
+        membership: None,
+        snapshot: &snapshot,
+        consumer_refusals: BTreeMap::new(),
+        actor_load: crate::actor::ActorLoadSnapshot {
+            commands: 0,
+            busy_nanos: 0,
+            queue_depth: 0,
+            queue_capacity: 1,
+        },
+        listeners: Vec::new(),
+    });
+    assert!(
+        !text.contains("tunnel_relay_membership_readiness"),
+        "{text}"
+    );
 }
 
 /// The hold's partition (every held OPEN leaves exactly once) can be checked

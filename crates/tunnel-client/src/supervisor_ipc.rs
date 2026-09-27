@@ -1,10 +1,16 @@
 //! Local, read-only supervisor status IPC (task row M6-06).
 //!
 //! `tunnel-client connect` is the supervisor. It listens on one Unix socket
-//! per profile and answers exactly one request, `status`, with a redacted
-//! snapshot; `tunnel-client status` and `tunnel-client doctor` read it. There
-//! is no mutating request: `disconnect` and `credentials renew` remain
-//! unimplemented, so nothing on this socket can change the supervisor.
+//! per profile and answers two requests. `status` returns a redacted
+//! snapshot; `tunnel-client status` and `tunnel-client doctor` read it.
+//! `disconnect` (task row M0-03, coordinator decision 2026-09-28) delivers
+//! one stop request to the supervisor, which then takes **the same orderly
+//! stop path SIGTERM takes**, with the same bounds; it is answered with the
+//! snapshot as it stood. That is the only request that changes anything, and
+//! it grants nothing new: the socket sits in the owner-only (`0700`)
+//! credential directory and admits only this UID, so anyone who can reach
+//! it can already read the client's private key. `credentials renew` remains
+//! unimplemented.
 //!
 //! **Authorization is the same user, checked three ways.** The socket is
 //! created in a directory that must be owned by this user and writable by no
@@ -51,6 +57,8 @@ use serde::{Deserialize, Serialize};
 
 /// The status request, one line.
 pub const STATUS_REQUEST: &str = "status";
+/// The disconnect request, one line (M0-03).
+pub const DISCONNECT_REQUEST: &str = "disconnect";
 /// A request longer than this is refused unread.
 pub const MAX_REQUEST_BYTES: usize = 64;
 /// A response longer than this is refused by the reader.
@@ -61,6 +69,10 @@ pub const IPC_IO_TIMEOUT: Duration = Duration::from_secs(2);
 /// terminating NUL; the smaller bound is enforced everywhere so a profile
 /// behaves the same on both.
 pub const MAX_SOCKET_PATH_BYTES: usize = 103;
+/// The reason an authorized supervisor that closed without answering is
+/// reported with. `disconnect` reads it as a supervisor shutting down.
+/// Platform-independent, so `main.rs` compiles where there is no IPC.
+pub const CLOSED_UNANSWERED: &str = "the supervisor closed the connection without answering";
 /// Schema version of [`SupervisorStatus`] and its response envelope.
 pub const IPC_SCHEMA_VERSION: u8 = 1;
 
@@ -283,6 +295,10 @@ pub struct IpcCounters {
     pub peers_refused: u64,
     /// Connections answered with `IPC_BAD_REQUEST`, or that timed out.
     pub bad_requests: u64,
+    /// `disconnect` requests answered (M0-03). Added within schema version
+    /// 1; a supervisor from before it omits the field, read as `0`.
+    #[serde(default)]
+    pub disconnects_requested: u64,
 }
 
 /// The supervisor's redacted status snapshot.
@@ -345,7 +361,7 @@ mod unix {
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::{UnixListener, UnixStream},
-        sync::watch,
+        sync::{mpsc, watch},
     };
     use tokio_util::sync::CancellationToken;
 
@@ -492,9 +508,21 @@ mod unix {
         path: PathBuf,
         identity: (u64, u64),
         expected_uid: u32,
+        /// Where a `disconnect` request is delivered; without one the
+        /// request is refused `IPC_BAD_REQUEST`.
+        disconnect: Option<mpsc::Sender<()>>,
     }
 
     impl SupervisorIpc {
+        /// Deliver `disconnect` requests to `sender` (M0-03). The channel is
+        /// bounded by its sender; a request arriving while an earlier one is
+        /// still undelivered is answered but not queued twice.
+        #[must_use]
+        pub fn with_disconnect(mut self, sender: mpsc::Sender<()>) -> Self {
+            self.disconnect = Some(sender);
+            self
+        }
+
         /// Bind the profile's supervisor socket. Only the holder of the
         /// profile lock may probe, unlink and bind, so the lock is required.
         pub fn bind(path: &Path, lock: &ProfileLock) -> Result<Self, IpcError> {
@@ -555,6 +583,7 @@ mod unix {
                 path: path.to_owned(),
                 identity: (metadata.dev(), metadata.ino()),
                 expected_uid,
+                disconnect: None,
             })
         }
 
@@ -596,8 +625,11 @@ mod unix {
                         continue;
                     }
                 }
-                match tokio::time::timeout(IPC_IO_TIMEOUT, answer(stream, &status, &mut counters))
-                    .await
+                match tokio::time::timeout(
+                    IPC_IO_TIMEOUT,
+                    answer(stream, &status, self.disconnect.as_ref(), &mut counters),
+                )
+                .await
                 {
                     Ok(Ok(())) => {}
                     Ok(Err(())) | Err(_) => {
@@ -617,8 +649,6 @@ mod unix {
             }
         }
     }
-
-    const CLOSED_UNANSWERED: &str = "the supervisor closed the connection without answering";
 
     /// A reset or broken pipe from an authorized supervisor is the same
     /// refusal as a clean close without an answer: the supervisor dropped
@@ -659,6 +689,7 @@ mod unix {
     async fn answer(
         mut stream: UnixStream,
         status: &watch::Receiver<SupervisorStatus>,
+        disconnect: Option<&mpsc::Sender<()>>,
         counters: &mut IpcCounters,
     ) -> Result<(), ()> {
         let mut request = Vec::with_capacity(MAX_REQUEST_BYTES);
@@ -671,8 +702,7 @@ mod unix {
                 Ok(_) | Err(_) => return Err(()),
             }
         }
-        let response = if request == STATUS_REQUEST.as_bytes() {
-            counters.requests_served = counters.requests_served.saturating_add(1);
+        let snapshot = |counters: &IpcCounters| {
             let mut snapshot = status.borrow().clone();
             snapshot.ipc = *counters;
             IpcResponse {
@@ -681,6 +711,19 @@ mod unix {
                 result: Some(snapshot),
                 error: None,
             }
+        };
+        let response = if request == STATUS_REQUEST.as_bytes() {
+            counters.requests_served = counters.requests_served.saturating_add(1);
+            snapshot(counters)
+        } else if let (true, Some(disconnect)) =
+            (request == DISCONNECT_REQUEST.as_bytes(), disconnect)
+        {
+            // Full means an earlier request is still undelivered: this one
+            // is the same request, so it is answered and not queued twice.
+            // Closed means the supervisor is already past its stop loop.
+            let _ = disconnect.try_send(());
+            counters.disconnects_requested = counters.disconnects_requested.saturating_add(1);
+            snapshot(counters)
         } else {
             counters.bad_requests = counters.bad_requests.saturating_add(1);
             IpcResponse {
@@ -702,6 +745,13 @@ mod unix {
         query_status_for_uid(path, effective_uid()).await
     }
 
+    /// Ask the supervisor at `path` to stop (M0-03), returning its snapshot
+    /// as it stood when the request was accepted. The reader's checks are
+    /// exactly `status`'s: the socket file, then the listening peer's UID.
+    pub async fn request_disconnect(path: &Path) -> Result<SupervisorStatus, IpcError> {
+        exchange(path, effective_uid(), DISCONNECT_REQUEST).await
+    }
+
     /// Read the status, authorizing a listening peer whose UID is
     /// `expected_peer_uid`. The socket file is always checked against this
     /// process's own UID; only tests pass anything but [`effective_uid`]
@@ -713,6 +763,15 @@ mod unix {
     pub async fn query_status_for_uid(
         path: &Path,
         expected_peer_uid: u32,
+    ) -> Result<SupervisorStatus, IpcError> {
+        exchange(path, expected_peer_uid, STATUS_REQUEST).await
+    }
+
+    /// One bounded request/answer exchange with the supervisor socket.
+    async fn exchange(
+        path: &Path,
+        expected_peer_uid: u32,
+        request: &'static str,
     ) -> Result<SupervisorStatus, IpcError> {
         check_path_length(path)?;
         check_socket_file(path, effective_uid())?;
@@ -740,11 +799,11 @@ mod unix {
         }
         let exchange = async {
             stream
-                .write_all(format!("{STATUS_REQUEST}\n").as_bytes())
+                .write_all(format!("{request}\n").as_bytes())
                 .await
                 .map_err(|error| {
                     closed_unanswered(&error)
-                        .unwrap_or(IpcError::Io("could not send the status request"))
+                        .unwrap_or(IpcError::Io("could not send the supervisor request"))
                 })?;
             let mut response = Vec::new();
             let mut limited = (&mut stream).take(MAX_RESPONSE_BYTES as u64 + 1);
@@ -777,11 +836,18 @@ mod unix {
 #[cfg(unix)]
 pub use unix::{
     ProfileLock, SupervisorIpc, effective_uid, lock_path, query_status, query_status_for_uid,
+    request_disconnect,
 };
 
 /// Read the supervisor's status; this platform has no supervisor IPC.
 #[cfg(not(unix))]
 pub async fn query_status(_path: &Path) -> Result<SupervisorStatus, IpcError> {
+    Err(IpcError::Unsupported)
+}
+
+/// Ask the supervisor to stop; this platform has no supervisor IPC.
+#[cfg(not(unix))]
+pub async fn request_disconnect(_path: &Path) -> Result<SupervisorStatus, IpcError> {
     Err(IpcError::Unsupported)
 }
 
@@ -838,6 +904,92 @@ mod tests {
             !path.exists(),
             "the socket file is removed when the server ends"
         );
+    }
+
+    /// M0-03: `disconnect` delivers one stop request and is answered with
+    /// the snapshot; a second request while the first is undelivered is
+    /// answered but not queued twice, so the bounded channel never grows.
+    #[tokio::test]
+    async fn a_disconnect_request_is_delivered_once_and_answered() {
+        let dir = private_dir();
+        let path = dir.path().join("s.sock");
+        let (_lock, ipc) = bind(&path).expect("bind");
+        let (stop_tx, mut stop_rx) = tokio::sync::mpsc::channel(1);
+        let (_tx, rx) = watch::channel(snapshot());
+        let cancel = CancellationToken::new();
+        let server = tokio::spawn(ipc.with_disconnect(stop_tx).serve(rx, cancel.clone()));
+        let first = request_disconnect(&path).await.expect("disconnect");
+        assert_eq!(first.pid, 7);
+        assert_eq!(first.ipc.disconnects_requested, 1);
+        let second = request_disconnect(&path).await.expect("disconnect again");
+        assert_eq!(second.ipc.disconnects_requested, 2);
+        assert_eq!(stop_rx.try_recv(), Ok(()), "the request must be delivered");
+        assert!(
+            stop_rx.try_recv().is_err(),
+            "an undelivered duplicate must not be queued"
+        );
+        // `status` is not a stop request.
+        let status = query_status(&path).await.expect("status");
+        assert_eq!(status.ipc.requests_served, 1);
+        assert!(stop_rx.try_recv().is_err());
+        cancel.cancel();
+        server.await.expect("server joins");
+    }
+
+    /// M0-03 review: a peer the kernel reports as another UID is closed
+    /// unanswered **before** its request is read, so its `disconnect` never
+    /// reaches the stop channel.
+    #[tokio::test]
+    async fn another_uids_disconnect_never_delivers_a_stop() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let dir = private_dir();
+        let path = dir.path().join("s.sock");
+        let other = effective_uid().wrapping_add(1);
+        let lock = ProfileLock::acquire(&path).expect("lock");
+        let ipc = SupervisorIpc::bind_for_uid(&path, other, &lock).expect("bind");
+        let (stop_tx, mut stop_rx) = tokio::sync::mpsc::channel(1);
+        let (_tx, rx) = watch::channel(snapshot());
+        let cancel = CancellationToken::new();
+        let server = tokio::spawn(ipc.with_disconnect(stop_tx).serve(rx, cancel.clone()));
+        let mut stream = tokio::net::UnixStream::connect(&path)
+            .await
+            .expect("connect");
+        stream
+            .write_all(format!("{DISCONNECT_REQUEST}\n").as_bytes())
+            .await
+            .expect("request written");
+        let mut answer = Vec::new();
+        let read = tokio::time::timeout(IPC_IO_TIMEOUT, stream.read_to_end(&mut answer))
+            .await
+            .expect("answer within the IPC timeout");
+        assert!(
+            read.is_ok(),
+            "a refused peer must see a clean close: {read:?}"
+        );
+        assert!(answer.is_empty(), "a refused peer is not answered");
+        drop(stream);
+        cancel.cancel();
+        server.await.expect("server joins");
+        assert!(
+            stop_rx.try_recv().is_err(),
+            "another UID's disconnect must never deliver a stop"
+        );
+    }
+
+    /// A server with nowhere to deliver `disconnect` refuses it rather than
+    /// answering as though it would stop.
+    #[tokio::test]
+    async fn a_disconnect_with_nowhere_to_go_is_refused() {
+        let dir = private_dir();
+        let path = dir.path().join("s.sock");
+        let (_lock, ipc) = bind(&path).expect("bind");
+        let (_tx, rx) = watch::channel(snapshot());
+        let cancel = CancellationToken::new();
+        let server = tokio::spawn(ipc.serve(rx, cancel.clone()));
+        let error = request_disconnect(&path).await.expect_err("refused");
+        assert_eq!(error, IpcError::Malformed);
+        cancel.cancel();
+        server.await.expect("server joins");
     }
 
     #[tokio::test]
