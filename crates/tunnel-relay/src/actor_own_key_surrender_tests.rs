@@ -1429,6 +1429,108 @@ async fn a_lapsed_peer_record_leaves_this_relay_ready_without_a_route_to_that_pe
     fixture.shutdown().await;
 }
 
+/// **Red first (M7-C187).** A relay that never saw relay-b's record fresh --
+/// one started or restarted after it lapsed, as in a rolling deploy -- has
+/// nothing to fall back to: the lapsed record is absent for relay-b, and this
+/// relay becomes `Ready` with no route to it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_lapsed_peer_record_never_seen_fresh_is_absent_for_that_peer() {
+    let fixture = Fixture::new().await;
+    let _control = fixture.register().await;
+    fixture
+        .authority
+        .others
+        .lock()
+        .expect("other nodes")
+        .insert(PEER_NODE.to_owned(), 1);
+    let now = Utc::now();
+    let own = fixture.signed(
+        NODE_ID,
+        2,
+        SERVED_SPKI,
+        now - ChronoDuration::seconds(1),
+        now + ChronoDuration::seconds(30),
+    );
+    let lapsed = fixture.signed(
+        PEER_NODE,
+        1,
+        OTHER_SPKI,
+        now - ChronoDuration::seconds(50),
+        now - ChronoDuration::seconds(10),
+    );
+    fixture.set_records(vec![own, lapsed]).await;
+    fixture.ready_pass().await;
+    assert!(
+        fixture
+            .membership
+            .verified_peer_route_targets()
+            .iter()
+            .all(|target| target.node_id() != PEER_NODE),
+        "a lapsed record must leave no route to relay-b"
+    );
+    fixture.shutdown().await;
+}
+
+/// **Red first (M7-C187 carve-out).** An already-expired revision is how a
+/// publisher withdraws a node's live record. If this relay retains an older
+/// verified record for relay-b that is still inside its window, skipping the
+/// newer lapsed revision would leave the superseded record routable, so it
+/// stays fatal (`Expired`, `MembershipRejected`) as before M7-C187. Red if
+/// the pre-filter skipped every lapsed peer record.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_lapsed_revision_superseding_a_live_peer_record_stays_fatal() {
+    let fixture = Fixture::new().await;
+    let _control = fixture.register().await;
+    fixture.add_peer(2).await;
+    assert!(
+        fixture
+            .membership
+            .verified_peer_route_targets()
+            .iter()
+            .any(|target| target.node_id() == PEER_NODE),
+        "relay-b is routable on its live version 1"
+    );
+    let now = Utc::now();
+    let own = fixture.signed(
+        NODE_ID,
+        3,
+        SERVED_SPKI,
+        now - ChronoDuration::seconds(1),
+        now + ChronoDuration::seconds(30),
+    );
+    let withdrawal = fixture.signed(
+        PEER_NODE,
+        2,
+        OTHER_SPKI,
+        now - ChronoDuration::seconds(3),
+        now - ChronoDuration::seconds(2),
+    );
+    fixture.set_records(vec![own, withdrawal]).await;
+    let error = fixture
+        .membership
+        .reconcile_once()
+        .await
+        .expect_err("a lapsed revision superseding a live record is fatal");
+    assert!(
+        matches!(
+            error,
+            crate::MembershipRuntimeError::Membership(
+                tunnel_cluster::membership::MembershipError::Expired
+            )
+        ),
+        "expected the lapsed revision to be judged, got {error:?}"
+    );
+    assert_eq!(
+        fixture.membership.readiness(),
+        MembershipReadiness::Unready(MembershipUnreadyReason::MembershipRejected)
+    );
+    assert!(
+        fixture.membership.verified_peer_route_targets().is_empty(),
+        "the superseded record stayed routable"
+    );
+    fixture.shutdown().await;
+}
+
 /// **Red first (M7-C187).** Only *another* node's lapsed record is absent:
 /// this relay's own record past its lifetime plus skew is still verified and
 /// fails the pass as `MembershipRejected` (`Expired`), which accrues toward

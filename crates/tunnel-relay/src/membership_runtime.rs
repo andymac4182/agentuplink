@@ -2197,7 +2197,27 @@ impl MembershipRuntime {
                 // and an unverified record is never retained. This relay's
                 // own expired record is still verified and stays fatal, and
                 // every unexpired record still fails the pass on any check.
-                if signed.node_id != self.config.node_id && signed.expires_at < freshness_floor {
+                //
+                // One carve-out keeps "absent" from granting anything: a
+                // lapsed record at a version above one this relay retains
+                // verified and still inside its window (plus skew) is not
+                // skipped. Skipping it would leave that older record
+                // routable, although the publisher has superseded it -- an
+                // already-expired revision is how a publisher withdraws a
+                // node's live record -- so it stays fatal as before. A
+                // stuck publisher never reaches this: its node's last record
+                // is the one retained, and any older one lapsed first.
+                if signed.node_id != self.config.node_id
+                    && signed.expires_at < freshness_floor
+                    && !candidate_verifier
+                        .retained_memberships()
+                        .iter()
+                        .any(|retained| {
+                            retained.node_id() == signed.node_id.as_str()
+                                && retained.record().record_version < signed.record_version
+                                && retained.record().expires_at >= freshness_floor
+                        })
+                {
                     continue;
                 }
                 candidate_verifier
