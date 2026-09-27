@@ -741,6 +741,26 @@ fn close_frame(code: SessionErrorCode) -> Option<axum::extract::ws::CloseFrame> 
         })
 }
 
+/// The close a filesystem session ends with.  A session whose OPEN the
+/// connector refused `GOAWAY` inside a scheduled rotation freeze, and which
+/// has no other code, closes **1013** (Try Again Later, which the contract
+/// maps to the retryable `RESOURCE_EXHAUSTED`) with reason `ROTATION_FREEZE`
+/// (task row M6-C210): nothing reached the device.  Before M6-C210 it closed
+/// with no code, through the actor-cancelled arm.
+fn consumer_close_frame(
+    close_with: Option<SessionErrorCode>,
+    open_refusal: Option<&'static str>,
+) -> Option<axum::extract::ws::CloseFrame> {
+    if close_with.is_none() && open_refusal == Some(crate::actor::ROTATION_FREEZE_ECHO_CODE) {
+        crate::metrics::count_local_rotation_freeze("fs");
+        return Some(axum::extract::ws::CloseFrame {
+            code: crate::http::ROTATION_FREEZE_STREAM_CLOSE_CODE,
+            reason: ROTATION_FREEZE_FS_CODE.into(),
+        });
+    }
+    close_with.and_then(close_frame)
+}
+
 /// Which arm ended the device→consumer pump.
 ///
 /// A diagnostic identifier, not a protocol value: it never reaches the wire and
@@ -819,6 +839,9 @@ async fn pump(
     let mut terminal_cause = registration.terminal.clone();
     // Without the M6-C190 refusal reset: this session's close code is the
     // device's RESET reason or the grant timer, never a relay RESET.
+    // The connector's refusal of this session's OPEN, if the actor recorded
+    // one (task row M6-C210); read after the loop ends.
+    let open_refusal = registration.base.open_refusal_handle();
     let (mut writer, mut reader, signal_task, _freeze) =
         actor_carriers_without_refusal_reset(&handle, registration);
 
@@ -1037,7 +1060,7 @@ async fn pump(
         cause_present = cause_present,
         close_code = ?close_with.and_then(SessionErrorCode::close_code),
     );
-    let frame = close_with.and_then(close_frame);
+    let frame = consumer_close_frame(close_with, open_refusal.get().copied());
     let _ = sink.send(Message::Close(frame)).await;
     let _ = sink.close().await;
     if matches!(

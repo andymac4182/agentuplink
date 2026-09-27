@@ -5947,6 +5947,9 @@ mod peer_cleanup_tests;
 mod pending_open_abandon_tests;
 
 #[cfg(test)]
+mod rotation_refusal_route_tests;
+
+#[cfg(test)]
 mod task_closure_tests;
 
 #[cfg(test)]

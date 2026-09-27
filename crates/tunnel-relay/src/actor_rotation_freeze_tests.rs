@@ -4531,6 +4531,59 @@ async fn m7c178_a_loss_report_naming_the_candidate_does_not_abort_the_rotation()
     assert!(fixture.session().active_carrier.is_some());
 }
 
+impl RelayActor {
+    /// Route-test hook (task row M6-C210): put a live M2 session into a
+    /// frozen scheduled attempt (`Quiescing`) through the same transition
+    /// the fixture above uses, `begin_rotation_quiesce`, so a consumer route
+    /// on a real listener sees the freeze.  The candidate carrier's receiver
+    /// is leaked: nothing reads it, and the attempt never completes.
+    pub(crate) fn enter_rotation_freeze_for_test(&mut self, key: &SessionKey) {
+        let session = self.sessions.get(&key.scope()).expect("route-test session");
+        let owner_id = runtime::owner_id(&session.owner);
+        let attempt = RotationAttemptIdentity::new(
+            key.session_id.clone(),
+            key.epoch,
+            owner_id,
+            "rotation-route-test".to_owned(),
+            session.generation,
+            session.generation + 1,
+            session.connection_id.clone(),
+            "new-route-test".to_owned(),
+        );
+        let (candidate_tx, candidate_rx) = mpsc::channel(self.options.limits.max_queue_messages);
+        std::mem::forget(candidate_rx);
+        let candidate_carrier = CarrierKey {
+            session: key.clone(),
+            generation: attempt.new_generation,
+            connection_id: attempt.new_connection_id.clone(),
+        };
+        let now_ms = super::monotonic_millis();
+        let mut rotation = test_rotation_runtime(now_ms, attempt.clone(), now_ms + 60_000);
+        rotation
+            .state
+            .prepare(attempt.clone(), now_ms)
+            .expect("route-test rotation prepares");
+        rotation
+            .state
+            .candidate_ready(&attempt, now_ms)
+            .expect("route-test candidate is ready");
+        rotation.candidate = Some(DataCarrier {
+            context: candidate_carrier.context(),
+            tx: candidate_tx,
+        });
+        rotation.old_connection_id = attempt.old_connection_id.clone();
+        rotation.prepare_message_id = "relay-prepare-route-test".to_owned();
+        self.sessions
+            .get_mut(&key.scope())
+            .expect("route-test session")
+            .rotation = Some(rotation);
+        self.begin_rotation_quiesce(key);
+        assert!(super::freeze_hold::attempt_frozen(
+            self.sessions.get(&key.scope()).expect("route-test session")
+        ));
+    }
+}
+
 // Task rows M6-C204, M6-C205 and M6-C207: outcomes of unary echoes that a
 // rotation freeze or an ended wait kept from running.  Each outcome is
 // `not_dispatched` only where the relay provably never queued the echo's
@@ -5165,6 +5218,14 @@ async fn m6c210_a_roster_stream_open_refused_goaway_during_a_freeze_is_answered_
         assert!(
             closed.is_cancelled(),
             "{label}: the consumer is released now"
+        );
+        // A record written after the release is refused at once, never
+        // parked on a stream that can no longer run it.
+        let mut late = fixture.write(b"after-release");
+        assert_eq!(
+            record_failure(&mut late),
+            Some(("STREAM_NOT_FOUND", "not_dispatched")),
+            "{label}: a released stream takes no new record"
         );
         if http {
             // A read issued after the release ends at once rather than

@@ -3215,6 +3215,20 @@ impl RelayHandle {
         });
         (handle, ops_rx)
     }
+
+    /// Route-test hook (task row M6-C210): put `key`'s session into a frozen
+    /// scheduled rotation attempt on the live actor, and wait until it is.
+    pub(crate) async fn enter_rotation_freeze_for_test(&self, key: SessionKey) {
+        let (done_tx, done_rx) = oneshot::channel();
+        self.tx
+            .send(Command::TestMutate(Box::new(move |actor| {
+                actor.enter_rotation_freeze_for_test(&key);
+                let _ = done_tx.send(());
+            })))
+            .await
+            .expect("actor accepts the test mutation");
+        done_rx.await.expect("the freeze was entered");
+    }
 }
 
 impl RelayHandle {
@@ -7583,7 +7597,14 @@ impl RelayActor {
                 http.local_terminal()
             }
         });
-        if stream.operation_id != operation_id || stream.terminal || locally_ended {
+        // A released stream (its `closed` fired: a refused OPEN, M6-C210, or
+        // a consumer close of a pending OPEN) takes no new record, as its
+        // read side delivers nothing more.
+        if stream.operation_id != operation_id
+            || stream.terminal
+            || locally_ended
+            || stream.closed.is_cancelled()
+        {
             let _ = response.send(Err(EchoOutcome::Failure {
                 code: "STREAM_NOT_FOUND",
                 execution: "not_dispatched",
