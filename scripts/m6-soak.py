@@ -43,6 +43,7 @@ import csv
 import json
 import os
 import re
+import shutil
 import signal
 import socket
 import ssl
@@ -268,6 +269,7 @@ class Stack:
         self.devices: dict[str, dict] = {}
         self.users: dict[str, dict] = {}
         self.relay_starts = 0
+        self.ipc_dirs: list[Path] = []
         self.events = (run_dir / "events.jsonl").open("a", buffering=1)
         self.tokens: dict[tuple[str, str], tuple[float, str]] = {}
         self.token_lock = threading.Lock()
@@ -472,6 +474,7 @@ class Stack:
         # connector's payload-free rotation phase and drain counters) works;
         # the default beside the key exceeds the 103-byte socket path limit.
         ipc_dir = Path(tempfile.mkdtemp(prefix="au-ipc-"))
+        self.ipc_dirs.append(ipc_dir)  # removed by `close`
         doc += f"\n[supervisor]\nipc_path = {tq(ipc_dir / (name + '.sock'))}\n"
         config = d / "client.toml"
         config.write_text(doc)
@@ -667,6 +670,8 @@ class Stack:
             self.event("namespace-deleted", namespace=self.namespace, keys=removed)
         except OSError as error:
             self.event("namespace-delete-failed", error=str(error))
+        for ipc_dir in self.ipc_dirs:  # the devices' supervisor sockets (M6-C195)
+            shutil.rmtree(ipc_dir, ignore_errors=True)
         self.events.close()
 
 
@@ -1527,7 +1532,15 @@ def base_stack(args, run_dir, nonce, tag, redis=None, mcp=True, **kw) -> Stack:
 def parse_rotation(text: str) -> tuple[int, int, int]:
     """`INTERVAL,HANDSHAKE,OVERLAP` seconds for relay and devices (M6-C195): a
     short interval puts many data rotations under one flood."""
-    interval, handshake, overlap = (int(part) for part in text.split(","))
+    parts = text.split(",")
+    if len(parts) != 3 or not all(part.strip().isdigit() for part in parts):
+        raise SystemExit(f"--rotation wants INTERVAL,HANDSHAKE,OVERLAP whole seconds, got {text!r}")
+    interval, handshake, overlap = (int(part) for part in parts)
+    # The relay's and client's own rule (tunnel-core RotationConfig): each is
+    # nonzero and handshake < overlap < interval; refuse here rather than
+    # start a stack whose relay then refuses its configuration.
+    if not 0 < handshake < overlap < interval <= 86400:
+        raise SystemExit(f"--rotation needs 0 < HANDSHAKE < OVERLAP < INTERVAL <= 86400, got {text!r}")
     return interval, handshake, overlap
 
 

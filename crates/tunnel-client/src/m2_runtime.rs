@@ -7907,11 +7907,14 @@ impl M2Actor {
                     .direction(Direction::RelayToConnector)
                     .recv_contiguous(),
                 // Task row M6-C195: the owner fenced a stream this connector
-                // holds no state for, at zero -- an OPEN in the QUIESCE
-                // roster that this connector refused, whose REJECTED crossed
-                // the owner's FROZEN.  The owner emitted nothing on it below
-                // the fence, so there is nothing to drain and the proof is
-                // `0` through `0`.  Waiting for a stream that will never
+                // holds no state for, at zero.  Two cases reach here: an OPEN
+                // in the QUIESCE roster that this connector refused (its
+                // REJECTED, `GOAWAY` once admission stopped, crossed the
+                // owner's FROZEN), and an OPEN still waiting in the bounded
+                // deferred-admission queue (`pending_open_queue`), which is
+                // refused or admitted only after the freeze.  Either way the
+                // owner emitted nothing on it below the fence, so there is
+                // nothing to drain and the proof is `0` through `0`.  Waiting for a stream that will never
                 // exist here withheld this proof until the overlap deadline:
                 // the rotation froze admission for the whole budget and every
                 // unary echo in the roster ended `unknown`.
@@ -19073,6 +19076,47 @@ mod tests {
         assert_eq!(drained[0].reply_to, "owner-frozen");
         assert_eq!(drained[0].proof.direction, Direction::RelayToConnector);
         assert_eq!(drained[0].proof.ack_cursors, vec![StreamAck::new(7, 0)]);
+    }
+
+    /// The other shape the review of PR #226 named: a roster OPEN still in the
+    /// bounded deferred-admission queue when the owner's FROZEN arrives.  The
+    /// connector holds no stream for it yet, and the owner, which has not
+    /// been challenged for it, fenced it at zero.  The proof is sent at once
+    /// and the OPEN stays queued for admission or refusal after the freeze.
+    #[tokio::test]
+    async fn m6c195_a_deferred_roster_open_fenced_at_zero_does_not_withhold_the_drain_proof() {
+        let (mut actor, attempt, _old, mut control_receiver, _candidate) =
+            m6c195_draining_actor(vec![7]);
+        let open = test_open(7);
+        let reservation = actor
+            .reserve_pending_open(&open)
+            .expect("the deferred OPEN is within its budget");
+        let pending = actor
+            .prepare_pending_open(open, reservation)
+            .expect("the deferred OPEN is well formed");
+        actor.pending_open_queue.push_back(pending);
+        assert!(!actor.streams.contains_key(&7));
+        let frozen = m6c195_owner_frozen(&mut actor, &attempt, vec![(7, 0)]);
+        actor
+            .handle_rotate_frozen(frozen)
+            .expect("the owner's fence is accepted");
+
+        assert!(
+            actor.sent_drain_proof,
+            "a deferred roster OPEN fenced at zero must not withhold the drain proof (M6-C195)"
+        );
+        assert_eq!(
+            drain_control_messages(&mut control_receiver)
+                .iter()
+                .filter(|message| matches!(message, ControlMessage::RotateDrained(_)))
+                .count(),
+            1
+        );
+        assert_eq!(
+            actor.pending_open_queue.len(),
+            1,
+            "the deferred OPEN is still queued, neither admitted nor dropped"
+        );
     }
 
     /// The exception stays narrow: a stream the owner fenced above zero was
