@@ -4938,28 +4938,28 @@ async fn m6c207_a_grant_revoked_during_the_freeze_is_still_refused() {
     fixture
         .commit_with_roster(&[(STREAM_ID, 0), (stream_id, 0)])
         .await;
-    let before = unary_failure(&mut receiver);
-    if before.is_none() {
-        let (key, reread, catalog_result) = fixture.next_challenge_read().await;
-        assert!(
-            matches!(&catalog_result, Ok((None, _, _, _))),
-            "the catalog has no grant for this consumer"
-        );
-        fixture
-            .actor
-            .finish_device_challenge(key, reread, catalog_result);
-        assert_eq!(
-            unary_failure(&mut receiver),
-            Some(("AUTHORIZATION_REVOKED", "not_dispatched"))
-        );
-        assert!(fixture.drain_control().iter().any(|message| matches!(
-            message,
-            ControlMessage::AuthorizationInvalidated(invalidated)
-                if invalidated.stream_id == stream_id && invalidated.reason == "grant unavailable"
-        )));
-    } else {
-        assert_eq!(before, Some(("AUTHORIZATION_REVOKED", "not_dispatched")));
-    }
+    assert_eq!(
+        unary_failure(&mut receiver),
+        None,
+        "the stale held result is read again, not applied"
+    );
+    let (key, reread, catalog_result) = fixture.next_challenge_read().await;
+    assert!(
+        matches!(&catalog_result, Ok((None, _, _, _))),
+        "the catalog has no grant for this consumer"
+    );
+    fixture
+        .actor
+        .finish_device_challenge(key, reread, catalog_result);
+    assert_eq!(
+        unary_failure(&mut receiver),
+        Some(("AUTHORIZATION_REVOKED", "not_dispatched"))
+    );
+    assert!(fixture.drain_control().iter().any(|message| matches!(
+        message,
+        ControlMessage::AuthorizationInvalidated(invalidated)
+            if invalidated.stream_id == stream_id && invalidated.reason == "grant unavailable"
+    )));
     assert!(
         !sequenced(&drain_data(&mut fixture.candidate_rx))
             .iter()
@@ -5003,4 +5003,74 @@ async fn m6c207_a_held_refusal_is_applied_without_a_second_read() {
             "a held refusal is not read again"
         );
     }
+}
+
+/// M6-C207 scope: the freeze answer is only for a result a freeze held.  A
+/// challenge that was never held, whose window lapsed before its result
+/// arrived, keeps the existing `AUTHORIZATION_REVOKED` answer even though the
+/// read itself still authorizes (task row M6-C211 tracks that answer).
+#[tokio::test]
+async fn m6c207_a_lapsed_challenge_never_held_by_a_freeze_is_not_a_freeze_answer() {
+    let mut fixture = FreezeFixture::new("m6c207-never-held", false);
+    assert_eq!(fixture.phase(), RotationPhase::Preparing);
+    let (stream_id, _, _, mut receiver) = fixture.admit_unary_echo(UNARY_BODY).await;
+    let challenge = fixture.unary_challenge(
+        stream_id,
+        StdDuration::from_secs(3),
+        StdDuration::from_secs(2),
+    );
+    let fresh = fixture.authorizing_result(Duration::zero());
+    fixture
+        .actor
+        .finish_device_challenge(fixture.key.clone(), challenge, fresh);
+    assert_eq!(
+        unary_failure(&mut receiver),
+        Some(("AUTHORIZATION_REVOKED", "not_dispatched")),
+        "only a result held by a freeze may be answered ROTATION_FREEZE"
+    );
+}
+
+/// M6-C207: a held result whose read is still valid (1 s old) but whose
+/// challenge window lapsed (3 s old against 2 s) is read again too, so a
+/// grant revoked during the freeze is refused by that read.  Without the
+/// window check the held result would be applied and answered as a freeze.
+#[tokio::test]
+async fn m6c207_a_held_result_with_only_its_challenge_window_lapsed_is_read_again() {
+    let mut fixture = FreezeFixture::new("m6c207-window-only", false);
+    let (stream_id, _, _, mut receiver) = fixture.admit_unary_echo(UNARY_BODY).await;
+    fixture.quiesce_roster(&[STREAM_ID, stream_id]);
+    let challenge = fixture.unary_challenge(
+        stream_id,
+        StdDuration::from_secs(3),
+        StdDuration::from_secs(2),
+    );
+    let held = fixture.authorizing_result(Duration::seconds(1));
+    fixture
+        .actor
+        .finish_device_challenge(fixture.key.clone(), challenge, held);
+    fixture
+        .commit_with_roster(&[(STREAM_ID, 0), (stream_id, 0)])
+        .await;
+    assert_eq!(
+        unary_failure(&mut receiver),
+        None,
+        "a held result past its challenge window is read again"
+    );
+    let (key, reread, catalog_result) = fixture.next_challenge_read().await;
+    assert!(
+        matches!(&catalog_result, Ok((None, _, _, _))),
+        "the catalog has no grant for this consumer"
+    );
+    fixture
+        .actor
+        .finish_device_challenge(key, reread, catalog_result);
+    assert_eq!(
+        unary_failure(&mut receiver),
+        Some(("AUTHORIZATION_REVOKED", "not_dispatched"))
+    );
+    assert!(fixture.drain_control().iter().any(|message| matches!(
+        message,
+        ControlMessage::AuthorizationInvalidated(invalidated)
+            if invalidated.stream_id == stream_id && invalidated.reason == "grant unavailable"
+    )));
 }
