@@ -1565,8 +1565,8 @@ the whole process, plus stage `rotation_freeze`: a request this relay, as the
 device's owner, refused `ROTATION_FREEZE` on the `echo`, `stream`,
 `http-forward` or `fs` route, counted without a log line, including a unary
 echo whose roster OPEN the connector refused `GOAWAY` during the freeze
-(M6-C204) and a local echo stream or `http-forward/1` stream refused that
-way (M6-C210); a freeze refusal for
+(M6-C204) and a local echo stream, `http-forward/1` stream or filesystem
+session refused that way (M6-C210); a freeze refusal for
 a request that reached the owner through a peer hop is a peer fault with cause
 `rotation_freeze` instead), `peer_faults_total{stage}` and
 `peer_fault_causes_total{cause}`. The single relay actor, which every device
