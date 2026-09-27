@@ -52,6 +52,17 @@ pub(crate) const OFFSET_INTERVAL: Duration = Duration::from_secs(5);
 /// deadlines (2 s each) and one second of margin, as for the authority check.
 pub(crate) const OFFSET_DEADLINE: Duration = Duration::from_secs(5);
 
+/// A sample whose round trip, measured on the monotonic clock, exceeds this
+/// is discarded as a failure: the midpoint estimate is uncertain by half the
+/// round trip, so a slow read cannot move the verdict (Opus review of #225,
+/// S2).
+pub(crate) const MAX_SAMPLE_ROUND_TRIP: Duration = Duration::from_millis(750);
+
+/// Consecutive successful samples on the other side of the readiness line
+/// needed to flip it, in either direction, so one outlier cannot take the
+/// relay out of rotation or put it back.
+pub(crate) const CONSECUTIVE_SAMPLES_TO_FLIP: u8 = 2;
+
 /// Where a measured offset falls.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum OffsetVerdict {
@@ -134,7 +145,8 @@ pub(crate) enum Measurement {
     Offset(TimeDelta),
     /// The authority has no separate clock; stop measuring.
     Unsupported,
-    /// The read failed or exceeded [`OFFSET_DEADLINE`].
+    /// The read failed, exceeded [`OFFSET_DEADLINE`], or took longer than
+    /// [`MAX_SAMPLE_ROUND_TRIP`].
     Failed,
 }
 
@@ -144,10 +156,13 @@ pub(crate) async fn measure<A: AuthorityClock, L: LocalClock + ?Sized>(
     local: &L,
     deadline: Duration,
 ) -> Measurement {
+    let started = tokio::time::Instant::now();
     let before = local.now();
     let answer = tokio::time::timeout(deadline, authority.authority_time()).await;
     let after = local.now();
+    let round_trip = started.elapsed();
     match answer {
+        Ok(Ok(Some(_))) if round_trip > MAX_SAMPLE_ROUND_TRIP => Measurement::Failed,
         Ok(Ok(Some(server))) => {
             let midpoint = before + (after - before) / 2;
             Measurement::Offset(midpoint - server)
@@ -163,6 +178,8 @@ pub(crate) struct ClockOffsetHealth {
     offset_ms: AtomicI64,
     measured: AtomicBool,
     verdict: AtomicU8,
+    /// Consecutive samples on the other side of the readiness line.
+    streak: AtomicU8,
     measurements: AtomicU64,
     failures: AtomicU64,
 }
@@ -173,6 +190,7 @@ impl ClockOffsetHealth {
             offset_ms: AtomicI64::new(0),
             measured: AtomicBool::new(false),
             verdict: AtomicU8::new(OffsetVerdict::Within.as_u8()),
+            streak: AtomicU8::new(0),
             measurements: AtomicU64::new(0),
             failures: AtomicU64::new(0),
         }
@@ -216,9 +234,27 @@ impl ClockOffsetHealth {
                 self.offset_ms
                     .store(offset.num_milliseconds(), Ordering::Release);
                 self.measured.store(true, Ordering::Release);
-                let next = OffsetVerdict::of(*offset);
-                let previous =
-                    OffsetVerdict::from_u8(self.verdict.swap(next.as_u8(), Ordering::AcqRel));
+                let sample = OffsetVerdict::of(*offset);
+                let previous = self.verdict();
+                // Crossing the readiness line (into or out of `Beyond`) takes
+                // `CONSECUTIVE_SAMPLES_TO_FLIP` samples in a row; moving
+                // between `Within` and `Warn` is immediate. A failed sample
+                // neither counts nor resets the streak.
+                let crosses =
+                    (sample == OffsetVerdict::Beyond) != (previous == OffsetVerdict::Beyond);
+                let next = if crosses {
+                    let streak = self.streak.fetch_add(1, Ordering::AcqRel).saturating_add(1);
+                    if streak >= CONSECUTIVE_SAMPLES_TO_FLIP {
+                        self.streak.store(0, Ordering::Release);
+                        sample
+                    } else {
+                        previous
+                    }
+                } else {
+                    self.streak.store(0, Ordering::Release);
+                    sample
+                };
+                self.verdict.store(next.as_u8(), Ordering::Release);
                 (previous != next).then_some((previous, next))
             }
             Measurement::Failed => {

@@ -104,10 +104,16 @@ async fn an_offset_beyond_the_bound_is_not_ready_until_measured_back_within_it()
     assert_eq!(state.verdict(), OffsetVerdict::Warn);
     assert!(state.is_ready());
 
-    // Relay 6 s ahead of Redis: beyond the bound, not ready.
+    // Relay 6 s ahead of Redis: beyond the bound. One sample is not
+    // enough to leave rotation; the second in a row is.
     set_lead(&authority, -6_000);
     step(&state, &authority, &local).await;
     assert_eq!(state.offset_ms(), Some(6_000));
+    assert!(
+        state.is_ready(),
+        "one over-bound sample must not flip readiness"
+    );
+    step(&state, &authority, &local).await;
     assert_eq!(state.verdict(), OffsetVerdict::Beyond);
     assert!(!state.is_ready());
 
@@ -124,12 +130,89 @@ async fn an_offset_beyond_the_bound_is_not_ready_until_measured_back_within_it()
         "a failed read must not restore readiness"
     );
 
-    // Exactly at the bound is ready again.
+    // Exactly at the bound: ready again after two in-bound samples in a row.
     set_lead(&authority, 5_000);
     step(&state, &authority, &local).await;
     assert_eq!(state.offset_ms(), Some(-5_000));
+    assert!(
+        !state.is_ready(),
+        "one in-bound sample must not restore readiness"
+    );
+    step(&state, &authority, &local).await;
     assert!(state.is_ready());
-    assert_eq!(state.measurements(), 4);
+    assert_eq!(state.measurements(), 6);
+}
+
+/// Opus review of #225, S2: a single outlier on either side of the line is
+/// absorbed, because the streak resets when a sample falls back.
+#[tokio::test]
+async fn a_single_outlier_never_flips_readiness() {
+    let (local, authority) = clocks();
+    let state = ClockOffsetHealth::new();
+    for lead in [0, -9_000, 0, -9_000, 0] {
+        set_lead(&authority, lead);
+        step(&state, &authority, &local).await;
+        assert!(
+            state.is_ready(),
+            "an isolated {lead} ms outlier flipped readiness"
+        );
+    }
+    for _ in 0..2 {
+        set_lead(&authority, -9_000);
+        step(&state, &authority, &local).await;
+    }
+    assert!(!state.is_ready());
+    for lead in [0, -9_000, 0, -9_000] {
+        set_lead(&authority, lead);
+        step(&state, &authority, &local).await;
+        assert!(
+            !state.is_ready(),
+            "an isolated in-bound sample at {lead} ms restored readiness"
+        );
+    }
+}
+
+/// Opus review of #225, S2: the round trip is measured on the monotonic
+/// clock, and a sample slower than 750 ms is a failure that keeps the
+/// verdict, even when its offset would flip it.
+#[tokio::test(start_paused = true)]
+async fn a_slow_round_trip_is_discarded() {
+    struct Slow {
+        delay: Duration,
+        at: DateTime<Utc>,
+    }
+    impl AuthorityClock for Slow {
+        async fn authority_time(&self) -> Result<Option<DateTime<Utc>>, CatalogError> {
+            tokio::time::sleep(self.delay).await;
+            Ok(Some(self.at))
+        }
+    }
+    let local = FixedLocal(Mutex::new(
+        DateTime::from_timestamp(1_800_000_000, 0).expect("instant"),
+    ));
+    let far = local.now() - TimeDelta::seconds(9);
+    let slow = Slow {
+        delay: MAX_SAMPLE_ROUND_TRIP + Duration::from_millis(1),
+        at: far,
+    };
+    assert_eq!(
+        measure(&slow, &local, OFFSET_DEADLINE).await,
+        Measurement::Failed
+    );
+    let state = ClockOffsetHealth::new();
+    for _ in 0..3 {
+        state.record(&measure(&slow, &local, OFFSET_DEADLINE).await);
+    }
+    assert!(state.is_ready(), "slow samples moved the verdict");
+    assert_eq!((state.measurements(), state.failures()), (0, 3));
+    let fast = Slow {
+        delay: MAX_SAMPLE_ROUND_TRIP,
+        at: far,
+    };
+    assert_eq!(
+        measure(&fast, &local, OFFSET_DEADLINE).await,
+        Measurement::Offset(TimeDelta::seconds(9))
+    );
 }
 
 #[tokio::test]
@@ -229,11 +312,13 @@ async fn readyz_is_not_ready_beyond_the_skew_bound() {
     assert_eq!(readyz_status(&app).await.0, 200);
     set_lead(&authority, 5_001);
     step(&state, &authority, &local).await;
+    step(&state, &authority, &local).await;
     assert_eq!(
         readyz_status(&app).await,
         (503, r#"{"status":"unready"}"#.to_owned())
     );
     set_lead(&authority, 4_000);
+    step(&state, &authority, &local).await;
     step(&state, &authority, &local).await;
     assert_eq!(
         readyz_status(&app).await,

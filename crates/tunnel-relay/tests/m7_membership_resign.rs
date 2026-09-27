@@ -991,6 +991,19 @@ async fn a_resign_from_a_signer_ahead_is_accepted_inside_the_skew_and_rejected_b
             PEER_SPKI_SHA256,
         ))
         .expect("a new peer admission binds the record signed ahead inside the skew");
+    // The peer route and its pin set agree with the binding (Opus review of
+    // #225, B1): a record and key signed ahead inside the skew are routable,
+    // not only bindable, so a dial to the peer is not refused its pin.
+    let targets = fixture.runtime.verified_peer_route_targets();
+    for (node, spki) in [(PEER_NODE_ID, PEER_SPKI_SHA256), (NODE_ID, SPKI_SHA256)] {
+        let target = targets
+            .iter()
+            .find(|target| target.node_id() == node)
+            .unwrap_or_else(|| {
+                panic!("M7-C171: {node} signed ahead inside the skew has no peer route")
+            });
+        assert_eq!(target.approved_spki_sha256(), [spki.to_owned()]);
+    }
 
     // Beyond the skew: the signer is ahead by skew + 1 s. Refused, fail closed.
     fixture

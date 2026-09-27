@@ -180,8 +180,8 @@ impl RelayOptions {
                 "challenge_interval must be <= 5 seconds",
             ));
         }
-        if self.owner_lease < Duration::from_secs(6) || self.owner_lease > Duration::from_secs(30) {
-            return Err(ConfigError::Invalid("owner_lease must be 6..=30 seconds"));
+        if self.owner_lease < MIN_OWNER_LEASE || self.owner_lease > Duration::from_secs(30) {
+            return Err(ConfigError::Invalid("owner_lease must be 15..=30 seconds"));
         }
         self.limits.validate()?;
         self.rotation.validate().map_err(ConfigError::Rotation)?;
@@ -1335,6 +1335,14 @@ fn default_max_queue_bytes() -> usize {
     4 * 1024 * 1024
 }
 
+/// The shortest owner lease (Opus review of #225, B2). A lease is renewed
+/// once a third of it has elapsed, so two thirds of it must still exceed the
+/// owner safety margin (cluster skew + 4 s = 9 s) or a freshly renewed owner
+/// could never issue a ticket. It was 6 s while the margin was 5 s.
+pub(crate) const MIN_OWNER_LEASE: Duration = Duration::from_secs(15);
+const _: () =
+    assert!(MIN_OWNER_LEASE.as_secs() * 2 / 3 > crate::actor::OWNER_LEASE_SAFETY_MARGIN.as_secs());
+const _: () = assert!(MIN_OWNER_LEASE.as_secs() == 15);
 const MAX_CLUSTER_AUTHORIZED_NODES: usize = 32;
 const MAX_CLUSTER_RECORD_LIFETIME_SECONDS: u64 = 60;
 const MAX_CLUSTER_REFRESH_SECONDS: u64 = 20;
@@ -2315,6 +2323,29 @@ consumer_tls_private_key = "consumer-key.pem"
         assert_eq!(cluster.peer_drain_timeout_seconds, 30);
         assert_eq!(cluster.checkpoint_timeout_seconds, 2);
         assert_eq!(cluster.max_clock_skew_seconds, 5);
+    }
+
+    /// Opus review of #225, B2: the owner safety margin tracks the cluster
+    /// skew (skew + 4 s), and the shortest owner lease leaves a renewed owner
+    /// more than that margin.
+    #[test]
+    fn owner_lease_safety_margin_tracks_the_cluster_skew() {
+        assert_eq!(
+            crate::actor::OWNER_LEASE_SAFETY_MARGIN,
+            tunnel_catalog::clock::MAX_CLUSTER_CLOCK_SKEW + Duration::from_secs(4)
+        );
+        assert!(MIN_OWNER_LEASE * 2 / 3 > crate::actor::OWNER_LEASE_SAFETY_MARGIN);
+        let mut options = RelayOptions::new(oidc());
+        options.owner_lease = MIN_OWNER_LEASE;
+        options.validate().expect("the minimum lease is accepted");
+        options.owner_lease = MIN_OWNER_LEASE - Duration::from_secs(1);
+        assert_eq!(
+            options
+                .validate()
+                .expect_err("a lease below the minimum is refused")
+                .to_string(),
+            "owner_lease must be 15..=30 seconds"
+        );
     }
 
     /// M7-C173: the cluster clock-skew ceiling is the shared five-second

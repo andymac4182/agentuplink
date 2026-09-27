@@ -538,8 +538,18 @@ impl VerifiedMembership {
     /// `expires_at` stays strict: no allowance ever extends trust.
     #[must_use]
     pub fn key_window_open(&self, key: &RelayKey, now: DateTime<Utc>) -> bool {
+        self.activated(key.not_before, now) && key.expires_at >= now
+    }
+
+    /// Whether a signed activation instant (`not_before` of this record or
+    /// of one of its keys) has been reached at `now`, honouring the
+    /// verifier's clock-skew allowance (M7-C171, option (a)).  Every caller
+    /// that decides whether a key or record is active uses this, so a bind,
+    /// a peer route and a pin set cannot disagree.
+    #[must_use]
+    pub fn activated(&self, not_before: DateTime<Utc>, now: DateTime<Utc>) -> bool {
         let activation = now.checked_add_signed(self.activation_skew).unwrap_or(now);
-        key.not_before <= activation && key.expires_at >= now
+        not_before <= activation
     }
 
     /// Select the latest non-revoked key active at an explicit wall-clock

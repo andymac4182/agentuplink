@@ -103,7 +103,32 @@ const CHALLENGE_MISMATCH_REASON: &str = "challenge mismatch";
 /// grant deadline expires.  It carries the existing `AUTHORIZATION_INVALIDATED`
 /// code like every other reason outside `authorization_failure_code`.
 const TERMINAL_STREAM_CHALLENGE_REASON: &str = "stream closed";
-const OWNER_LEASE_SAFETY_MARGIN: Duration = Duration::from_secs(5);
+/// How long before its Redis lease expiry an owner stops relying on it.
+///
+/// Owner leases are stamped with this relay's wall clock and expired by the
+/// Redis server clock, so up to [`MAX_CLUSTER_CLOCK_SKEW`] of the margin can
+/// be consumed by skew alone (Opus review of #225, B2). The margin is
+/// therefore derived from the one cluster skew bound plus the 4 s of real
+/// safety the pre-M7-C173 value (5 s over a 1 s skew) left.
+///
+/// The device-side owner fence is separate and does not depend on any wall
+/// clock: the owner sends the connector a *relative* remaining budget
+/// (`remaining_ms`, from `owner_lease - OWNER_LEASE_SAFETY_MARGIN`), and the
+/// connector enforces it on its own monotonic clock. That fence is the
+/// data-plane guard; this margin guards the relay's own wall-clock decisions
+/// (ticket issuance, attachment, dispatch authorization).
+///
+/// [`MAX_CLUSTER_CLOCK_SKEW`]: tunnel_catalog::clock::MAX_CLUSTER_CLOCK_SKEW
+pub(crate) const OWNER_LEASE_SAFETY_MARGIN: Duration =
+    tunnel_catalog::clock::MAX_CLUSTER_CLOCK_SKEW.saturating_add(Duration::from_secs(4));
+/// [`OWNER_LEASE_SAFETY_MARGIN`] as a wall-clock delta.
+#[allow(clippy::cast_possible_wrap)]
+const OWNER_LEASE_SAFETY_MARGIN_WALL: ChronoDuration =
+    ChronoDuration::seconds(OWNER_LEASE_SAFETY_MARGIN.as_secs() as i64);
+const _: () = assert!(
+    OWNER_LEASE_SAFETY_MARGIN.as_secs()
+        == tunnel_catalog::clock::MAX_CLUSTER_CLOCK_SKEW_SECONDS + 4
+);
 const MAX_ECHO_RESPONSE_EXTRA_BYTES: usize = 256;
 const INITIAL_ATTACHMENT_PURPOSE: &str = "initial";
 const CLEANUP_QUEUE_CAPACITY: usize = 64;
@@ -5077,6 +5102,10 @@ impl RelayActor {
             }
         };
         let (owner_fence, owner_fence_deadline) = if cluster_profile {
+            // The device-side owner fence: a relative budget the connector
+            // enforces on its own monotonic clock, so wall-clock skew between
+            // this relay, Redis and the device cannot extend it (see
+            // `OWNER_LEASE_SAFETY_MARGIN`).
             let lease_budget = self
                 .options
                 .owner_lease
@@ -5621,10 +5650,7 @@ impl RelayActor {
         };
         if ticket.owner != session.owner
             || current_owner.token != session.owner
-            || current_owner.lease_expires_at
-                <= now_wall
-                    + ChronoDuration::from_std(OWNER_LEASE_SAFETY_MARGIN)
-                        .unwrap_or_else(|_| ChronoDuration::seconds(5))
+            || current_owner.lease_expires_at <= now_wall + OWNER_LEASE_SAFETY_MARGIN_WALL
         {
             return Err(RelayError::Unauthorized);
         }
@@ -12918,9 +12944,7 @@ impl RelayActor {
             return;
         }
         let dispatch_deadline = Instant::now() + Duration::from_millis(remaining_ms);
-        let owner_safe_until = owner.lease_expires_at
-            - ChronoDuration::from_std(OWNER_LEASE_SAFETY_MARGIN)
-                .unwrap_or_else(|_| ChronoDuration::seconds(5));
+        let owner_safe_until = owner.lease_expires_at - OWNER_LEASE_SAFETY_MARGIN_WALL;
         let grant_read_started_at = current.read_started_at;
         let authorization_is_live = || {
             let now = Utc::now();
