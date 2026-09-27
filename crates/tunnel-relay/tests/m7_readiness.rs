@@ -1393,6 +1393,37 @@ mod rekey {
         );
     }
 
+    /// **Control (M8-C65).** The widened approval is for `MissingLocalKey`
+    /// only. With the staged key approved by the retained record and the hold
+    /// long served, a pass that concludes `MembershipRejected` (a malformed
+    /// catalog record) still answers `NotReady` and nothing switches. Red if
+    /// the approval guard admits other unready states.
+    #[tokio::test(start_paused = true)]
+    async fn m8c65_a_rejected_membership_never_switches_to_the_staged_key() {
+        let pki = Pki::new();
+        let current = pki.peer(NODE_ID);
+        let next = pki.peer(NODE_ID);
+        let fixture = RuntimeFixture::new_with_local_spki(true, &current.spki);
+        let rekey = staged_and_approved(&fixture, &pki, &current, &next).await;
+        // The malformed envelope comes first, so it is what fails the pass.
+        let mut malformed = record(&fixture, 2, &[&current.spki, &next.spki], &[]);
+        malformed.version = 0;
+        fixture.source.replace(vec![malformed]).await;
+        assert!(fixture.runtime.reconcile_once().await.is_err());
+        assert_eq!(
+            fixture.runtime.readiness(),
+            MembershipReadiness::Unready(MembershipUnreadyReason::MembershipRejected)
+        );
+        let snapshot = rekey.tick().await;
+        assert_eq!(
+            snapshot.phase,
+            PeerRekeyPhase::Staged,
+            "a relay whose membership evidence was rejected switched keys"
+        );
+        assert_eq!(snapshot.staged_approval, Some("not_ready"));
+        assert_eq!(snapshot.serving_spki, current.spki);
+    }
+
     /// **Red first (M8-C65).** Two own-key passes judged the predecessor and
     /// confirmed its retirement before the rekey tick ran. The switch binds
     /// readiness to a different key, so those passes are no evidence about

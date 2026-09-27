@@ -54,6 +54,8 @@ use crate::{
 const DEPLOYMENT_ID: &str = "c181-deployment";
 const DEPLOYMENT_INCARNATION: &str = "c181-incarnation";
 const NODE_ID: &str = "relay-a";
+/// Another relay in the same deployment.
+const PEER_NODE: &str = "relay-b";
 const PUBLISHER_KEY_ID: &str = "c181-publisher";
 /// The key this relay serves.
 const SERVED_SPKI: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -77,6 +79,8 @@ struct SignedAuthority {
     omit_node: AtomicBool,
     /// The minimum record version the checkpoint requires of this node.
     minimum_version: AtomicU64,
+    /// Other nodes the checkpoint names, with their minimum versions.
+    others: std::sync::Mutex<BTreeMap<String, u64>>,
 }
 
 impl CheckpointAuthority for SignedAuthority {
@@ -95,13 +99,19 @@ impl CheckpointAuthority for SignedAuthority {
                 deployment_incarnation: request.deployment_incarnation,
                 checkpoint_version: self.next_version.fetch_add(1, Ordering::AcqRel),
                 nonce: request.nonce,
-                minimum_versions: if self.omit_node.load(Ordering::Acquire) {
-                    BTreeMap::new()
-                } else {
-                    BTreeMap::from([(
-                        NODE_ID.to_owned(),
-                        self.minimum_version.load(Ordering::Acquire),
-                    )])
+                minimum_versions: {
+                    let mut minimums = self
+                        .others
+                        .lock()
+                        .expect("other nodes mutex poisoned")
+                        .clone();
+                    if !self.omit_node.load(Ordering::Acquire) {
+                        minimums.insert(
+                            NODE_ID.to_owned(),
+                            self.minimum_version.load(Ordering::Acquire),
+                        );
+                    }
+                    minimums
                 },
                 issued_at: now - ChronoDuration::seconds(1),
                 not_before: now - ChronoDuration::seconds(1),
@@ -136,6 +146,9 @@ impl MembershipRecordSource for RecordSource {
 }
 
 struct Fixture {
+    /// Another relay's fresh record, re-published unchanged with this
+    /// relay's, once [`Fixture::add_peer`] has run.
+    peer_record: std::sync::Mutex<Option<CatalogMembershipRecord>>,
     issuer: Arc<MembershipIssuer>,
     authority: Arc<SignedAuthority>,
     source: RecordSource,
@@ -168,6 +181,7 @@ impl Fixture {
             fail: AtomicBool::new(false),
             omit_node: AtomicBool::new(false),
             minimum_version: AtomicU64::new(1),
+            others: std::sync::Mutex::new(BTreeMap::new()),
         });
         let source = RecordSource {
             records: Arc::new(RwLock::new(Vec::new())),
@@ -219,6 +233,7 @@ impl Fixture {
         let relay = RelayHandle::spawn(options, Arc::new(catalog.clone()));
 
         let fixture = Self {
+            peer_record: std::sync::Mutex::new(None),
             issuer,
             authority,
             source,
@@ -250,17 +265,68 @@ impl Fixture {
     /// Publish this relay's signed record approving exactly `spki`.
     async fn publish(&self, version: u64, spki: &str) {
         let now = Utc::now();
-        let not_before = now - ChronoDuration::seconds(1);
-        let expires_at = now + ChronoDuration::seconds(30);
+        let record = self.signed(
+            NODE_ID,
+            version,
+            spki,
+            now - ChronoDuration::seconds(1),
+            now + ChronoDuration::seconds(30),
+        );
+        let mut records = vec![record];
+        records.extend(self.peer_record.lock().expect("peer record").clone());
+        *self.source.records.write().await = records;
+    }
+
+    /// Name another relay in the checkpoint and publish its fresh record
+    /// alongside this relay's (republished at `own_version`), so this relay
+    /// is not the only node with evidence: a gap then concerns this node
+    /// alone, not a shared publisher outage (M7-C186).
+    async fn add_peer(&self, own_version: u64) {
+        self.authority
+            .others
+            .lock()
+            .expect("other nodes")
+            .insert(PEER_NODE.to_owned(), 1);
+        let now = Utc::now();
+        *self.peer_record.lock().expect("peer record") = Some(self.signed(
+            PEER_NODE,
+            1,
+            OTHER_SPKI,
+            now - ChronoDuration::seconds(1),
+            now + ChronoDuration::seconds(50),
+        ));
+        self.publish(own_version, SERVED_SPKI).await;
+        self.ready_pass().await;
+    }
+
+    /// Replace the catalog's records.
+    async fn set_records(&self, records: Vec<CatalogMembershipRecord>) {
+        *self.source.records.write().await = records;
+    }
+
+    /// A signed record for `node` approving `spki` inside the given window.
+    fn signed(
+        &self,
+        node: &str,
+        version: u64,
+        spki: &str,
+        not_before: chrono::DateTime<Utc>,
+        expires_at: chrono::DateTime<Utc>,
+    ) -> CatalogMembershipRecord {
+        let host = if node == NODE_ID {
+            "10.0.0.1"
+        } else {
+            "10.0.0.2"
+        };
         let record = SignedRecord {
             schema_version: MEMBERSHIP_SCHEMA_VERSION,
             deployment_id: DEPLOYMENT_ID.to_owned(),
             deployment_incarnation: DEPLOYMENT_INCARNATION.to_owned(),
-            node_id: NODE_ID.to_owned(),
+            node_id: node.to_owned(),
             record_version: version,
             roles: vec![RELAY_PEER_ROLE.to_owned()],
-            peer_endpoint: "10.0.0.1:8443".to_owned(),
-            server_name: "10.0.0.1".to_owned(),
+            peer_endpoint: format!("{host}:8443"),
+            server_name: host.to_owned(),
             keys: vec![RelayKey {
                 key_id: format!("key-{version}"),
                 spki_sha256: spki.to_owned(),
@@ -272,13 +338,13 @@ impl Fixture {
             not_before,
             expires_at,
         };
-        *self.source.records.write().await = vec![CatalogMembershipRecord {
+        CatalogMembershipRecord {
             version,
             bytes: self
                 .issuer
                 .sign_membership_bytes(record)
                 .expect("synthetic signed membership"),
-        }];
+        }
     }
 
     async fn register(&self) -> ControlRegistration {
@@ -617,15 +683,6 @@ const SHORT_BOUND: Duration = Duration::from_millis(400);
 const LONG_BOUND: Duration = Duration::from_secs(3_600);
 
 impl Fixture {
-    /// Remove this node's record from the catalog. Both M7-C182 cases need
-    /// it: a record that *is* in the catalog but is omitted by the
-    /// checkpoint, or below its minimum, fails verification
-    /// (`NodeNotInCheckpoint`, `VersionBelowCheckpoint`) and the pass
-    /// concludes `MembershipRejected` instead, which only M7-C184 bounds.
-    async fn clear_records(&self) {
-        self.source.records.write().await.clear();
-    }
-
     /// One reconcile pass that concludes `MissingLocalMembership`.
     async fn missing_membership_pass(&self) {
         assert!(
@@ -647,6 +704,25 @@ impl Fixture {
         assert_eq!(
             self.membership.readiness(),
             MembershipReadiness::Unready(MembershipUnreadyReason::UnknownAuthority)
+        );
+    }
+
+    /// One reconcile pass that concludes `MembershipRejected` for a reason
+    /// local to the catalog's contents -- a malformed record envelope beside
+    /// this relay's fresh record -- so it is counted toward M7-C184.
+    async fn rejected_pass(&self) {
+        let original = self.source.records.read().await.clone();
+        let mut records = original.clone();
+        records.push(CatalogMembershipRecord {
+            version: 0,
+            bytes: b"{}".to_vec(),
+        });
+        self.set_records(records).await;
+        assert!(self.membership.reconcile_once().await.is_err());
+        self.set_records(original).await;
+        assert_eq!(
+            self.membership.readiness(),
+            MembershipReadiness::Unready(MembershipUnreadyReason::MembershipRejected)
         );
     }
 
@@ -693,8 +769,10 @@ impl Fixture {
 async fn a_checkpoint_that_omits_this_node_surrenders_after_two_passes() {
     let fixture = Fixture::new().await;
     let mut control = fixture.register().await;
+    // The catalog keeps this node's record, as production does (it never
+    // deletes a removed node's record): M7-C185 skips it, so the pass
+    // concludes the removal rather than failing every relay's pass.
     fixture.authority.omit_node.store(true, Ordering::Release);
-    fixture.clear_records().await;
 
     fixture.missing_membership_pass().await;
     assert_eq!(fixture.membership.ownership_surrender_cause(), None);
@@ -727,8 +805,7 @@ async fn a_checkpoint_that_omits_this_node_surrenders_after_two_passes() {
 
 /// **Control (M7-C182, case (b)).** The checkpoint names this node at a
 /// minimum version whose record has not reached Redis yet (the catalog holds
-/// none for it; only the older record retained from bootstrap): the publish
-/// race. Unready, but two passes -- or several -- never surrender
+/// only an older one): the publish race. Unready, but two passes -- or several -- never surrender
 /// while the production bound (one record lifetime plus skew) has not
 /// elapsed. Red if the record-below-minimum case is confirmed by passes like
 /// a node omission.
@@ -736,11 +813,14 @@ async fn a_checkpoint_that_omits_this_node_surrenders_after_two_passes() {
 async fn a_record_below_the_checkpoint_minimum_does_not_surrender_on_two_passes() {
     let fixture = Fixture::new().await;
     let _control = fixture.register().await;
+    // Another relay's record stays fresh, so the gap is this node's alone
+    // (M7-C186), and this relay's own v2 record stays in the catalog below
+    // the new minimum, absent for this node only (M7-C185).
+    fixture.add_peer(2).await;
     fixture
         .authority
         .minimum_version
         .store(5, Ordering::Release);
-    fixture.clear_records().await;
     for _ in 0..OWN_KEY_SURRENDER_CONFIRMATIONS + 2 {
         fixture.missing_membership_pass().await;
     }
@@ -766,11 +846,14 @@ async fn a_record_below_the_minimum_surrenders_once_it_outlasts_the_publish_race
     let fixture = Fixture::new().await;
     let mut control = fixture.register().await;
     fixture.set_bounds(SHORT_BOUND, LONG_BOUND);
+    // Another relay's record stays fresh, so the gap is this node's alone
+    // (M7-C186), and this relay's own v2 record stays in the catalog below
+    // the new minimum, absent for this node only (M7-C185).
+    fixture.add_peer(2).await;
     fixture
         .authority
         .minimum_version
         .store(5, Ordering::Release);
-    fixture.clear_records().await;
 
     fixture.missing_membership_pass().await;
     fixture.missing_membership_pass().await;
@@ -805,11 +888,14 @@ async fn a_different_conclusion_restarts_the_below_minimum_run() {
     let fixture = Fixture::new().await;
     let _control = fixture.register().await;
     fixture.set_bounds(SHORT_BOUND, LONG_BOUND);
+    // Another relay's record stays fresh, so the gap is this node's alone
+    // (M7-C186), and this relay's own v2 record stays in the catalog below
+    // the new minimum, absent for this node only (M7-C185).
+    fixture.add_peer(2).await;
     fixture
         .authority
         .minimum_version
         .store(5, Ordering::Release);
-    fixture.clear_records().await;
     fixture.missing_membership_pass().await;
     tokio::time::sleep(SHORT_BOUND * 3 / 4).await;
     fixture.catalog_unavailable_pass().await;
@@ -825,9 +911,9 @@ async fn a_different_conclusion_restarts_the_below_minimum_run() {
 
 // ---- M7-C184: a bounded surrender for any prolonged unready state ----------
 
-/// **Red first (M7-C184).** The checkpoint authority stays unusable while
-/// Redis is reachable (`UnknownAuthority`), so the relay could renew its
-/// leases forever. Once the unready time confirmed by passes exceeds the
+/// **Red first (M7-C184).** The catalog holds a record this relay rejects
+/// while Redis is reachable (`MembershipRejected`), so the relay could renew
+/// its leases forever. Once the unready time confirmed by passes exceeds the
 /// bound it surrenders with `MEMBERSHIP_UNREADY_PROLONGED`; before that it
 /// keeps its sessions. Before M7-C184 nothing ever closed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -836,13 +922,13 @@ async fn a_prolonged_unready_relay_with_redis_reachable_surrenders_after_the_bou
     let mut control = fixture.register().await;
     fixture.set_bounds(LONG_BOUND, SHORT_BOUND);
 
-    fixture.unknown_authority_pass().await;
+    fixture.rejected_pass().await;
     tokio::time::sleep(SHORT_BOUND * 5 / 8).await;
-    fixture.unknown_authority_pass().await;
+    fixture.rejected_pass().await;
     assert_eq!(fixture.membership.ownership_surrender_cause(), None);
     fixture.assert_kept("surrendered before the bound").await;
 
-    fixture.unknown_authority_pass().await;
+    fixture.rejected_pass().await;
     assert_eq!(
         fixture.membership.ownership_surrender_cause(),
         Some(OwnershipSurrenderCause::ProlongedUnready)
@@ -859,9 +945,12 @@ async fn a_prolonged_unready_relay_with_redis_reachable_surrenders_after_the_bou
 }
 
 /// **Control (M7-C184).** Time while the catalog is unreachable never counts:
-/// the relay cannot renew then, so leases lapse on their own. Neither an
-/// all-unreachable run nor the intervals either side of an unreachable pass
-/// add up to the bound. Red if `CatalogUnavailable` counts.
+/// the relay cannot renew then, so leases lapse on their own. An
+/// all-unreachable run adds nothing, and neither does an interval with an
+/// unreachable pass at either end -- including a gap longer than the whole
+/// bound from an unreachable pass to the next counted one. Red if
+/// `CatalogUnavailable` counts, or if an unreachable pass still marks itself
+/// as the last counted pass.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn catalog_unavailable_time_never_counts_toward_the_prolonged_unready_bound() {
     let fixture = Fixture::new().await;
@@ -874,16 +963,101 @@ async fn catalog_unavailable_time_never_counts_toward_the_prolonged_unready_boun
     fixture.catalog_unavailable_pass().await;
     assert_eq!(fixture.membership.ownership_surrender_cause(), None);
 
-    // Counted, unreachable, counted: neither interval touches two counted
-    // passes, so nothing accumulates.
+    // Counted, then unreachable, then -- more than the whole bound later --
+    // counted again. Neither interval has counted passes at both ends.
+    fixture.rejected_pass().await;
+    fixture.catalog_unavailable_pass().await;
+    tokio::time::sleep(SHORT_BOUND * 5 / 4).await;
+    fixture.rejected_pass().await;
+    assert_eq!(fixture.membership.ownership_surrender_cause(), None);
+    fixture
+        .assert_kept("unreachable-catalog time counted toward the bound")
+        .await;
+    fixture.shutdown().await;
+}
+
+/// **Red first (M7-C184's guard).** Unready time already accrued past the
+/// bound does not surrender while the latest pass is not a counted one: a
+/// relay whose catalog is unreachable *now* cannot renew anyway. The next
+/// counted pass surrenders. Red if the cause ignores whether the latest pass
+/// counted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn accrued_unready_time_does_not_surrender_while_the_latest_pass_is_uncounted() {
+    let fixture = Fixture::new().await;
+    let _control = fixture.register().await;
+    fixture.set_bounds(LONG_BOUND, SHORT_BOUND);
+    fixture.rejected_pass().await;
+    tokio::time::sleep(SHORT_BOUND * 5 / 4).await;
+    fixture.rejected_pass().await;
+    fixture.catalog_unavailable_pass().await;
+    assert_eq!(
+        fixture.membership.ownership_surrender_cause(),
+        None,
+        "surrendered on accrued time while the catalog is unreachable now"
+    );
+    fixture.rejected_pass().await;
+    assert_eq!(
+        fixture.membership.ownership_surrender_cause(),
+        Some(OwnershipSurrenderCause::ProlongedUnready)
+    );
+    assert!(wait_until_released(&fixture).await.is_some());
+    fixture.shutdown().await;
+}
+
+// ---- M7-C186: shared control-plane outages never accrue ------------------
+
+/// **Control (M7-C186).** The checkpoint authority is unreachable for longer
+/// than the bound. Every relay is equally unready, so surrendering would only
+/// move devices to relays that cannot serve them: nothing closes. Red if an
+/// authority error counts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unreachable_checkpoint_authority_never_accrues_toward_surrender() {
+    let fixture = Fixture::new().await;
+    let _control = fixture.register().await;
+    fixture.set_bounds(LONG_BOUND, SHORT_BOUND);
     fixture.unknown_authority_pass().await;
     tokio::time::sleep(SHORT_BOUND * 3 / 4).await;
-    fixture.catalog_unavailable_pass().await;
+    fixture.unknown_authority_pass().await;
     tokio::time::sleep(SHORT_BOUND * 3 / 4).await;
     fixture.unknown_authority_pass().await;
     assert_eq!(fixture.membership.ownership_surrender_cause(), None);
     fixture
-        .assert_kept("unreachable-catalog time counted toward the bound")
+        .assert_kept("an authority outage counted toward the bound")
+        .await;
+    fixture.shutdown().await;
+}
+
+/// **Control (M7-C186).** The shared publisher has stopped: the checkpoint is
+/// fresh, but every record it names has passed its signed lifetime, so every
+/// relay's pass fails alike (`MembershipRejected`, a record window error).
+/// Nothing accrues and nothing closes. Red if the publisher-outage signature
+/// is ignored.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stopped_publisher_never_accrues_toward_surrender() {
+    let fixture = Fixture::new().await;
+    let _control = fixture.register().await;
+    fixture.set_bounds(SHORT_BOUND, SHORT_BOUND);
+    let now = Utc::now();
+    fixture
+        .set_records(vec![fixture.signed(
+            NODE_ID,
+            2,
+            SERVED_SPKI,
+            now - ChronoDuration::seconds(50),
+            now - ChronoDuration::seconds(10),
+        )])
+        .await;
+    for _ in 0..3 {
+        assert!(fixture.membership.reconcile_once().await.is_err());
+        assert_eq!(
+            fixture.membership.readiness(),
+            MembershipReadiness::Unready(MembershipUnreadyReason::MembershipRejected)
+        );
+        tokio::time::sleep(SHORT_BOUND * 3 / 4).await;
+    }
+    assert_eq!(fixture.membership.ownership_surrender_cause(), None);
+    fixture
+        .assert_kept("a stopped publisher counted toward the bound")
         .await;
     fixture.shutdown().await;
 }
@@ -895,13 +1069,13 @@ async fn a_ready_pass_resets_the_prolonged_unready_clock() {
     let fixture = Fixture::new().await;
     let _control = fixture.register().await;
     fixture.set_bounds(LONG_BOUND, SHORT_BOUND);
-    fixture.unknown_authority_pass().await;
+    fixture.rejected_pass().await;
     tokio::time::sleep(SHORT_BOUND * 3 / 4).await;
-    fixture.unknown_authority_pass().await;
+    fixture.rejected_pass().await;
     fixture.ready_pass().await;
-    fixture.unknown_authority_pass().await;
+    fixture.rejected_pass().await;
     tokio::time::sleep(SHORT_BOUND * 3 / 4).await;
-    fixture.unknown_authority_pass().await;
+    fixture.rejected_pass().await;
     assert_eq!(fixture.membership.ownership_surrender_cause(), None);
     fixture
         .assert_kept("two short episodes were summed across a Ready pass")
@@ -997,5 +1171,113 @@ async fn a_surrender_queued_before_a_re_sign_closes_nothing() {
         "the re-approved relay kept its lease"
     );
     assert_eq!(fixture.live_sessions().await, 1);
+    fixture.shutdown().await;
+}
+
+// ---- M7-C185: a record the checkpoint does not ask for is not fatal --------
+
+/// **Red first (M7-C185).** The catalog never deletes a removed node's
+/// record. A record for a node the checkpoint omits -- and one below its
+/// node's minimum -- must not fail this relay's pass: it stays `Ready`.
+/// Before M7-C185 every relay concluded `MembershipRejected`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stale_record_for_another_node_leaves_this_relay_ready() {
+    let fixture = Fixture::new().await;
+    let _control = fixture.register().await;
+    let now = Utc::now();
+    let own = fixture.signed(
+        NODE_ID,
+        2,
+        SERVED_SPKI,
+        now - ChronoDuration::seconds(1),
+        now + ChronoDuration::seconds(30),
+    );
+    let stale = fixture.signed(
+        PEER_NODE,
+        1,
+        OTHER_SPKI,
+        now - ChronoDuration::seconds(1),
+        now + ChronoDuration::seconds(30),
+    );
+    // The checkpoint omits relay-b: it was removed.
+    fixture.set_records(vec![own.clone(), stale.clone()]).await;
+    fixture.ready_pass().await;
+    // The checkpoint names relay-b again, at a minimum above its record.
+    fixture
+        .authority
+        .others
+        .lock()
+        .expect("other nodes")
+        .insert(PEER_NODE.to_owned(), 5);
+    fixture.ready_pass().await;
+    fixture.assert_kept("a stale record for another node").await;
+    fixture.shutdown().await;
+}
+
+/// **Red first (M7-C185).** The same, with the removed node's record also
+/// past its signed lifetime: it is selected out by node before verification,
+/// so the window check that runs first inside verification never sees it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_expired_stale_record_for_another_node_leaves_this_relay_ready() {
+    let fixture = Fixture::new().await;
+    let _control = fixture.register().await;
+    let now = Utc::now();
+    let own = fixture.signed(
+        NODE_ID,
+        2,
+        SERVED_SPKI,
+        now - ChronoDuration::seconds(1),
+        now + ChronoDuration::seconds(30),
+    );
+    let expired = fixture.signed(
+        PEER_NODE,
+        1,
+        OTHER_SPKI,
+        now - ChronoDuration::seconds(50),
+        now - ChronoDuration::seconds(10),
+    );
+    fixture.set_records(vec![own, expired]).await;
+    fixture.ready_pass().await;
+    fixture
+        .assert_kept("an expired stale record for another node")
+        .await;
+    fixture.shutdown().await;
+}
+
+/// **Control (M7-C185).** A record the checkpoint *does* ask for still fails
+/// the pass if it fails any check: here relay-b is named at minimum 1 and
+/// its record has expired. Red if the pre-filter skipped more than omitted
+/// or below-minimum records.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_named_record_at_its_minimum_that_fails_a_check_stays_fatal() {
+    let fixture = Fixture::new().await;
+    let _control = fixture.register().await;
+    fixture
+        .authority
+        .others
+        .lock()
+        .expect("other nodes")
+        .insert(PEER_NODE.to_owned(), 1);
+    let now = Utc::now();
+    let own = fixture.signed(
+        NODE_ID,
+        2,
+        SERVED_SPKI,
+        now - ChronoDuration::seconds(1),
+        now + ChronoDuration::seconds(30),
+    );
+    let expired = fixture.signed(
+        PEER_NODE,
+        1,
+        OTHER_SPKI,
+        now - ChronoDuration::seconds(50),
+        now - ChronoDuration::seconds(10),
+    );
+    fixture.set_records(vec![own, expired]).await;
+    assert!(fixture.membership.reconcile_once().await.is_err());
+    assert_eq!(
+        fixture.membership.readiness(),
+        MembershipReadiness::Unready(MembershipUnreadyReason::MembershipRejected)
+    );
     fixture.shutdown().await;
 }

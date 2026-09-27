@@ -154,7 +154,12 @@ pub struct SurrenderBounds {
     /// the default rekey convergence hold is the same 65 s and never makes
     /// the relay unready, and every more specific rule (M7-C181, M7-C182)
     /// fires first. Time while the catalog is unreachable does not count:
-    /// the relay cannot renew leases then, so they lapse on their own.
+    /// the relay cannot renew leases then, so they lapse on their own. Nor
+    /// does time inside a shared control-plane outage -- the checkpoint
+    /// authority unreachable, or the publisher no longer re-signing any
+    /// record -- which leaves every relay equally unready, so a surrender
+    /// would only move devices between relays that cannot serve them
+    /// (M7-C186).
     pub prolonged_unready: Duration,
 }
 
@@ -676,6 +681,13 @@ impl MembershipUnreadyReason {
     /// lapse on their own and a surrender would add nothing but a reason to
     /// close sessions on a transient. `Cancelled` is shutdown, which closes
     /// every session anyway.
+    ///
+    /// A pass is also excluded, whatever its reason, when it shows a shared
+    /// control-plane outage (M7-C186): the checkpoint authority unreachable
+    /// (`UnknownAuthority` from an authority error, not from a record signed
+    /// by an unknown key), or a fresh checkpoint with no record for any node
+    /// it names still inside its lifetime (the publisher has stopped). That
+    /// is decided per pass in `count_surrender_evidence`, not here.
     #[must_use]
     pub const fn counts_toward_prolonged_unready(self) -> bool {
         !matches!(self, Self::CatalogUnavailable | Self::Cancelled)
@@ -1124,6 +1136,11 @@ struct RuntimeState {
     /// The local-membership gap the pass in progress concluded, if any. Set
     /// by the pass, consumed when it is counted (M7-C182).
     pass_local_gap: Option<LocalMembershipGap>,
+    /// Whether the pass in progress saw the signature of a shared publisher
+    /// outage: a fresh checkpoint, but no record for any node it names still
+    /// inside its signed lifetime (M7-C186). Set by the pass, consumed when
+    /// it is counted.
+    pass_publisher_outage: bool,
     /// The time-based surrender bounds (M7-C182, M7-C184).
     surrender_bounds: SurrenderBounds,
 }
@@ -1363,6 +1380,7 @@ impl MembershipRuntime {
                 prolonged_unready: Duration::ZERO,
                 last_counted_unready_pass: None,
                 pass_local_gap: None,
+                pass_publisher_outage: false,
                 surrender_bounds: SurrenderBounds::derive(
                     config.membership_record_lifetime,
                     config.max_clock_skew,
@@ -1827,16 +1845,17 @@ impl MembershipRuntime {
         // bootstrap may all race.  Keep one complete pass in flight so a
         // slower persistence result cannot be overtaken by a later pass.
         let _reconcile_guard = self.reconcile_gate.lock().await;
-        self.state
-            .lock()
-            .expect("membership state mutex poisoned")
-            .pass_local_gap = None;
+        {
+            let mut state = self.state.lock().expect("membership state mutex poisoned");
+            state.pass_local_gap = None;
+            state.pass_publisher_outage = false;
+        }
         let result = self.reconcile_once_inner().await;
         if let Err(error) = &result {
             self.mark_error(error);
         }
         self.count_own_key_missing_pass(&result);
-        self.count_surrender_evidence(Instant::now());
+        self.count_surrender_evidence(&result, Instant::now());
         result
     }
 
@@ -1852,9 +1871,20 @@ impl MembershipRuntime {
     /// prolonged-unready (M7-C184) surrenders. Runs under the reconcile gate
     /// after the pass has installed its readiness, so passes are counted in
     /// the order they completed.
-    fn count_surrender_evidence(&self, now: Instant) {
+    fn count_surrender_evidence(
+        &self,
+        result: &Result<MembershipSnapshot, MembershipRuntimeError>,
+        now: Instant,
+    ) {
         let mut state = self.state.lock().expect("membership state mutex poisoned");
         let gap = state.pass_local_gap.take();
+        // M7-C186: a shared control-plane outage -- the checkpoint authority
+        // unreachable, or the publisher no longer re-signing any record --
+        // makes every relay unready alike. Surrendering devices then only
+        // moves them to relays that are just as unready, so such a pass
+        // neither advances the publish-race run nor accrues unready time.
+        let shared_outage = std::mem::take(&mut state.pass_publisher_outage)
+            || matches!(result, Err(MembershipRuntimeError::Authority(_)));
         let missing_local_membership = state.readiness
             == MembershipReadiness::Unready(MembershipUnreadyReason::MissingLocalMembership);
 
@@ -1868,7 +1898,10 @@ impl MembershipRuntime {
 
         // Case (b): a record below the checkpoint's minimum, time-confirmed
         // between the first and the latest pass that each observed it.
-        if missing_local_membership && gap == Some(LocalMembershipGap::BelowMinimum) {
+        if missing_local_membership
+            && gap == Some(LocalMembershipGap::BelowMinimum)
+            && !shared_outage
+        {
             let since = *state.below_minimum_since.get_or_insert(now);
             state.below_minimum_persisted = now.saturating_duration_since(since);
         } else {
@@ -1883,7 +1916,7 @@ impl MembershipRuntime {
                 state.last_counted_unready_pass = None;
             }
             MembershipReadiness::Unready(reason) => {
-                let counted = reason.counts_toward_prolonged_unready();
+                let counted = reason.counts_toward_prolonged_unready() && !shared_outage;
                 if counted && let Some(previous) = state.last_counted_unready_pass {
                     state.prolonged_unready = state
                         .prolonged_unready
@@ -1926,9 +1959,11 @@ impl MembershipRuntime {
             {
                 Some(OwnershipSurrenderCause::LocalRecordBelowMinimum)
             }
-            reason
-                if reason.counts_toward_prolonged_unready()
-                    && state.prolonged_unready >= bounds.prolonged_unready =>
+            // Only while the latest pass itself counted: a relay whose
+            // catalog is unreachable now, or that is inside a shared outage
+            // now, keeps what it accrued but does not surrender on it.
+            _ if state.last_counted_unready_pass.is_some()
+                && state.prolonged_unready >= bounds.prolonged_unready =>
             {
                 Some(OwnershipSurrenderCause::ProlongedUnready)
             }
@@ -2049,6 +2084,27 @@ impl MembershipRuntime {
         // actually holds the evidence, and every check stays strict at it.
         let records_received_wall = Utc::now();
         let records_received_mono = Instant::now();
+        let checkpoint_minimums = &checkpoint.checkpoint().minimum_versions;
+        let freshness_floor = records_received_wall
+            - chrono::Duration::from_std(self.config.max_clock_skew)
+                .unwrap_or(chrono::Duration::zero());
+        // Whether any record for a node the checkpoint names, at or above its
+        // minimum, is still inside its signed lifetime (M7-C186). Computed
+        // over every record, before and independently of verification (which
+        // stops at the first failure), from each record's *claimed* node,
+        // version and expiry: it only decides whether this pass counts
+        // toward a surrender, never what is trusted.
+        let fresh_named_record = records.iter().any(|catalog_record| {
+            serde_json::from_slice::<tunnel_cluster::membership::SignedMembershipRecord>(
+                &catalog_record.bytes,
+            )
+            .is_ok_and(|signed| {
+                checkpoint_minimums
+                    .get(&signed.node_id)
+                    .is_some_and(|&minimum| signed.record_version >= minimum)
+                    && signed.expires_at >= freshness_floor
+            })
+        });
         let record_result = (|| {
             if records.len() > MAX_MEMBERSHIP_RECORDS {
                 return Err(MembershipRuntimeError::Source(
@@ -2076,12 +2132,41 @@ impl MembershipRuntime {
                         MembershipSourceError::InvalidRecordEnvelope,
                     ));
                 }
+                // M7-C185: the catalog never deletes a removed node's record,
+                // so a record the checkpoint does not ask for must not fail
+                // every relay's pass. Selected by the record's claimed node
+                // and version *before* verification -- the shape check runs
+                // first inside `verify_membership`, so a removed record that
+                // has also expired would otherwise fail as a window error.
+                // A record for a node the checkpoint omits is skipped; a
+                // record below its node's minimum is absent for that node
+                // only (for this relay's own node that is M7-C182 case (b)).
+                // Skipped records are never signature-checked. That grants
+                // nothing: a skipped record is never retained, bound or
+                // routed to. Everything else stays fatal: a bad signature,
+                // non-canonical encoding, a rollback, an equal-version
+                // conflict, and any record at or above its minimum that
+                // fails any check.
+                let Some(&minimum) = checkpoint_minimums.get(&signed.node_id) else {
+                    continue;
+                };
+                if signed.record_version < minimum {
+                    continue;
+                }
                 candidate_verifier
                     .verify_membership(&catalog_record.bytes, records_received_wall)
                     .map_err(MembershipRuntimeError::Membership)?;
             }
             Ok::<_, MembershipRuntimeError>(())
         })();
+        // A publisher outage signature: the checkpoint is fresh but no node
+        // it names has a record still inside its lifetime (M7-C186).
+        if !fresh_named_record {
+            self.state
+                .lock()
+                .expect("membership state mutex poisoned")
+                .pass_publisher_outage = true;
+        }
         if let Err(error) = record_result {
             // Persist partially accepted record fences before installing the
             // failed candidate as unready. This also covers a valid
