@@ -109,10 +109,8 @@ impl OidcFixture {
         options: OidcTokenOptions,
     ) -> Result<String> {
         let now = unix_seconds(SystemTime::now())?;
-        // An "expired" token is expired beyond the relay's 60 s default
-        // clock leeway (M7-C174), with a minute of margin.
         let exp = if options.expires_in.is_zero() {
-            now.saturating_sub(120)
+            now.saturating_sub(60)
         } else {
             now.saturating_add(options.expires_in.as_secs() as i64)
         };

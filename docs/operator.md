@@ -398,23 +398,19 @@ so a key rotation at the issuer means editing this file and restarting `serve`.
 A token is accepted only if its header has `alg` `RS256` and a `kid` from that
 file, and its claims have `iss` equal to `oidc_issuer` **byte for byte**
 (including any trailing `/`), an `aud` in `oidc_audience`, a non-empty `sub`,
-and an unexpired `exp`. `nbf` is checked if present. Both are checked with
-a **60 s clock leeway** (M7-C174, a coordinator decision under the owner's
-delegation, 2026-09-27; before it there was none): the token verifier accepts
-a token up to 60 s past `exp` or up to 60 s before `nbf`. **What that changes
-in practice is `nbf` only** (read from the source, not tested at the routes):
-every dispatching route (echo, stream, HTTP forwarding, filesystem) also
-refuses a token whose signed `exp` has passed on the relay's clock (`401`
-"consumer token expired before dispatch" on echo), and an admitted request or
-stream ends at the signed `exp`. So an issuer or client clock up to 60 s ahead
-of the relay's is tolerated; a relay clock ahead of the issuer's still ends a
-token at its signed `exp` (only the device and service listings honour the
-`exp` leeway). Tokens come from issuers and
-clients whose clocks the deployment does not discipline, 60 s is the usual
-JWT library default, and it is small against the 300 s token lifetime the
-smoke-test tokens in [deploy-fly.md](deploy-fly.md) use. It is not configurable in `relay.toml`; the verifier
-refuses a leeway above 60 s. It is separate from the 5 s cluster clock-skew
-bound ([cluster.md](cluster.md), M7-C173), which governs relay-to-relay and
+and an unexpired `exp`. `nbf` is checked if present. **`nbf` has a 60 s clock
+leeway; `exp` has none** (M7-C174, coordinator decisions under the owner's
+delegation, 2026-09-27; before them there was no leeway at all). A token whose
+`nbf` is up to 60 s ahead of the relay's clock is accepted, because the
+failure seen in practice is a freshly minted token refused as not yet valid
+by a relay whose clock is behind the issuer's. A token is refused from the
+second its signed `exp` passes on the relay's clock, by the verifier and by
+every dispatching route alike, and an admitted request or stream ends at the
+signed `exp`: tolerating expired tokens would only stretch credentials and
+stream deadlines, and clients refresh 300 s tokens before they expire. `iat`
+is not checked. The leeway is not configurable in `relay.toml`; the verifier
+refuses one above 60 s. It is separate from the 5 s cluster clock-skew bound
+([cluster.md](cluster.md), M7-C173), which governs relay-to-relay and
 relay-to-Redis comparisons.
 `scope` is one space-separated string. A request with no bearer token gets
 `401` "a consumer access token is required". Every refusal of a token that was

@@ -97,11 +97,12 @@ impl ApprovedJwk {
 
 /// The consumer token clock leeway a relay applies by default (M7-C174).
 ///
-/// Consumer tokens come from external issuers and are presented by external
-/// clients, whose clocks the deployment does not discipline, so this is not
-/// the cluster-internal skew bound. Sixty seconds is the usual JWT library
-/// default and small against the 300 s token lifetime the operator guide
-/// recommends. It applies to `exp` and `nbf` alike.
+/// Consumer tokens come from external issuers whose clocks the deployment
+/// does not discipline, so this is not the cluster-internal skew bound. It
+/// tolerates an issuer clock *ahead* of the relay's: it applies to `nbf`
+/// only. `exp` is always strict, so no leeway stretches a credential or a
+/// stream deadline (coordinator decision under the owner's delegation,
+/// 2026-09-27).
 pub const DEFAULT_OIDC_LEEWAY_SECONDS: u64 = 60;
 
 /// The largest consumer token leeway a verifier accepts (M7-C174).
@@ -292,8 +293,12 @@ impl OidcVerifier {
             .map(String::as_str)
             .collect::<Vec<_>>();
         validation.set_audience(&audiences);
+        // M7-C174 (coordinator decision, 2026-09-27): the leeway tolerates an
+        // issuer or client clock *ahead* of this relay's, so it applies to
+        // `nbf` only. jsonwebtoken's single `leeway` covers `exp` too, so
+        // `exp` is checked below, strictly, instead.
         validation.leeway = self.config.leeway_seconds;
-        validation.validate_exp = true;
+        validation.validate_exp = false;
         validation.validate_nbf = true;
         validation.required_spec_claims.clear();
         validation.required_spec_claims.insert("exp".to_owned());
@@ -317,6 +322,11 @@ impl OidcVerifier {
         }
         let exp = i64::try_from(decoded.claims.exp).map_err(|_| OidcError::InvalidToken)?;
         let expires_at = DateTime::<Utc>::from_timestamp(exp, 0).ok_or(OidcError::InvalidToken)?;
+        // `exp` is strict, with no leeway: the same instant every dispatching
+        // route and stream deadline uses.
+        if expires_at <= Utc::now() {
+            return Err(OidcError::ClaimsRejected);
+        }
         let scopes = decoded
             .claims
             .scope
@@ -957,9 +967,9 @@ MCowBQYDK2VwAyEA+0dizco+FMBvifqw1ZUJzKYN5gspRlxsvm+MudOfijQ=
         );
     }
 
-    /// M7-C174: the default leeway is sixty seconds, applied to `exp` and
-    /// `nbf` alike and to nothing beyond it; the cap is sixty seconds; a
-    /// verifier configured with zero leeway is exact.
+    /// M7-C174: the default leeway is sixty seconds and applies to `nbf`
+    /// only (an issuer clock ahead of the relay's); `exp` is strict; the cap
+    /// is sixty seconds; a verifier configured with zero leeway is exact.
     #[test]
     fn enforces_exp_and_nbf_with_only_the_configured_leeway() {
         let key = EdKey::generate();
@@ -967,44 +977,35 @@ MCowBQYDK2VwAyEA+0dizco+FMBvifqw1ZUJzKYN5gspRlxsvm+MudOfijQ=
         assert_eq!(default.config().leeway_seconds, DEFAULT_OIDC_LEEWAY_SECONDS);
         assert_eq!(DEFAULT_OIDC_LEEWAY_SECONDS, 60);
         let sign = |claims: &Value| key.sign(&header(Algorithm::EdDSA, ED_KID), claims);
-        let leeway = DEFAULT_OIDC_LEEWAY_SECONDS;
-        // Beyond the default leeway, both ways: refused.
-        let mut expired = claims();
-        expired["exp"] = json!(now() - leeway - 30);
-        rejects(default.validate_token(&sign(&expired)), claims_rejected);
-        let mut not_yet_valid = claims();
-        not_yet_valid["nbf"] = json!(now() + leeway + 60);
+        // `nbf` 50 s ahead: inside the leeway, accepted.
+        let mut ahead_inside = claims();
+        ahead_inside["nbf"] = json!(now() + 50);
+        default
+            .validate_token(&sign(&ahead_inside))
+            .expect("an nbf 50 s ahead is inside the leeway");
+        // `nbf` 70 s ahead: beyond the leeway, refused.
+        let mut ahead_beyond = claims();
+        ahead_beyond["nbf"] = json!(now() + 70);
         rejects(
-            default.validate_token(&sign(&not_yet_valid)),
+            default.validate_token(&sign(&ahead_beyond)),
             claims_rejected,
         );
-        // Inside the default leeway, both ways: accepted.
-        let mut slightly_expired = claims();
-        slightly_expired["exp"] = json!(now() - 30);
-        default
-            .validate_token(&sign(&slightly_expired))
-            .expect("an exp inside the default leeway validates");
-        let mut slightly_early = claims();
-        slightly_early["nbf"] = json!(now() + 30);
-        default
-            .validate_token(&sign(&slightly_early))
-            .expect("an nbf inside the default leeway validates");
+        // `exp` 1 s past: refused, no leeway on expiry.
+        let mut just_expired = claims();
+        just_expired["exp"] = json!(now() - 1);
+        rejects(
+            default.validate_token(&sign(&just_expired)),
+            claims_rejected,
+        );
         let mut already_valid = claims();
         already_valid["nbf"] = json!(now() - 5);
         default
             .validate_token(&sign(&already_valid))
             .expect("past nbf validates");
-        // A verifier configured with zero leeway is exact.
+        // A verifier configured with zero leeway is exact on `nbf` too.
         let strict = OidcVerifier::new(config(vec![key.approved(ED_KID)]).with_leeway_seconds(0))
             .expect("zero leeway is allowed");
-        rejects(
-            strict.validate_token(&sign(&slightly_expired)),
-            claims_rejected,
-        );
-        rejects(
-            strict.validate_token(&sign(&slightly_early)),
-            claims_rejected,
-        );
+        rejects(strict.validate_token(&sign(&ahead_inside)), claims_rejected);
         // The cap is sixty seconds.
         OidcVerifier::new(
             config(vec![key.approved(ED_KID)]).with_leeway_seconds(MAX_OIDC_LEEWAY_SECONDS),
