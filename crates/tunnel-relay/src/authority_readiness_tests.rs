@@ -243,7 +243,13 @@ async fn m6c67_readyz_follows_a_lost_and_a_stalled_authority_and_recovers() {
     let shared: SharedCatalog = catalog.clone();
     let cancel = CancellationToken::new();
     let authority = AuthorityReadiness::spawn(shared, cancel.clone());
-    let app: axum::Router = crate::health::router(None, Some(authority));
+    let app: axum::Router = crate::health::router(
+        None,
+        crate::health::ReadinessChecks {
+            authority: Some(authority),
+            clock: None,
+        },
+    );
     let bound = PROBE_INTERVAL + PROBE_DEADLINE + Duration::from_secs(2);
 
     let (_, body) = until_readyz(&app, 200, bound).await;

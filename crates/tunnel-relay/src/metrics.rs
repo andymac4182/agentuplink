@@ -41,9 +41,7 @@ use axum::{
 };
 use tokio::sync::Semaphore;
 
-use crate::{
-    RelayHandle, RelaySnapshot, authority_readiness::AuthorityReadiness, peer_runtime::PeerRuntime,
-};
+use crate::{RelayHandle, RelaySnapshot, health::ReadinessChecks, peer_runtime::PeerRuntime};
 
 /// The longest a scrape waits for the relay actor's snapshot.
 pub(crate) const SNAPSHOT_DEADLINE: Duration = Duration::from_secs(2);
@@ -170,6 +168,8 @@ pub(crate) struct MetricsInput<'a> {
     pub(crate) ready: bool,
     /// `None` on a relay without a Redis authority check (a cluster relay).
     pub(crate) authority: Option<AuthorityMetrics>,
+    /// `None` on a relay without the clock-offset check (a library relay).
+    pub(crate) clock: Option<ClockOffsetMetrics>,
     pub(crate) snapshot: &'a RelaySnapshot,
     pub(crate) consumer_refusals: BTreeMap<(&'static str, &'static str), u64>,
     /// The single relay actor's load (M6-C182, M6-C183).
@@ -244,6 +244,16 @@ fn render_listener_fairness(
             out.sample(name, &[("listener", label)], value(listener));
         }
     }
+}
+
+/// The clock-offset check's state and counters (M7-C175).
+pub(crate) struct ClockOffsetMetrics {
+    pub(crate) ready: bool,
+    /// Local minus Redis, in milliseconds; `None` before the first
+    /// measurement.
+    pub(crate) offset_ms: Option<i64>,
+    pub(crate) measurements: u64,
+    pub(crate) failures: u64,
 }
 
 /// The authority check's state and counters (M6-C67).
@@ -430,6 +440,35 @@ pub(crate) fn render(input: &MetricsInput<'_>) -> String {
         }
     }
 
+    if let Some(clock) = &input.clock {
+        gauge(
+            &mut out,
+            "tunnel_relay_clock_offset_ready",
+            "1 while the last measured clock offset from Redis is within the cluster clock-skew bound.",
+            u64::from(clock.ready),
+        );
+        if let Some(offset_ms) = clock.offset_ms {
+            out.family(
+                "tunnel_relay_clock_offset_milliseconds",
+                "gauge",
+                "This relay's wall clock minus the Redis server clock at the last measurement.",
+            );
+            let _ = writeln!(out.0, "tunnel_relay_clock_offset_milliseconds {offset_ms}");
+        }
+        counter(
+            &mut out,
+            "tunnel_relay_clock_offset_measurements_total",
+            "Clock offset measurements against the Redis server clock.",
+            clock.measurements,
+        );
+        counter(
+            &mut out,
+            "tunnel_relay_clock_offset_measurement_failures_total",
+            "Clock offset reads that failed or exceeded their deadline.",
+            clock.failures,
+        );
+    }
+
     let load = input.actor_load;
     counter(
         &mut out,
@@ -599,7 +638,7 @@ pub(crate) fn render(input: &MetricsInput<'_>) -> String {
 struct MetricsState {
     handle: RelayHandle,
     peer: Option<Arc<PeerRuntime>>,
-    authority: Option<Arc<AuthorityReadiness>>,
+    checks: ReadinessChecks,
     scrape: Arc<Semaphore>,
 }
 
@@ -607,14 +646,14 @@ struct MetricsState {
 pub(crate) fn router(
     handle: RelayHandle,
     peer: Option<Arc<PeerRuntime>>,
-    authority: Option<Arc<AuthorityReadiness>>,
+    checks: ReadinessChecks,
 ) -> Router {
     Router::new()
         .route("/metrics", get(scrape))
         .with_state(MetricsState {
             handle,
             peer,
-            authority,
+            checks,
             scrape: Arc::new(Semaphore::new(1)),
         })
 }
@@ -631,15 +670,26 @@ async fn scrape(State(state): State<MetricsState>) -> Response {
         )
             .into_response();
     };
-    let ready = crate::health::relay_ready(state.peer.as_ref(), state.authority.as_ref());
-    let authority = state.authority.as_ref().map(|authority| AuthorityMetrics {
-        ready: authority.is_ready(),
-        checks: authority.checks(),
-        failures: authority.failures(),
+    let ready = crate::health::relay_ready(state.peer.as_ref(), &state.checks);
+    let clock = state.checks.clock.as_ref().map(|clock| ClockOffsetMetrics {
+        ready: clock.is_ready(),
+        offset_ms: clock.offset_ms(),
+        measurements: clock.measurements(),
+        failures: clock.failures(),
     });
+    let authority = state
+        .checks
+        .authority
+        .as_ref()
+        .map(|authority| AuthorityMetrics {
+            ready: authority.is_ready(),
+            checks: authority.checks(),
+            failures: authority.failures(),
+        });
     let body = render(&MetricsInput {
         ready,
         authority,
+        clock,
         snapshot: &snapshot,
         consumer_refusals: consumer_refusals(),
         actor_load: state.handle.actor_load(),

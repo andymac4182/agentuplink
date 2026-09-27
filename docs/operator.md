@@ -398,7 +398,20 @@ so a key rotation at the issuer means editing this file and restarting `serve`.
 A token is accepted only if its header has `alg` `RS256` and a `kid` from that
 file, and its claims have `iss` equal to `oidc_issuer` **byte for byte**
 (including any trailing `/`), an `aud` in `oidc_audience`, a non-empty `sub`,
-and an unexpired `exp`. `nbf` is checked if present. There is no clock leeway.
+and an unexpired `exp`. `nbf` is checked if present. **`nbf` has a 60 s clock
+leeway; `exp` has none** (M7-C174, coordinator decisions under the owner's
+delegation, 2026-09-27; before them there was no leeway at all). A token whose
+`nbf` is up to 60 s ahead of the relay's clock is accepted, because the
+failure seen in practice is a freshly minted token refused as not yet valid
+by a relay whose clock is behind the issuer's. A token is refused from the
+second its signed `exp` passes on the relay's clock, by the verifier and by
+every dispatching route alike, and an admitted request or stream ends at the
+signed `exp`: tolerating expired tokens would only stretch credentials and
+stream deadlines, and clients refresh 300 s tokens before they expire. `iat`
+is not checked. The leeway is not configurable in `relay.toml`; the verifier
+refuses one above 60 s. It is separate from the 5 s cluster clock-skew bound
+([cluster.md](cluster.md), M7-C173), which governs relay-to-relay and
+relay-to-Redis comparisons.
 `scope` is one space-separated string. A request with no bearer token gets
 `401` "a consumer access token is required". Every refusal of a token that was
 sent -- malformed, badly signed, an unknown `kid`, a claim above, or a `sub`
@@ -1032,6 +1045,42 @@ same check and it reads the set every peer dial reads. **A non-empty set is
 necessary for a peer dial, not sufficient:** a set that lacks one peer's key
 still reads ready, and a dial to that peer then fails its TLS pin check.
 
+**Clock offset (M7-C175).** Every relay, with or without `[cluster]`, also
+answers `503` while its wall clock is more than **5 s** from the Redis server
+clock, the cluster clock-skew bound ([cluster.md](cluster.md), M7-C173). A
+background task reads Redis `TIME` every 5 s (bounded at 5 s) and publishes
+the offset on the metrics listener (section 5). Above 2 s it logs `relay clock
+offset from Redis is above the warning threshold` at `warn` with `offset_ms`
+and stays ready; above 5 s it logs `relay clock offset from Redis exceeds the
+cluster clock-skew bound; not ready` and answers `503` until a measurement is
+back within 5 s (`relay clock offset back within the bound; readiness
+restored`). Each is logged once per change. Readiness changes only after two
+consecutive samples on the other side of 5 s, in either direction, and a
+sample whose round trip exceeds 750 ms is discarded. A failed `TIME` read
+changes nothing but a counter.
+
+Three consequences to plan for:
+
+- **The bounds are not symmetric.** `/readyz` goes `503` beyond 5 s either
+  way, but the Redis authority accepts a caller timestamp up to 5 s ahead of
+  Redis and up to 7 s behind it (its 2 s reply deadline plus the skew). So a
+  relay 5-7 s behind Redis is out of rotation while its authority reads still
+  succeed; a relay more than 5 s ahead is out of rotation and also refused by
+  Redis.
+- **Redis's clock is the reference for the whole fleet.** A step in the Redis
+  host's clock, or a failover to a Redis whose clock differs by more than 5 s,
+  makes every relay's offset exceed the bound at once and takes the whole
+  fleet out of rotation until Redis's clock is corrected. Keep the Redis
+  host's clock disciplined exactly like the relays'.
+- **`max_clock_skew_seconds` does not change this check.** A stricter
+  `[cluster]` `max_clock_skew_seconds = 1` tightens signed membership
+  verification only; the Redis authority scripts and this readiness check
+  stay at the fixed 5 s bound.
+
+Fix the host clock (NTP) rather than the bound. This is exercised with an injected clock
+(`crates/tunnel-relay/src/clock_offset_tests.rs`) and against the local Redis
+for `TIME` itself; it was not exercised by stepping a real host clock.
+
 What a load balancer should do:
 
 - Route new public traffic only to relays that answer `200` on `/readyz`.
@@ -1211,7 +1260,7 @@ relay stages and serves a successor, but only your publisher can approve it.
    peer_tls_next_cert_chain = "/etc/agent-tunnel/peer-next-chain.pem"
    peer_tls_next_private_key = "/etc/agent-tunnel/peer-next-key.pem"
    # Optional; these are the defaults.
-   # peer_rekey_convergence_seconds = 61   # record lifetime + clock skew
+   # peer_rekey_convergence_seconds = 65   # record lifetime + clock skew (5 s)
    # peer_rekey_overlap_seconds = 600
    ```
 
@@ -1500,7 +1549,12 @@ back. That includes the image currently deployed on Fly, `main-77bfd28`
 The series, all prefixed `tunnel_relay_`: `build_info{version}`, `ready`
 (what `/readyz` answers), and on a relay without `[cluster]`
 `authority_ready`, `authority_checks_total` and
-`authority_check_failures_total{class}` (section 3.2); the gauges
+`authority_check_failures_total{class}` (section 3.2); on every served relay
+the clock offset from Redis (M7-C175, section 3.2): the signed gauge
+`clock_offset_milliseconds` (this relay's clock minus Redis `TIME`, absent
+before the first measurement; the only sample that can be negative),
+`clock_offset_ready`, `clock_offset_measurements_total` and
+`clock_offset_measurement_failures_total`; the gauges
 `device_sessions`, `device_sockets`, `streams`, `sessions_rotating`,
 `sessions_owner_write_unknown`, `queue_bytes` and `replay_bytes` over the live
 sessions this relay owns; the counters `application_dispatches_total`,

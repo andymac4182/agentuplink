@@ -36,8 +36,9 @@ pub const MAX_KEYS_PER_NODE: usize = 2;
 pub const MAX_KEYS: usize = MAX_KEYS_PER_NODE;
 /// The maximum validity period of signed membership/checkpoint records.
 pub const MAX_RECORD_LIFETIME: Duration = Duration::seconds(60);
-/// The maximum clock skew accepted by this policy.
-pub const MAX_CLOCK_SKEW: Duration = Duration::seconds(1);
+/// The maximum clock skew accepted by this policy: the one cluster-internal
+/// bound ([`tunnel_catalog::clock`], M7-C173).
+pub const MAX_CLOCK_SKEW: Duration = tunnel_catalog::clock::MAX_CLUSTER_CLOCK_SKEW_WALL;
 const MAX_IDENTIFIER_BYTES: usize = 128;
 const MAX_SERVER_NAME_BYTES: usize = 255;
 const MAX_ENDPOINT_BYTES: usize = 255;
@@ -255,9 +256,10 @@ impl MembershipPolicy {
             ));
         }
         if self.max_clock_skew < Duration::zero() || self.max_clock_skew > MAX_CLOCK_SKEW {
-            return Err(MembershipError::InvalidPolicy(
-                "clock skew must be in 0..=1 second".into(),
-            ));
+            return Err(MembershipError::InvalidPolicy(format!(
+                "clock skew must be in 0..={} seconds",
+                MAX_CLOCK_SKEW.num_seconds()
+            )));
         }
         self.endpoint_policy.validate()?;
         Ok(self.clone())
@@ -478,6 +480,11 @@ pub struct VerifiedMembership {
     record: MembershipRecord,
     publisher_key_id: String,
     signed_bytes: Vec<u8>,
+    /// The policy's clock-skew allowance this record was verified under.
+    /// Activation instants (`not_before` of the record and of each key) are
+    /// honoured up to this much early; expiries stay strict (M7-C171,
+    /// option (a)).
+    activation_skew: Duration,
 }
 
 impl VerifiedMembership {
@@ -516,16 +523,46 @@ impl VerifiedMembership {
         &self.record.keys
     }
 
+    /// The clock-skew allowance applied to activation instants.
+    #[must_use]
+    pub fn activation_skew(&self) -> Duration {
+        self.activation_skew
+    }
+
+    /// Whether `key`'s signed window is open at `now`, ignoring revocation.
+    ///
+    /// Task row M7-C171, option (a): `not_before` is honoured up to the
+    /// verifier's clock-skew allowance early, the same allowance the record
+    /// itself was verified with, so a signer whose clock leads this relay's
+    /// by at most the skew cannot make a freshly re-signed key unusable.
+    /// `expires_at` stays strict: no allowance ever extends trust.
+    #[must_use]
+    pub fn key_window_open(&self, key: &RelayKey, now: DateTime<Utc>) -> bool {
+        self.activated(key.not_before, now) && key.expires_at >= now
+    }
+
+    /// Whether a signed activation instant (`not_before` of this record or
+    /// of one of its keys) has been reached at `now`, honouring the
+    /// verifier's clock-skew allowance (M7-C171, option (a)).  Every caller
+    /// that decides whether a key or record is active uses this, so a bind,
+    /// a peer route and a pin set cannot disagree.
+    #[must_use]
+    pub fn activated(&self, not_before: DateTime<Utc>, now: DateTime<Utc>) -> bool {
+        let activation = now.checked_add_signed(self.activation_skew).unwrap_or(now);
+        not_before <= activation
+    }
+
     /// Select the latest non-revoked key active at an explicit wall-clock
-    /// instant.  The caller still verifies the presented certificate SPKI
-    /// against this key's digest at the TLS boundary.
+    /// instant ([`Self::key_window_open`]).  The caller still verifies the
+    /// presented certificate SPKI against this key's digest at the TLS
+    /// boundary.
     #[must_use]
     pub fn active_key(&self, now: DateTime<Utc>) -> Option<&RelayKey> {
         self.record
             .keys
             .iter()
             .rev()
-            .find(|key| !key.revoked && key.not_before <= now && key.expires_at >= now)
+            .find(|key| !key.revoked && self.key_window_open(key, now))
     }
 
     /// Bind authenticated transport facts to this signed node record.
@@ -554,8 +591,12 @@ impl VerifiedMembership {
         {
             return Err(MembershipError::PeerKeyMismatch);
         }
-        if now < self.record.not_before || now >= self.record.expires_at {
-            return Err(if now < self.record.not_before {
+        // M7-C171, option (a): the record's activation is honoured up to the
+        // skew early, exactly as `validate_window` accepted it; its expiry
+        // stays strict.
+        let activation = now.checked_add_signed(self.activation_skew).unwrap_or(now);
+        if activation < self.record.not_before || now >= self.record.expires_at {
+            return Err(if activation < self.record.not_before {
                 MembershipError::NotYetValid
             } else {
                 MembershipError::Expired
@@ -567,8 +608,7 @@ impl VerifiedMembership {
             .iter()
             .find(|key| {
                 !key.revoked
-                    && key.not_before <= now
-                    && key.expires_at >= now
+                    && self.key_window_open(key, now)
                     && key.spki_sha256 == presented_spki_sha256
             })
             .ok_or(MembershipError::PeerKeyMismatch)?;
@@ -876,6 +916,7 @@ impl MembershipVerifier {
             record,
             publisher_key_id: signed.publisher_key_id,
             signed_bytes: bytes.to_vec(),
+            activation_skew: self.policy.max_clock_skew,
         };
         self.highest_memberships.insert(
             verified.record.node_id.clone(),
@@ -1947,7 +1988,7 @@ mod tests {
             Err(MembershipError::CheckpointReplay)
         ));
         assert!(matches!(
-            verifier.fresh_checkpoint(now + Duration::seconds(62)),
+            verifier.fresh_checkpoint(now + Duration::seconds(61) + MAX_CLOCK_SKEW),
             Err(MembershipError::Expired)
         ));
     }
@@ -2016,6 +2057,79 @@ mod tests {
             ),
             Err(MembershipError::PeerKeyMismatch)
         ));
+    }
+
+    /// M7-C171, option (a): activation instants (a key's and the record's
+    /// `not_before`) are honoured up to the policy's clock skew early, and
+    /// not a millisecond more; expiry stays strict.
+    #[test]
+    fn key_and_record_activation_honour_the_skew_and_expiry_stays_strict() {
+        let (issuer, _) = MembershipIssuer::generate("publisher-a").expect("issuer");
+        let mut verifier = verifier(&issuer);
+        let now = now();
+        verify_test_checkpoint(&issuer, &mut verifier, now);
+        assert_eq!(MAX_CLOCK_SKEW, Duration::seconds(5));
+
+        // A successor key activating in ten seconds.
+        let mut rotated = record(now, "node-a", 1);
+        let next_at = now + Duration::seconds(10);
+        rotated.keys.push(RelayKey {
+            key_id: "node-a-next".into(),
+            spki_sha256: "11".repeat(32),
+            not_before: next_at,
+            expires_at: now + Duration::seconds(600),
+            revoked: false,
+        });
+        let signed = issuer
+            .sign_membership(rotated)
+            .expect("rotated record")
+            .encode()
+            .expect("rotated bytes");
+        let verified = verifier
+            .verify_membership(&signed, now)
+            .expect("rotated membership");
+        assert_eq!(verified.activation_skew(), MAX_CLOCK_SKEW);
+        let at_bound = next_at - MAX_CLOCK_SKEW;
+        let before_bound = at_bound - Duration::milliseconds(1);
+        assert_eq!(
+            verified.active_key(at_bound).map(|key| key.key_id.as_str()),
+            Some("node-a-next")
+        );
+        assert_eq!(
+            verified
+                .active_key(before_bound)
+                .map(|key| key.key_id.as_str()),
+            Some("node-a-current")
+        );
+        verified
+            .bind_peer("node-a", "boot-a", &"11".repeat(32), at_bound)
+            .expect("the successor binds at the skew bound");
+        assert!(matches!(
+            verified.bind_peer("node-a", "boot-a", &"11".repeat(32), before_bound),
+            Err(MembershipError::PeerKeyMismatch)
+        ));
+        // Expiry is strict: no allowance after `expires_at`.
+        let current = &verified.keys()[0];
+        assert!(verified.key_window_open(current, current.expires_at));
+        assert!(!verified.key_window_open(current, current.expires_at + Duration::milliseconds(1)));
+
+        // A record re-signed by a signer ahead inside the skew binds now.
+        let mut ahead = record(now + Duration::seconds(3), "node-a", 2);
+        ahead.keys[0].not_before = now + Duration::seconds(3);
+        let signed = issuer
+            .sign_membership(ahead)
+            .expect("record signed ahead")
+            .encode()
+            .expect("record bytes");
+        let verified = verifier
+            .verify_membership(&signed, now)
+            .expect("a record signed ahead inside the skew verifies");
+        verified
+            .bind_peer("node-a", "boot-a", &"00".repeat(32), now)
+            .expect("a record signed ahead inside the skew binds");
+        verifier
+            .bind_peer("node-a", "boot-a", &"00".repeat(32), now)
+            .expect("the verifier binds it too");
     }
 
     #[test]

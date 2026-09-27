@@ -462,7 +462,7 @@ impl MembershipRuntimeConfig {
             || self.membership_reconcile > Duration::from_secs(5)
             || self.checkpoint_timeout.is_zero()
             || self.checkpoint_timeout > MAX_CHECKPOINT_REQUEST_TIMEOUT
-            || self.max_clock_skew > Duration::from_secs(1)
+            || self.max_clock_skew > tunnel_catalog::clock::MAX_CLUSTER_CLOCK_SKEW
         {
             return Err(MembershipRuntimeError::InvalidConfiguration);
         }
@@ -1265,10 +1265,8 @@ impl MembershipRuntime {
             if key.revoked {
                 return LocalKeyApproval::Revoked;
             }
-            if key.not_before <= now
-                && key.expires_at >= now
-                && membership.record().expires_at >= now
-            {
+            // M7-C171, option (a): activation within the skew, expiry strict.
+            if membership.key_window_open(key, now) && membership.record().expires_at >= now {
                 return LocalKeyApproval::Approved {
                     record_version: membership.record().record_version,
                 };
@@ -1805,10 +1803,13 @@ impl MembershipRuntime {
         let local_spki = local_serving_spki.as_deref();
         let local_key = local_spki.and_then(|spki| {
             local_membership.keys().iter().find(|key| {
+                // M7-C171, option (a): a `not_before` up to the accepted
+                // clock skew ahead of this relay's clock is active, as the
+                // verifier already accepted the record itself; expiry stays
+                // strict.
                 !key.revoked
                     && key.spki_sha256 == spki
-                    && key.not_before <= records_received_wall
-                    && key.expires_at >= records_received_wall
+                    && local_membership.key_window_open(key, records_received_wall)
             })
         });
         let Some(local_key) = local_key else {

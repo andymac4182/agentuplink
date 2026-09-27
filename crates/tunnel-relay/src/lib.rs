@@ -12,6 +12,7 @@
 mod actor;
 mod authority_readiness;
 pub mod catalog_changes;
+mod clock_offset;
 mod config;
 mod consumer_framing;
 mod consumer_write_diagnostics;

@@ -329,7 +329,7 @@ script. Its RS256 header names the JWKS key's `kid`, and its claims are:
 | `iss` | exactly `oidc_issuer` in `relay.toml`, trailing `/` included |
 | `aud` | one of `oidc_audience` |
 | `sub` | the catalog user's `oidc_subject` |
-| `iat`, `exp` | now, and now plus a short lifetime (the proof uses 300 s); there is no clock leeway |
+| `iat`, `exp` | now, and now plus a short lifetime (the proof uses 300 s); `exp` is strict (a token is refused once `exp` passes); only an `nbf` up to 60 s ahead of the relay's clock is tolerated (M7-C174, [operator.md](operator.md#22-relay-listener-identities)) |
 | `scope` | the operation the route needs: `echo:invoke` for the echo, `http:invoke` for MCP or ACP, and the `fs:` operations the grant names for a filesystem |
 
 Take the scope as an argument rather than fixing it at `echo:invoke`, so the
