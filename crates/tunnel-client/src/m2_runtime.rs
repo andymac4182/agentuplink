@@ -2556,6 +2556,38 @@ impl M2Actor {
             RotationPhase::Recovering => "recovering",
             RotationPhase::Closed => "closed",
         };
+        // What this connector's drain proof is waiting for (M6-C195): owner
+        // fence entries naming a stream this connector holds no state for
+        // (all of them, and those fenced above zero), and entries whose
+        // received cursor is still below the fence.
+        let mut drain_wait_unknown_streams = 0_usize;
+        let mut drain_wait_unknown_nonzero_streams = 0_usize;
+        let mut drain_wait_below_fence_streams = 0_usize;
+        if rotation_status.phase == RotationPhase::Draining
+            && !self.sent_drain_proof
+            && let Some(fence) = self.peer_fence.as_ref()
+        {
+            for entry in &fence.entries {
+                match self.streams.get(&entry.stream_id) {
+                    None => {
+                        drain_wait_unknown_streams += 1;
+                        if entry.last_emitted > 0 {
+                            drain_wait_unknown_nonzero_streams += 1;
+                        }
+                    }
+                    Some(stream)
+                        if stream
+                            .sequence
+                            .direction(Direction::RelayToConnector)
+                            .recv_contiguous()
+                            < entry.last_emitted =>
+                    {
+                        drain_wait_below_fence_streams += 1;
+                    }
+                    Some(_) => {}
+                }
+            }
+        }
         let status = ConnectionStatus {
             phase: phase.to_owned(),
             session_id: Some(self.session.session_id.clone()),
@@ -2605,6 +2637,9 @@ impl M2Actor {
                 .iter()
                 .filter(|drained| **drained)
                 .count(),
+            drain_wait_unknown_streams,
+            drain_wait_unknown_nonzero_streams,
+            drain_wait_below_fence_streams,
             replay_frames,
             replay_bytes,
             queue_frames: self.pending_outputs.len(),
@@ -7866,13 +7901,30 @@ impl M2Actor {
         };
         let mut acks = Vec::with_capacity(fence.entries.len());
         for entry in &fence.entries {
-            let Some(stream) = self.streams.get(&entry.stream_id) else {
-                return Ok(());
+            let ack = match self.streams.get(&entry.stream_id) {
+                Some(stream) => stream
+                    .sequence
+                    .direction(Direction::RelayToConnector)
+                    .recv_contiguous(),
+                // Task row M6-C195: the owner fenced a stream this connector
+                // holds no state for, at zero.  Two cases reach here: an OPEN
+                // in the QUIESCE roster that this connector refused (its
+                // REJECTED, `GOAWAY` once admission stopped, crossed the
+                // owner's FROZEN), and an OPEN still waiting in the bounded
+                // deferred-admission queue (`pending_open_queue`), which is
+                // refused or admitted only after the freeze.  Either way the
+                // owner emitted nothing on it below the fence, so there is
+                // nothing to drain and the proof is `0` through `0`.  Waiting for a stream that will never
+                // exist here withheld this proof until the overlap deadline:
+                // the rotation froze admission for the whole budget and every
+                // unary echo in the roster ended `unknown`.
+                None if entry.last_emitted == 0 => 0,
+                // A stream fenced above zero was dispatched, so this
+                // connector admitted it; not holding it any more is not a
+                // state this proof may paper over.  Keep waiting, bounded by
+                // the overlap deadline.
+                None => return Ok(()),
             };
-            let ack = stream
-                .sequence
-                .direction(Direction::RelayToConnector)
-                .recv_contiguous();
             if ack < entry.last_emitted {
                 return Ok(());
             }
@@ -18882,6 +18934,208 @@ mod tests {
                     if detail == "candidate abort owner decision not received before overlap deadline"
             ),
             "{failure:?}"
+        );
+    }
+
+    /// Task row M6-C195: an OPEN in the owner's QUIESCE roster that this
+    /// connector refused leaves no stream here, and the owner fences it at
+    /// zero because it emitted nothing on it.  The measured stall: the
+    /// connector's drain proof waited for that stream forever, so under a
+    /// flood a data rotation stayed frozen for its whole overlap budget and
+    /// every unary echo in the roster ended `unknown`.  The owner's FROZEN
+    /// must be answered with a drain proof at once.
+    fn m6c195_draining_actor(
+        roster: Vec<u64>,
+    ) -> (
+        M2Actor,
+        RotationAttemptIdentity,
+        mpsc::Receiver<CarrierCommand>,
+        mpsc::Receiver<crate::QueuedMessage>,
+        mpsc::Receiver<CarrierCommand>,
+    ) {
+        let (mut actor, old_key, old_receiver, control_receiver) =
+            test_actor_with_carrier(M2_CARRIER_QUEUE_FRAMES);
+        let candidate_key = CarrierKey::new(2, "candidate");
+        let (candidate_tx, candidate_receiver) = mpsc::channel(M2_CARRIER_QUEUE_FRAMES);
+        actor.candidate = Some(Carrier {
+            key: candidate_key.clone(),
+            local_addr: None,
+            tx: candidate_tx,
+            pending_controls: BTreeMap::new(),
+            reader_cancel: CancellationToken::new(),
+            reader: None,
+            writer: None,
+        });
+        let attempt = RotationAttemptIdentity::new(
+            "session",
+            1,
+            "owner",
+            "rotation",
+            old_key.generation,
+            candidate_key.generation,
+            old_key.connection_id.clone(),
+            candidate_key.connection_id.clone(),
+        );
+        let now = actor.now_ms();
+        actor
+            .rotation
+            .prepare(attempt.clone(), now)
+            .expect("rotation prepares");
+        actor
+            .rotation
+            .candidate_ready(&attempt, now)
+            .expect("candidate is ready");
+        actor
+            .rotation
+            .quiesce(
+                &attempt,
+                tunnel_protocol::rotation_control::StreamRoster::new("snapshot", roster.clone()),
+                now,
+            )
+            .expect("rotation quiesces");
+        let local_fence = FenceSnapshot::new(
+            "snapshot",
+            roster
+                .iter()
+                .map(|stream_id| StreamFence::new(*stream_id, Direction::ConnectorToRelay, 0))
+                .collect(),
+        );
+        actor
+            .rotation
+            .frozen(
+                &attempt,
+                local_fence.clone(),
+                Direction::ConnectorToRelay,
+                now,
+            )
+            .expect("local fence is accepted");
+        actor.local_fence = Some(local_fence);
+        actor.local_frozen_message_id = Some("connector-frozen".to_owned());
+        (
+            actor,
+            attempt,
+            old_receiver,
+            control_receiver,
+            candidate_receiver,
+        )
+    }
+
+    fn m6c195_owner_frozen(
+        actor: &mut M2Actor,
+        attempt: &RotationAttemptIdentity,
+        fences: Vec<(u64, u64)>,
+    ) -> RotateFrozen {
+        let frozen = RotateFrozen {
+            message_id: "owner-frozen".to_owned(),
+            reply_to: "connector-frozen".to_owned(),
+            attempt: attempt.clone(),
+            snapshot: FenceSnapshot::new(
+                "snapshot",
+                fences
+                    .into_iter()
+                    .map(|(stream_id, last)| {
+                        StreamFence::new(stream_id, Direction::RelayToConnector, last)
+                    })
+                    .collect(),
+            ),
+        };
+        let message = ControlMessage::RotateFrozen(frozen.clone());
+        let scope = actor
+            .rotation_journal_scope(&message)
+            .expect("the owner's FROZEN belongs to the active rotation");
+        actor
+            .observe_rotation_message(&message, scope)
+            .expect("the owner's FROZEN is journaled");
+        frozen
+    }
+
+    #[tokio::test]
+    async fn m6c195_a_refused_open_fenced_at_zero_does_not_withhold_the_drain_proof() {
+        // Stream 7 was in the roster and refused here: no stream remains.
+        let (mut actor, attempt, _old, mut control_receiver, _candidate) =
+            m6c195_draining_actor(vec![7]);
+        assert!(!actor.streams.contains_key(&7));
+        let frozen = m6c195_owner_frozen(&mut actor, &attempt, vec![(7, 0)]);
+        actor
+            .handle_rotate_frozen(frozen)
+            .expect("the owner's fence is accepted");
+
+        assert!(
+            actor.sent_drain_proof,
+            "a stream fenced at zero that this connector refused must not withhold the drain \
+             proof until the overlap deadline (M6-C195)"
+        );
+        let drained: Vec<_> = drain_control_messages(&mut control_receiver)
+            .into_iter()
+            .filter_map(|message| match message {
+                ControlMessage::RotateDrained(drained) => Some(drained),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(drained.len(), 1, "exactly one ROTATE_DRAINED is queued");
+        assert_eq!(drained[0].reply_to, "owner-frozen");
+        assert_eq!(drained[0].proof.direction, Direction::RelayToConnector);
+        assert_eq!(drained[0].proof.ack_cursors, vec![StreamAck::new(7, 0)]);
+    }
+
+    /// The other shape the review of PR #226 named: a roster OPEN still in the
+    /// bounded deferred-admission queue when the owner's FROZEN arrives.  The
+    /// connector holds no stream for it yet, and the owner, which has not
+    /// been challenged for it, fenced it at zero.  The proof is sent at once
+    /// and the OPEN stays queued for admission or refusal after the freeze.
+    #[tokio::test]
+    async fn m6c195_a_deferred_roster_open_fenced_at_zero_does_not_withhold_the_drain_proof() {
+        let (mut actor, attempt, _old, mut control_receiver, _candidate) =
+            m6c195_draining_actor(vec![7]);
+        let open = test_open(7);
+        let reservation = actor
+            .reserve_pending_open(&open)
+            .expect("the deferred OPEN is within its budget");
+        let pending = actor
+            .prepare_pending_open(open, reservation)
+            .expect("the deferred OPEN is well formed");
+        actor.pending_open_queue.push_back(pending);
+        assert!(!actor.streams.contains_key(&7));
+        let frozen = m6c195_owner_frozen(&mut actor, &attempt, vec![(7, 0)]);
+        actor
+            .handle_rotate_frozen(frozen)
+            .expect("the owner's fence is accepted");
+
+        assert!(
+            actor.sent_drain_proof,
+            "a deferred roster OPEN fenced at zero must not withhold the drain proof (M6-C195)"
+        );
+        assert_eq!(
+            drain_control_messages(&mut control_receiver)
+                .iter()
+                .filter(|message| matches!(message, ControlMessage::RotateDrained(_)))
+                .count(),
+            1
+        );
+        assert_eq!(
+            actor.pending_open_queue.len(),
+            1,
+            "the deferred OPEN is still queued, neither admitted nor dropped"
+        );
+    }
+
+    /// The exception stays narrow: a stream the owner fenced above zero was
+    /// dispatched, so this connector admitted it, and a proof must never
+    /// claim bytes it cannot account for.  It keeps waiting, bounded by the
+    /// overlap deadline.
+    #[tokio::test]
+    async fn m6c195_an_unknown_stream_fenced_above_zero_still_withholds_the_drain_proof() {
+        let (mut actor, attempt, _old, mut control_receiver, _candidate) =
+            m6c195_draining_actor(vec![7]);
+        let frozen = m6c195_owner_frozen(&mut actor, &attempt, vec![(7, 2)]);
+        actor
+            .handle_rotate_frozen(frozen)
+            .expect("the owner's fence is accepted");
+        assert!(!actor.sent_drain_proof);
+        assert!(
+            drain_control_messages(&mut control_receiver)
+                .iter()
+                .all(|message| !matches!(message, ControlMessage::RotateDrained(_)))
         );
     }
 }

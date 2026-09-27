@@ -43,6 +43,7 @@ import csv
 import json
 import os
 import re
+import shutil
 import signal
 import socket
 import ssl
@@ -50,6 +51,7 @@ import statistics
 import subprocess
 import sys
 import threading
+import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -267,6 +269,7 @@ class Stack:
         self.devices: dict[str, dict] = {}
         self.users: dict[str, dict] = {}
         self.relay_starts = 0
+        self.ipc_dirs: list[Path] = []
         self.events = (run_dir / "events.jsonl").open("a", buffering=1)
         self.tokens: dict[tuple[str, str], tuple[float, str]] = {}
         self.token_lock = threading.Lock()
@@ -467,6 +470,12 @@ class Stack:
                     f"command = {tq(self.bins / 'tunnel-mcp-fixture')}\nargs = [\"stdio\"]\n"
                     f"workspace = {tq(ws)}\n")
         doc = "\n".join(lines[:start] + ["\n".join(tables).rstrip()] + lines[end:]) + "\n"
+        # M6-C195: a short, private supervisor socket, so `status --json` (the
+        # connector's payload-free rotation phase and drain counters) works;
+        # the default beside the key exceeds the 103-byte socket path limit.
+        ipc_dir = Path(tempfile.mkdtemp(prefix="au-ipc-"))
+        self.ipc_dirs.append(ipc_dir)  # removed by `close`
+        doc += f"\n[supervisor]\nipc_path = {tq(ipc_dir / (name + '.sock'))}\n"
         config = d / "client.toml"
         config.write_text(doc)
         run([self.bins / "tunnel-client", "credentials", "create", "--config", config,
@@ -661,6 +670,8 @@ class Stack:
             self.event("namespace-deleted", namespace=self.namespace, keys=removed)
         except OSError as error:
             self.event("namespace-delete-failed", error=str(error))
+        for ipc_dir in self.ipc_dirs:  # the devices' supervisor sockets (M6-C195)
+            shutil.rmtree(ipc_dir, ignore_errors=True)
         self.events.close()
 
 
@@ -696,7 +707,11 @@ METRIC_SERIES = ("tunnel_relay_device_sessions", "tunnel_relay_device_sockets",
                  "tunnel_relay_listener_capacity_refusals_total",
                  "tunnel_relay_listener_fairness_handoffs_total",
                  "tunnel_relay_listener_fairness_recycled_total",
-                 "tunnel_relay_listener_under_pressure")
+                 "tunnel_relay_listener_under_pressure",
+                 # M6-C195: sessions per rotation phase, so a long freeze's phase is sampled.
+                 *(f"rotation_phase_{phase}" for phase in (
+                     "preparing", "quiescing", "draining", "committing", "retiring",
+                     "aborting", "recovering")))
 
 
 def scrape_metrics(port: int) -> dict[str, float]:
@@ -719,6 +734,8 @@ def scrape_metrics(port: int) -> dict[str, float]:
         if len(parts) != 2:
             continue
         name = parts[0].split("{", 1)[0]
+        if name == "tunnel_relay_sessions_by_rotation_phase" and 'phase="' in parts[0]:
+            name = "rotation_phase_" + parts[0].split('phase="', 1)[1].split('"', 1)[0]
         if name in METRIC_SERIES:
             try:
                 values[name] = values.get(name, 0.0) + float(parts[1])
@@ -1512,6 +1529,21 @@ def base_stack(args, run_dir, nonce, tag, redis=None, mcp=True, **kw) -> Stack:
     return stack
 
 
+def parse_rotation(text: str) -> tuple[int, int, int]:
+    """`INTERVAL,HANDSHAKE,OVERLAP` seconds for relay and devices (M6-C195): a
+    short interval puts many data rotations under one flood."""
+    parts = text.split(",")
+    if len(parts) != 3 or not all(part.strip().isdigit() for part in parts):
+        raise SystemExit(f"--rotation wants INTERVAL,HANDSHAKE,OVERLAP whole seconds, got {text!r}")
+    interval, handshake, overlap = (int(part) for part in parts)
+    # The relay's and client's own rule (tunnel-core RotationConfig): each is
+    # nonzero and handshake < overlap < interval; refuse here rather than
+    # start a stack whose relay then refuses its configuration.
+    if not 0 < handshake < overlap < interval <= 86400:
+        raise SystemExit(f"--rotation needs 0 < HANDSHAKE < OVERLAP < INTERVAL <= 86400, got {text!r}")
+    return interval, handshake, overlap
+
+
 def parse_redis(text: str) -> tuple[str, int]:
     host, port = text.rsplit(":", 1)
     return host, int(port)
@@ -1671,7 +1703,8 @@ def first_ok_seconds(rows: list[tuple]) -> dict:
 
 async def fairness(args: argparse.Namespace) -> None:
     run_dir, nonce = make_run(args, "fairness")
-    stack = base_stack(args, run_dir, nonce, "m6-03-fair", mcp=False)
+    stack = base_stack(args, run_dir, nonce, "m6-03-fair", mcp=False,
+                       rotation=parse_rotation(args.rotation))
     rec = Recorder(run_dir / "requests.csv", nonce)
     sampler = None
     attribution: dict[str, dict] = {}
@@ -1767,7 +1800,8 @@ async def flood(args: argparse.Namespace) -> None:
     consumers for a fixed time; report every device session end and whether
     `connect` exited, and with what."""
     run_dir, nonce = make_run(args, "flood")
-    stack = base_stack(args, run_dir, nonce, "m6-03-flood", mcp=False)
+    stack = base_stack(args, run_dir, nonce, "m6-03-flood", mcp=False,
+                       rotation=parse_rotation(args.rotation))
     rec = Recorder(run_dir / "requests.csv", nonce)
     try:
         stack.start_relay()
@@ -2060,6 +2094,10 @@ def main() -> None:
                            help="MCP sessions shared by a step's workers (the stdio export's "
                                 "default max_children is 8); every session is DELETEd after "
                                 "the step")
+        if name in ("flood", "fairness"):
+            p.add_argument("--rotation", default="300,10,30",
+                           help="INTERVAL,HANDSHAKE,OVERLAP seconds for the relay and every "
+                                "device (M6-C195); a short interval rotates under the flood")
         if name == "flood":
             p.add_argument("--workers", type=int, default=128)
             p.add_argument("--seconds", type=float, default=60)
