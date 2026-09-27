@@ -43,6 +43,12 @@ pub(crate) const HTTP_REQUEST_MAX: usize = 32 * 1024;
 pub(crate) const HEALTH_BODY_MAX: usize = 128;
 pub(crate) const AUXILIARY_CONNECTION_LIMIT: usize = 8;
 pub(crate) const AUXILIARY_CONNECTION_DEADLINE: Duration = Duration::from_secs(5);
+/// Concurrent forwarded connections a Redis TLS proxy admits. A relay holds
+/// seven long-lived catalog lanes (primary, four authorization, two
+/// maintenance), and a forwarded connection now lives until a fault,
+/// cancellation or close rather than for 5 s, so the auxiliary limit of 8
+/// would leave one slot for a reconnect or a second client (M7-C177).
+pub(crate) const REDIS_PROXY_CONNECTION_LIMIT: usize = 32;
 pub(crate) const AUXILIARY_SHUTDOWN_DEADLINE: Duration = Duration::from_secs(2);
 
 pub(crate) async fn wait_for_ready(
@@ -621,7 +627,7 @@ pub(crate) async fn run_redis_proxy(
                         )));
                     }
                 };
-                if active_connections >= AUXILIARY_CONNECTION_LIMIT {
+                if active_connections >= REDIS_PROXY_CONNECTION_LIMIT {
                     drop(stream);
                     continue;
                 }
@@ -652,28 +658,33 @@ pub(crate) async fn run_redis_connection(
     handshakes: Arc<AtomicUsize>,
     cancellation: CancellationToken,
 ) {
-    let _ = timeout(AUXILIARY_CONNECTION_DEADLINE, async move {
-        let mut tls = tokio::select! {
-            _ = cancellation.cancelled() => return,
-            accepted = acceptor.accept(stream) => match accepted {
-                Ok(tls) => tls,
-                Err(_) => return,
-            },
+    // M7-C177: only setup (TLS accept and the upstream connect) is bounded
+    // by the auxiliary deadline. An established connection lives until
+    // cancellation or either side closes it. It used to be cut after the same
+    // 5 s, so every relay Redis connection behind this proxy died every 5 s:
+    // a periodic failed catalog read and, on a cluster relay, a brief
+    // not-ready window a gate could land in (the fault behind hosted run
+    // 36301647506 on the dependency-restore proxy, M7-C175).
+    let established = timeout(AUXILIARY_CONNECTION_DEADLINE, async {
+        let tls = tokio::select! {
+            _ = cancellation.cancelled() => return None,
+            accepted = acceptor.accept(stream) => accepted.ok()?,
         };
         handshakes.fetch_add(1, Ordering::Release);
-        let mut upstream_stream = tokio::select! {
-            _ = cancellation.cancelled() => return,
-            connected = TcpStream::connect(upstream) => match connected {
-                Ok(stream) => stream,
-                Err(_) => return,
-            },
+        let upstream_stream = tokio::select! {
+            _ = cancellation.cancelled() => return None,
+            connected = TcpStream::connect(upstream) => connected.ok()?,
         };
-        tokio::select! {
-            _ = cancellation.cancelled() => {}
-            _ = tokio::io::copy_bidirectional(&mut tls, &mut upstream_stream) => {}
-        }
+        Some((tls, upstream_stream))
     })
     .await;
+    let Ok(Some((mut tls, mut upstream_stream))) = established else {
+        return;
+    };
+    tokio::select! {
+        _ = cancellation.cancelled() => {}
+        _ = tokio::io::copy_bidirectional(&mut tls, &mut upstream_stream) => {}
+    }
 }
 
 pub(crate) fn join_connection(

@@ -1228,6 +1228,9 @@ async fn start_cluster(
         shutdown.clone(),
     ));
 
+    // A relay whose own served key its signed record no longer approves
+    // surrenders the device ownership it holds, once confirmed (M7-C181).
+    let surrender_task = running.spawn_own_key_surrender(Arc::clone(&membership));
     let rekey_task = rekey.spawn(shutdown.clone());
     let rekey_trigger = RekeyTrigger::install(cluster, Arc::clone(&rekey))?;
 
@@ -1239,6 +1242,7 @@ async fn start_cluster(
         running,
         peer_runtime,
         peer_task,
+        surrender_task,
         rekey_task,
         rekey_trigger,
         membership_handle,
@@ -1338,6 +1342,7 @@ struct ClusterServing {
     running: tunnel_relay::RunningRelay,
     peer_runtime: Arc<PeerRuntime>,
     peer_task: tokio::task::JoinHandle<()>,
+    surrender_task: tokio::task::JoinHandle<()>,
     rekey_task: tokio::task::JoinHandle<()>,
     rekey_trigger: RekeyTrigger,
     membership_handle: tunnel_relay::MembershipRuntimeHandle,
@@ -1350,6 +1355,7 @@ impl ClusterServing {
             running,
             peer_runtime,
             peer_task,
+            surrender_task,
             rekey_task,
             mut rekey_trigger,
             membership_handle,
@@ -1385,6 +1391,7 @@ impl ClusterServing {
                 .await
                 .map_err(|error| format!("peer readiness task failed: {error}"));
             let _ = rekey_task.await;
+            let _ = surrender_task.await;
             let membership_result = membership_handle.shutdown().await;
             running_result?;
             peer_result?;

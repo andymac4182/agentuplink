@@ -470,14 +470,20 @@ original generation and a public canary still returns the exact canary plus
 payload bytes; A's readiness stays ready for every sample across the overlap;
 the retired SPKI is refused once the replacement-only record is adopted, with
 A's readiness reflecting that pin transition while relay B is still running; the
-relay whose own key was retired loses its owner claim and its device session
-(**caveat, M7-C181:** only because the gate's Redis proxy cut every connection
-after 5 s; the relay itself does not surrender them, and with the proxy fixed,
-M7-C177, this assertion fails); a public request across the retired route returns
+relay whose own key was retired surrenders its owner claim and closes its device
+session (M7-C181); a public request across the retired route returns
 `503 CLUSTER_UNREADY` / `not_dispatched` and the impostor receives a connection
 from A but never a request stream; an untrusted signer naming a rogue SPKI
 leaves A unready with both the rogue and the replacement certificate refused;
 and a trusted record restores the replacement-only key set.
+
+The surrender requirement was not met by the relay before task row M7-C181.
+Earlier passes of this gate came from its Redis proxy, which cut every
+forwarded connection after the 5 s setup deadline (M7-C177) and so stopped the
+retired relay's lease renewals; with that proxy fixed, the gate failed with
+`the relay whose peer certificate was retired kept its owner claim past the
+bounded deadline` until the relay itself surrendered its ownership
+([cluster.md](cluster.md), *Own served key retired*).
 
 That rogue-signer phase is also **the regression for which unready states may
 keep a relay's peer pins** ([cluster.md](cluster.md#implementation-and-acceptance-gates)).
