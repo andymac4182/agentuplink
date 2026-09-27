@@ -4529,3 +4529,548 @@ async fn m7c178_a_loss_report_naming_the_candidate_does_not_abort_the_rotation()
     );
     assert!(fixture.session().active_carrier.is_some());
 }
+
+// Task rows M6-C204, M6-C205 and M6-C207: outcomes of unary echoes that a
+// rotation freeze or an ended wait kept from running.  Each outcome is
+// `not_dispatched` only where the relay provably never queued the echo's
+// DATA and FIN, and a real refusal keeps its strict answer.
+
+fn unary_failure(
+    receiver: &mut oneshot::Receiver<EchoOutcome>,
+) -> Option<(&'static str, &'static str)> {
+    match receiver.try_recv() {
+        Ok(EchoOutcome::Failure { code, execution }) => Some((code, execution)),
+        _ => None,
+    }
+}
+
+impl FreezeFixture {
+    async fn connector_rejected_goaway(
+        &mut self,
+        stream_id: u64,
+        operation_id: &str,
+        open_id: &str,
+    ) {
+        self.actor
+            .inbound_control(
+                self.key.clone(),
+                ControlMessage::Rejected(Rejected::new(
+                    "connector-goaway",
+                    open_id,
+                    self.key.session_id.clone(),
+                    self.key.epoch,
+                    stream_id,
+                    operation_id,
+                    tunnel_protocol::open_refusal::CONNECTOR_DRAINING.code(),
+                    tunnel_protocol::open_refusal::CONNECTOR_DRAINING.reason(),
+                )),
+            )
+            .await;
+    }
+
+    fn set_unary_created_at(&mut self, stream_id: u64, created_at: Instant) {
+        self.actor
+            .sessions
+            .get_mut(&self.key.scope())
+            .and_then(|session| session.pending.get_mut(&stream_id))
+            .expect("finite echo is pending")
+            .created_at = created_at;
+    }
+
+    /// Mark a unary echo's challenge in flight and return that challenge,
+    /// received `age` ago with window `lifetime`.
+    fn unary_challenge(
+        &mut self,
+        stream_id: u64,
+        age: StdDuration,
+        lifetime: StdDuration,
+    ) -> DeviceChallenge {
+        let challenge_id = format!("m6c207-challenge-{stream_id}");
+        {
+            let pending = self
+                .actor
+                .sessions
+                .get_mut(&self.key.scope())
+                .and_then(|session| session.pending.get_mut(&stream_id))
+                .expect("finite echo is pending");
+            pending.authorization_in_flight = true;
+            pending.challenge_id = Some(challenge_id.clone());
+        }
+        DeviceChallenge {
+            message_id: format!("m6c207-auth-{stream_id}"),
+            stream_id,
+            service_id: self.service_id.to_string(),
+            challenge_id,
+            nonce: format!("m6c207-nonce-{stream_id}"),
+            permission_digest: wire::permission_digest(&self.grant, &self.service_id.to_string()),
+            grant_revision: self.grant.revision,
+            received_at: Instant::now()
+                .checked_sub(age)
+                .expect("the host clock has run longer than the simulated freeze"),
+            lifetime,
+        }
+    }
+
+    /// An authorizing catalog result whose grant read started `read_age` ago
+    /// and, as the catalog bounds every read, is valid for 5 s from then.
+    fn authorizing_result(&self, read_age: Duration) -> super::ChallengeAuthorizationResult {
+        let now = Utc::now();
+        let mut grant = self.grant.clone();
+        grant.read_started_at = now - read_age;
+        grant.valid_until = grant.read_started_at + Duration::seconds(5);
+        Ok((
+            Some(grant),
+            Some(OwnerClaim {
+                token: self.session().owner.clone(),
+                lease_expires_at: now + Duration::minutes(1),
+            }),
+            Some(self.session().identity.clone()),
+            Some(Instant::now() + StdDuration::from_secs(60)),
+        ))
+    }
+
+    /// Complete the attempt up to COMMITTED, which resumes the writer and
+    /// applies every held authorization result.
+    async fn commit_with_roster(&mut self, roster: &[(u64, u64)]) {
+        assert!(self.complete_barrier().is_empty());
+        self.connector_frozen_streams(roster).await;
+        self.connector_drained().await;
+        self.connector_committed().await;
+    }
+
+    /// The next challenge read the actor started, as its background task
+    /// delivers it.
+    async fn next_challenge_read(
+        &mut self,
+    ) -> (
+        SessionKey,
+        DeviceChallenge,
+        super::ChallengeAuthorizationResult,
+    ) {
+        loop {
+            let command = tokio::time::timeout(StdDuration::from_secs(5), self.actor.rx.recv())
+                .await
+                .expect("a fresh challenge read is started")
+                .expect("command channel open");
+            if let super::Command::ChallengeAuthorized {
+                key,
+                challenge,
+                result,
+            } = command
+            {
+                return (key, challenge, *result);
+            }
+        }
+    }
+}
+
+/// M6-C204: an OPEN in the frozen roster that the connector dequeued after
+/// QUIESCE and refused `GOAWAY` never ran.  Its consumer gets the retryable
+/// rotation answer (`ROTATION_FREEZE`, `not_dispatched`, with the retry hint
+/// the HTTP layer adds), not `DEVICE_REJECTED`.
+#[tokio::test]
+async fn m6c204_a_roster_open_refused_goaway_during_a_freeze_is_a_retryable_rotation_answer() {
+    let mut fixture = FreezeFixture::new("m6c204-goaway", false);
+    let (stream_id, operation_id, open_id, mut receiver) =
+        fixture.admit_unary_echo(UNARY_BODY).await;
+    fixture.quiesce_roster(&[STREAM_ID, stream_id]);
+    fixture
+        .connector_rejected_goaway(stream_id, &operation_id, &open_id)
+        .await;
+    assert_eq!(
+        unary_failure(&mut receiver),
+        Some((
+            super::freeze_hold::ROTATION_FREEZE_ECHO_CODE,
+            "not_dispatched"
+        )),
+        "a roster OPEN refused by the rotation's drain is retryable, not DEVICE_REJECTED"
+    );
+    assert!(fixture.session_alive());
+}
+
+/// M6-C204 control: a `GOAWAY` while no attempt freezes admission (here the
+/// attempt is only preparing, so it is the connector shutting down) stays
+/// `DEVICE_REJECTED`, and so does any other refusal during a freeze.
+#[tokio::test]
+async fn m6c204_a_goaway_outside_a_freeze_and_other_refusals_stay_device_rejected() {
+    let mut fixture = FreezeFixture::new("m6c204-control", false);
+    assert_eq!(fixture.phase(), RotationPhase::Preparing);
+    let (stream_id, operation_id, open_id, mut receiver) =
+        fixture.admit_unary_echo(UNARY_BODY).await;
+    fixture
+        .connector_rejected_goaway(stream_id, &operation_id, &open_id)
+        .await;
+    assert_eq!(
+        unary_failure(&mut receiver),
+        Some(("DEVICE_REJECTED", "not_dispatched"))
+    );
+
+    let (stream_id, operation_id, open_id, mut receiver) =
+        fixture.admit_unary_echo(UNARY_BODY).await;
+    fixture.quiesce_roster(&[STREAM_ID, stream_id]);
+    fixture
+        .actor
+        .inbound_control(
+            fixture.key.clone(),
+            ControlMessage::Rejected(Rejected::new(
+                "connector-export-denied",
+                open_id,
+                fixture.key.session_id.clone(),
+                fixture.key.epoch,
+                stream_id,
+                operation_id,
+                "EXPORT_DENIED",
+                "service is not locally allowlisted",
+            )),
+        )
+        .await;
+    assert_eq!(
+        unary_failure(&mut receiver),
+        Some(("DEVICE_REJECTED", "not_dispatched"))
+    );
+}
+
+/// M6-C205: an echo whose DATA and FIN were never queued -- its challenge
+/// never answered -- provably did not run, so the operation timeout answers
+/// it `not_dispatched`.
+#[tokio::test]
+async fn m6c205_an_undispatched_echo_past_the_operation_timeout_is_not_dispatched() {
+    let mut fixture = FreezeFixture::new("m6c205-expire", false);
+    let (stream_id, _, _, mut receiver) = fixture.admit_unary_echo(UNARY_BODY).await;
+    let timeout = fixture.actor.options.limits.operation_timeout;
+    let past = Instant::now()
+        .checked_sub(timeout + StdDuration::from_secs(1))
+        .expect("the host clock has run longer than the operation timeout");
+    fixture.set_unary_created_at(stream_id, past);
+    let key = fixture.key.clone();
+    fixture.actor.expire_pending_echoes(&key);
+    assert_eq!(
+        unary_failure(&mut receiver),
+        Some(("REVERSE_CHANNEL_INTERRUPTED", "not_dispatched"))
+    );
+}
+
+/// M6-C205 control: once DATA and FIN are queued the device may have run
+/// the echo, so the operation timeout keeps `unknown`.
+#[tokio::test]
+async fn m6c205_a_dispatched_echo_past_the_operation_timeout_stays_unknown() {
+    let mut fixture = FreezeFixture::new("m6c205-expire-dispatched", false);
+    let (stream_id, _, _, mut receiver) = fixture.admit_unary_echo(UNARY_BODY).await;
+    fixture.authorize_unary_echo(stream_id);
+    assert_eq!(sequenced(&drain_data(&mut fixture.old_rx)).len(), 2);
+    let timeout = fixture.actor.options.limits.operation_timeout;
+    let past = Instant::now()
+        .checked_sub(timeout + StdDuration::from_secs(1))
+        .expect("the host clock has run longer than the operation timeout");
+    fixture.set_unary_created_at(stream_id, past);
+    let key = fixture.key.clone();
+    fixture.actor.expire_pending_echoes(&key);
+    assert_eq!(
+        unary_failure(&mut receiver),
+        Some(("REVERSE_CHANNEL_INTERRUPTED", "unknown"))
+    );
+}
+
+/// M6-C205, session end: closing the session answers a never-dispatched
+/// echo `not_dispatched` and a dispatched one `unknown`.
+#[tokio::test]
+async fn m6c205_a_session_end_answers_undispatched_echoes_not_dispatched() {
+    let mut fixture = FreezeFixture::new("m6c205-close", false);
+    let (dispatched, _, _, mut dispatched_rx) = fixture.admit_unary_echo(UNARY_BODY).await;
+    fixture.authorize_unary_echo(dispatched);
+    let (_, _, _, mut undispatched_rx) = fixture.admit_unary_echo(UNARY_BODY).await;
+    let key = fixture.key.clone();
+    fixture.actor.close_session(&key, "TEST_SESSION_END").await;
+    assert_eq!(
+        unary_failure(&mut undispatched_rx),
+        Some(("REVERSE_CHANNEL_INTERRUPTED", "not_dispatched"))
+    );
+    assert_eq!(
+        unary_failure(&mut dispatched_rx),
+        Some(("REVERSE_CHANNEL_INTERRUPTED", "unknown"))
+    );
+}
+
+/// M6-C205, carrier loss: losing the active data carrier answers a
+/// never-dispatched echo `not_dispatched` and a dispatched one `unknown`.
+#[tokio::test]
+async fn m6c205_losing_the_data_carrier_answers_undispatched_echoes_not_dispatched() {
+    let mut fixture = FreezeFixture::new("m6c205-carrier", false);
+    let (dispatched, _, _, mut dispatched_rx) = fixture.admit_unary_echo(UNARY_BODY).await;
+    fixture.authorize_unary_echo(dispatched);
+    let (_, _, _, mut undispatched_rx) = fixture.admit_unary_echo(UNARY_BODY).await;
+    fixture
+        .actor
+        .disconnect_data(fixture.old_carrier.clone())
+        .await;
+    assert_eq!(
+        unary_failure(&mut undispatched_rx),
+        Some(("REVERSE_CHANNEL_INTERRUPTED", "not_dispatched"))
+    );
+    assert_eq!(
+        unary_failure(&mut dispatched_rx),
+        Some(("REVERSE_CHANNEL_INTERRUPTED", "unknown"))
+    );
+}
+
+/// M6-C207: an authorizing result held across a freeze longer than the
+/// challenge window and the read's 5 s bound is read again at flush, not
+/// refused `AUTHORIZATION_REVOKED`.  The fresh read still authorizes, but the
+/// lapsed challenge can no longer be confirmed, so the consumer gets the
+/// retryable `ROTATION_FREEZE`/`not_dispatched` and the connector is told.
+#[tokio::test]
+async fn m6c207_a_result_held_past_its_bounds_is_read_again_not_revoked() {
+    let mut fixture = FreezeFixture::new("m6c207-lapsed", false);
+    let (stream_id, _, _, mut receiver) = fixture.admit_unary_echo(UNARY_BODY).await;
+    fixture.quiesce_roster(&[STREAM_ID, stream_id]);
+    // The default challenge window (2 s); the challenge and its read are 6 s
+    // old when the writer resumes.
+    let challenge = fixture.unary_challenge(
+        stream_id,
+        StdDuration::from_secs(6),
+        StdDuration::from_secs(2),
+    );
+    let challenge_id = challenge.challenge_id.clone();
+    let held = fixture.authorizing_result(Duration::seconds(6));
+    fixture
+        .actor
+        .finish_device_challenge(fixture.key.clone(), challenge, held);
+    assert!(
+        receiver.try_recv().is_err(),
+        "held, not answered, while frozen"
+    );
+    fixture
+        .commit_with_roster(&[(STREAM_ID, 0), (stream_id, 0)])
+        .await;
+    assert_eq!(
+        unary_failure(&mut receiver),
+        None,
+        "a stale held result must be read again, not refused as revoked"
+    );
+    let (key, reread, _catalog_result) = fixture.next_challenge_read().await;
+    assert_eq!(reread.challenge_id, challenge_id);
+    // The catalog still authorizes (a fresh read, valid for 5 s from now).
+    let fresh = fixture.authorizing_result(Duration::zero());
+    fixture.actor.finish_device_challenge(key, reread, fresh);
+    assert_eq!(
+        unary_failure(&mut receiver),
+        Some((
+            super::freeze_hold::ROTATION_FREEZE_ECHO_CODE,
+            "not_dispatched"
+        ))
+    );
+    let control = fixture.drain_control();
+    assert!(control.iter().any(|message| matches!(
+        message,
+        ControlMessage::AuthorizationInvalidated(invalidated)
+            if invalidated.stream_id == stream_id && invalidated.reason == "authorization expired"
+    )));
+    assert!(
+        !control
+            .iter()
+            .any(|message| matches!(message, ControlMessage::AuthorizationConfirmed(_))),
+        "a lapsed challenge is never confirmed"
+    );
+    assert!(
+        !fixture
+            .session()
+            .pending
+            .get(&stream_id)
+            .is_some_and(|pending| pending.dispatched)
+    );
+}
+
+/// M6-C207: where the challenge window is still open and only the held
+/// read's 5 s bound passed, the fresh read lets the echo be dispatched.
+#[tokio::test]
+async fn m6c207_a_stale_held_read_with_an_open_challenge_is_dispatched_after_a_fresh_read() {
+    let mut fixture = FreezeFixture::new("m6c207-served", false);
+    let (stream_id, _, _, mut receiver) = fixture.admit_unary_echo(UNARY_BODY).await;
+    fixture.quiesce_roster(&[STREAM_ID, stream_id]);
+    let challenge = fixture.unary_challenge(
+        stream_id,
+        StdDuration::from_secs(6),
+        StdDuration::from_secs(30),
+    );
+    let held = fixture.authorizing_result(Duration::seconds(6));
+    fixture
+        .actor
+        .finish_device_challenge(fixture.key.clone(), challenge, held);
+    fixture
+        .commit_with_roster(&[(STREAM_ID, 0), (stream_id, 0)])
+        .await;
+    assert_eq!(unary_failure(&mut receiver), None);
+    let (key, reread, _catalog_result) = fixture.next_challenge_read().await;
+    let fresh = fixture.authorizing_result(Duration::zero());
+    fixture.actor.finish_device_challenge(key, reread, fresh);
+    let new_generation = fixture.attempt.new_generation;
+    assert_eq!(
+        sequenced(&drain_data(&mut fixture.candidate_rx)),
+        vec![
+            (FrameKind::Data, 1, new_generation),
+            (FrameKind::Fin, 2, new_generation)
+        ],
+        "the held echo is dispatched once, on the activated carrier"
+    );
+    assert!(
+        receiver.try_recv().is_err(),
+        "dispatched, awaiting the reply"
+    );
+}
+
+/// M6-C207 control: a grant revoked during the freeze is still refused.  The
+/// fresh read is the fixture's real (empty) memory catalog, which has no
+/// grant, and the answer is `AUTHORIZATION_REVOKED` from that read.
+#[tokio::test]
+async fn m6c207_a_grant_revoked_during_the_freeze_is_still_refused() {
+    let mut fixture = FreezeFixture::new("m6c207-revoked", false);
+    let (stream_id, _, _, mut receiver) = fixture.admit_unary_echo(UNARY_BODY).await;
+    fixture.quiesce_roster(&[STREAM_ID, stream_id]);
+    let challenge = fixture.unary_challenge(
+        stream_id,
+        StdDuration::from_secs(6),
+        StdDuration::from_secs(2),
+    );
+    let held = fixture.authorizing_result(Duration::seconds(6));
+    fixture
+        .actor
+        .finish_device_challenge(fixture.key.clone(), challenge, held);
+    fixture
+        .commit_with_roster(&[(STREAM_ID, 0), (stream_id, 0)])
+        .await;
+    assert_eq!(
+        unary_failure(&mut receiver),
+        None,
+        "the stale held result is read again, not applied"
+    );
+    let (key, reread, catalog_result) = fixture.next_challenge_read().await;
+    assert!(
+        matches!(&catalog_result, Ok((None, _, _, _))),
+        "the catalog has no grant for this consumer"
+    );
+    fixture
+        .actor
+        .finish_device_challenge(key, reread, catalog_result);
+    assert_eq!(
+        unary_failure(&mut receiver),
+        Some(("AUTHORIZATION_REVOKED", "not_dispatched"))
+    );
+    assert!(fixture.drain_control().iter().any(|message| matches!(
+        message,
+        ControlMessage::AuthorizationInvalidated(invalidated)
+            if invalidated.stream_id == stream_id && invalidated.reason == "grant unavailable"
+    )));
+    assert!(
+        !sequenced(&drain_data(&mut fixture.candidate_rx))
+            .iter()
+            .any(|(kind, _, _)| *kind == FrameKind::Data),
+        "a revoked grant is never dispatched"
+    );
+}
+
+/// M6-C207 control: a held refusal is applied as it stands when the writer
+/// resumes, with no second read.
+#[tokio::test]
+async fn m6c207_a_held_refusal_is_applied_without_a_second_read() {
+    let mut fixture = FreezeFixture::new("m6c207-held-refusal", false);
+    let (stream_id, _, _, mut receiver) = fixture.admit_unary_echo(UNARY_BODY).await;
+    fixture.quiesce_roster(&[STREAM_ID, stream_id]);
+    let challenge = fixture.unary_challenge(
+        stream_id,
+        StdDuration::from_secs(6),
+        StdDuration::from_secs(2),
+    );
+    let identity = fixture.session().identity.clone();
+    fixture.actor.finish_device_challenge(
+        fixture.key.clone(),
+        challenge,
+        Ok((None, None, Some(identity), None)),
+    );
+    fixture
+        .commit_with_roster(&[(STREAM_ID, 0), (stream_id, 0)])
+        .await;
+    assert_eq!(
+        unary_failure(&mut receiver),
+        Some(("AUTHORIZATION_REVOKED", "not_dispatched")),
+        "the held refusal is answered when the writer resumes"
+    );
+    for _ in 0..16 {
+        tokio::task::yield_now().await;
+    }
+    while let Ok(command) = fixture.actor.rx.try_recv() {
+        assert!(
+            !matches!(command, super::Command::ChallengeAuthorized { .. }),
+            "a held refusal is not read again"
+        );
+    }
+}
+
+/// M6-C207 scope: the freeze answer is only for a result a freeze held.  A
+/// challenge that was never held, whose window lapsed before its result
+/// arrived, keeps the existing `AUTHORIZATION_REVOKED` answer even though the
+/// read itself still authorizes (task row M6-C211 tracks that answer).
+#[tokio::test]
+async fn m6c207_a_lapsed_challenge_never_held_by_a_freeze_is_not_a_freeze_answer() {
+    let mut fixture = FreezeFixture::new("m6c207-never-held", false);
+    assert_eq!(fixture.phase(), RotationPhase::Preparing);
+    let (stream_id, _, _, mut receiver) = fixture.admit_unary_echo(UNARY_BODY).await;
+    let challenge = fixture.unary_challenge(
+        stream_id,
+        StdDuration::from_secs(3),
+        StdDuration::from_secs(2),
+    );
+    let fresh = fixture.authorizing_result(Duration::zero());
+    fixture
+        .actor
+        .finish_device_challenge(fixture.key.clone(), challenge, fresh);
+    assert_eq!(
+        unary_failure(&mut receiver),
+        Some(("AUTHORIZATION_REVOKED", "not_dispatched")),
+        "only a result held by a freeze may be answered ROTATION_FREEZE"
+    );
+}
+
+/// M6-C207: a held result whose read is still valid (1 s old) but whose
+/// challenge window lapsed (3 s old against 2 s) is read again too, so a
+/// grant revoked during the freeze is refused by that read.  Without the
+/// window check the held result would be applied and answered as a freeze.
+#[tokio::test]
+async fn m6c207_a_held_result_with_only_its_challenge_window_lapsed_is_read_again() {
+    let mut fixture = FreezeFixture::new("m6c207-window-only", false);
+    let (stream_id, _, _, mut receiver) = fixture.admit_unary_echo(UNARY_BODY).await;
+    fixture.quiesce_roster(&[STREAM_ID, stream_id]);
+    let challenge = fixture.unary_challenge(
+        stream_id,
+        StdDuration::from_secs(3),
+        StdDuration::from_secs(2),
+    );
+    let held = fixture.authorizing_result(Duration::seconds(1));
+    fixture
+        .actor
+        .finish_device_challenge(fixture.key.clone(), challenge, held);
+    fixture
+        .commit_with_roster(&[(STREAM_ID, 0), (stream_id, 0)])
+        .await;
+    assert_eq!(
+        unary_failure(&mut receiver),
+        None,
+        "a held result past its challenge window is read again"
+    );
+    let (key, reread, catalog_result) = fixture.next_challenge_read().await;
+    assert!(
+        matches!(&catalog_result, Ok((None, _, _, _))),
+        "the catalog has no grant for this consumer"
+    );
+    fixture
+        .actor
+        .finish_device_challenge(key, reread, catalog_result);
+    assert_eq!(
+        unary_failure(&mut receiver),
+        Some(("AUTHORIZATION_REVOKED", "not_dispatched"))
+    );
+    assert!(fixture.drain_control().iter().any(|message| matches!(
+        message,
+        ControlMessage::AuthorizationInvalidated(invalidated)
+            if invalidated.stream_id == stream_id && invalidated.reason == "grant unavailable"
+    )));
+}
