@@ -4728,6 +4728,12 @@ fn echo_failure_response(code: &'static str, execution: &'static str) -> Respons
     if code == "RESOURCE_EXHAUSTED" && execution == "not_dispatched" {
         return echo_capacity_response();
     }
+    // A challenge read that found this relay no longer owns the device, or
+    // an owner lease inside its safety margin (task row M6-C214): the answer
+    // admission gives an owner that is not ready, retryable with its hint.
+    if code == crate::actor::OWNER_UNAVAILABLE_CODE && execution == "not_dispatched" {
+        return retryable_peer_failure_response(OWNER_NOT_READY_RETRY_AFTER_MS);
+    }
     failure_outcome(code, execution)
 }
 
@@ -5164,6 +5170,26 @@ mod tests {
         ] {
             assert!(super::forwarded_refusal_close(&body).is_none(), "{body:?}");
         }
+    }
+
+    /// M6-C214: a unary echo refused because this relay lost the device's
+    /// ownership (or its owner lease entered the safety margin) is answered
+    /// as admission answers an owner that is not ready: `503
+    /// PEER_UNAVAILABLE`, `not_dispatched`, retryable, with its hint.
+    #[tokio::test]
+    async fn m6c214_an_unavailable_owner_is_503_peer_unavailable_retryable() {
+        let response =
+            super::echo_failure_response(crate::actor::OWNER_UNAVAILABLE_CODE, "not_dispatched");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(response.headers().get(header::RETRY_AFTER).is_some());
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .expect("bounded body");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("JSON body");
+        assert_eq!(body["code"], "PEER_UNAVAILABLE");
+        assert_eq!(body["execution"], "not_dispatched");
+        assert_eq!(body["retryable"], true);
+        assert!(body["retry_after_ms"].as_u64().is_some_and(|ms| ms > 0));
     }
 
     /// M6-C215: a refusal outside a freeze closes with its own code: 1013

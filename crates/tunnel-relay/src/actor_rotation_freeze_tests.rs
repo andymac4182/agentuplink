@@ -5518,3 +5518,280 @@ async fn m6c211_a_read_showing_a_revocation_is_still_revoked() {
         );
     }
 }
+
+// Task row M6-C214: unary challenge outcomes that are not revocations --
+// an ownership loss, an owner lease inside its safety margin, and a bound
+// that passes between the checks and the send -- are not answered
+// `AUTHORIZATION_REVOKED`; a lapsed consumer token still is.
+
+impl FreezeFixture {
+    /// Apply `result` to a fresh unary echo's challenge of `age` (lifetime
+    /// 2 s), optionally after `adjust` edits the pending echo, and return
+    /// the consumer's answer, the connector's invalidation reason and
+    /// whether anything was confirmed or dispatched.
+    async fn m6c214_apply(
+        &mut self,
+        age: StdDuration,
+        result: impl FnOnce(&Self) -> super::ChallengeAuthorizationResult,
+        adjust: impl FnOnce(&mut super::PendingEcho),
+    ) -> (Option<(&'static str, &'static str)>, Option<String>, bool) {
+        let (stream_id, _, _, mut receiver) = self.admit_unary_echo(UNARY_BODY).await;
+        adjust(
+            self.actor
+                .sessions
+                .get_mut(&self.key.scope())
+                .and_then(|session| session.pending.get_mut(&stream_id))
+                .expect("finite echo is pending"),
+        );
+        let challenge = self.unary_challenge(stream_id, age, StdDuration::from_secs(2));
+        let result = result(self);
+        self.actor
+            .finish_device_challenge(self.key.clone(), challenge, result);
+        let control = self.drain_control();
+        let reason = control.iter().find_map(|message| match message {
+            ControlMessage::AuthorizationInvalidated(invalidated)
+                if invalidated.stream_id == stream_id =>
+            {
+                Some(invalidated.reason.clone())
+            }
+            _ => None,
+        });
+        let confirmed = control
+            .iter()
+            .any(|message| matches!(message, ControlMessage::AuthorizationConfirmed(_)));
+        let dispatched = !sequenced(&drain_data(&mut self.old_rx)).is_empty();
+        (
+            unary_failure(&mut receiver),
+            reason,
+            confirmed || dispatched,
+        )
+    }
+}
+
+/// M6-C214: a challenge read that finds no owner claim (this relay lost the
+/// device's ownership) answers the retryable `PEER_UNAVAILABLE`/
+/// `not_dispatched` admission gives an owner that is not ready; the connector
+/// is told "owner unavailable" as before.
+#[tokio::test]
+async fn m6c214_a_read_finding_no_owner_claim_is_owner_not_ready_not_revoked() {
+    let mut fixture = FreezeFixture::new("m6c214-no-owner", false);
+    let answer = fixture
+        .m6c214_apply(
+            StdDuration::from_millis(10),
+            |fixture| {
+                let mut result = fixture.authorizing_result(Duration::zero());
+                if let Ok((_, owner, _, _)) = &mut result {
+                    *owner = None;
+                }
+                result
+            },
+            |_| {},
+        )
+        .await;
+    assert_eq!(
+        answer,
+        (
+            Some(("PEER_UNAVAILABLE", "not_dispatched")),
+            Some("owner unavailable".to_owned()),
+            false
+        )
+    );
+}
+
+/// M6-C214: an owner lease inside its safety margin when the challenge is
+/// applied (the owner deadline already passed) answers `PEER_UNAVAILABLE`,
+/// whether or not the challenge window lapsed too; the connector is told
+/// "authorization expired" and nothing is confirmed or dispatched.
+#[tokio::test]
+async fn m6c214_an_owner_lease_inside_its_margin_is_owner_not_ready_not_revoked() {
+    for (label, age) in [
+        ("m6c214-owner-margin", StdDuration::from_millis(10)),
+        ("m6c214-owner-margin-lapsed", StdDuration::from_secs(3)),
+    ] {
+        let mut fixture = FreezeFixture::new(label, false);
+        let answer = fixture
+            .m6c214_apply(
+                age,
+                |fixture| {
+                    let mut result = fixture.authorizing_result(Duration::zero());
+                    if let Ok((_, _, _, owner_deadline)) = &mut result {
+                        *owner_deadline = Some(Instant::now());
+                    }
+                    result
+                },
+                |_| {},
+            )
+            .await;
+        assert_eq!(
+            answer,
+            (
+                Some(("PEER_UNAVAILABLE", "not_dispatched")),
+                Some("authorization expired".to_owned()),
+                false
+            ),
+            "{label}"
+        );
+    }
+}
+
+/// M6-C214: a bound that passes between the checks and the send in
+/// `finish_device_challenge` is the same lapse by another route: the owner
+/// lease's wall-clock margin answers `PEER_UNAVAILABLE`, and the challenge
+/// window (the dispatch deadline, made to pass by the test hook) answers
+/// `AUTHORIZATION_UNAVAILABLE`.  Nothing is confirmed or dispatched.
+#[tokio::test]
+async fn m6c214_a_bound_passing_before_the_send_is_not_a_revocation() {
+    // The owner lease: its instant deadline is open, its wall-clock lease is
+    // already inside the safety margin.
+    let mut fixture = FreezeFixture::new("m6c214-race-owner", false);
+    let answer = fixture
+        .m6c214_apply(
+            StdDuration::from_millis(10),
+            |fixture| {
+                let mut result = fixture.authorizing_result(Duration::zero());
+                if let Ok((_, Some(owner), _, _)) = &mut result {
+                    owner.lease_expires_at = Utc::now() + Duration::milliseconds(1);
+                }
+                result
+            },
+            |_| {},
+        )
+        .await;
+    assert_eq!(
+        answer,
+        (
+            Some(("PEER_UNAVAILABLE", "not_dispatched")),
+            Some("authorization expired".to_owned()),
+            false
+        ),
+        "owner lease"
+    );
+
+    // The challenge window: 50 ms left at the checks, 120 ms blocked before
+    // the send.
+    let mut fixture = FreezeFixture::new("m6c214-race-window", false);
+    fixture.actor.dispatch_race_delay = Some(StdDuration::from_millis(120));
+    let answer = fixture
+        .m6c214_apply(
+            StdDuration::from_millis(1_950),
+            |fixture| fixture.authorizing_result(Duration::zero()),
+            |_| {},
+        )
+        .await;
+    assert_eq!(
+        answer,
+        (
+            Some(("AUTHORIZATION_UNAVAILABLE", "not_dispatched")),
+            Some("authorization expired".to_owned()),
+            false
+        ),
+        "challenge window"
+    );
+}
+
+/// M6-C214 control: revocation stays strict at the send too.  A consumer
+/// token that lapses between the checks and the send is still
+/// `AUTHORIZATION_REVOKED`, and without the hook the same challenge is
+/// dispatched (the fixture can go green).
+#[tokio::test]
+async fn m6c214_a_token_passing_before_the_send_is_still_revoked() {
+    let mut fixture = FreezeFixture::new("m6c214-race-token", false);
+    fixture.actor.dispatch_race_delay = Some(StdDuration::from_millis(120));
+    let answer = fixture
+        .m6c214_apply(
+            StdDuration::from_millis(10),
+            |fixture| fixture.authorizing_result(Duration::zero()),
+            |pending| pending.consumer_expires_at = Utc::now() + Duration::milliseconds(60),
+        )
+        .await;
+    assert_eq!(
+        answer,
+        (
+            Some(("AUTHORIZATION_REVOKED", "not_dispatched")),
+            Some("authorization expired".to_owned()),
+            false
+        )
+    );
+
+    let mut fixture = FreezeFixture::new("m6c214-race-none", false);
+    let answer = fixture
+        .m6c214_apply(
+            StdDuration::from_millis(10),
+            |fixture| fixture.authorizing_result(Duration::zero()),
+            |_| {},
+        )
+        .await;
+    assert_eq!(
+        answer,
+        (None, None, true),
+        "an open challenge is dispatched"
+    );
+}
+
+/// M6-C214: the lapse classification, every bound.  Revocation-shaped bounds
+/// win over the owner, the owner over the window.
+#[test]
+fn m6c214_lapsed_challenge_codes() {
+    use super::{ChallengeBounds, lapsed_challenge_code};
+    let open = ChallengeBounds {
+        window: true,
+        snapshot: true,
+        token: true,
+        owner: true,
+        credential: true,
+    };
+    for held in [false, true] {
+        for lapsed in [
+            ChallengeBounds {
+                token: false,
+                ..open
+            },
+            ChallengeBounds {
+                snapshot: false,
+                ..open
+            },
+            ChallengeBounds {
+                credential: false,
+                ..open
+            },
+            ChallengeBounds {
+                token: false,
+                owner: false,
+                window: false,
+                ..open
+            },
+        ] {
+            assert_eq!(
+                lapsed_challenge_code(lapsed, held),
+                "AUTHORIZATION_REVOKED",
+                "{lapsed:?}"
+            );
+        }
+        for lapsed in [
+            ChallengeBounds {
+                owner: false,
+                ..open
+            },
+            ChallengeBounds {
+                owner: false,
+                window: false,
+                ..open
+            },
+        ] {
+            assert_eq!(
+                lapsed_challenge_code(lapsed, held),
+                "PEER_UNAVAILABLE",
+                "{lapsed:?}"
+            );
+        }
+    }
+    let window = ChallengeBounds {
+        window: false,
+        ..open
+    };
+    assert_eq!(
+        lapsed_challenge_code(window, false),
+        "AUTHORIZATION_UNAVAILABLE"
+    );
+    assert_eq!(lapsed_challenge_code(window, true), "ROTATION_FREEZE");
+}
