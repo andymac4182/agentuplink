@@ -1986,9 +1986,29 @@ struct PendingEcho {
     /// frozen fence; the result is re-applied, with every freshness check,
     /// once the writer resumes (task row M7-C93).
     deferred_authorization: Option<(DeviceChallenge, ChallengeAuthorizationResult)>,
+    /// Whether this echo's authorization result was held by a rotation freeze
+    /// and, if so, whether it has been read again since (task row M6-C207).
+    freeze_authorization: FreezeAuthorization,
     /// Where an exchange whose consumer was already answered stands on its
     /// way to a provable terminal (task row M7-C94).
     abandon: UnaryAbandon,
+}
+
+/// A unary echo's authorization result and a rotation freeze (task row
+/// M6-C207).  A result held across a freeze is applied when the writer
+/// resumes; if it went stale meanwhile -- its read's `valid_until` or the
+/// challenge's window passed -- the relay reads the catalog again instead of
+/// refusing an unrevoked request as `AUTHORIZATION_REVOKED`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum FreezeAuthorization {
+    /// Never held by a freeze.
+    #[default]
+    NotHeld,
+    /// Held by a freeze and not read again since.
+    Held,
+    /// Held, found stale when the writer resumed, and read again: this
+    /// result is fresh, so it is applied as it stands.
+    Reread,
 }
 
 /// The state of a unary echo whose consumer has been answered by an exit
@@ -2026,6 +2046,21 @@ struct UnaryAbandon {
 }
 
 impl PendingEcho {
+    /// The execution outcome of an echo whose wait ended without an answer
+    /// (the operation timeout or its session ending), task row M6-C205.
+    /// The connector can run a unary echo only on the relay's DATA and FIN,
+    /// and `dispatched` is set only once both are queued, so an echo that is
+    /// not `dispatched` provably did not run: `not_dispatched`.  Once they
+    /// are queued the device may have run it, whatever happened afterwards:
+    /// `unknown`.
+    fn interrupted_execution(&self) -> &'static str {
+        if self.dispatched {
+            "unknown"
+        } else {
+            "not_dispatched"
+        }
+    }
+
     /// The relay->connector sequence this exchange has emitted: its FIN once
     /// DATA and FIN are queued, its RESET when an abandoned exchange was
     /// ended before dispatch, nothing otherwise.
@@ -6049,6 +6084,7 @@ impl RelayActor {
                 dispatched: false,
                 authorization_in_flight: false,
                 deferred_authorization: None,
+                freeze_authorization: FreezeAuthorization::NotHeld,
                 abandon: UnaryAbandon::default(),
             },
         );
@@ -12349,9 +12385,24 @@ impl RelayActor {
                     }
                     // The connector's own capacity refusal is a per-request,
                     // retryable capacity answer, not a device fault (task row
-                    // M6-C120); every other refusal stays DEVICE_REJECTED.
+                    // M6-C120).  So is its `GOAWAY` while a scheduled rotation
+                    // attempt freezes admission (task row M6-C204): the owner
+                    // sent the OPEN before QUIESCE, the connector dequeued it
+                    // from its deferred-OPEN queue after QUIESCE stopped its
+                    // admission, and nothing ran.  It gets the answer a new
+                    // request gets during the same freeze, `ROTATION_FREEZE`
+                    // with its retry hint.  (In recovery the loss of the
+                    // active carrier has already answered every pending
+                    // echo.)  A `GOAWAY` outside a freeze (the connector
+                    // shutting down) and every other refusal stay
+                    // DEVICE_REJECTED.
                     let code = if rejected.code == "RESOURCE_EXHAUSTED" {
                         "RESOURCE_EXHAUSTED"
+                    } else if rejected.code
+                        == tunnel_protocol::open_refusal::CONNECTOR_DRAINING.code()
+                        && freeze_hold::attempt_frozen(session)
+                    {
+                        freeze_hold::ROTATION_FREEZE_ECHO_CODE
                     } else {
                         "DEVICE_REJECTED"
                     };
@@ -12909,6 +12960,21 @@ impl RelayActor {
             }
             return;
         };
+        self.spawn_challenge_read(key, challenge, consumer, service_id, read_started_at, spki);
+    }
+
+    /// Read the catalog for one device challenge: the grant from
+    /// `read_started_at`, the owner claim and the device identity.  The
+    /// result returns to the actor as `Command::ChallengeAuthorized`.
+    fn spawn_challenge_read(
+        &mut self,
+        key: SessionKey,
+        challenge: DeviceChallenge,
+        consumer: AuthenticatedConsumer,
+        service_id: Uuid,
+        read_started_at: chrono::DateTime<Utc>,
+        spki: String,
+    ) {
         let catalog = self.catalog.clone();
         let command_tx = self.command_tx.clone();
         let cancel = self.options.shutdown.clone();
@@ -12994,7 +13060,34 @@ impl RelayActor {
                 && pending.deferred_authorization.is_none()
             {
                 pending.deferred_authorization = Some((challenge, result));
+                pending.freeze_authorization = FreezeAuthorization::Held;
             }
+            return;
+        }
+        // A result held across a freeze was read before it (task row
+        // M6-C207).  The catalog bounds a read to five seconds from its start
+        // and the relay confirms a challenge only inside its window, so after
+        // a longer freeze the held result is stale although nothing changed:
+        // applying it would refuse the request `AUTHORIZATION_REVOKED`.  Read
+        // the catalog again instead, as M6-C180 does for a late challenge.
+        // Only an authorizing result is re-read: a held refusal stands, and
+        // the fresh read applies every check below, so a grant revoked during
+        // the freeze is still refused.
+        let freeze_authorization = pending.freeze_authorization;
+        if freeze_authorization == FreezeAuthorization::Held
+            && let Ok((Some(held), _, _, _)) = &result
+            && (held.valid_until <= Utc::now()
+                || challenge.received_at.elapsed() >= challenge.lifetime)
+        {
+            let consumer = pending.consumer.clone();
+            let service_id = pending.service_id;
+            let spki = session.identity.spki_fingerprint.clone();
+            if let Some(session) = self.session_mut(&key)
+                && let Some(pending) = session.pending.get_mut(&challenge.stream_id)
+            {
+                pending.freeze_authorization = FreezeAuthorization::Reread;
+            }
+            self.spawn_challenge_read(key, challenge, consumer, service_id, Utc::now(), spki);
             return;
         }
         let consumer_expires_at = pending.consumer_expires_at;
@@ -13079,11 +13172,29 @@ impl RelayActor {
             .min(credential_remaining);
         let remaining_ms = remaining.as_millis().min(5_000) as u64;
         if remaining_ms == 0 {
-            self.invalidate_pending(
+            // A freeze that outlasted the challenge's window, with a fresh
+            // read still authorizing and every other bound open, is the
+            // freeze's doing, not a revocation (task row M6-C207): the
+            // challenge can no longer be confirmed, nothing was dispatched,
+            // and the consumer gets the retryable answer a request refused by
+            // the same freeze gets.  The connector is told as before.
+            let freeze_lapsed = freeze_authorization != FreezeAuthorization::NotHeld
+                && challenge_remaining.is_zero()
+                && !snapshot_remaining.is_zero()
+                && !token_remaining.is_zero()
+                && !owner_remaining.is_zero()
+                && !credential_remaining.is_zero();
+            let code = if freeze_lapsed {
+                freeze_hold::ROTATION_FREEZE_ECHO_CODE
+            } else {
+                "AUTHORIZATION_REVOKED"
+            };
+            self.invalidate_pending_with(
                 &key,
                 challenge.stream_id,
                 &challenge,
                 "authorization expired",
+                code,
             );
             return;
         }
@@ -15751,9 +15862,10 @@ impl RelayActor {
                 session.queued_bytes = 0;
                 for (_, pending) in pending {
                     release_pending_budget(session, &pending);
+                    let execution = pending.interrupted_execution();
                     let _ = pending.response.send(EchoOutcome::Failure {
                         code: "REVERSE_CHANNEL_INTERRUPTED",
-                        execution: "unknown",
+                        execution,
                     });
                 }
             }
@@ -15989,9 +16101,10 @@ impl RelayActor {
                 .len()
                 .saturating_add(pending.response_body.len());
             queue_budget.release(bytes);
+            let execution = pending.interrupted_execution();
             let _ = pending.response.send(EchoOutcome::Failure {
                 code: "REVERSE_CHANNEL_INTERRUPTED",
-                execution: "unknown",
+                execution,
             });
         }
         // Why this session ended, for an ingress that must name a reason to
@@ -16713,8 +16826,10 @@ impl RelayActor {
 
     /// The maintenance tick's expiry of unary echoes: one whose consumer has
     /// gone away (its HTTP request closed) or that has outlived the operation
-    /// timeout is answered `REVERSE_CHANNEL_INTERRUPTED`.  An already
-    /// abandoned exchange is not expired again (task row M7-C94).
+    /// timeout is answered `REVERSE_CHANNEL_INTERRUPTED`, `not_dispatched`
+    /// if its DATA and FIN were never queued and `unknown` otherwise (task row
+    /// M6-C205).  An already abandoned exchange is not expired again (task row
+    /// M7-C94).
     fn expire_pending_echoes(&mut self, key: &SessionKey) {
         let expired: Vec<_> = self
             .session_for(key)
@@ -16728,12 +16843,12 @@ impl RelayActor {
                                 || pending.created_at.elapsed()
                                     > self.options.limits.operation_timeout)
                     })
-                    .map(|(stream_id, _)| *stream_id)
+                    .map(|(stream_id, pending)| (*stream_id, pending.interrupted_execution()))
                     .collect()
             })
             .unwrap_or_default();
-        for stream_id in expired {
-            self.fail_pending(key, stream_id, "REVERSE_CHANNEL_INTERRUPTED", "unknown");
+        for (stream_id, execution) in expired {
+            self.fail_pending(key, stream_id, "REVERSE_CHANNEL_INTERRUPTED", execution);
         }
     }
 
@@ -16904,6 +17019,18 @@ impl RelayActor {
         challenge: &DeviceChallenge,
         reason: &str,
     ) {
+        self.invalidate_pending_with(key, stream_id, challenge, reason, "AUTHORIZATION_REVOKED");
+    }
+
+    /// [`Self::invalidate_pending`] answering the consumer `code`.
+    fn invalidate_pending_with(
+        &mut self,
+        key: &SessionKey,
+        stream_id: u64,
+        challenge: &DeviceChallenge,
+        reason: &str,
+        code: &'static str,
+    ) {
         let _ = self.send_control(
             key,
             wire::authorization_invalidated(
@@ -16915,7 +17042,7 @@ impl RelayActor {
                 reason,
             ),
         );
-        self.fail_pending(key, stream_id, "AUTHORIZATION_REVOKED", "not_dispatched");
+        self.fail_pending(key, stream_id, code, "not_dispatched");
     }
 
     fn send_control(&self, key: &SessionKey, message: ControlMessage) -> Result<(), RelayError> {
