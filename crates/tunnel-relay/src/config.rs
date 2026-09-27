@@ -765,10 +765,11 @@ pub struct ServeConfig {
     pub listener_refusal_margin: usize,
     /// Task row M6-C193: while the public consumer listener is full (it
     /// refused a connection for capacity within the last second), a served
-    /// keep-alive connection that has lived this many seconds since that
-    /// pressure began is closed after its current response, so waiting
-    /// clients get a permit.  `1..=3600`, default 10.  Not applied to the
-    /// device listener.
+    /// keep-alive connection is closed after its current response once it
+    /// has lived, since that pressure began, an age drawn per connection
+    /// uniformly between 50% and 100% of this many seconds (so 5 -- 10 s by
+    /// default), so waiting clients get a permit.  `1..=3600`, default 10.
+    /// Not applied to the device listener.
     #[serde(default = "default_listener_turnover_max_age_seconds")]
     pub listener_turnover_max_age_seconds: u64,
     /// Task row M6-C193: the same turnover after this many requests served

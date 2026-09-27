@@ -93,8 +93,10 @@ pub const HANDOFF_WAIT: Duration = Duration::from_millis(500);
 /// listener: device control and data sockets are never recycled.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ListenerTurnover {
-    /// Connection age, counted from the later of its first byte and the start
-    /// of the pressure episode, after which it is recycled.  Default
+    /// The upper bound of a connection's turnover age.  Each connection draws
+    /// its own age uniformly between 50% and 100% of this value, counted from
+    /// the later of its first byte and the start of the pressure episode,
+    /// and is recycled once it has lived that long.  Default
     /// [`DEFAULT_TURNOVER_MAX_AGE`]; accepts 1 s..=3600 s.
     pub max_age: Duration,
     /// Requests served since the pressure episode began after which the

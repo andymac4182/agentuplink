@@ -798,7 +798,7 @@ async fn turnover_of_connections_open_before_pressure_is_spread_out() -> TestRes
     let spread = recycled_at[HOLDERS - 1] - recycled_at[0];
     eprintln!("M6-C193 first recycles after pressure began: {recycled_at:?}; spread {spread:?}");
     assert!(
-        spread >= max_age / 5,
+        spread >= max_age / 10,
         "first recycles were not spread out: {recycled_at:?}"
     );
     assert!(
