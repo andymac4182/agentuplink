@@ -1,11 +1,14 @@
-//! Task row M7-C181: a relay whose own served peer key is retired surrenders
-//! the device ownership it holds.
+//! Task rows M7-C181, M7-C182 and M7-C184: a relay whose membership no
+//! longer entitles it to serve surrenders the device ownership it holds.
 //!
 //! Each test drives a real [`MembershipRuntime`] (a signed in-memory
 //! checkpoint authority and record source) and a real relay actor over a
 //! [`MemoryCatalog`], with the production watcher loop
-//! ([`own_key_surrender_loop`]) between them. Reconcile passes are run by
-//! hand so the confirmation count is deterministic.
+//! ([`ownership_surrender_loop`]) between them. Reconcile passes are run by
+//! hand so the confirmation count is deterministic. The time-based bounds
+//! (M7-C182 case (b), M7-C184) are shortened through
+//! [`MembershipRuntime::set_surrender_bounds`]; their derived production
+//! values are pinned separately.
 
 use std::{
     collections::BTreeMap,
@@ -32,7 +35,10 @@ use tunnel_cluster::membership::{
 use tunnel_protocol::ControlMessage;
 use uuid::Uuid;
 
-use super::{ControlOutbound, ControlRegistration, LOCAL_IDENTITY_RETIRED, RelayHandle};
+use super::{
+    Command, ControlOutbound, ControlRegistration, LOCAL_IDENTITY_RETIRED,
+    LOCAL_MEMBERSHIP_WITHDRAWN, MEMBERSHIP_UNREADY_PROLONGED, RelayHandle,
+};
 use crate::{
     RelayOptions,
     clock_offset::{ClockOffsetHealth, Measurement},
@@ -40,9 +46,9 @@ use crate::{
         CheckpointAuthority, CheckpointAuthorityError, CheckpointRequest, CheckpointResponse,
         MembershipFuture, MembershipReadiness, MembershipRecordSource, MembershipRuntime,
         MembershipRuntimeConfig, MembershipSourceError, MembershipUnreadyReason,
-        OWN_KEY_SURRENDER_CONFIRMATIONS,
+        OWN_KEY_SURRENDER_CONFIRMATIONS, OwnershipSurrenderCause, SurrenderBounds,
     },
-    own_key_surrender::own_key_surrender_loop,
+    ownership_surrender::{ownership_surrender_loop, surrender_if_required},
 };
 
 const DEPLOYMENT_ID: &str = "c181-deployment";
@@ -67,6 +73,10 @@ struct SignedAuthority {
     issuer: Arc<MembershipIssuer>,
     next_version: AtomicU64,
     fail: AtomicBool,
+    /// Sign checkpoints that do not name this node (M7-C182, case (a)).
+    omit_node: AtomicBool,
+    /// The minimum record version the checkpoint requires of this node.
+    minimum_version: AtomicU64,
 }
 
 impl CheckpointAuthority for SignedAuthority {
@@ -85,7 +95,14 @@ impl CheckpointAuthority for SignedAuthority {
                 deployment_incarnation: request.deployment_incarnation,
                 checkpoint_version: self.next_version.fetch_add(1, Ordering::AcqRel),
                 nonce: request.nonce,
-                minimum_versions: BTreeMap::from([(NODE_ID.to_owned(), 1)]),
+                minimum_versions: if self.omit_node.load(Ordering::Acquire) {
+                    BTreeMap::new()
+                } else {
+                    BTreeMap::from([(
+                        NODE_ID.to_owned(),
+                        self.minimum_version.load(Ordering::Acquire),
+                    )])
+                },
                 issued_at: now - ChronoDuration::seconds(1),
                 not_before: now - ChronoDuration::seconds(1),
                 expires_at: now + ChronoDuration::seconds(30),
@@ -132,6 +149,16 @@ struct Fixture {
 
 impl Fixture {
     async fn new() -> Self {
+        Self::build(true).await
+    }
+
+    /// A fixture whose watcher is not running, so a test can drive the
+    /// surrender request by hand.
+    async fn without_watcher() -> Self {
+        Self::build(false).await
+    }
+
+    async fn build(watcher: bool) -> Self {
         let (issuer, _private_key) =
             MembershipIssuer::generate(PUBLISHER_KEY_ID).expect("synthetic membership issuer");
         let issuer = Arc::new(issuer);
@@ -139,6 +166,8 @@ impl Fixture {
             issuer: Arc::clone(&issuer),
             next_version: AtomicU64::new(1),
             fail: AtomicBool::new(false),
+            omit_node: AtomicBool::new(false),
+            minimum_version: AtomicU64::new(1),
         });
         let source = RecordSource {
             records: Arc::new(RwLock::new(Vec::new())),
@@ -207,12 +236,14 @@ impl Fixture {
             .await
             .expect("the served key is approved at startup");
         assert_eq!(fixture.membership.readiness(), MembershipReadiness::Ready);
-        tokio::spawn(own_key_surrender_loop(
-            Arc::clone(&fixture.membership),
-            fixture.relay.clone(),
-            POLL,
-            fixture.cancel.child_token(),
-        ));
+        if watcher {
+            tokio::spawn(ownership_surrender_loop(
+                Arc::clone(&fixture.membership),
+                fixture.relay.clone(),
+                POLL,
+                fixture.cancel.child_token(),
+            ));
+        }
         fixture
     }
 
@@ -551,8 +582,13 @@ async fn a_transient_failure_between_own_key_passes_resets_the_confirmation() {
     fixture.shutdown().await;
 }
 
-/// **Control.** A clock offset beyond the cluster skew bound makes the relay
-/// not ready (M7-C175) but is not an own-key retirement: nothing closes.
+/// **Control, not counted as red-first.** A clock offset beyond the cluster
+/// skew bound makes the relay not ready (M7-C175) but is not a membership
+/// condition: nothing closes. Clock-offset health feeds only the `/readyz`
+/// health path; the watcher reads membership state alone, which clock health
+/// never writes. So no mutation of the surrender logic can turn this red --
+/// only rewiring the watcher to a different input could -- and it is kept as
+/// documentation of that separation, not as evidence (review of #228).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_clock_offset_not_ready_never_closes_sessions() {
     let fixture = Fixture::new().await;
@@ -568,6 +604,381 @@ async fn a_clock_offset_not_ready_never_closes_sessions() {
         fixture.owned().await,
         "a clock-offset unready kept the lease"
     );
+    assert_eq!(fixture.live_sessions().await, 1);
+    fixture.shutdown().await;
+}
+
+// ---- M7-C182: a checkpoint that omits this node, or a record below its
+// minimum --------------------------------------------------------------------
+
+/// Bounds for the time-based tests: short enough to wait out, and each far
+/// from the other so only the rule under test can fire.
+const SHORT_BOUND: Duration = Duration::from_millis(400);
+const LONG_BOUND: Duration = Duration::from_secs(3_600);
+
+impl Fixture {
+    /// Remove this node's record from the catalog. Both M7-C182 cases need
+    /// it: a record that *is* in the catalog but is omitted by the
+    /// checkpoint, or below its minimum, fails verification
+    /// (`NodeNotInCheckpoint`, `VersionBelowCheckpoint`) and the pass
+    /// concludes `MembershipRejected` instead, which only M7-C184 bounds.
+    async fn clear_records(&self) {
+        self.source.records.write().await.clear();
+    }
+
+    /// One reconcile pass that concludes `MissingLocalMembership`.
+    async fn missing_membership_pass(&self) {
+        assert!(
+            self.membership.reconcile_once().await.is_err(),
+            "local membership is missing"
+        );
+        assert_eq!(
+            self.membership.readiness(),
+            MembershipReadiness::Unready(MembershipUnreadyReason::MissingLocalMembership)
+        );
+    }
+
+    /// One reconcile pass that concludes `UnknownAuthority`: the checkpoint
+    /// authority fails while the record catalog stays reachable.
+    async fn unknown_authority_pass(&self) {
+        self.authority.fail.store(true, Ordering::Release);
+        assert!(self.membership.reconcile_once().await.is_err());
+        self.authority.fail.store(false, Ordering::Release);
+        assert_eq!(
+            self.membership.readiness(),
+            MembershipReadiness::Unready(MembershipUnreadyReason::UnknownAuthority)
+        );
+    }
+
+    /// One reconcile pass that concludes `CatalogUnavailable`.
+    async fn catalog_unavailable_pass(&self) {
+        self.source.fail.store(true, Ordering::Release);
+        assert!(self.membership.reconcile_once().await.is_err());
+        self.source.fail.store(false, Ordering::Release);
+        assert_eq!(
+            self.membership.readiness(),
+            MembershipReadiness::Unready(MembershipUnreadyReason::CatalogUnavailable)
+        );
+    }
+
+    async fn ready_pass(&self) {
+        self.membership
+            .reconcile_once()
+            .await
+            .expect("membership is ready");
+        assert_eq!(self.membership.readiness(), MembershipReadiness::Ready);
+    }
+
+    fn set_bounds(&self, local_record_below_minimum: Duration, prolonged_unready: Duration) {
+        self.membership.set_surrender_bounds(SurrenderBounds {
+            local_record_below_minimum,
+            prolonged_unready,
+        });
+    }
+
+    /// Wait a quiet window and assert nothing was surrendered.
+    async fn assert_kept(&self, why: &str) {
+        tokio::time::sleep(QUIET_WINDOW).await;
+        assert!(self.owned().await, "{why}: the owner lease was released");
+        assert_eq!(self.live_sessions().await, 1, "{why}: the session closed");
+    }
+}
+
+/// **Red first (M7-C182, case (a)).** A fresh signed checkpoint that no
+/// longer names this node is a signed removal. One pass never surrenders;
+/// the confirming pass does, with `LOCAL_MEMBERSHIP_WITHDRAWN`, and the
+/// lease is released for a successor. Before M7-C182 the relay kept the
+/// session and renewed its lease.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_checkpoint_that_omits_this_node_surrenders_after_two_passes() {
+    let fixture = Fixture::new().await;
+    let mut control = fixture.register().await;
+    fixture.authority.omit_node.store(true, Ordering::Release);
+    fixture.clear_records().await;
+
+    fixture.missing_membership_pass().await;
+    assert_eq!(fixture.membership.ownership_surrender_cause(), None);
+    fixture
+        .assert_kept("a single node-omitted pass must never surrender")
+        .await;
+
+    fixture.missing_membership_pass().await;
+    assert_eq!(
+        fixture.membership.ownership_surrender_cause(),
+        Some(OwnershipSurrenderCause::NodeRemoved)
+    );
+    assert!(
+        wait_until_released(&fixture).await.is_some(),
+        "a relay its checkpoint omits kept its owner lease past {SURRENDER_BOUND:?}"
+    );
+    assert_eq!(
+        rejection_code(&mut control).await.as_deref(),
+        Some(LOCAL_MEMBERSHIP_WITHDRAWN)
+    );
+    assert!(fixture.successor_claims().await);
+
+    // Named again: Ready, and nothing is surrendered any more.
+    fixture.authority.omit_node.store(false, Ordering::Release);
+    fixture.publish(3, SERVED_SPKI).await;
+    fixture.ready_pass().await;
+    assert_eq!(fixture.membership.ownership_surrender_cause(), None);
+    fixture.shutdown().await;
+}
+
+/// **Control (M7-C182, case (b)).** The checkpoint names this node at a
+/// minimum version whose record has not reached Redis yet (the catalog holds
+/// none for it; only the older record retained from bootstrap): the publish
+/// race. Unready, but two passes -- or several -- never surrender
+/// while the production bound (one record lifetime plus skew) has not
+/// elapsed. Red if the record-below-minimum case is confirmed by passes like
+/// a node omission.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_record_below_the_checkpoint_minimum_does_not_surrender_on_two_passes() {
+    let fixture = Fixture::new().await;
+    let _control = fixture.register().await;
+    fixture.authority.minimum_version.store(5, Ordering::Release);
+    fixture.clear_records().await;
+    for _ in 0..OWN_KEY_SURRENDER_CONFIRMATIONS + 2 {
+        fixture.missing_membership_pass().await;
+    }
+    assert_eq!(fixture.membership.ownership_surrender_cause(), None);
+    fixture
+        .assert_kept("the publish race surrendered on passes")
+        .await;
+
+    // The publisher's record lands: Ready, and the run resets.
+    fixture.publish(5, SERVED_SPKI).await;
+    fixture.ready_pass().await;
+    assert_eq!(fixture.membership.ownership_surrender_cause(), None);
+    fixture.shutdown().await;
+}
+
+/// **Red first (M7-C182, case (b)).** A record that stays below the
+/// checkpoint's minimum for longer than the bound is no longer a race in
+/// flight: the relay surrenders with `LOCAL_MEMBERSHIP_WITHDRAWN`. The bound
+/// is measured between passes that each observed the gap, so it is reached
+/// only on evidence. Before M7-C182 nothing ever closed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_record_below_the_minimum_surrenders_once_it_outlasts_the_publish_race_bound() {
+    let fixture = Fixture::new().await;
+    let mut control = fixture.register().await;
+    fixture.set_bounds(SHORT_BOUND, LONG_BOUND);
+    fixture.authority.minimum_version.store(5, Ordering::Release);
+    fixture.clear_records().await;
+
+    fixture.missing_membership_pass().await;
+    fixture.missing_membership_pass().await;
+    // Wall time alone is not evidence: with no further pass, nothing closes
+    // even after the bound has passed since the first observation.
+    tokio::time::sleep(SHORT_BOUND).await;
+    assert_eq!(fixture.membership.ownership_surrender_cause(), None);
+    fixture
+        .assert_kept("the bound was reached without a confirming pass")
+        .await;
+
+    fixture.missing_membership_pass().await;
+    assert_eq!(
+        fixture.membership.ownership_surrender_cause(),
+        Some(OwnershipSurrenderCause::LocalRecordBelowMinimum)
+    );
+    assert!(
+        wait_until_released(&fixture).await.is_some(),
+        "a relay whose record stayed below the minimum kept its lease"
+    );
+    assert_eq!(
+        rejection_code(&mut control).await.as_deref(),
+        Some(LOCAL_MEMBERSHIP_WITHDRAWN)
+    );
+    fixture.shutdown().await;
+}
+
+/// **Control (M7-C182).** A pass with any other conclusion restarts the
+/// below-minimum run: the bound must be outlasted by one unbroken run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_different_conclusion_restarts_the_below_minimum_run() {
+    let fixture = Fixture::new().await;
+    let _control = fixture.register().await;
+    fixture.set_bounds(SHORT_BOUND, LONG_BOUND);
+    fixture.authority.minimum_version.store(5, Ordering::Release);
+    fixture.clear_records().await;
+    fixture.missing_membership_pass().await;
+    tokio::time::sleep(SHORT_BOUND * 3 / 4).await;
+    fixture.catalog_unavailable_pass().await;
+    fixture.missing_membership_pass().await;
+    tokio::time::sleep(SHORT_BOUND * 3 / 4).await;
+    fixture.missing_membership_pass().await;
+    assert_eq!(fixture.membership.ownership_surrender_cause(), None);
+    fixture
+        .assert_kept("two broken runs were summed into one")
+        .await;
+    fixture.shutdown().await;
+}
+
+// ---- M7-C184: a bounded surrender for any prolonged unready state ----------
+
+/// **Red first (M7-C184).** The checkpoint authority stays unusable while
+/// Redis is reachable (`UnknownAuthority`), so the relay could renew its
+/// leases forever. Once the unready time confirmed by passes exceeds the
+/// bound it surrenders with `MEMBERSHIP_UNREADY_PROLONGED`; before that it
+/// keeps its sessions. Before M7-C184 nothing ever closed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_prolonged_unready_relay_with_redis_reachable_surrenders_after_the_bound() {
+    let fixture = Fixture::new().await;
+    let mut control = fixture.register().await;
+    fixture.set_bounds(LONG_BOUND, SHORT_BOUND);
+
+    fixture.unknown_authority_pass().await;
+    tokio::time::sleep(SHORT_BOUND * 5 / 8).await;
+    fixture.unknown_authority_pass().await;
+    assert_eq!(fixture.membership.ownership_surrender_cause(), None);
+    fixture.assert_kept("surrendered before the bound").await;
+
+    fixture.unknown_authority_pass().await;
+    assert_eq!(
+        fixture.membership.ownership_surrender_cause(),
+        Some(OwnershipSurrenderCause::ProlongedUnready)
+    );
+    assert!(
+        wait_until_released(&fixture).await.is_some(),
+        "a relay unready past the bound kept its owner lease"
+    );
+    assert_eq!(
+        rejection_code(&mut control).await.as_deref(),
+        Some(MEMBERSHIP_UNREADY_PROLONGED)
+    );
+    fixture.shutdown().await;
+}
+
+/// **Control (M7-C184).** Time while the catalog is unreachable never counts:
+/// the relay cannot renew then, so leases lapse on their own. Neither an
+/// all-unreachable run nor the intervals either side of an unreachable pass
+/// add up to the bound. Red if `CatalogUnavailable` counts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn catalog_unavailable_time_never_counts_toward_the_prolonged_unready_bound() {
+    let fixture = Fixture::new().await;
+    let _control = fixture.register().await;
+    fixture.set_bounds(LONG_BOUND, SHORT_BOUND);
+    for _ in 0..3 {
+        fixture.catalog_unavailable_pass().await;
+        tokio::time::sleep(SHORT_BOUND / 2).await;
+    }
+    fixture.catalog_unavailable_pass().await;
+    assert_eq!(fixture.membership.ownership_surrender_cause(), None);
+
+    // Counted, unreachable, counted: neither interval touches two counted
+    // passes, so nothing accumulates.
+    fixture.unknown_authority_pass().await;
+    tokio::time::sleep(SHORT_BOUND * 3 / 4).await;
+    fixture.catalog_unavailable_pass().await;
+    tokio::time::sleep(SHORT_BOUND * 3 / 4).await;
+    fixture.unknown_authority_pass().await;
+    assert_eq!(fixture.membership.ownership_surrender_cause(), None);
+    fixture
+        .assert_kept("unreachable-catalog time counted toward the bound")
+        .await;
+    fixture.shutdown().await;
+}
+
+/// **Control (M7-C184).** A `Ready` pass resets the clock: two unready
+/// episodes each shorter than the bound never add up to it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_ready_pass_resets_the_prolonged_unready_clock() {
+    let fixture = Fixture::new().await;
+    let _control = fixture.register().await;
+    fixture.set_bounds(LONG_BOUND, SHORT_BOUND);
+    fixture.unknown_authority_pass().await;
+    tokio::time::sleep(SHORT_BOUND * 3 / 4).await;
+    fixture.unknown_authority_pass().await;
+    fixture.ready_pass().await;
+    fixture.unknown_authority_pass().await;
+    tokio::time::sleep(SHORT_BOUND * 3 / 4).await;
+    fixture.unknown_authority_pass().await;
+    assert_eq!(fixture.membership.ownership_surrender_cause(), None);
+    fixture
+        .assert_kept("two short episodes were summed across a Ready pass")
+        .await;
+    fixture.shutdown().await;
+}
+
+/// The production bounds are derived, not chosen: one record lifetime plus
+/// skew for the publish race (65 s at the configured maxima), and the
+/// longest owner lease plus that margin for any prolonged unready state
+/// (95 s). The runtime uses exactly the derivation from its configuration.
+#[tokio::test]
+async fn the_surrender_bounds_are_derived_from_the_record_lifetime_skew_and_owner_lease() {
+    let bounds = SurrenderBounds::derive(Duration::from_secs(60), Duration::from_secs(5));
+    assert_eq!(bounds.local_record_below_minimum, Duration::from_secs(65));
+    assert_eq!(bounds.prolonged_unready, Duration::from_secs(95));
+    assert_eq!(
+        bounds.prolonged_unready,
+        crate::config::MAX_OWNER_LEASE + bounds.local_record_below_minimum
+    );
+    let fixture = Fixture::new().await;
+    // The fixture runs with a 60 s record lifetime and a 1 s skew.
+    assert_eq!(
+        fixture.membership.surrender_bounds(),
+        SurrenderBounds::derive(Duration::from_secs(60), Duration::from_secs(1))
+    );
+    // Clear of the default rekey convergence hold, which is the same record
+    // lifetime plus skew and never makes a relay unready.
+    assert!(bounds.prolonged_unready > bounds.local_record_below_minimum);
+    fixture.shutdown().await;
+}
+
+// ---- Review of #228: the surrender condition is re-checked in the actor ----
+
+/// **Red first.** The watcher saw the confirmed condition and queued the
+/// request, but a re-sign restored membership before the actor ran it. The
+/// actor re-checks immediately before collecting sessions, so nothing
+/// closes. Held deterministically: the actor is parked on a test command
+/// while the request queues behind it and the re-sign lands.
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+async fn a_surrender_queued_before_a_re_sign_closes_nothing() {
+    let fixture = Fixture::without_watcher().await;
+    let _control = fixture.register().await;
+    fixture.publish(2, OTHER_SPKI).await;
+    fixture.missing_key_pass().await;
+    fixture.missing_key_pass().await;
+    assert_eq!(
+        fixture.membership.ownership_surrender_cause(),
+        Some(OwnershipSurrenderCause::OwnKeyRetired)
+    );
+
+    // Park the actor.
+    let (release, parked) = std::sync::mpsc::channel::<()>();
+    let (entered, entered_rx) = tokio::sync::oneshot::channel::<()>();
+    fixture
+        .relay
+        .tx
+        .send(Command::TestMutate(Box::new(move |_actor| {
+            let _ = entered.send(());
+            tokio::task::block_in_place(|| {
+                let _ = parked.recv();
+            });
+        })))
+        .await
+        .expect("the actor is running");
+    entered_rx.await.expect("the actor is parked");
+
+    // The watcher's request: its pre-check passes and the command queues.
+    let membership = Arc::clone(&fixture.membership);
+    let relay = fixture.relay.clone();
+    let queued =
+        tokio::spawn(async move { surrender_if_required(&membership, &relay).await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!queued.is_finished(), "the request waits behind the parked actor");
+
+    // The re-sign lands while the request is queued.
+    fixture.publish(3, SERVED_SPKI).await;
+    fixture.ready_pass().await;
+    release.send(()).expect("release the actor");
+
+    let outcome = queued
+        .await
+        .expect("the request task")
+        .expect("the actor answered");
+    assert_eq!(outcome, None, "the actor's re-check found nothing to surrender");
+    assert!(fixture.owned().await, "the re-approved relay kept its lease");
     assert_eq!(fixture.live_sessions().await, 1);
     fixture.shutdown().await;
 }

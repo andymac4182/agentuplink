@@ -1228,9 +1228,12 @@ async fn start_cluster(
         shutdown.clone(),
     ));
 
-    // A relay whose own served key its signed record no longer approves
-    // surrenders the device ownership it holds, once confirmed (M7-C181).
-    let surrender_task = running.spawn_own_key_surrender(Arc::clone(&membership));
+    // A relay whose membership no longer entitles it to serve surrenders the
+    // device ownership it holds, once confirmed: its served key retired
+    // (M7-C181), its node removed or its record left below the checkpoint
+    // minimum (M7-C182), or unready past the bound with Redis reachable
+    // (M7-C184).
+    let surrender_task = running.spawn_ownership_surrender(Arc::clone(&membership));
     let rekey_task = rekey.spawn(shutdown.clone());
     let rekey_trigger = RekeyTrigger::install(cluster, Arc::clone(&rekey))?;
 

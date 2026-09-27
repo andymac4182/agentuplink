@@ -65,18 +65,122 @@ pub const MAX_MEMBERSHIP_PERSISTENCE_TIMEOUT: Duration = Duration::from_secs(2);
 pub const MAX_MEMBERSHIP_RECORDS: usize = MAX_AUTHORIZED_NODES;
 /// Consecutive reconcile passes that must each conclude
 /// [`MembershipUnreadyReason::MissingLocalKey`] before this relay surrenders
-/// the device ownership it holds (task row M7-C181).
+/// the device ownership it holds (task row M7-C181). The same count confirms
+/// a checkpoint that omits this node entirely (M7-C182, case (a)).
 ///
 /// **Coordinator decision under the owner's delegation (2026-09-27).** Two:
-/// the pass that first observes the served key missing or revoked, and one
-/// independent confirming pass. One pass is never enough, so a single bad
-/// read of a record cannot close a fleet of device sessions; two keeps the
-/// surrender bounded by one reconcile interval (at most 5 s by
-/// configuration), well inside the 30 s owner lease the surrender exists to
-/// give up early. Any pass that concludes anything else -- `Ready`, a
-/// transient read or checkpoint failure, an expiry -- resets the count, so
-/// the surrender can only ever be later than this bound, never earlier.
+/// the pass that first observes the condition, and one independent
+/// confirming pass. One pass is never enough, so a single bad read of a
+/// record cannot close a fleet of device sessions. The confirming pass is
+/// the next completed pass, so the surrender starts **no later than** about
+/// one reconcile interval (1 to 5 s by configuration) after the first
+/// observation -- an upper bound, not a guaranteed gap: a pass woken early
+/// by a membership notification can confirm sooner, and a slow or failing
+/// authority can delay it (a failure resets the count). No minimum elapsed
+/// time is added: the two passes each fetch a fresh nonce-bound checkpoint
+/// and re-read the catalog, so the confirmation is independent evidence
+/// whatever the gap, and the publish race that *does* need time to settle is
+/// handled separately ([`SurrenderBounds::local_record_below_minimum`]). Any
+/// pass that concludes anything else -- `Ready`, a transient read or
+/// checkpoint failure, an expiry -- resets the count, so the surrender can
+/// only ever be later than this bound, never earlier.
 pub const OWN_KEY_SURRENDER_CONFIRMATIONS: u32 = 2;
+
+/// Why this relay must give up the device ownership it holds while its
+/// membership is unready (M7-C181, M7-C182, M7-C184).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OwnershipSurrenderCause {
+    /// This relay's own verified record no longer approves the key it
+    /// serves, confirmed by [`OWN_KEY_SURRENDER_CONFIRMATIONS`] passes
+    /// (M7-C181).
+    OwnKeyRetired,
+    /// A fresh signed checkpoint does not name this node at all: a signed
+    /// removal, confirmed by [`OWN_KEY_SURRENDER_CONFIRMATIONS`] passes
+    /// (M7-C182, case (a)).
+    NodeRemoved,
+    /// The checkpoint names this node, but no verified record for it reaches
+    /// the checkpoint's minimum version, and that has persisted for
+    /// [`SurrenderBounds::local_record_below_minimum`] (M7-C182, case (b)).
+    LocalRecordBelowMinimum,
+    /// Membership has been unready for a reason other than an unreachable
+    /// catalog for [`SurrenderBounds::prolonged_unready`] (M7-C184).
+    ProlongedUnready,
+}
+
+impl OwnershipSurrenderCause {
+    /// A bounded, payload-free diagnostic label.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::OwnKeyRetired => "own_key_retired",
+            Self::NodeRemoved => "node_removed",
+            Self::LocalRecordBelowMinimum => "local_record_below_minimum",
+            Self::ProlongedUnready => "prolonged_unready",
+        }
+    }
+}
+
+/// The time-based ownership surrender bounds (M7-C182, M7-C184).
+///
+/// Both are derived from configuration by [`SurrenderBounds::derive`]; the
+/// field-level documents give the reasoning. Tests may shorten them.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SurrenderBounds {
+    /// How long a local record below the checkpoint's minimum version must
+    /// persist before it is treated as a removal (M7-C182, case (b)).
+    ///
+    /// **Coordinator decision under the owner's delegation (2026-09-27).**
+    /// One membership record lifetime plus the accepted clock skew (60 s +
+    /// 5 s = 65 s at the configured maximum). No record at the minimum is
+    /// what a publish race produces: the authority's checkpoint names the
+    /// node at a version whose record has not reached Redis yet. A
+    /// publisher that is alive re-signs within one record lifetime, so a
+    /// gap still present after a whole lifetime plus skew is not a race in
+    /// flight but a publisher that is not going to publish this node. (A
+    /// record that is in Redis but below the minimum fails verification and
+    /// is `MembershipRejected`, bounded by `prolonged_unready` instead.)
+    pub local_record_below_minimum: Duration,
+    /// How long membership may stay unready, for any reason except an
+    /// unreachable catalog, before ownership is surrendered (M7-C184).
+    ///
+    /// **Coordinator decision under the owner's delegation (2026-09-27).**
+    /// The longest owner lease (30 s) plus a margin of one record lifetime
+    /// plus skew (65 s): 95 s at the configured maxima. The lease term is
+    /// the point of the rule -- a relay that stopped renewing would have lost
+    /// every device within one lease, so an unready relay that keeps
+    /// renewing should not hold them much longer than that. The margin keeps
+    /// the rule clear of every routine signed-evidence window: a missed
+    /// re-sign or a publish race heals within one record lifetime plus skew,
+    /// the default rekey convergence hold is the same 65 s and never makes
+    /// the relay unready, and every more specific rule (M7-C181, M7-C182)
+    /// fires first. Time while the catalog is unreachable does not count:
+    /// the relay cannot renew leases then, so they lapse on their own.
+    pub prolonged_unready: Duration,
+}
+
+impl SurrenderBounds {
+    /// Derive both bounds from the membership record lifetime, the accepted
+    /// clock skew, and the longest owner lease.
+    #[must_use]
+    pub fn derive(membership_record_lifetime: Duration, max_clock_skew: Duration) -> Self {
+        let local_record_below_minimum = membership_record_lifetime.saturating_add(max_clock_skew);
+        Self {
+            local_record_below_minimum,
+            prolonged_unready: crate::config::MAX_OWNER_LEASE
+                .saturating_add(local_record_below_minimum),
+        }
+    }
+}
+
+/// Which local-membership gap a reconcile pass concluded (M7-C182).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LocalMembershipGap {
+    /// The fresh checkpoint does not name this node.
+    NodeOmitted,
+    /// The checkpoint names this node, but no verified record for it reaches
+    /// the checkpoint's minimum version.
+    BelowMinimum,
+}
 
 /// Boxed async boundary used by the injectable authority and catalog source.
 pub type MembershipFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -563,6 +667,19 @@ impl MembershipUnreadyReason {
             | Self::Cancelled => true,
         }
     }
+
+    /// Whether time unready for this reason counts toward the
+    /// prolonged-unready ownership surrender (M7-C184).
+    ///
+    /// Every reason counts except two. `CatalogUnavailable` is Redis being
+    /// unreachable: the relay cannot renew owner leases then either, so they
+    /// lapse on their own and a surrender would add nothing but a reason to
+    /// close sessions on a transient. `Cancelled` is shutdown, which closes
+    /// every session anyway.
+    #[must_use]
+    pub const fn counts_toward_prolonged_unready(self) -> bool {
+        !matches!(self, Self::CatalogUnavailable | Self::Cancelled)
+    }
 }
 
 impl fmt::Display for MembershipUnreadyReason {
@@ -986,6 +1103,29 @@ struct RuntimeState {
     /// (`MissingLocalKey`). Reset by any pass that concludes otherwise
     /// (M7-C181).
     own_key_missing_passes: u32,
+    /// Consecutive completed passes whose fresh checkpoint did not name this
+    /// node (M7-C182, case (a)). Reset by any pass that concludes otherwise.
+    node_omitted_passes: u32,
+    /// When the current run of consecutive passes that each found this
+    /// node's record below the checkpoint's minimum began, and how long that
+    /// run has been confirmed for: from its first pass to its latest pass
+    /// (M7-C182, case (b)). Measured between completed passes, so it grows
+    /// only on evidence, never on the absence of a pass.
+    below_minimum_since: Option<Instant>,
+    below_minimum_persisted: Duration,
+    /// Unready time confirmed by consecutive passes that each concluded an
+    /// unready reason other than an unreachable catalog (M7-C184). Reset by
+    /// a `Ready` pass. An interval with an unreachable-catalog pass at either
+    /// end adds nothing.
+    prolonged_unready: Duration,
+    /// When the most recent completed pass concluded, if it concluded an
+    /// unready reason that counts toward [`Self::prolonged_unready`].
+    last_counted_unready_pass: Option<Instant>,
+    /// The local-membership gap the pass in progress concluded, if any. Set
+    /// by the pass, consumed when it is counted (M7-C182).
+    pass_local_gap: Option<LocalMembershipGap>,
+    /// The time-based surrender bounds (M7-C182, M7-C184).
+    surrender_bounds: SurrenderBounds,
 }
 
 /// A cancellable, joined membership reconciliation task.
@@ -1217,6 +1357,16 @@ impl MembershipRuntime {
                 callback: None,
                 last_persisted_version_state: persisted_version_state,
                 own_key_missing_passes: 0,
+                node_omitted_passes: 0,
+                below_minimum_since: None,
+                below_minimum_persisted: Duration::ZERO,
+                prolonged_unready: Duration::ZERO,
+                last_counted_unready_pass: None,
+                pass_local_gap: None,
+                surrender_bounds: SurrenderBounds::derive(
+                    config.membership_record_lifetime,
+                    config.max_clock_skew,
+                ),
             }),
             local_serving_spki: Mutex::new(config.local_spki_sha256.clone()),
             config,
@@ -1251,7 +1401,19 @@ impl MembershipRuntime {
         spki: &str,
         now: DateTime<Utc>,
     ) -> LocalKeyApproval {
-        if !matches!(state.readiness, MembershipReadiness::Ready) {
+        // `MissingLocalKey` is the one unready state whose retained evidence
+        // is fully verified and current: the pass verified a fresh checkpoint
+        // and every record, and concluded only that the *served* key is not
+        // approved by this node's record. Answering from that evidence lets
+        // a staged successor the same record approves be switched to, which
+        // is the only way out of that state during a rotation whose
+        // predecessor was withdrawn early (M8-C65). Every other unready
+        // reason means the evidence itself is missing, failed or expired.
+        if !matches!(
+            state.readiness,
+            MembershipReadiness::Ready
+                | MembershipReadiness::Unready(MembershipUnreadyReason::MissingLocalKey)
+        ) {
             return LocalKeyApproval::NotReady;
         }
         let Ok(checkpoint) = state.verifier.fresh_checkpoint(now) else {
@@ -1323,6 +1485,16 @@ impl MembershipRuntime {
             .local_serving_spki
             .lock()
             .expect("local serving SPKI mutex poisoned") = Some(spki.to_owned());
+        // The own-key passes counted so far judged the key served until now;
+        // they are no evidence about the one served from here on (M8-C65).
+        // Held under the reconcile gate, so no pass is counted half-way
+        // through. A fresh pass is requested so readiness follows the switch
+        // without waiting for the periodic interval.
+        self.state
+            .lock()
+            .expect("membership state mutex poisoned")
+            .own_key_missing_passes = 0;
+        self.wake.notify_one();
         Ok(())
     }
 
@@ -1655,12 +1827,132 @@ impl MembershipRuntime {
         // bootstrap may all race.  Keep one complete pass in flight so a
         // slower persistence result cannot be overtaken by a later pass.
         let _reconcile_guard = self.reconcile_gate.lock().await;
+        self.state
+            .lock()
+            .expect("membership state mutex poisoned")
+            .pass_local_gap = None;
         let result = self.reconcile_once_inner().await;
         if let Err(error) = &result {
             self.mark_error(error);
         }
         self.count_own_key_missing_pass(&result);
+        self.count_surrender_evidence(Instant::now());
         result
+    }
+
+    /// Record the local-membership gap the pass in progress concluded.
+    fn note_local_gap(&self, gap: LocalMembershipGap) {
+        self.state
+            .lock()
+            .expect("membership state mutex poisoned")
+            .pass_local_gap = Some(gap);
+    }
+
+    /// Count this completed pass toward the local-membership (M7-C182) and
+    /// prolonged-unready (M7-C184) surrenders. Runs under the reconcile gate
+    /// after the pass has installed its readiness, so passes are counted in
+    /// the order they completed.
+    fn count_surrender_evidence(&self, now: Instant) {
+        let mut state = self.state.lock().expect("membership state mutex poisoned");
+        let gap = state.pass_local_gap.take();
+        let missing_local_membership = state.readiness
+            == MembershipReadiness::Unready(MembershipUnreadyReason::MissingLocalMembership);
+
+        // Case (a): a checkpoint that omits this node, pass-confirmed.
+        state.node_omitted_passes =
+            if missing_local_membership && gap == Some(LocalMembershipGap::NodeOmitted) {
+                state.node_omitted_passes.saturating_add(1)
+            } else {
+                0
+            };
+
+        // Case (b): a record below the checkpoint's minimum, time-confirmed
+        // between the first and the latest pass that each observed it.
+        if missing_local_membership && gap == Some(LocalMembershipGap::BelowMinimum) {
+            let since = *state.below_minimum_since.get_or_insert(now);
+            state.below_minimum_persisted = now.saturating_duration_since(since);
+        } else {
+            state.below_minimum_since = None;
+            state.below_minimum_persisted = Duration::ZERO;
+        }
+
+        // M7-C184: unready while the catalog is reachable.
+        match state.readiness {
+            MembershipReadiness::Ready | MembershipReadiness::Starting => {
+                state.prolonged_unready = Duration::ZERO;
+                state.last_counted_unready_pass = None;
+            }
+            MembershipReadiness::Unready(reason) => {
+                let counted = reason.counts_toward_prolonged_unready();
+                if counted && let Some(previous) = state.last_counted_unready_pass {
+                    state.prolonged_unready = state
+                        .prolonged_unready
+                        .saturating_add(now.saturating_duration_since(previous));
+                }
+                state.last_counted_unready_pass = counted.then_some(now);
+            }
+        }
+    }
+
+    /// Why this relay must surrender the device ownership it holds now, if
+    /// it must (M7-C181, M7-C182, M7-C184). Reads retained in-process state
+    /// only; it never fetches anything.
+    ///
+    /// The more specific causes are checked first. Deliberately narrower
+    /// than "not ready": a single failed pass, an unreachable catalog, or
+    /// clock-offset health (which is not membership state at all) never
+    /// answers `Some` here.
+    #[must_use]
+    pub fn ownership_surrender_cause(&self) -> Option<OwnershipSurrenderCause> {
+        let state = self.state.lock().expect("membership state mutex poisoned");
+        let MembershipReadiness::Unready(reason) = state.readiness else {
+            return None;
+        };
+        let bounds = state.surrender_bounds;
+        match reason {
+            MembershipUnreadyReason::MissingLocalKey
+                if state.own_key_missing_passes >= OWN_KEY_SURRENDER_CONFIRMATIONS =>
+            {
+                Some(OwnershipSurrenderCause::OwnKeyRetired)
+            }
+            MembershipUnreadyReason::MissingLocalMembership
+                if state.node_omitted_passes >= OWN_KEY_SURRENDER_CONFIRMATIONS =>
+            {
+                Some(OwnershipSurrenderCause::NodeRemoved)
+            }
+            MembershipUnreadyReason::MissingLocalMembership
+                if state.below_minimum_since.is_some()
+                    && state.below_minimum_persisted >= bounds.local_record_below_minimum =>
+            {
+                Some(OwnershipSurrenderCause::LocalRecordBelowMinimum)
+            }
+            reason
+                if reason.counts_toward_prolonged_unready()
+                    && state.prolonged_unready >= bounds.prolonged_unready =>
+            {
+                Some(OwnershipSurrenderCause::ProlongedUnready)
+            }
+            _ => None,
+        }
+    }
+
+    /// The time-based surrender bounds in effect.
+    #[must_use]
+    pub fn surrender_bounds(&self) -> SurrenderBounds {
+        self.state
+            .lock()
+            .expect("membership state mutex poisoned")
+            .surrender_bounds
+    }
+
+    /// Replace the time-based surrender bounds. A test seam: the relay
+    /// itself always runs with [`SurrenderBounds::derive`].
+    #[doc(hidden)]
+    pub fn set_surrender_bounds(&self, bounds: SurrenderBounds) {
+        self.state
+            .lock()
+            .expect("membership state mutex poisoned")
+            .surrender_bounds = bounds;
     }
 
     /// Count this completed pass toward the own-key surrender (M7-C181).
@@ -1709,9 +2001,7 @@ impl MembershipRuntime {
     /// lease rules still bound what an unready owner may dispatch.
     #[must_use]
     pub fn own_key_surrender_required(&self) -> bool {
-        let state = self.state.lock().expect("membership state mutex poisoned");
-        state.readiness == MembershipReadiness::Unready(MembershipUnreadyReason::MissingLocalKey)
-            && state.own_key_missing_passes >= OWN_KEY_SURRENDER_CONFIRMATIONS
+        self.ownership_surrender_cause() == Some(OwnershipSurrenderCause::OwnKeyRetired)
     }
 
     async fn reconcile_once_inner(&self) -> Result<MembershipSnapshot, MembershipRuntimeError> {
@@ -1820,6 +2110,11 @@ impl MembershipRuntime {
             let version_state = candidate_verifier.version_state();
             self.persist_if_changed(version_state, checkpoint_received_wall)
                 .await?;
+            // A fresh signed checkpoint that does not name this node, and no
+            // record for it in the catalog (one would have failed
+            // verification as `NodeNotInCheckpoint`): a signed removal
+            // (M7-C182, case (a)).
+            self.note_local_gap(LocalMembershipGap::NodeOmitted);
             self.install_unready_candidate(
                 candidate_verifier,
                 MembershipUnreadyReason::MissingLocalMembership,
@@ -1850,6 +2145,13 @@ impl MembershipRuntime {
             let version_state = candidate_verifier.version_state();
             self.persist_if_changed(version_state, checkpoint_received_wall)
                 .await?;
+            // The node is named, but the catalog holds no record for it and
+            // any record retained from an earlier pass is below the minimum:
+            // what a publish race produces, or a publisher that stopped
+            // writing this node (M7-C182, case (b)). A record that *is* in
+            // the catalog below the minimum fails verification above and is
+            // `MembershipRejected`, which only M7-C184 bounds.
+            self.note_local_gap(LocalMembershipGap::BelowMinimum);
             self.install_unready_candidate(
                 candidate_verifier,
                 MembershipUnreadyReason::MissingLocalMembership,
