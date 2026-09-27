@@ -69,6 +69,10 @@ pub const IPC_IO_TIMEOUT: Duration = Duration::from_secs(2);
 /// terminating NUL; the smaller bound is enforced everywhere so a profile
 /// behaves the same on both.
 pub const MAX_SOCKET_PATH_BYTES: usize = 103;
+/// The reason an authorized supervisor that closed without answering is
+/// reported with. `disconnect` reads it as a supervisor shutting down.
+/// Platform-independent, so `main.rs` compiles where there is no IPC.
+pub const CLOSED_UNANSWERED: &str = "the supervisor closed the connection without answering";
 /// Schema version of [`SupervisorStatus`] and its response envelope.
 pub const IPC_SCHEMA_VERSION: u8 = 1;
 
@@ -646,10 +650,6 @@ mod unix {
         }
     }
 
-    /// The reason an authorized supervisor that closed without answering is
-    /// reported with. `disconnect` reads it as a supervisor shutting down.
-    pub const CLOSED_UNANSWERED: &str = "the supervisor closed the connection without answering";
-
     /// A reset or broken pipe from an authorized supervisor is the same
     /// refusal as a clean close without an answer: the supervisor dropped
     /// this reader. The server closes refused peers cleanly
@@ -835,8 +835,8 @@ mod unix {
 
 #[cfg(unix)]
 pub use unix::{
-    CLOSED_UNANSWERED, ProfileLock, SupervisorIpc, effective_uid, lock_path, query_status,
-    query_status_for_uid, request_disconnect,
+    ProfileLock, SupervisorIpc, effective_uid, lock_path, query_status, query_status_for_uid,
+    request_disconnect,
 };
 
 /// Read the supervisor's status; this platform has no supervisor IPC.

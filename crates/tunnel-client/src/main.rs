@@ -768,8 +768,8 @@ enum StopSignal {
     // SIGTERM has no Windows counterpart here: Ctrl-C arrives as `Interrupt`.
     #[cfg_attr(not(unix), allow(dead_code))]
     Terminate,
-    /// A `disconnect` request on the supervisor socket (Unix only).
-    #[cfg_attr(not(unix), allow(dead_code))]
+    /// A `disconnect` request on the supervisor socket (Unix only in
+    /// practice: no other platform has the socket).
     Disconnect,
 }
 
@@ -859,11 +859,14 @@ impl StopSignals {
         }
         #[cfg(windows)]
         {
-            self.ctrl_c
-                .recv()
-                .await
-                .map(|()| StopSignal::Interrupt)
-                .ok_or_else(closed)
+            // No supervisor IPC on Windows, so `disconnect` stays `None` and
+            // this arm never fires; it is kept so the two platforms read the
+            // same stop requests.
+            let disconnect = &mut self.disconnect;
+            tokio::select! {
+                received = self.ctrl_c.recv() => received.map(|()| StopSignal::Interrupt).ok_or_else(closed),
+                () = next_disconnect(disconnect) => Ok(StopSignal::Disconnect),
+            }
         }
     }
 }
@@ -879,7 +882,6 @@ impl StopSignals {
 /// The next `disconnect` request, or never. Cancel-safe (`mpsc::recv` is).
 /// A closed channel -- the IPC server has stopped -- is not a stop request
 /// and not an error: the signals still stop the process.
-#[cfg_attr(not(unix), allow(dead_code))]
 async fn next_disconnect(receiver: &mut Option<tokio::sync::mpsc::Receiver<()>>) {
     if let Some(channel) = receiver.as_mut()
         && channel.recv().await.is_some()
