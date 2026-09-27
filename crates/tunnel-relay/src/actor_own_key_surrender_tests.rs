@@ -1548,21 +1548,28 @@ async fn this_relays_own_lapsed_record_stays_fatal_beside_a_fresh_peer() {
         .insert(PEER_NODE.to_owned(), 1);
     fixture.set_bounds(LONG_BOUND, SHORT_BOUND);
     let now = Utc::now();
+    let own_expiry = now + ChronoDuration::seconds(1);
     let own = fixture.signed(
         NODE_ID,
         2,
         SERVED_SPKI,
-        now - ChronoDuration::seconds(50),
-        now - ChronoDuration::seconds(10),
+        now - ChronoDuration::seconds(1),
+        own_expiry,
     );
     let peer = fixture.signed(
         PEER_NODE,
         1,
         OTHER_SPKI,
         now - ChronoDuration::seconds(1),
-        now + ChronoDuration::seconds(30),
+        now + ChronoDuration::seconds(50),
     );
     fixture.set_records(vec![own, peer]).await;
+    fixture.ready_pass().await;
+    // This relay's own record, never re-signed, ages past its lifetime and
+    // the 1 s skew while relay-b's stays fresh.
+    while Utc::now() <= own_expiry + ChronoDuration::milliseconds(1_200) {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
     for _ in 0..2 {
         let error = fixture
             .membership
