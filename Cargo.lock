@@ -3495,6 +3495,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "tunnel-authority"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "libc",
+ "rcgen",
+ "ring",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "tokio-rustls",
+ "tunnel-catalog",
+ "tunnel-transport",
+ "uuid",
+ "zeroize",
+]
+
+[[package]]
 name = "tunnel-catalog"
 version = "0.1.0"
 dependencies = [

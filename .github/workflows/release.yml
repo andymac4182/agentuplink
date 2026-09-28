@@ -21,6 +21,8 @@ on:
       - 'crates/tunnel-client/src/main.rs'
       - 'crates/tunnel-relay/src/main.rs'
       - 'crates/tunnel-deadman/src/**'
+      - 'crates/tunnel-authority/src/**'
+      - 'crates/tunnel-authority/Cargo.toml'
 
 permissions:
   contents: read
@@ -96,9 +98,9 @@ jobs:
       - name: Fetch locked dependencies and licence sources
         run: cargo +1.95.0 fetch --locked
       - name: Build release binaries
-        # The relay is not built for device-half targets: Windows (task row
-        # M6-C83 -- it has never run there and refuses to start) and every
-        # CI-only target (M6-C115). The set comes from
+        # The relay and tunnel-authority (M6-C22) are not built for
+        # device-half targets: Windows (task row M6-C83 -- the relay has never
+        # run there and refuses to start) and every CI-only target (M6-C115). The set comes from
         # scripts/package_release.py's `binaries_for`, which also decides
         # what is packed, so the two cannot disagree.
         run: |

@@ -118,6 +118,16 @@ class PackagingTests(unittest.TestCase):
             # The relay is in every Unix bundle and in no Windows bundle.
             has_relay = any("tunnel-relay" in name for name in names)
             self.assertEqual(has_relay, not manifest["target"].endswith("windows-msvc"), file.name)
+            # M6-C22: a full bundle carries exactly four binaries, including
+            # the operator's tunnel-authority; a device half carries two.
+            # Literal names, not binaries_for, so dropping a binary from
+            # BINARIES turns this red instead of moving the expectation.
+            shipped = sorted(name.replace("\\", "/") for name in names
+                             if name.replace("\\", "/").startswith("bin/") and name.rstrip("/") != "bin")
+            windows_bundle = manifest["target"].endswith("windows-msvc")
+            self.assertEqual(shipped, ["bin/tunnel-client.exe", "bin/tunnel-deadman.exe"] if windows_bundle else
+                             ["bin/tunnel-authority", "bin/tunnel-client", "bin/tunnel-deadman", "bin/tunnel-relay"],
+                             file.name)
             self.assertEqual(manifest["sourceSha"], self.sha)
             # M6-C50: the guide and exactly the documents it links ship.
             documents = sorted(name for name in names if name.startswith("docs/"))
@@ -286,6 +296,7 @@ class PackagingTests(unittest.TestCase):
             self.assertIn("bin/tunnel-client", names)
             self.assertIn("bin/tunnel-deadman", names)
             self.assertNotIn("bin/tunnel-relay", names)
+            self.assertNotIn("bin/tunnel-authority", names)
             self.assertFalse([n for n in names if n.startswith("examples/") and "relay" in n], names)
         published = assets(self.output, version(self.root, self.sha, "123"))
         self.assertEqual(len(published), 2 * len(TARGETS))
@@ -341,6 +352,26 @@ class PackagingTests(unittest.TestCase):
         (self.root / "target" / TARGETS[0] / "release" / "tunnel-deadman").unlink()
         with self.assertRaises(ValueError):
             package(self.root, TARGETS[0], self.sha, "123", self.output, {"packages": []})
+
+    def test_missing_authority_fails_a_full_bundle_only(self):
+        # M6-C22: tunnel-authority is part of every full (relay) bundle, so
+        # packaging one without it is refused; a device half never needs it.
+        full = next(t for t in TARGETS if not t.endswith("windows-msvc"))
+        (self.root / "target" / full / "release" / "tunnel-authority").unlink()
+        with self.assertRaises(ValueError):
+            package(self.root, full, self.sha, "123", self.output, {"packages": []})
+        windows = next(t for t in TARGETS if t.endswith("windows-msvc"))
+        self.assertFalse((self.root / "target" / windows / "release" / "tunnel-authority.exe").exists())
+        package(self.root, windows, self.sha, "123", self.output, {"packages": []})
+
+    def test_the_full_bundle_readme_names_four_binaries(self):
+        target = next(t for t in TARGETS if not t.endswith("windows-msvc"))
+        archive = package(self.root, target, self.sha, "123", self.output, {"packages": []})
+        with tarfile.open(archive) as handle:
+            readme = handle.extractfile("README.txt").read().decode()
+        self.assertIn("Keep all four binaries together", readme)
+        self.assertIn("tunnel-authority", readme)
+        self.assertNotIn("three", readme)
 
     def test_incomplete_matrix_fails(self):
         package(self.root, TARGETS[0], self.sha, "123", self.output, {"packages": []})

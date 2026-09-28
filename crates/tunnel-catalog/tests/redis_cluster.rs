@@ -703,3 +703,255 @@ async fn m7_membership_directory_reads_all_nodes_with_per_node_versions() {
     ));
     catalog.cleanup_fixture_namespace().await.ok();
 }
+
+/// The Redis ACL rules the membership publisher needs (task row M6-C22):
+/// `RedisMembershipPublisher::connect` runs `PING` and `INFO server` on each
+/// of its seven connections, and `publish_signed_membership_for_node` runs one
+/// `EVAL` whose script calls `HGET`, `HLEN`, `HSET` and `EXPIRE` on the one
+/// directory key.  With the key pattern that is the eight rules
+/// docs/operator.md section 3.3 states.
+const PUBLISHER_ACL_COMMANDS: [&str; 7] =
+    ["ping", "info", "eval", "hget", "hlen", "hset", "expire"];
+
+fn acl_rules(namespace: &str, secret: &str, commands: &[&str], keys: bool) -> Vec<String> {
+    let mut rules = vec!["reset".to_owned(), "on".to_owned(), format!(">{secret}")];
+    if keys {
+        rules.push(format!("~tunnel-catalog:{namespace}:membership:operator:*"));
+    }
+    rules.push("-@all".to_owned());
+    rules.extend(commands.iter().map(|command| format!("+{command}")));
+    rules
+}
+
+/// `redis://HOST:PORT/DB` with this ACL user's name and secret spliced in.
+fn url_as(base: &str, user: &str, secret: &str) -> String {
+    let rest = base
+        .strip_prefix("redis://")
+        .expect("a plaintext redis:// fixture URL");
+    let rest = rest.rsplit_once('@').map_or(rest, |(_, host)| host);
+    let mut url = String::from("redis://");
+    url.push_str(user);
+    url.push(':');
+    url.push_str(secret);
+    url.push('@');
+    url.push_str(rest);
+    url
+}
+
+/// `(reason, object)` of every `ACL LOG` entry for `user`: `reason` is
+/// `command` or `key`, `object` the refused command or key.
+async fn acl_denials(
+    admin: &mut redis::aio::MultiplexedConnection,
+    user: &str,
+) -> Result<Vec<(String, String)>, String> {
+    let entries: Vec<redis::Value> = redis::cmd("ACL")
+        .arg("LOG")
+        .arg(128)
+        .query_async(admin)
+        .await
+        .map_err(|error| format!("ACL LOG: {error}"))?;
+    let text = |value: &redis::Value| match value {
+        redis::Value::BulkString(bytes) => String::from_utf8_lossy(bytes).into_owned(),
+        redis::Value::SimpleString(text) => text.clone(),
+        other => format!("{other:?}"),
+    };
+    let mut denials = Vec::new();
+    for entry in entries {
+        let pairs: Vec<(redis::Value, redis::Value)> = match entry {
+            redis::Value::Map(pairs) => pairs,
+            redis::Value::Array(items) => items
+                .chunks_exact(2)
+                .map(|pair| (pair[0].clone(), pair[1].clone()))
+                .collect(),
+            _ => continue,
+        };
+        let field = |name: &str| {
+            pairs
+                .iter()
+                .find(|(key, _)| text(key) == name)
+                .map(|(_, value)| text(value))
+                .unwrap_or_default()
+        };
+        if field("username") == user {
+            denials.push((field("reason"), field("object")));
+        }
+    }
+    Ok(denials)
+}
+
+async fn set_acl(
+    admin: &mut redis::aio::MultiplexedConnection,
+    user: &str,
+    rules: Vec<String>,
+) -> Result<(), String> {
+    let mut command = redis::cmd("ACL");
+    command.arg("SETUSER").arg(user);
+    for rule in rules {
+        command.arg(rule);
+    }
+    command
+        .query_async::<()>(admin)
+        .await
+        .map_err(|error| format!("ACL SETUSER: {error}"))
+}
+
+async fn publish_as(url: &str, namespace: &str, node_id: &str) -> Result<(), String> {
+    let publisher = RedisMembershipPublisher::connect(url, namespace)
+        .await
+        .map_err(|error| format!("connect: {error}"))?;
+    publisher
+        .publish_signed_membership_for_node(
+            node_id,
+            &SignedMembershipRecord {
+                version: 1,
+                bytes: format!(r#"{{"node_id":"{node_id}"}}"#).into_bytes(),
+            },
+        )
+        .await
+        .map_err(|error| format!("publish: {error}"))
+}
+
+#[tokio::test]
+#[ignore = "requires TUNNEL_CATALOG_REDIS_URL Redis primary fixture"]
+async fn m6c22_membership_publisher_runs_under_the_documented_acl_and_needs_every_rule() {
+    let url = std::env::var("TUNNEL_CATALOG_REDIS_URL")
+        .expect("M7 Redis tests require TUNNEL_CATALOG_REDIS_URL");
+    let namespace = format!("test-publisher-acl-{}", Uuid::new_v4().simple());
+    let user = format!("test-m6c22-publisher-{}", Uuid::new_v4().simple());
+    // Synthetic, generated per run, never written anywhere but this Redis.
+    let secret = Uuid::new_v4().simple().to_string();
+    let catalog = RedisCatalog::connect(&url, &namespace)
+        .await
+        .expect("connect catalog");
+    let admin = redis::Client::open(url.as_str()).expect("admin client");
+    let mut admin = admin
+        .get_multiplexed_async_connection()
+        .await
+        .expect("admin connection");
+
+    let outcome: Result<(), String> = async {
+        // The full list: the publisher connects and publishes.
+        set_acl(
+            &mut admin,
+            &user,
+            acl_rules(&namespace, &secret, &PUBLISHER_ACL_COMMANDS, true),
+        )
+        .await?;
+        let scoped = url_as(&url, &user, &secret);
+        publish_as(&scoped, &namespace, "relay-acl")
+            .await
+            .map_err(|error| format!("the documented ACL was not enough: {error}"))?;
+        let published = catalog
+            .read_signed_memberships()
+            .await
+            .map_err(|error| format!("read back: {error}"))?;
+        if published.len() != 1 {
+            return Err(format!(
+                "expected one published record, read {}",
+                published.len()
+            ));
+        }
+        // Scoped: the same user cannot read or write any other key in the
+        // namespace.
+        let mut scoped_connection = redis::Client::open(scoped.as_str())
+            .map_err(|error| error.to_string())?
+            .get_multiplexed_async_connection()
+            .await
+            .map_err(|error| error.to_string())?;
+        let outside = format!("tunnel-catalog:{namespace}:meta:deployment_incarnation");
+        let read = redis::cmd("HGET")
+            .arg(&outside)
+            .arg("x")
+            .query_async::<Option<String>>(&mut scoped_connection)
+            .await;
+        if read.is_ok() {
+            return Err("the publisher ACL could read outside membership:operator:*".into());
+        }
+        // Nor write outside it, with a command it holds: refused for the key.
+        let _: () = redis::cmd("ACL")
+            .arg("LOG")
+            .arg("RESET")
+            .query_async(&mut admin)
+            .await
+            .map_err(|error| format!("ACL LOG RESET: {error}"))?;
+        let outside_write = format!("tunnel-catalog:{namespace}:membership:other");
+        let write = redis::cmd("HSET")
+            .arg(&outside_write)
+            .arg("x")
+            .arg("y")
+            .query_async::<i64>(&mut scoped_connection)
+            .await;
+        match write {
+            Ok(_) => {
+                return Err("the publisher ACL could write outside membership:operator:*".into());
+            }
+            Err(error) if error.code() != Some("NOPERM") => {
+                return Err(format!("an outside write failed, but not NOPERM: {error}"));
+            }
+            Err(_) => {}
+        }
+        let denials = acl_denials(&mut admin, &user).await?;
+        if !denials.contains(&("key".to_owned(), outside_write.clone())) {
+            return Err(format!("no key denial for the outside write: {denials:?}"));
+        }
+        // Minimal: without any one of the eight rules, the publisher fails,
+        // and Redis logs a NOPERM denial of exactly that rule (reason
+        // `command` naming the dropped command, or `key` for the pattern).
+        let directory = format!("tunnel-catalog:{namespace}:membership:operator:directory");
+        let mut dropped_rules: Vec<Option<&str>> =
+            PUBLISHER_ACL_COMMANDS.iter().copied().map(Some).collect();
+        dropped_rules.push(None); // the key pattern
+        assert_eq!(dropped_rules.len(), 8, "eight rules, eight controls");
+        for (index, dropped) in dropped_rules.into_iter().enumerate() {
+            let kept: Vec<&str> = PUBLISHER_ACL_COMMANDS
+                .iter()
+                .copied()
+                .filter(|command| Some(*command) != dropped)
+                .collect();
+            set_acl(
+                &mut admin,
+                &user,
+                acl_rules(&namespace, &secret, &kept, dropped.is_some()),
+            )
+            .await?;
+            let _: () = redis::cmd("ACL")
+                .arg("LOG")
+                .arg("RESET")
+                .query_async(&mut admin)
+                .await
+                .map_err(|error| format!("ACL LOG RESET: {error}"))?;
+            let label = dropped.map_or("the key pattern".to_owned(), |command| {
+                format!("+{command}")
+            });
+            if publish_as(&scoped, &namespace, &format!("relay-without-{index}"))
+                .await
+                .is_ok()
+            {
+                return Err(format!("the publisher still worked without {label}"));
+            }
+            let denials = acl_denials(&mut admin, &user).await?;
+            let expected = match dropped {
+                Some(command) => ("command".to_owned(), command.to_owned()),
+                None => ("key".to_owned(), directory.clone()),
+            };
+            if !denials.contains(&expected) {
+                return Err(format!(
+                    "without {label} the publisher failed, but Redis logged no NOPERM denial \
+                     {expected:?}: {denials:?}"
+                ));
+            }
+        }
+        Ok(())
+    }
+    .await;
+
+    let _ = redis::cmd("ACL")
+        .arg("DELUSER")
+        .arg(&user)
+        .query_async::<i64>(&mut admin)
+        .await;
+    catalog.cleanup_fixture_namespace().await.ok();
+    if let Err(message) = outcome {
+        panic!("{message}");
+    }
+}

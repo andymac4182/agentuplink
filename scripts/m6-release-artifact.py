@@ -52,7 +52,9 @@ that is **not the build machine**.  Every check here therefore runs against the
                 because that needs running the file and `doctor` promises to
                 start nothing.  Executing it here is affordable and is the
                 whole point of checking at assembly time.
-  `cli`         `--help`, `--version`, both `check-config` forms and
+  `cli`         `--help`, `--version` (client and, since M6-C22,
+                `tunnel-authority` with both its subcommands' `--help`),
+                both `check-config` forms and
                 `check-serve-config` on every bundled `*-relay.toml`,
                 executed from the unpacked bundle and asserting **content**,
                 not exit status.  An exit code of 0 from a binary that
@@ -175,9 +177,11 @@ PINNED_RUST = "1.95.0"
 # carries 3 executables and 4 configuration examples, and the lockfile
 # resolves 353 registry crates.  The floors sit below the measurement with
 # room for ordinary movement, and above zero by enough that an empty input
-# cannot clear them.
+# cannot clear them.  The executable floor tracks the bundle's binary set
+# exactly (four since M6-C22 added tunnel-authority): a bundle attesting
+# fewer is missing a product binary, not "ordinary movement".
 MIN_BUNDLE_FILES = 10
-MIN_EXECUTABLES = 3
+MIN_EXECUTABLES = 4
 MIN_NOTICE_CRATES = 300
 MIN_EXAMPLES = 2
 # Measured at ec663a7: 628 licence files totalling 3,145,598 bytes across the
@@ -196,10 +200,15 @@ MIN_EMBEDDED_LICENCE_BYTES = 300_000
 #                   the running executable.  It is in this list because it is
 #                   a **required runtime asset**, and because omitting it
 #                   degrades rather than fails.
+#   tunnel-authority  the operator's signing tool (recovery approvals today;
+#                   M6-C22).  It belongs on the authority host, never a relay
+#                   host, which is how signing keys stay off relays; it ships
+#                   in the same Unix bundle as the relay so an operator gets
+#                   it from the same verified download.
 #
 # `tunnel-test-harness` and the three `*-fixture` binaries are deliberately
 # absent: they are test scaffolding, not something an outside tester runs.
-BUNDLE_BINARIES = ("tunnel-client", "tunnel-relay", "tunnel-deadman")
+BUNDLE_BINARIES = ("tunnel-client", "tunnel-relay", "tunnel-deadman", "tunnel-authority")
 
 # Configuration examples a tester needs in order to run the config checks at
 # all.  These are the same files CI dry-runs.
@@ -1240,6 +1249,11 @@ CLI_PROBES = (
     ("tunnel-client", ["--help"], "tunnel-client"),
     ("tunnel-client", ["--version"], "tunnel-client "),
     ("tunnel-relay", ["--help"], "tunnel-relay"),
+    # M6-C22: the operator's signing tool, its version and both subcommands.
+    ("tunnel-authority", ["--help"], "Usage: tunnel-authority"),
+    ("tunnel-authority", ["--version"], "tunnel-authority "),
+    ("tunnel-authority", ["sign-recovery-approval", "--help"], "Usage: tunnel-authority"),
+    ("tunnel-authority", ["generate-recovery-key", "--help"], "Usage: tunnel-authority"),
 )
 
 
@@ -1650,7 +1664,9 @@ DOCS_SHAPE_ONLY_PERMITTED = {
 #: Flags that make a permitted command runnable offline, so a shape-only
 #: command carrying one is a demoted executable command.
 DOCS_SHAPE_ONLY_REFUSED_FLAGS = ("--dry-run",)
-DOCS_BINARIES = ("tunnel-client", "tunnel-relay", "tunnel-deadman")
+# `tunnel-authority` (M6-C22) runs offline, so every command of it the guide
+# shows is executed, and each must assert output like any product command.
+DOCS_BINARIES = ("tunnel-client", "tunnel-relay", "tunnel-deadman", "tunnel-authority")
 # **Pinned, not floored.**  The first version had a floor of 20 executed
 # commands against 35 measured, so 43% of the guide could vanish silently
 # (Fable review of `b041e0a`).  Each section's executed commands, output
@@ -1661,7 +1677,8 @@ DOCS_BINARIES = ("tunnel-client", "tunnel-relay", "tunnel-deadman")
 DOCS_PINNED_SECTIONS: dict[str, tuple[int, int, int]] = {
     # section title: (executed commands, output assertions, shape-only commands)
     # M6-C50 added `ls docs/operator.md` (one assertion): the guide ships.
-    "1. Download and verify": (10, 11, 0),
+    # M6-C22 added `tunnel-authority --version` (one assertion).
+    "1. Download and verify": (11, 12, 0),
     # M6-C21 added section 2.3: `cp` of the records example (exit status
     # only), the `provision-catalog --dry-run` transcript (one assertion), and
     # the two Redis-writing commands as shape-only.  M6-C57 added the
@@ -1681,16 +1698,23 @@ DOCS_PINNED_SECTIONS: dict[str, tuple[int, int, int]] = {
     # shows the backoff events of one retry (five assertion lines), then the
     # `--no-reconnect` one-shot (two lines, as the old example had): +2
     # commands, +5 assertions.
-    "3. Deployment": (11, 15, 2),
+    # M6-C22 added section 3.3's `mkdir` of the authority and recovery
+    # directories (exit status only) and `tunnel-authority
+    # generate-recovery-key` (one assertion).
+    "3. Deployment": (13, 16, 2),
     # M6-C65 added `rebind-redis-run` to section 4 as a third shape-only
     # command.
-    "4. Service installation, upgrade, backup and recovery": (0, 0, 3),
+    # M6-C22 added the offline rehearsal of the recovery approval: the
+    # `printf` of an observation and two `chmod`s (exit status only), one
+    # signing (one assertion) and two refusals (three lines each).
+    "4. Service installation, upgrade, backup and recovery": (6, 7, 3),
     "6. Diagnostics": (4, 7, 0),
 }
 # M6-C219: two untagged fences (the P-256 key example, section 2.2, from
 # acc45776, and the CONNECTION_LIMIT answer, section 3.2, from d59f4316)
 # kept this check red on main; both are prose and now tagged `text`.
-DOCS_PINNED_PROSE_FENCES = 2
+# M6-C22 adds a third: section 3.3's publisher Redis ACL.
+DOCS_PINNED_PROSE_FENCES = 3
 MIN_EXIT_CAUSES = 10
 MIN_EXIT_TABLE_ROWS = 6
 DOCS_SESSION_TIMEOUT = 300
@@ -3769,6 +3793,22 @@ def _replace_at_line(text: str, line: int, old: str, new: str) -> str:
     return "\n".join(lines)
 
 
+def control_assets_authority_removed(bundle: Path) -> tuple[bool, str]:
+    """A bundle without tunnel-authority is missing a product binary (M6-C22).
+
+    Unlike the sentinel, its absence is not silent degradation: the operator
+    has no way to sign a recovery approval.  So it is the generic
+    `binary-missing`, not a witness of its own.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        copy = copy_bundle(bundle, Path(tmp))
+        authority = copy / "bin" / "tunnel-authority"
+        if not authority.is_file():
+            return False, "the bundle under test ships no bin/tunnel-authority; nothing to remove"
+        authority.unlink()
+        return expect_red("assets", copy, "binary-missing")
+
+
 def control_assets_guide_removed(bundle: Path) -> tuple[bool, str]:
     """A bundle without the operator guide is red for that reason (M6-C50)."""
     with tempfile.TemporaryDirectory() as tmp:
@@ -4172,6 +4212,7 @@ CONTROLS: dict[str, list[tuple[str, object]]] = {
         ("the tunnel-deadman sentinel removed", control_assets_sentinel_removed),
         ("a decoy file of the sentinel's name", control_assets_sentinel_is_a_decoy),
         ("a decoy that also exits 2", control_assets_decoy_that_exits_two),
+        ("the tunnel-authority binary removed (M6-C22)", control_assets_authority_removed),
         ("the operator guide removed", control_assets_guide_removed),
         ("a document the guide links removed", control_assets_linked_document_removed),
     ],

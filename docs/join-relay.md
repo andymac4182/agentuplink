@@ -105,13 +105,13 @@ this page, which those archives also carry as `docs/join-relay.md`.
 download` does not mark files as quarantined, so they run as they are. An
 archive downloaded **with a browser** is quarantined, and Gatekeeper refuses
 to open its binaries. After the checksum passes, and only then, remove the
-mark from the three binaries:
+mark from the binaries:
 
 ```text
 xattr -dr com.apple.quarantine bin
 ```
 
-Keep the three binaries in `bin/` together: `tunnel-client` looks for
+Keep the binaries in `bin/` together: `tunnel-client` looks for
 `tunnel-deadman` beside itself. Put `bin/` on your `PATH`, in each terminal you
 use below:
 
