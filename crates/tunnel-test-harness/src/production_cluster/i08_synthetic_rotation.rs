@@ -251,10 +251,16 @@ fn require_non_owner_ingress(scope: &str, ingress: &str, owner: &str) -> Result<
 
 /// M2-06: a scheduled rotation replaces the data carrier and must not reset
 /// the logical stream's per-direction sequence spaces.  Each gate exchanges at
-/// least one record between consecutive rotations, so both directions' fences
-/// (and, since a fence equals its ACK, both ACK cursors) must strictly advance
-/// from one rotation to the next.  A counter reset onto the replacement
-/// carrier would present the same or a lower fence and is rejected here.
+/// least one record between consecutive rotations -- the synthetic gate after
+/// every committed rotation, and the partial-response gate through its
+/// witnessed between-rotation exchange (M7-C217; its burst alone did not
+/// guarantee one) -- so both directions' fences (and, since a fence equals its
+/// ACK, both ACK cursors) must strictly advance from one rotation to the next.
+/// A counter reset onto the replacement carrier would present the same or a
+/// lower fence and is rejected here.  For the partial gate this check is
+/// implied by, and shadowed by, `require_between_rotation_exchanges`
+/// (before fence <= exchange before < exchange after <= after fence); it
+/// still binds the synthetic gate.
 fn require_sequences_advance_across_rotations(
     scope: &str,
     rotations: &[I08RotationEvidence],
@@ -1584,6 +1590,9 @@ const I08_PARTIAL_SCENARIO_TIMEOUT: Duration = Duration::from_secs(150);
 /// Bounded wait for the rotation overlap window used by the adapter-shutdown
 /// clause.
 const I08_PARTIAL_OVERLAP_TIMEOUT: Duration = Duration::from_secs(12);
+/// Bound on the single re-sample a between-rotation exchange may take when
+/// its after-sample finds the next attempt already active (M7-C217).
+const I08_EXCHANGE_RESAMPLE_TIMEOUT: Duration = Duration::from_secs(2);
 /// Bounded wait for the one probe issued after the adapter shutdown.
 const I08_PARTIAL_POST_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 /// The resume unit the connector and relay actually implement.
@@ -1700,9 +1709,15 @@ pub struct I08BetweenRotationExchange {
     /// the complete response.
     pub connector_sequence_before: u64,
     pub connector_sequence_after: u64,
-    /// Both owner samples showed exactly `after_rotation` completed rotations,
-    /// phase `active`, no attempt and no candidate.
+    /// The exchange is proven to precede the next rotation's freeze in both
+    /// directions: both owner samples showed exactly `after_rotation`
+    /// completed rotations, phase `active`, no attempt and no candidate, or
+    /// (see `next_attempt_fenced_above`) the next attempt began after the
+    /// response and its published fences are at or above both cursors.
     pub settled_before_next_attempt: bool,
+    /// The after-sample found the next attempt already active and one bounded
+    /// re-sample proved settlement from that attempt's own published fences.
+    pub next_attempt_fenced_above: bool,
     /// The response matched the checksum derived from its source record with
     /// no cursor gap and no duplicated byte.
     pub checksum_matched: bool,
@@ -2384,7 +2399,59 @@ async fn between_rotation_exchange(
         deadline,
     )
     .await?;
-    let (settled_after, relay_after, connector_after) = sample(&after)?;
+    let (mut settled_after, relay_after, connector_after) = sample(&after)?;
+    let mut next_attempt_fenced_above = false;
+    if settled_before && !settled_after && after.rotations_completed == rotation {
+        // The next attempt may have begun only after the response was fully
+        // received.  One bounded re-sample waits for that attempt's own
+        // per-stream fences: a fence at or above a cursor proves every frame
+        // through that cursor was sequenced before the freeze.  An aborted
+        // attempt that leaves the session settled also counts.  Anything
+        // else -- the freeze landed inside the exchange, or the attempt ended
+        // before its fences were observed -- stays unsettled and fails.
+        let resample_deadline = (Instant::now() + I08_EXCHANGE_RESAMPLE_TIMEOUT).min(deadline);
+        loop {
+            let session = owner_session(
+                cluster,
+                tenant_id,
+                device_id,
+                &cli_status.session_id,
+                cli_status.epoch,
+                resample_deadline,
+            )
+            .await?;
+            if session.rotations_completed != rotation {
+                break;
+            }
+            if sample(&session)?.0 {
+                settled_after = true;
+                break;
+            }
+            if let Some(diagnostics) = session.rotation_diagnostics.as_ref()
+                && diagnostics.attempt_active
+            {
+                let fence = |values: &[(u64, u64)]| {
+                    values
+                        .iter()
+                        .find_map(|(id, sequence)| (*id == stream_id).then_some(*sequence))
+                };
+                if let (Some(relay_fence), Some(connector_fence)) = (
+                    fence(&diagnostics.relay_fence_sequences),
+                    fence(&diagnostics.connector_fence_sequences),
+                ) {
+                    if relay_fence >= relay_after && connector_fence >= connector_after {
+                        settled_after = true;
+                        next_attempt_fenced_above = true;
+                    }
+                    break;
+                }
+            }
+            if Instant::now() >= resample_deadline {
+                break;
+            }
+            sleep(I08_PARTIAL_POLL).await;
+        }
+    }
     Ok(I08BetweenRotationExchange {
         after_rotation: rotation,
         relay_sequence_before: relay_before,
@@ -2392,6 +2459,7 @@ async fn between_rotation_exchange(
         connector_sequence_before: connector_before,
         connector_sequence_after: connector_after,
         settled_before_next_attempt: settled_before && settled_after,
+        next_attempt_fenced_above,
         checksum_matched: delivery.checksum_matched
             && delivery.cursor_gaps == 0
             && delivery.duplicated_bytes == 0,
@@ -3111,6 +3179,7 @@ mod envelope_and_evidence_tests {
                     connector_sequence_before: 4 * rotation,
                     connector_sequence_after: 4 * rotation + 2,
                     settled_before_next_attempt: true,
+                    next_attempt_fenced_above: false,
                     checksum_matched: true,
                 })
                 .collect(),
@@ -3131,14 +3200,32 @@ mod envelope_and_evidence_tests {
     /// carrier.  Every mutation below was accepted before the rules existed.
     #[test]
     fn m2_06_rotation_gates_require_a_non_owner_ingress_and_advancing_sequences() {
-        type Mutation = (&'static str, fn(&mut Vec<I08RotationEvidence>, &mut String));
+        use crate::acceptance_test_support::assert_failed;
+
+        const NON_OWNER: &str = "did not prove a non-owner ingress";
+        const ADVANCE: &str = "did not advance the logical stream sequences";
+        // M7-C217: in the partial gate the witness bounds (before fence <=
+        // exchange before < exchange after <= after fence) imply, and run
+        // before, the strict-advance check, so each fence mutation there is
+        // credited to the witness bound it breaks.
+        const FENCED_BELOW: &str = "fenced below a sequence already exchanged";
+        type Mutation = (
+            &'static str,
+            &'static str,
+            &'static str,
+            fn(&mut Vec<I08RotationEvidence>, &mut String),
+        );
         let mutations: [Mutation; 6] = [
-            ("ingress is the owner", |_, owner| {
+            ("ingress is the owner", NON_OWNER, NON_OWNER, |_, owner| {
                 *owner = "relay-c".to_owned()
             }),
-            ("owner not observed", |_, owner| owner.clear()),
+            ("owner not observed", NON_OWNER, NON_OWNER, |_, owner| {
+                owner.clear()
+            }),
             (
                 "relay sequence reset on replacement carrier",
+                ADVANCE,
+                FENCED_BELOW,
                 |rotations, _| {
                     rotations[2].relay_fence_sequence = 1;
                     rotations[2].relay_ack_sequence = 1;
@@ -3146,6 +3233,8 @@ mod envelope_and_evidence_tests {
             ),
             (
                 "connector sequence reset on replacement carrier",
+                ADVANCE,
+                FENCED_BELOW,
                 |rotations, _| {
                     rotations[1].connector_fence_sequence = 1;
                     rotations[1].connector_ack_sequence = 1;
@@ -3153,6 +3242,8 @@ mod envelope_and_evidence_tests {
             ),
             (
                 "relay sequence stalled across a rotation",
+                ADVANCE,
+                FENCED_BELOW,
                 |rotations, _| {
                     rotations[2].relay_fence_sequence = rotations[1].relay_fence_sequence;
                     rotations[2].relay_ack_sequence = rotations[1].relay_ack_sequence;
@@ -3160,6 +3251,8 @@ mod envelope_and_evidence_tests {
             ),
             (
                 "connector sequence rewound below the first fence",
+                ADVANCE,
+                FENCED_BELOW,
                 |rotations, _| {
                     rotations[1].connector_fence_sequence = 0;
                     rotations[1].connector_ack_sequence = 0;
@@ -3167,22 +3260,30 @@ mod envelope_and_evidence_tests {
             ),
         ];
         // Collected rather than asserted one at a time, so a red run names
-        // every mutation a validator accepts instead of only the first.
-        let mut accepted = Vec::new();
-        for (name, mutate) in mutations {
+        // every mutation a validator accepts or credits to the wrong check.
+        let mut misattributed = Vec::new();
+        for (name, synthetic_fragment, partial_fragment, mutate) in mutations {
             let mut synthetic = valid_evidence();
             mutate(&mut synthetic.rotations, &mut synthetic.owner_relay);
-            if validate_i08_evidence(&synthetic).is_ok() {
-                accepted.push(format!("synthetic-rotation: {name}"));
+            match validate_i08_evidence(&synthetic) {
+                Ok(()) => misattributed.push(format!("synthetic-rotation: {name}: accepted")),
+                Err(error) if !error.to_string().contains(synthetic_fragment) => {
+                    misattributed.push(format!("synthetic-rotation: {name}: {error}"))
+                }
+                Err(_) => {}
             }
 
             let mut partial = valid_partial_evidence();
             mutate(&mut partial.rotations, &mut partial.owner_relay);
-            if validate_i08_partial_response_evidence(&partial).is_ok() {
-                accepted.push(format!("partial-response: {name}"));
+            let diagnostic = assert_failed(validate_i08_partial_response_evidence(&partial));
+            if !diagnostic.contains(partial_fragment) {
+                misattributed.push(format!("partial-response: {name}: {diagnostic}"));
             }
         }
-        assert!(accepted.is_empty(), "validators accepted: {accepted:#?}");
+        assert!(
+            misattributed.is_empty(),
+            "validators accepted or misattributed: {misattributed:#?}"
+        );
     }
 
     /// M7-C217: the exact fence shape hosted CI run 36354897882 reported
@@ -3225,6 +3326,7 @@ mod envelope_and_evidence_tests {
                 connector_sequence_before: 4,
                 connector_sequence_after: 6,
                 settled_before_next_attempt: true,
+                next_attempt_fenced_above: false,
                 checksum_matched: true,
             },
             I08BetweenRotationExchange {
@@ -3234,6 +3336,7 @@ mod envelope_and_evidence_tests {
                 connector_sequence_before: 6,
                 connector_sequence_after: 8,
                 settled_before_next_attempt: true,
+                next_attempt_fenced_above: false,
                 checksum_matched: true,
             },
         ];
