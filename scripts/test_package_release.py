@@ -82,8 +82,22 @@ class PackagingTests(unittest.TestCase):
         for target in TARGETS:
             package(self.root, target, self.sha, "123", self.output, {"packages": []})
 
+    def test_publish_refuses_a_crlf_checksum(self):
+        # M6-C217: the last gate before publishing compares bytes.
+        self.build_all()
+        tag = version(self.root, self.sha, "123")
+        sidecar = next(self.output.glob("*windows-msvc.zip.sha256"))
+        sidecar.write_bytes(sidecar.read_bytes().replace(b"\n", b"\r\n"))
+        with self.assertRaises(ValueError):
+            assets(self.output, tag)
+
     def test_complete_archives_and_checksums(self):
         self.build_all()
+        # M6-C217: every checksum file is one LF-terminated line, on every host.
+        for file in self.output.glob("*.sha256"):
+            body = file.read_bytes()
+            self.assertNotIn(b"\r", body, file.name)
+            self.assertTrue(body.endswith(b"\n") and body.count(b"\n") == 1, file.name)
         self.assertEqual(len(assets(self.output, version(self.root, self.sha, "123"))), 8)
         for file in self.output.iterdir():
             if file.name.endswith("tar.gz"):

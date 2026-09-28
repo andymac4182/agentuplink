@@ -46,7 +46,9 @@ run() { # LABEL WANT_RC CMD...
   [ "$rc" = "$want" ] || die "$label exited $rc (wanted $want)"
 }
 # Count the files among the arguments that contain a secret-shaped string.
-secret_hits() { grep -Elc -- "$DEMO_SECRET_PATTERN" "$@" 2>/dev/null | wc -l | tr -d ' '; }
+# `-l` alone: macOS 27's /usr/bin/grep prints a count line as well as the name
+# for `-lc`, which doubled the tally and failed the positive control (M6-C130).
+secret_hits() { grep -El -- "$DEMO_SECRET_PATTERN" "$@" 2>/dev/null | wc -l | tr -d ' '; }
 
 # Positive control: the scanner must find both shapes.
 # The synthetic JWT and PEM are assembled from fragments at run time, so no

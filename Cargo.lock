@@ -3563,6 +3563,7 @@ dependencies = [
  "tunnel-fs-ninep",
  "tunnel-fs-provider",
  "tunnel-http-bridge",
+ "tunnel-http-forward",
  "tunnel-mcp-export",
  "tunnel-protocol",
  "tunnel-transport",

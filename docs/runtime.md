@@ -401,7 +401,7 @@ Keep transport failures, authentication decisions, admission, and application ou
 | `Pairing` | `DATA_TICKET_USED`, `DATA_KEY_MISMATCH` | Diagnose attachment/epoch/credential lifecycle; a retry needs a fresh authorized ticket |
 | `PeerAdmission` | `PEER_KEY_UNAPPROVED`, `PEER_TRUST_STALE` | Inspect signed membership and node identity; public HTTPS health is unrelated |
 | `Ownership` | `OWNER_FENCED`, `AUTHORITY_UNAVAILABLE` | Follow cluster recovery; never manually copy an old epoch into a new process |
-| `Capacity` | `STREAM_LIMIT`, `QUEUE_BUDGET_EXCEEDED` | Work was refused before dispatch; return a bounded retry hint |
+| `Capacity` | `STREAM_LIMIT`, `QUEUE_BUDGET_EXCEEDED`, `RESOURCE_EXHAUSTED` | Work was refused before dispatch; return a bounded retry hint. `RESOURCE_EXHAUSTED` is also `connect`'s exit `7` (a bounded local budget exhausted) and the retryable `503` a flooded device's unary echo answers from its bounded budget (M6-C120) |
 | `Rotation` | `CANDIDATE_TIMEOUT`, `DRAIN_TIMEOUT` | Inspect connection IDs, watermark gaps, credit stalls, and the absolute overlap deadline |
 | `Adapter` | `ADAPTER_UNAVAILABLE`, `OUTCOME_UNKNOWN` | Distinguish failure before dispatch from an operation that may have executed |
 

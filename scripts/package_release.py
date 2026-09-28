@@ -413,7 +413,9 @@ def package(root, target, sha, run, output, metadata, binaries=None):
                 for file in sorted(staging.iterdir()):
                     handle.add(file, arcname=file.name, filter=normalised_member)
     digest = hashlib.sha256(archive.read_bytes()).hexdigest()
-    (output / f"{filename}.sha256").write_text(f"{digest}  {filename}\n")
+    # Bytes, not text: write_text writes CRLF on Windows, which `shasum -c`
+    # and `sha256sum -c` on macOS and Linux cannot read (M6-C217).
+    (output / f"{filename}.sha256").write_bytes(f"{digest}  {filename}\n".encode())
     return archive
 
 
