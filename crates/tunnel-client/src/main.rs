@@ -658,7 +658,9 @@ fn run_renew(config_path: &Path, step: RenewStep, json: bool) -> Result<(), CliE
                 println!(
                     "{} the renewed credential ({} certificate(s), valid until unix time {}). \
                      A running `tunnel-client connect` keeps the previous pair until it is \
-                     stopped and started (`tunnel-client disconnect`, or the service manager).",
+                     stopped and started (`tunnel-client disconnect`, or the service manager). \
+                     The relay admits the new key only once its catalog holds a credential \
+                     for it (task row M6-C56).",
                     if renewed.already_installed {
                         "Already installed"
                     } else {

@@ -21,8 +21,10 @@ describing a procedure the code does not have.**
 > decision on 2026-09-25). `credentials import` refuses to replace an
 > installed certificate, and the relay's catalog keeps the **first**
 > certificate's expiry, so even a hand-installed renewal stops being accepted
-> at the original expiry. **Re-enrol the device before its certificate
-> expires**, as a new device:
+> at the original expiry. `credentials renew` (M0-07) now replaces the
+> device's own key and certificate safely, but nothing yet registers the new
+> key in the relay's catalog, so it does not lift this limitation.
+> **Re-enrol the device before its certificate expires**, as a new device:
 >
 > 1. Create a new key and CSR in a new profile and have it issued, as in
 >    [section 2.1](#21-device-credentials) (`credentials create`, the
@@ -350,11 +352,15 @@ exit=0
 A healthy local `doctor` does **not** mean the relay will admit the device. The
 relay also needs the device's CA in its `device_tls_client_ca` file, and a
 matching device and credential record in the Redis catalog, which section 2.3
-creates. Certificate renewal and self-service enrollment are not implemented
-(`credentials renew` and `enroll` in
-[runtime.md](runtime.md#proposed-cli-surface); renewal is deferred by owner
-decision, M6-C56, and its shape is still open under M0-03). **Re-enrol before
-the certificate expires**; see the known limitation at the top of this guide.
+creates. Self-service enrollment is not implemented (`enroll` in
+[runtime.md](runtime.md#proposed-cli-surface)). The **device half** of
+renewal is (M0-07): `credentials renew` writes a new key and CSR beside the
+current pair and later swaps an issued certificate in, crash-safely
+([runtime.md](runtime.md#credential-renewal)). The **relay half** is not:
+the new key needs a catalog credential that no shipped command can add for an
+existing device (M6-C56, deferred by owner decision), so the relay refuses the
+renewed pair until then. **Re-enrol before the certificate expires**; see the
+known limitation at the top of this guide.
 
 `credentials import` never leaves the profile half-updated by a **refusal**
 (M6-C55). It checks both destinations before writing either, writes each under
