@@ -397,7 +397,12 @@ pub(super) struct FreezeWatch {
 }
 
 impl FreezeWatch {
-    pub(super) fn record(&self, phase: &str, rotations_completed: u64) {
+    /// `admission_frozen` is the connector's own report that a rotation
+    /// attempt froze its OPEN admission (`rotation_admission_frozen`), which
+    /// the phase alone does not show while a failed candidate waits in
+    /// `preparing` for the owner's ABORT.  It is observed, like the phase,
+    /// never inferred from a refusal.
+    pub(super) fn record(&self, phase: &str, rotations_completed: u64, admission_frozen: bool) {
         let mut started = self.started.lock().unwrap_or_else(|e| e.into_inner());
         if started.is_none() {
             *started = Some(Instant::now());
@@ -407,7 +412,7 @@ impl FreezeWatch {
         *self.phase.lock().unwrap_or_else(|e| e.into_inner()) = phase.to_owned();
         self.rotations_completed
             .store(rotations_completed, Ordering::SeqCst);
-        let frozen = FROZEN_PHASES.contains(&phase);
+        let frozen = FROZEN_PHASES.contains(&phase) || admission_frozen;
         self.frozen.store(frozen, Ordering::SeqCst);
         if frozen {
             self.seen_frozen.store(true, Ordering::SeqCst);
@@ -816,15 +821,23 @@ impl Gate<'_> {
         let mut status = client.status();
         {
             let status = status.borrow_and_update();
-            freeze.record(&status.phase, status.rotations_completed);
+            freeze.record(
+                &status.phase,
+                status.rotations_completed,
+                status.rotation_admission_frozen,
+            );
         }
         self.freeze_task = Some(tokio::spawn(async move {
             while status.changed().await.is_ok() {
-                let (phase, rotations) = {
+                let (phase, rotations, admission_frozen) = {
                     let status = status.borrow_and_update();
-                    (status.phase.clone(), status.rotations_completed)
+                    (
+                        status.phase.clone(),
+                        status.rotations_completed,
+                        status.rotation_admission_frozen,
+                    )
                 };
-                freeze.record(&phase, rotations);
+                freeze.record(&phase, rotations, admission_frozen);
             }
         }));
         let session = timeout(STARTUP_TIMEOUT, client.wait_ready())

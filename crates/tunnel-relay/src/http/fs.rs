@@ -695,9 +695,17 @@ async fn upgrade_session(
 /// this maps to `AuthExpired` rather than `CapabilitiesChanged` — both close
 /// 1008, which is what a consumer branches on, and claiming to distinguish them
 /// here would be inventing a distinction the reason code does not carry.
+///
+/// `AUTHORIZATION_STALE` (task row M4-70) is the connector's authorization
+/// deadline passing with no confirmation -- a refresh that never landed, with
+/// nothing revoked.  It says nothing about the grant, so it closes 1011
+/// `SESSION_LOST`, which a consumer may retry through a fresh admission; a
+/// revoked grant still arrives as `AUTHORIZATION_EXPIRED` (the connector's
+/// answer to the relay's invalidation, or the relay's own publication).
 fn session_close_for_reset(reason: Option<u16>) -> SessionErrorCode {
     match reason {
         Some(tunnel_protocol::reset_reason::AUTHORIZATION_EXPIRED) => SessionErrorCode::AuthExpired,
+        // `AUTHORIZATION_STALE` included.
         _ => SessionErrorCode::SessionLost,
     }
 }

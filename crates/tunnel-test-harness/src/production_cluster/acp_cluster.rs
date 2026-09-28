@@ -848,15 +848,23 @@ impl Gate<'_> {
         let mut status = client.status();
         {
             let status = status.borrow_and_update();
-            freeze.record(&status.phase, status.rotations_completed);
+            freeze.record(
+                &status.phase,
+                status.rotations_completed,
+                status.rotation_admission_frozen,
+            );
         }
         self.freeze_task = Some(tokio::spawn(async move {
             while status.changed().await.is_ok() {
-                let (phase, rotations) = {
+                let (phase, rotations, admission_frozen) = {
                     let status = status.borrow_and_update();
-                    (status.phase.clone(), status.rotations_completed)
+                    (
+                        status.phase.clone(),
+                        status.rotations_completed,
+                        status.rotation_admission_frozen,
+                    )
                 };
-                freeze.record(&phase, rotations);
+                freeze.record(&phase, rotations, admission_frozen);
             }
         }));
         let session = timeout(STARTUP_TIMEOUT, client.wait_ready())
@@ -3011,8 +3019,16 @@ impl Gate<'_> {
         let relay = self.cluster.relay("relay-c")?;
         super::publish_verified_pins(&relay.membership, &relay.pins)?;
         // The route has to be answering again before the next case starts, or
-        // that case would be measuring this one's recovery.
+        // that case would be measuring this one's recovery.  Peer readiness
+        // alone is not that (see `wait_route_answers`): after the pins are
+        // republished the ingress can still refuse `PEER_UNTRUSTED` or
+        // `CLUSTER_UNREADY` for a moment, and `owner-loss`'s first POST met
+        // exactly that once the M4-53 revocation case shifted the later cases
+        // by about a second (the #247 CI follow-up).  So settle the route too,
+        // with a probe that has no side effect and is not a case refusal.
         self.wait_peers_ready().await?;
+        let settle_probes = self.probe_until_route_answers().await?;
+        eprintln!("ACP cluster peer-path-loss route settle probes={settle_probes}");
         Ok(())
     }
 

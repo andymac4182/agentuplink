@@ -37,6 +37,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{Instant, SystemTime};
 
 #[cfg(unix)]
 use bytes::Bytes;
@@ -165,25 +166,104 @@ pub struct StreamAuthority {
     /// Every capability bit, as gate 1 packs them.
     grant: AtomicU64,
     fresh: AtomicBool,
+    /// The instant the counts below are measured from.
+    origin: Instant,
+    /// The same origin on the wall clock.
+    origin_wall: SystemTime,
+    /// When the last confirmation ends, in nanoseconds after `origin`;
+    /// `u64::MAX` for no deadline (task row M4-53).
+    ///
+    /// The provider reads freshness before every host call, and a refresh
+    /// in flight does not move this: a request that waited in the queue past
+    /// the last confirmed deadline is refused even if the actor has not yet
+    /// run its lapse pass (docs/cluster.md step 5, "stop dispatch when the
+    /// prior snapshot expires").
+    until_nanos: AtomicU64,
+    /// The same deadline on the wall clock, in nanoseconds after
+    /// `origin_wall` (review of #247).  The monotonic clock excludes system
+    /// sleep on Linux and macOS, so after a resume it alone would let one
+    /// queued host call run before the actor's next tick noticed; docs/
+    /// cluster.md step 5 requires the check "after any process suspension".
+    /// Both halves must hold, as for the actor's `DualDeadline`, and a wall
+    /// clock stepped back before the origin also counts as stale.
+    until_wall_nanos: AtomicU64,
 }
 
 impl StreamAuthority {
-    /// The authority for a stream admitted at `revision` with `grant`.
+    /// The authority for a stream admitted at `revision` with `grant`, with
+    /// no confirmation deadline of its own.
     #[must_use]
     pub fn new(revision: u64, grant: CapabilitySet) -> Self {
         Self {
             revision: AtomicU64::new(revision),
             grant: AtomicU64::new(pack(grant)),
             fresh: AtomicBool::new(true),
+            origin: Instant::now(),
+            origin_wall: SystemTime::now(),
+            until_nanos: AtomicU64::new(u64::MAX),
+            until_wall_nanos: AtomicU64::new(u64::MAX),
         }
     }
 
-    /// Record that the authorization context is confirmed and inside its
-    /// deadline.
-    pub fn confirm(&self, revision: u64, grant: CapabilitySet) {
+    /// The authority for a stream admitted at `revision` with `grant`,
+    /// confirmed until `until` on the monotonic clock and `until_wall` on
+    /// the wall clock.
+    #[must_use]
+    pub fn new_until(
+        revision: u64,
+        grant: CapabilitySet,
+        until: Instant,
+        until_wall: SystemTime,
+    ) -> Self {
+        let authority = Self::new(revision, grant);
+        authority.set_until(until, until_wall);
+        authority
+    }
+
+    fn set_until(&self, until: Instant, until_wall: SystemTime) {
+        let nanos = until
+            .checked_duration_since(self.origin)
+            .map_or(0, |elapsed| {
+                u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX - 1)
+            });
+        let wall_nanos = until_wall
+            .duration_since(self.origin_wall)
+            .map_or(0, |elapsed| {
+                u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX - 1)
+            });
+        self.until_nanos.store(nanos, Ordering::Release);
+        self.until_wall_nanos.store(wall_nanos, Ordering::Release);
+    }
+
+    /// Record that the authorization context is confirmed until `until`
+    /// (monotonic) and `until_wall` (wall clock).
+    pub fn confirm(
+        &self,
+        revision: u64,
+        grant: CapabilitySet,
+        until: Instant,
+        until_wall: SystemTime,
+    ) {
         self.revision.store(revision, Ordering::Release);
         self.grant.store(pack(grant), Ordering::Release);
+        self.set_until(until, until_wall);
         self.fresh.store(true, Ordering::Release);
+    }
+
+    /// Whether the last confirmation is still inside its deadline on both
+    /// clocks.
+    fn within_deadline(&self) -> bool {
+        let until = self.until_nanos.load(Ordering::Acquire);
+        let until_wall = self.until_wall_nanos.load(Ordering::Acquire);
+        let monotonic_ok = until == u64::MAX
+            || u64::try_from(self.origin.elapsed().as_nanos()).unwrap_or(u64::MAX) < until;
+        let wall_ok = until_wall == u64::MAX
+            || SystemTime::now()
+                .duration_since(self.origin_wall)
+                .is_ok_and(|elapsed| {
+                    u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX) < until_wall
+                });
+        monotonic_ok && wall_ok
     }
 
     /// The capabilities this session currently carries.
@@ -226,7 +306,7 @@ impl Authority for SharedAuthority {
         Authorization {
             revision: self.0.revision.load(Ordering::Acquire),
             grant: unpack(self.0.grant.load(Ordering::Acquire)),
-            fresh: self.0.fresh.load(Ordering::Acquire),
+            fresh: self.0.fresh.load(Ordering::Acquire) && self.0.within_deadline(),
         }
     }
 }
@@ -1162,12 +1242,149 @@ mod tests {
         assert!(!live.fresh);
         assert_eq!(live.grant, grant, "invalidation is not a narrowing");
 
-        authority
-            .0
-            .confirm(12, CapabilitySet::from_slice(&[Capability::List]));
+        authority.0.confirm(
+            12,
+            CapabilitySet::from_slice(&[Capability::List]),
+            std::time::Instant::now() + std::time::Duration::from_secs(60),
+            std::time::SystemTime::now() + std::time::Duration::from_secs(60),
+        );
         let live = authority.current();
         assert_eq!(live.revision, 12);
         assert!(live.fresh);
         assert_eq!(live.grant, CapabilitySet::from_slice(&[Capability::List]));
+    }
+
+    /// Task row M4-53 (review of #247): the authority is stale once its last
+    /// confirmation's deadline passes, whether or not anything invalidated
+    /// it -- the actor may not have run its lapse pass yet, and a refresh in
+    /// flight does not move the deadline.
+    #[test]
+    fn an_authority_past_its_confirmed_deadline_is_stale() {
+        let grant = CapabilitySet::from_slice(&[Capability::Read]);
+        let past = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_millis(1))
+            .expect("a past instant");
+        let authority = super::SharedAuthority::new(Arc::new(StreamAuthority::new(1, grant)));
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
+        authority.0.confirm(1, grant, past, later);
+        assert!(!authority.current().fresh, "past its confirmed deadline");
+        authority.0.confirm(
+            1,
+            grant,
+            std::time::Instant::now() + std::time::Duration::from_secs(60),
+            later,
+        );
+        assert!(authority.current().fresh);
+    }
+
+    /// Review of #247: the wall-clock half.  The monotonic clock excludes
+    /// system sleep on Linux and macOS, so after a resume the monotonic
+    /// deadline can still look open while the wall clock -- which kept
+    /// running through the sleep -- has passed it.  Either half passing makes
+    /// the authority stale.
+    #[test]
+    fn an_authority_past_its_wall_clock_deadline_is_stale() {
+        let grant = CapabilitySet::from_slice(&[Capability::Read]);
+        let authority = super::SharedAuthority::new(Arc::new(StreamAuthority::new(1, grant)));
+        // What a resume from sleep looks like: monotonic time barely moved,
+        // wall time is past the deadline.
+        let wall_past = std::time::SystemTime::now()
+            .checked_sub(std::time::Duration::from_millis(1))
+            .expect("a past wall instant");
+        authority.0.confirm(
+            1,
+            grant,
+            std::time::Instant::now() + std::time::Duration::from_secs(60),
+            wall_past,
+        );
+        assert!(
+            !authority.current().fresh,
+            "past its wall-clock deadline although the monotonic one is open"
+        );
+    }
+
+    /// Task row M4-53 (review of #247): a 9P request that arrives after the
+    /// session's last confirmation ended -- as while a refresh is in flight
+    /// and unanswered -- is not performed: the session closes instead.
+    /// Before the fix the provider read only the invalidation flag, which the
+    /// actor sets at its next lapse pass, so a queued request ran past the
+    /// deadline.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_request_after_the_confirmed_deadline_is_not_performed() {
+        use tunnel_fs_core::SessionErrorCode;
+        use tunnel_fs_ninep::{Frame, Message, NOFID, NONUNAME, NOTAG};
+        let root = tempfile::tempdir().expect("synthetic export root");
+        std::fs::write(root.path().join("data.bin"), b"synthetic").expect("synthetic file");
+        let export = super::FsExport::read_only(root.path());
+        let grant = CapabilitySet::from_slice(&[Capability::Read, Capability::List]);
+        let confirmed_for = std::time::Duration::from_millis(400);
+        let authority = Arc::new(StreamAuthority::new_until(
+            1,
+            grant,
+            std::time::Instant::now() + confirmed_for,
+            std::time::SystemTime::now() + confirmed_for,
+        ));
+        let (inbound_tx, inbound_rx, _) = tunnel_http_bridge::channel(65_536);
+        let (outbound_tx, outbound_rx, _) = tunnel_http_bridge::channel(65_536);
+        let task = tokio::spawn(super::serve(
+            export,
+            grant,
+            authority,
+            inbound_rx,
+            outbound_tx,
+        ));
+        let mut consumer = TestConsumer {
+            tx: inbound_tx,
+            rx: outbound_rx,
+            records: tunnel_fs_provider::RecordDecoder::new(),
+        };
+        consumer
+            .send(Frame::new(
+                NOTAG,
+                Message::Tversion {
+                    msize: 65_536,
+                    version: tunnel_fs_ninep::DIALECT.to_owned(),
+                },
+            ))
+            .await;
+        assert!(matches!(
+            consumer.reply().await.message,
+            Message::Rversion { .. }
+        ));
+        consumer
+            .send(Frame::new(
+                1,
+                Message::Tattach {
+                    fid: 0,
+                    afid: NOFID,
+                    uname: String::new(),
+                    aname: String::new(),
+                    n_uname: NONUNAME,
+                },
+            ))
+            .await;
+        assert!(matches!(
+            consumer.reply().await.message,
+            Message::Rattach { .. }
+        ));
+        // No confirmation renews it; the deadline passes.
+        tokio::time::sleep(confirmed_for + std::time::Duration::from_millis(100)).await;
+        consumer
+            .send(Frame::new(
+                2,
+                Message::Tgetattr {
+                    fid: 0,
+                    request_mask: 0x7ff,
+                },
+            ))
+            .await;
+        match consumer.next(None).await {
+            Seen::Close(code) => assert_eq!(code, SessionErrorCode::AuthExpired),
+            other => panic!("the request past the deadline was answered: {other:?}"),
+        }
+        drop(consumer);
+        let report = task.await.expect("session task");
+        assert_eq!(report.stats.freshness_closures, 1, "{report:?}");
     }
 }

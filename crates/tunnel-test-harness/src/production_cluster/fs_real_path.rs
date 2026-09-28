@@ -268,6 +268,9 @@ pub struct FsRealPathEvidence {
     pub revoked_session_close_code: Option<u16>,
     /// 9P replies that arrived after the revocation.  Must be zero.
     pub revoked_session_replies_after: usize,
+    /// Milliseconds from the catalog's revocation to the consumer's socket
+    /// ending, measured by this gate (task row M4-53).
+    pub revoked_session_close_ms: Option<u64>,
     // (s) task row M4-22: a live session held idle across its grant deadline.
     /// The owner's admission deadline for the session's stream when the hold
     /// began, on the owner's monotonic clock.
@@ -277,6 +280,8 @@ pub struct FsRealPathEvidence {
     pub grant_deadline_crossed: bool,
     /// Distinct later admission deadlines the owner confirmed during the
     /// hold: each is one completed refresh of the stream's authorization.
+    /// Bounded both ways: at least one, and at most
+    /// [`MAX_GRANT_DEADLINE_RENEWALS`] (task row M4-53).
     pub grant_deadline_renewals: usize,
     /// Whether a request sent after the hold was answered on the same fid.
     pub grant_deadline_served_after: bool,
@@ -289,7 +294,7 @@ pub struct FsRealPathEvidence {
 /// A `HarnessError::Process` naming the violated rule.
 #[allow(clippy::too_many_lines)]
 pub fn validate_fs_real_path_evidence(evidence: &FsRealPathEvidence) -> Result<()> {
-    let checks: [(&str, bool); 57] = [
+    let checks: [(&str, bool); 59] = [
         ("three relays", evidence.relay_count == 3),
         (
             "the upgrade ran against the owning relay and the refusal against another",
@@ -519,12 +524,22 @@ pub fn validate_fs_real_path_evidence(evidence: &FsRealPathEvidence) -> Result<(
             evidence.revoked_session_replies_after == 0,
         ),
         (
+            "the revoked session ended within the five-second authorization bound plus its tolerance",
+            evidence
+                .revoked_session_close_ms
+                .is_some_and(|elapsed| elapsed <= REVOCATION_CLOSE_BOUND_MS),
+        ),
+        (
             "the idle session was held across its grant deadline on the owner's clock",
             evidence.grant_deadline_initial_ms.is_some() && evidence.grant_deadline_crossed,
         ),
         (
             "the filesystem stream's authorization was renewed during the hold",
             evidence.grant_deadline_renewals >= 1,
+        ),
+        (
+            "the idle stream refreshed no faster than docs/cluster.md's two-second schedule",
+            evidence.grant_deadline_renewals <= MAX_GRANT_DEADLINE_RENEWALS,
         ),
         (
             "the session kept serving after its original grant deadline",
@@ -1195,6 +1210,24 @@ async fn exercise(
 /// deadline rather than trusted to.
 const GRANT_DEADLINE_HOLD: Duration = Duration::from_secs(12);
 
+/// The most refreshes an idle stream may complete in [`GRANT_DEADLINE_HOLD`]
+/// (task row M4-53).  docs/cluster.md refreshes an active context every two
+/// seconds, and the relay confirms a refresh for the rest of its five-second
+/// snapshot, so the 12 s hold completes about six; three more absorb a
+/// renewal landing at each edge of the hold and a retried refresh.  Before
+/// M4-53 the relay confirmed for its two-second challenge window only and
+/// the connector refreshed with 1.5 s left, so the same hold completed 24.
+const MAX_GRANT_DEADLINE_RENEWALS: usize = 9;
+
+/// How long after the catalog revokes a grant the consumer's live session
+/// must have ended, in milliseconds (task row M4-53).  A relay confirms a
+/// stream for at most five seconds from its catalog read (docs/cluster.md,
+/// operator.md's `revoke-grant`); the tolerance of one second covers the
+/// invalidation's delivery and this gate's own observation, as the
+/// filesystem demo's check does.  The expected close is the next refresh,
+/// about two seconds after the last one.
+const REVOCATION_CLOSE_BOUND_MS: u64 = 6_000;
+
 /// The owner's admission deadline for the one live, admitted stream of this
 /// run's session, if exactly one exists.
 fn live_stream_admission_deadline(snapshot: &RelaySnapshot) -> Option<u64> {
@@ -1460,7 +1493,8 @@ async fn revocation_case(
 
     // Bounded by a deadline, not by a fixed wait: the loop ends the moment the
     // socket does, and a socket that never ends fails by name.
-    let deadline = Instant::now() + AUTHORIZATION_WAIT;
+    let revoked_at = Instant::now();
+    let deadline = revoked_at + AUTHORIZATION_WAIT;
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
@@ -1475,6 +1509,13 @@ async fn revocation_case(
             Ok(Ok(Event::Close(code))) => {
                 evidence.revoked_session_closed = true;
                 evidence.revoked_session_close_code = code;
+                evidence.revoked_session_close_ms =
+                    Some(u64::try_from(revoked_at.elapsed().as_millis()).unwrap_or(u64::MAX));
+                eprintln!(
+                    "fs revocation: the live session closed {:?} {} ms after the revocation",
+                    code,
+                    revoked_at.elapsed().as_millis()
+                );
                 break;
             }
             Ok(Ok(Event::Ended)) => {
@@ -1969,9 +2010,10 @@ mod tests {
             revoked_session_closed: true,
             revoked_session_close_code: Some(AUTHORIZATION_CLOSE),
             revoked_session_replies_after: 0,
+            revoked_session_close_ms: Some(REVOCATION_CLOSE_BOUND_MS),
             grant_deadline_initial_ms: Some(5_000),
             grant_deadline_crossed: true,
-            grant_deadline_renewals: 2,
+            grant_deadline_renewals: MAX_GRANT_DEADLINE_RENEWALS,
             grant_deadline_served_after: true,
         }
     }
@@ -2131,6 +2173,23 @@ mod tests {
             ("the stream's authorization was never renewed", |e| {
                 e.grant_deadline_renewals = 0;
             }),
+            // M4-53: the pre-fix cadence, 24 in the hold, and one past the
+            // bound.
+            ("the idle stream refreshed twice a second", |e| {
+                e.grant_deadline_renewals = 24;
+            }),
+            ("the idle stream refreshed once past the bound", |e| {
+                e.grant_deadline_renewals = MAX_GRANT_DEADLINE_RENEWALS + 1;
+            }),
+            ("the revoked session's close was not timed", |e| {
+                e.revoked_session_close_ms = None;
+            }),
+            (
+                "the revoked session ended a millisecond past the bound",
+                |e| {
+                    e.revoked_session_close_ms = Some(REVOCATION_CLOSE_BOUND_MS + 1);
+                },
+            ),
             (
                 "the session stopped serving after its grant deadline",
                 |e| {

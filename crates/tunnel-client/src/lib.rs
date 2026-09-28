@@ -261,6 +261,13 @@ pub struct ConnectionStatus {
     pub queue_frames: usize,
     pub queue_bytes: usize,
     pub rotations_completed: u64,
+    /// Whether this connector has frozen OPEN admission for a scheduled
+    /// rotation attempt: from its candidate's failure in `preparing`, or from
+    /// QUIESCE, until the attempt commits or its abort completes.  In
+    /// `preparing` the phase alone does not show it -- the connector keeps
+    /// the phase while it waits for the owner's ABORT decision -- so an
+    /// observer that gates retries on an observed freeze reads this too.
+    pub rotation_admission_frozen: bool,
     /// Current retained-recovery attempt number, or the last completed
     /// attempt carried with a verified successor reset.  This is bounded by
     /// the protocol's maximum recovery attempts and never contains payloads.
@@ -464,6 +471,7 @@ impl Default for ConnectionStatus {
             queue_frames: 0,
             queue_bytes: 0,
             rotations_completed: 0,
+            rotation_admission_frozen: false,
             recovery_attempt: None,
             recovery_attempt_started_at_ms: None,
             recovery_attempt_deadline_ms: None,

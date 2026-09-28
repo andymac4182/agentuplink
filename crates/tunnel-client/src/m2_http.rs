@@ -679,12 +679,20 @@ impl M2Actor {
             let _ = reply.send(DeviceRead::Closed);
             return Ok(());
         };
-        let expired = stream.auth.confirmed
-            && stream
-                .auth
-                .deadline
-                .min(stream.auth.operation_deadline)
-                .expired();
+        // Checked whether or not a refresh is in flight (task row M4-53,
+        // review of #247).  Before, only a confirmed stream was checked, so
+        // while a refresh waited for its answer the chunks already buffered
+        // for the handler kept flowing past the previous confirmation.  The
+        // refresh's own deadline never passes that confirmation, and
+        // `confirmed_until` holds it independently, as defence in depth.
+        let expired = stream
+            .auth
+            .deadline
+            .min(stream.auth.operation_deadline)
+            .expired()
+            || stream
+                .confirmed_until
+                .is_some_and(|until| std::time::Instant::now() >= until);
         let invalidated = stream.auth.invalidated;
         let input_reset = stream.input_reset;
         let Some(http) = stream.http.as_mut() else {
@@ -699,7 +707,7 @@ impl M2Actor {
             // Authorization is checked before every chunk reaches the
             // handler; an expired stream is reset, never read further.
             let _ = reply.send(DeviceRead::Closed);
-            return self.expire_stream(stream_id).await;
+            return self.lapse_stream(stream_id).await;
         }
         if invalidated || input_reset {
             let _ = reply.send(DeviceRead::Reset(M2_RESET_PROTOCOL));
@@ -1217,6 +1225,9 @@ mod tests {
             reset_queued: false,
             http: state,
             fs_authority: None,
+            refresh_challenges: 0,
+            retired_challenges: Vec::new(),
+            confirmed_until: None,
         }
     }
 

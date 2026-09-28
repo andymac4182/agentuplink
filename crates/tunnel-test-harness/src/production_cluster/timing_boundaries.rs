@@ -1307,6 +1307,10 @@ struct AuthorizationPauseObservation {
     dispatch_after: u64,
 }
 
+/// How far past the captured admission deadline the old confirmation may be
+/// observed to end: one snapshot poll and its loopback round trip.
+const ADMISSION_DEADLINE_TOLERANCE_MS: u64 = 250;
+
 struct AuthorizationChallengeBarrier {
     challenge_deadline_ms: u64,
     admission_deadline_ms: u64,
@@ -1435,11 +1439,22 @@ async fn wait_for_authorization_deadline(
         if snapshot.monotonic_now_ms >= target_ms {
             return Ok(());
         }
-        if target_ms != challenge_deadline_ms && snapshot.monotonic_now_ms >= challenge_deadline_ms
+        // Task row M4-53: the previous confirmation ends about three seconds
+        // after this refresh challenge started, after the relay's two-second
+        // answer window, which this gate holds open by delaying the read's
+        // result.  Before M4-53 it ended inside the window.  Waiting for a
+        // target other than the challenge deadline, the stream must still be
+        // in flight no later than the captured admission deadline plus the
+        // snapshot poll's tolerance; past that, the wait itself is broken.
+        if target_ms != challenge_deadline_ms
+            && snapshot.monotonic_now_ms
+                >= barrier
+                    .admission_deadline_ms
+                    .saturating_add(ADMISSION_DEADLINE_TOLERANCE_MS)
+            && snapshot.monotonic_now_ms < target_ms
         {
             return Err(HarnessError::Timeout(
-                "timing old authorization admission did not expire before the challenge deadline"
-                    .into(),
+                "timing old authorization admission did not expire by its captured deadline".into(),
             ));
         }
         timing_poll_sleep(deadline, label).await?;
@@ -1766,6 +1781,19 @@ async fn run_authorization_expiry(
                     && session.epoch == owner_before.token.epoch
             })
             .collect::<Vec<_>>();
+        if let Some(stream) = authorization_stream(
+            &owner_snapshot,
+            &owner_before.token.session_id,
+            owner_before.token.epoch,
+            authorization_stream_id,
+        ) {
+            eprintln!(
+                "timing auth: stream terminal={} authorization_failure_code={:?} sessions={}",
+                stream.terminal,
+                stream.authorization_failure_code,
+                matching_sessions.len()
+            );
+        }
         let typed_expiry_cause_observed = matching_sessions.len() == 1
             && authorization_stream(
                 &owner_snapshot,
@@ -1774,6 +1802,14 @@ async fn run_authorization_expiry(
                 authorization_stream_id,
             )
             .is_some_and(|stream| {
+                // Since task row M4-53 the previous confirmation and its
+                // catalog snapshot both end about three seconds after this
+                // refresh challenge started, a second after its answer
+                // window.  The probe, sent once that confirmation ended,
+                // meets the owner's own snapshot check first:
+                // `AUTHORIZATION_EXPIRED`, the prior snapshot lapsed with its
+                // refresh held (observed on every local and hosted run).
+                // Pinned to that one cause (review of #247).
                 stream.authorization_failure_code == Some("AUTHORIZATION_EXPIRED")
                     && stream.terminal
             });

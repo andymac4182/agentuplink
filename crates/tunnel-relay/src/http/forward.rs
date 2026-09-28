@@ -2772,6 +2772,12 @@ mod tests {
             crate::http::fs::session_close_code_for_reset(Some(reset_reason::CANCELLED)),
             Some(1011)
         );
+        // M4-70: a connector lapse is retryable, never the 1008 of a
+        // revocation.
+        assert_eq!(
+            crate::http::fs::session_close_code_for_reset(Some(reset_reason::AUTHORIZATION_STALE)),
+            Some(1011)
+        );
     }
 
     /// M3-04.  The binding an ingress derives is a stable, opaque function of
