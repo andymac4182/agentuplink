@@ -709,6 +709,11 @@ struct Fixture {
 /// The five export roots, each with only the content its own case needs.
 fn build_fixtures(harness: &RunningHarness) -> Result<Vec<Fixture>> {
     let mut fixtures = Vec::new();
+    // M0-09: every file's content starts with the same synthetic run, so its
+    // leading slices are this gate's file-body sentinels: the first 128 bytes
+    // (ASCII, so a JSON-escaped leak is matched too) and the first 4 KiB.
+    crate::c11_capture::record_payload_sentinel(&synthetic_bytes(128))?;
+    crate::c11_capture::record_payload_sentinel(&synthetic_bytes(4096))?;
     for label in [
         "client-rw",
         "client-ro",
