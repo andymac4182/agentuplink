@@ -451,3 +451,58 @@ jobs:
           cat "$log"
           grep -q "^fs-demo: PASS" "$log"
           grep -q "^cleanup: deleted [1-9][0-9]* keys of namespace" "$log"
+
+  # M0-08: the cross-milestone payload scan (docs/tasks.md M0-04, M0-08,
+  # M0-09).  It re-runs the M1, M2, M3, M4 and M8 gates listed in
+  # scripts/m0-payload-scan.py with a private capture directory each, so every
+  # fixture records the exact synthetic credentials, application payloads,
+  # paths and endpoints it used, and scans every captured stream -- the gate's
+  # own stdout and stderr (where the in-process relays' and clients' tracing
+  # lands), each managed process's streams and each typed snapshot -- for them
+  # and for fixed credential shapes.  It fails on any hit, on a gate that
+  # records no sentinel of a kind it declares, and on any of its five planted
+  # controls (one per milestone) that does not go red with its declared
+  # witness.  It runs as its own job, beside the milestone jobs rather than
+  # inside them, so it adds no time to their critical path and M8's gates run
+  # in hosted CI at all.
+  #
+  # **No artifacts, on purpose (M7-C112).**  The captures hold the fixture's
+  # synthetic keys and tokens; the script prints only counts, categories,
+  # stream roles and offsets, and deletes its captures on exit.
+  m0-payload-scan:
+    name: M0 cross-milestone payload scan (Linux, Redis)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    services:
+      redis:
+        image: redis:8.4.0-alpine@sha256:6cbef353e480a8a6e7f10ec545f13d7d3fa85a212cdcc5ffaf5a1c818b9d3798
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 2s
+          --health-timeout 2s
+          --health-retries 20
+          --memory 256m
+    env:
+      TEST_REDIS_URL: redis://127.0.0.1:6379/
+      TUNNEL_CATALOG_REDIS_URL: redis://127.0.0.1:6379/
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Install Rust 1.95.0
+        run: rustup toolchain install 1.95.0 --profile minimal
+      # verify-m4-fs-client-e2e runs the shared TypeScript client's sources
+      # under node, as in the M4 job.
+      - name: Install Node 24
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+      - name: Scanner unit probes
+        run: python3 scripts/m0-payload-scan.py --unit
+      - name: Build runnable workspace binaries
+        run: cargo +1.95.0 build --workspace --bins --locked
+      - name: Scan the M1, M2, M3, M4 and M8 gates, with one planted witness per milestone
+        run: python3 scripts/m0-payload-scan.py

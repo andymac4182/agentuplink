@@ -76,6 +76,16 @@ pub const STREAM_WINDOW_BYTES: usize = 128 * 1024;
 pub const PEER_STREAM_BUDGET_BYTES: usize = 256 * 1024;
 const CANCEL_REASON: u16 = tunnel_protocol::reset_reason::CANCELLED;
 const COOKIE_SECRET: &str = "synthetic-session-cookie-0a1b2c";
+/// Distinctive synthetic request and response bodies, recorded as
+/// `application_payload` sentinels so the cross-milestone scan (M0-08, M0-09)
+/// can match them exactly.  The handler discards the request body and the
+/// gate compares responses against these same constants.
+const PERMISSION_REQUEST_BODY: &[u8] =
+    br#"{"permission":"allow_once","note":"m3-forward-permission-request-5b1f0c7e"}"#;
+const PERMISSION_RESPONSE_BODY: &[u8] = b"m3-forward-permission-granted-9d2a4e61";
+const EVENT_BODY: &[u8] = b"data: m3-forward-event-3c8e7a52\n\n";
+/// The recorded leading slice of the synthetic upload (binary, raw match).
+const UPLOAD_SENTINEL_BYTES: usize = 4096;
 const INTERNAL_HEADER: &str = "x-agent-tunnel-owner";
 const DIAGNOSTIC_WAIT: Duration = Duration::from_secs(15);
 /// M7-C82: one device session used to admit at most this many streams in its
@@ -652,7 +662,7 @@ fn handler(state: Arc<HandlerState>) -> Arc<dyn HttpHandler> {
                         let (tx, rx) = mpsc::channel::<Bytes>(1);
                         let state = Arc::clone(&state);
                         tokio::spawn(async move {
-                            let _ = tx.send(Bytes::from_static(b"data: synthetic-1\n\n")).await;
+                            let _ = tx.send(Bytes::from_static(EVENT_BODY)).await;
                             state.events_started_flag.store(true, Ordering::SeqCst);
                             state.events_started.notify_waiters();
                             if let Some(HandlerCancellation(token)) = cancellation {
@@ -679,7 +689,7 @@ fn handler(state: Arc<HandlerState>) -> Arc<dyn HttpHandler> {
                         http::Response::builder()
                             .status(200)
                             .header("content-type", "text/plain")
-                            .body(full_body(b"permission-granted"))
+                            .body(full_body(PERMISSION_RESPONSE_BODY))
                             .map_err(|_| HttpHandlerError)
                     }
                     _ => Err(HttpHandlerError),
@@ -1047,6 +1057,15 @@ async fn exercise(
     session_id: &str,
     evidence: &mut HttpForwardRealPathEvidence,
 ) -> Result<()> {
+    // M0-09: record the synthetic bodies before any is sent.
+    for body in [
+        PERMISSION_REQUEST_BODY,
+        PERMISSION_RESPONSE_BODY,
+        EVENT_BODY,
+    ] {
+        crate::c11_capture::record_payload_sentinel(body)?;
+    }
+    crate::c11_capture::record_payload_sentinel(&synthetic_chunk(0, UPLOAD_SENTINEL_BYTES))?;
     // Wait for the owner claim to land on relay-a.
     let owner = {
         let deadline = Instant::now() + STARTUP_TIMEOUT;
@@ -1248,7 +1267,7 @@ async fn exercise(
                 &format!("{base}/permission"),
                 Some(&token),
                 &[("content-type", "application/json")],
-                once_stream(br#"{"permission":"allow_once"}"#),
+                once_stream(PERMISSION_REQUEST_BODY),
             )?),
         )
         .await
@@ -1261,7 +1280,7 @@ async fn exercise(
             .map_err(|error| HarnessError::Http(format!("/permission body: {error}")))?
             .to_bytes();
         evidence.permission_latency_ms = started.elapsed().as_millis() as u64;
-        evidence.permission_body_exact = body.as_ref() == b"permission-granted";
+        evidence.permission_body_exact = body.as_ref() == PERMISSION_RESPONSE_BODY;
         if !evidence.permission_body_exact && body.len() <= 512 {
             // A gateway error body is sanitized `{code, execution}` JSON.
             eprintln!(
@@ -1290,7 +1309,7 @@ async fn exercise(
                 &format!("{base}/permission"),
                 Some(&token),
                 &[("content-type", "application/json")],
-                once_stream(br#"{"permission":"allow_once"}"#),
+                once_stream(PERMISSION_REQUEST_BODY),
             )?),
         )
         .await
@@ -1303,7 +1322,7 @@ async fn exercise(
             .map_err(|error| HarnessError::Http(format!("owner-local body: {error}")))?
             .to_bytes();
         evidence.owner_local_permission_exact =
-            status == 200 && body.as_ref() == b"permission-granted";
+            status == 200 && body.as_ref() == PERMISSION_RESPONSE_BODY;
         drop(sender);
         task.abort();
     }
@@ -1751,7 +1770,7 @@ async fn sequential_streams(
                 &format!("{base}/permission"),
                 Some(token),
                 &[("content-type", "application/json")],
-                once_stream(br#"{"permission":"allow_once"}"#),
+                once_stream(PERMISSION_REQUEST_BODY),
             )?),
         )
         .await
@@ -1769,7 +1788,7 @@ async fn sequential_streams(
             .map_err(|error| HarnessError::Http(format!("sequential body {index}: {error}")))?
             .to_bytes();
         on_connection += 1;
-        if status == 200 && body.as_ref() == b"permission-granted" {
+        if status == 200 && body.as_ref() == PERMISSION_RESPONSE_BODY {
             evidence.sequential_ok += 1;
             index += 1;
         } else if body.windows(14).any(|window| window == b"not_dispatched")

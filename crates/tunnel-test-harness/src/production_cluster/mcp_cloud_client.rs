@@ -1901,6 +1901,11 @@ impl Gate<'_> {
 
     async fn streaming(&mut self, combo: &Combo) -> Result<StreamingEvidence> {
         let label = combo.label("stream");
+        // M0-09: the fixture's 4 KiB pseudo-random stream events are the
+        // gate's distinctive response payloads; record them before the call.
+        for message in expected_stream_messages(&label) {
+            crate::c11_capture::record_payload_sentinel(message.as_bytes())?;
+        }
         let stream_before = combo.invocations("stream");
         let (client, handler, ledger) = self.connect(combo).await?;
         let mut evidence = StreamingEvidence::default();
@@ -2132,6 +2137,8 @@ async fn run(
         ..McpCloudClientEvidence::default()
     };
     evidence.relay_profiles.sort();
+    // M0-09: the echo tool's image reply is a fixed synthetic payload.
+    crate::c11_capture::record_payload_sentinel(tunnel_mcp_fixture::IMAGE_PNG_BASE64.as_bytes())?;
     let device = harness
         .topology
         .devices_a

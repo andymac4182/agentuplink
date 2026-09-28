@@ -13,7 +13,7 @@ use std::{
     io::Write,
     net::{SocketAddr, TcpListener},
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
     sync::{Mutex, OnceLock},
 };
 
@@ -67,6 +67,27 @@ pub(crate) fn retire_sentinel(kind: &'static str, value: &[u8]) -> Result<()> {
 pub(crate) fn record_sentinel(kind: &'static str, value: &[u8]) -> Result<()> {
     record_manifest_entry(kind, value, false)
 }
+
+/// Record one synthetic application request or response body (M0-09).
+///
+/// Only distinctive values are worth recording: the scan matches exact bytes,
+/// so a short or common value ("ok", a byte fill) would match unrelated
+/// diagnostics.  Callers therefore record the fixture's own distinctive
+/// payloads -- a value carrying a UUID or a long generated body -- and leave
+/// generic probes out.  A value over the manifest's per-record bound is
+/// recorded by its leading slice, which any verbatim leak of it contains.
+pub(crate) fn record_payload_sentinel(value: &[u8]) -> Result<()> {
+    if value.is_empty() {
+        return Ok(());
+    }
+    record_sentinel(
+        "application_payload",
+        &value[..value.len().min(PAYLOAD_SENTINEL_SLICE)],
+    )
+}
+
+/// The leading slice recorded for a payload larger than this.
+const PAYLOAD_SENTINEL_SLICE: usize = 4096;
 
 /// Hold, for the rest of this C11 child, the TCP port whose number equals the
 /// UDP private endpoint `address`.
@@ -219,8 +240,45 @@ fn record_manifest_entry(kind: &'static str, value: &[u8], retired: bool) -> Res
             .and_then(|_| file.write_all(value))
             .map_err(|_| HarnessError::Process("C11 sentinel manifest write failed".into()))?;
         recorded.insert(key);
+        if !retired {
+            plant_witness_leak(kind, value);
+        }
         Ok(())
     })
+}
+
+/// Names the one sentinel kind the M0-08 witness control plants.
+const WITNESS_PLANT_ENV: &str = "M0_PAYLOAD_SCAN_PLANT";
+/// The tracing target of the planted event.  `scripts/m0-payload-scan.py`
+/// attributes a witness hit to the plant only when it lies on a line carrying
+/// this target, so a genuine leak is never credited to the control.
+const WITNESS_PLANT_TARGET: &str = "m0_payload_scan_witness";
+static WITNESS_PLANTED: AtomicBool = AtomicBool::new(false);
+
+/// The M0-08 declared-witness control: deliberately leak one recorded value.
+///
+/// Only a capture child whose parent set `M0_PAYLOAD_SCAN_PLANT` to a
+/// sentinel kind does anything here.  The first recorded value of that kind
+/// is emitted once, through the process's own tracing subscriber -- the path
+/// an in-process relay or client diagnostic takes -- so the scan must go red
+/// on the gate's own stderr.  Ordinary acceptance runs never set the variable,
+/// and the scanner removes it from every clean run's environment.
+fn plant_witness_leak(kind: &'static str, value: &[u8]) {
+    if std::env::var(WITNESS_PLANT_ENV).ok().as_deref() != Some(kind) {
+        return;
+    }
+    let Ok(text) = std::str::from_utf8(value) else {
+        return;
+    };
+    if WITNESS_PLANTED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    tracing::warn!(
+        target: WITNESS_PLANT_TARGET,
+        kind,
+        planted = text,
+        "M0-08 witness control: planted a recorded sentinel"
+    );
 }
 
 /// Persist both joined output streams from one ManagedProcess. Each process
