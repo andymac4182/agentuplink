@@ -1273,3 +1273,143 @@ async fn a_consumer_that_leaves_before_any_head_still_yields_a_report() {
     assert_eq!(device.error, Some(HttpErrorCode::Cancelled));
     assert_eq!(device.execution, Execution::Dispatched);
 }
+
+/// Spawn a device exchange whose handler streams one SSE event and then
+/// idles, and report its [`HandlerCancellation`] token once it has one.
+fn idle_sse_device(
+    device_rx: tunnel_http_bridge::FrameReceiver,
+    to_owner: tunnel_http_bridge::FrameSender,
+) -> (
+    tokio::task::JoinHandle<tunnel_http_bridge::ExchangeReport>,
+    oneshot::Receiver<tokio_util::sync::CancellationToken>,
+) {
+    let (token_tx, token_rx) = oneshot::channel();
+    let device = tokio::spawn(serve(
+        profile(),
+        BridgeConfig::default(),
+        device_rx,
+        to_owner,
+        move |request: Request<ChannelBody>| async move {
+            let token = request
+                .extensions()
+                .get::<HandlerCancellation>()
+                .unwrap()
+                .0
+                .clone();
+            let _ = token_tx.send(token);
+            let (tx, body) = test_body(1);
+            tokio::spawn(async move {
+                tx.send(data(b"data: 0\n\n")).await.unwrap();
+                tx.closed().await;
+            });
+            Ok::<_, TestError>(Response::builder().status(200).body(body).unwrap())
+        },
+    ));
+    (device, token_rx)
+}
+
+/// Task row M3-53: the connector reclaims an HTTP stream (STREAM_FORGET) as
+/// soon as both sides' terminals are proved, and dropping the stream's state
+/// aborts its exchange task.  After a RESET that can happen before the task
+/// is next polled, i.e. before its watchdog has cancelled the handler: the
+/// handler's `HandlerCancellation` was never cancelled and an idle handler
+/// (an SSE stream between events, an MCP call) ran on with nobody to tell it.
+/// An exchange future dropped before its response completed must cancel the
+/// handler itself.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_exchange_task_aborted_before_its_response_completed_cancels_the_handler() {
+    let Link {
+        to_device,
+        device_rx,
+        to_owner,
+        owner_rx,
+        ..
+    } = link(STREAM_CREDIT);
+    let (device, token) = idle_sse_device(device_rx, to_owner);
+    let (mut response, _handle) = within(forward(
+        request("GET", "/events", &[], empty_body()),
+        profile(),
+        BridgeConfig::default(),
+        to_device,
+        owner_rx,
+    ))
+    .await;
+    within(next_chunk(response.body_mut()))
+        .await
+        .unwrap()
+        .unwrap();
+    let token = within(token).await.unwrap();
+    assert!(!token.is_cancelled(), "the exchange is still running");
+    // What dropping the connector's stream state does to a live exchange.
+    device.abort();
+    assert!(within(device).await.unwrap_err().is_cancelled());
+    assert!(
+        token.is_cancelled(),
+        "an abandoned exchange must still cancel its handler"
+    );
+}
+
+/// The other side of M3-53's rule: `HandlerCancellation` is for an exchange
+/// that ends before its response completes.  One whose response already
+/// completed -- here while the upload is still open -- is not cancelled by
+/// being dropped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_exchange_task_aborted_after_its_response_completed_does_not_cancel_the_handler() {
+    let (upload, body) = test_body(4);
+    upload.send(data(b"part-1;")).await.unwrap();
+    let (token_tx, token_rx) = oneshot::channel();
+    let Link {
+        to_device,
+        device_rx,
+        to_owner,
+        owner_rx,
+        ..
+    } = link(STREAM_CREDIT);
+    let device = tokio::spawn(serve(
+        profile(),
+        BridgeConfig::default(),
+        device_rx,
+        to_owner,
+        move |request: Request<ChannelBody>| async move {
+            let token = request
+                .extensions()
+                .get::<HandlerCancellation>()
+                .unwrap()
+                .0
+                .clone();
+            let _ = token_tx.send(token);
+            // Keep the request body open and unread: the upload outlives
+            // the complete response.
+            tokio::spawn(async move {
+                let _request = request;
+                std::future::pending::<()>().await;
+            });
+            Ok::<_, TestError>(Response::builder().status(200).body(full(b"done")).unwrap())
+        },
+    ));
+    let (response, handle) = within(forward(
+        request(
+            "POST",
+            "/echo",
+            &[("content-type", "application/octet-stream")],
+            body,
+        ),
+        profile(),
+        BridgeConfig::default(),
+        to_device,
+        owner_rx,
+    ))
+    .await;
+    assert_eq!(
+        within(collect(response.into_body())).await.unwrap(),
+        b"done"
+    );
+    let token = within(token_rx).await.unwrap();
+    device.abort();
+    assert!(within(device).await.unwrap_err().is_cancelled());
+    assert!(
+        !token.is_cancelled(),
+        "a completed response is not a cancellation"
+    );
+    drop((upload, handle));
+}

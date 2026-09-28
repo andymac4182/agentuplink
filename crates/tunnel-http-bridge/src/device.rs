@@ -124,6 +124,13 @@ where
     let deadline_at = started + config.deadline();
     let discard_until = started + config.discard_bound();
     let cancel = CancellationToken::new();
+    // Dropping this future is abandoning the exchange (the connector aborts
+    // the task when it reclaims the stream), which may happen before the
+    // watchdog below has run: the handler is told here instead (M3-53).
+    let _abandoned = CancelIfAbandoned {
+        exchange: &exchange,
+        cancel: &cancel,
+    };
     let (dispatch_tx, dispatch_rx) = oneshot::channel();
     let request = request_pump(
         &exchange,
@@ -153,6 +160,29 @@ where
     };
     tokio::join!(request, response, watchdog);
     exchange.report()
+}
+
+/// Cancels the handler's [`HandlerCancellation`] when [`serve_paused`] is
+/// dropped before the response completed (task row M3-53).
+///
+/// The watchdog cancels the handler once the exchange stops, but only when
+/// it is polled.  The connector reclaims a stream as soon as both sides'
+/// terminals are proved and aborts the exchange task with it, so after a
+/// RESET the task can be dropped between the request pump's abort and the
+/// watchdog's next poll.  Without this guard the handler — an idle SSE
+/// stream, an MCP call — was never told and ran on.  A response that
+/// already completed is not a cancellation, so it is left alone.
+struct CancelIfAbandoned<'a> {
+    exchange: &'a Exchange,
+    cancel: &'a CancellationToken,
+}
+
+impl Drop for CancelIfAbandoned<'_> {
+    fn drop(&mut self) {
+        if !self.exchange.is_complete(Dir::Response) {
+            self.cancel.cancel();
+        }
+    }
 }
 
 async fn request_pump(
