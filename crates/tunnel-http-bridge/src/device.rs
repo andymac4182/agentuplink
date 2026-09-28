@@ -27,8 +27,14 @@ use crate::status::{ExchangeReport, Execution};
 use crate::stream::{Frame, FrameReceiver, FrameSender};
 use crate::{BridgeConfig, Profile};
 
-/// Request extension: cancelled when the exchange is reset, cancelled, or
-/// fails before the response completes.
+/// Request extension: cancelled when the exchange ends before its response
+/// completes -- it is reset, cancelled, fails, or is abandoned by the
+/// connector (task row M3-53).
+///
+/// **The one rule** ([`handler_cancellation_due`]): the token is cancelled if
+/// and only if the exchange stops or is dropped while the response has not
+/// completed.  A response that completed is never cancelled afterwards, even
+/// if the upload is then reset.
 #[derive(Clone, Debug)]
 pub struct HandlerCancellation(pub CancellationToken);
 
@@ -160,7 +166,7 @@ where
                 exchange.abort(HttpErrorCode::DeadlineExceeded);
             }
         }
-        if exchange.stop.is_cancelled() {
+        if exchange.stop.is_cancelled() && handler_cancellation_due(&exchange) {
             cancel.cancel();
         }
     };
@@ -168,8 +174,21 @@ where
     exchange.report()
 }
 
+/// Whether an exchange that stopped, or was dropped, owes its handler a
+/// [`HandlerCancellation`]: only while the response has not completed.  The
+/// watchdog and [`CancelIfAbandoned`] both decide through this, so there is
+/// one rule (task row M3-53).
+fn handler_cancellation_due(exchange: &Exchange) -> bool {
+    !exchange.is_complete(Dir::Response)
+}
+
 /// Cancels the handler's [`HandlerCancellation`] when [`serve_paused`] is
 /// dropped before the response completed (task row M3-53).
+///
+/// It is dropped on every exit, including a normal return from
+/// [`serve_paused`]; the rule is the same there, so an exchange that ended
+/// early has already cancelled the token (a second cancel is a no-op) and one
+/// whose response completed is left alone.
 ///
 /// The watchdog cancels the handler once the exchange stops, but only when
 /// it is polled.  The connector reclaims a stream as soon as both sides'
@@ -185,9 +204,18 @@ struct CancelIfAbandoned<'a> {
 
 impl Drop for CancelIfAbandoned<'_> {
     fn drop(&mut self) {
-        if !self.exchange.is_complete(Dir::Response) {
+        if handler_cancellation_due(self.exchange) {
             self.cancel.cancel();
         }
+    }
+}
+
+/// A spawned handler task that is aborted when its owner is dropped.
+struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
 
@@ -337,17 +365,21 @@ async fn response_pump<H, F, B, E>(
     if !exchange.begin_dispatch() {
         return;
     }
-    let mut task = tokio::spawn(async move { handler(request).await });
+    // Aborted on drop: if this exchange is itself abandoned (the connector
+    // aborts its task when it reclaims the stream) while the handler has not
+    // answered, the handler future is dropped with it rather than detached
+    // with no deadline, head bound or discard bound (task row M3-53).
+    let mut task = AbortOnDrop(tokio::spawn(async move { handler(request).await }));
     let joined = tokio::select! {
         biased;
         () = exchange.stop.cancelled() => {
             // Wait until the handler future has actually been dropped, so the
             // terminal report never precedes the handler's cancellation.
-            task.abort();
-            let _ = task.await;
+            task.0.abort();
+            let _ = (&mut task.0).await;
             return;
         }
-        joined = &mut task => joined,
+        joined = &mut task.0 => joined,
     };
     // A panic, a cancelled task and a handler error are indistinguishable to
     // the peer; none of their messages is carried.

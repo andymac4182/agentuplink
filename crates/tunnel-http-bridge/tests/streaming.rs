@@ -1554,3 +1554,121 @@ fn the_response_head_bound_is_finite_and_capped_by_the_deadline() {
         Some(Duration::from_secs(2))
     );
 }
+
+/// Task row M3-53 (review of #251): a handler that never answers and ignores
+/// its `HandlerCancellation` -- ACP's bridge never reads the token -- must
+/// still be dropped when the connector abandons the exchange task.  The
+/// handler ran on a plain spawned task, so dropping the exchange detached it
+/// with no deadline, head bound or discard bound.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_abandoned_exchange_drops_a_handler_that_never_answers() {
+    struct Dropped(Option<oneshot::Sender<()>>);
+    impl Drop for Dropped {
+        fn drop(&mut self) {
+            if let Some(tx) = self.0.take() {
+                let _ = tx.send(());
+            }
+        }
+    }
+    let (dropped_tx, dropped_rx) = oneshot::channel();
+    let (entered_tx, entered_rx) = oneshot::channel();
+    let Link {
+        to_device,
+        device_rx,
+        to_owner,
+        owner_rx,
+        ..
+    } = link(STREAM_CREDIT);
+    let device = tokio::spawn(serve(
+        profile(),
+        BridgeConfig::default(),
+        device_rx,
+        to_owner,
+        move |_request: Request<ChannelBody>| async move {
+            let _guard = Dropped(Some(dropped_tx));
+            let _ = entered_tx.send(());
+            std::future::pending::<Result<Response<TestBody>, TestError>>().await
+        },
+    ));
+    let owner = tokio::spawn(forward(
+        request("GET", "/events", &[], empty_body()),
+        profile(),
+        BridgeConfig::default(),
+        to_device,
+        owner_rx,
+    ));
+    within(entered_rx).await.unwrap();
+    // What dropping the connector's stream state does to a live exchange.
+    device.abort();
+    assert!(within(device).await.unwrap_err().is_cancelled());
+    within(dropped_rx)
+        .await
+        .expect("the handler future must be dropped with its exchange");
+    owner.abort();
+}
+
+/// Task row M3-53 (review of #251): one cancellation rule.  A response that
+/// completed while the upload was still open is not cancelled when the owner
+/// then resets the upload and the exchange runs to its end -- the watchdog
+/// follows the same rule as an abandoned exchange.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reset_upload_after_a_completed_response_does_not_cancel_the_handler() {
+    let (upload, body) = test_body(4);
+    upload.send(data(b"part-1;")).await.unwrap();
+    let (token_tx, token_rx) = oneshot::channel();
+    let Link {
+        to_device,
+        device_rx,
+        to_owner,
+        owner_rx,
+        ..
+    } = link(STREAM_CREDIT);
+    let device = tokio::spawn(serve(
+        profile(),
+        BridgeConfig::default(),
+        device_rx,
+        to_owner,
+        move |request: Request<ChannelBody>| async move {
+            let token = request
+                .extensions()
+                .get::<HandlerCancellation>()
+                .unwrap()
+                .0
+                .clone();
+            let _ = token_tx.send(token);
+            tokio::spawn(async move {
+                let _request = request;
+                std::future::pending::<()>().await;
+            });
+            Ok::<_, TestError>(Response::builder().status(200).body(full(b"done")).unwrap())
+        },
+    ));
+    let (response, handle) = within(forward(
+        request(
+            "POST",
+            "/echo",
+            &[("content-type", "application/octet-stream")],
+            body,
+        ),
+        profile(),
+        BridgeConfig::default(),
+        to_device,
+        owner_rx,
+    ))
+    .await;
+    assert_eq!(
+        within(collect(response.into_body())).await.unwrap(),
+        b"done"
+    );
+    let token = within(token_rx).await.unwrap();
+    // The owner resets the still-open upload.
+    handle.cancel();
+    let report = within(device).await.unwrap();
+    assert_eq!(report.response, Outcome::Complete);
+    assert_eq!(report.request, Outcome::Aborted);
+    assert!(
+        !token.is_cancelled(),
+        "a completed response is not a cancellation"
+    );
+    drop(upload);
+}
