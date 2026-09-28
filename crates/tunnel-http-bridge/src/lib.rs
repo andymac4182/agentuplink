@@ -106,12 +106,13 @@ impl core::fmt::Display for ConfigError {
 
 impl std::error::Error for ConfigError {}
 
-/// Per-exchange adapter limits.  Both are finite and bounded by
+/// Per-exchange adapter limits.  Every one is finite and bounded by
 /// construction.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BridgeConfig {
     body_queue: usize,
     deadline: Duration,
+    response_head: Option<Duration>,
     progress: ProgressBudgets,
 }
 
@@ -120,6 +121,7 @@ impl Default for BridgeConfig {
         Self {
             body_queue: DEFAULT_BODY_QUEUE,
             deadline: DEFAULT_DEADLINE,
+            response_head: None,
             progress: ProgressBudgets::default(),
         }
     }
@@ -165,6 +167,38 @@ impl BridgeConfig {
     #[must_use]
     pub const fn deadline(&self) -> Duration {
         self.deadline
+    }
+
+    /// Bound how long the exchange may run before a response head exists
+    /// (task row M4-71).  On the device it runs from the exchange's start
+    /// until the handler returns its response; on the owner, until the
+    /// device's `RESPONSE_HEAD` is decoded.  Missing it fails the exchange
+    /// `HTTP_DEADLINE_EXCEEDED`, exactly as the absolute deadline does.
+    ///
+    /// Once the head exists only the absolute [`Self::deadline`] and the
+    /// transport progress budgets bound the exchange, so a streaming
+    /// response -- an SSE GET that stays open and silent between events --
+    /// is not cut at the head bound.  Like the absolute deadline it never
+    /// pauses.  Unset by default: the exchange then has no bound shorter
+    /// than the absolute deadline.
+    ///
+    /// # Errors
+    /// [`ConfigError::Deadline`] for zero or above [`MAX_DEADLINE`].
+    pub fn with_response_head_deadline(self, bound: Duration) -> Result<Self, ConfigError> {
+        if bound.is_zero() || bound > MAX_DEADLINE {
+            return Err(ConfigError::Deadline);
+        }
+        Ok(Self {
+            response_head: Some(bound),
+            ..self
+        })
+    }
+
+    /// The effective response-head bound: the configured one, never later
+    /// than the absolute deadline.  `None` when none is configured.
+    #[must_use]
+    pub fn response_head_deadline(&self) -> Option<Duration> {
+        self.response_head.map(|bound| bound.min(self.deadline))
     }
 
     /// How long after the exchange starts terminal discard may continue:

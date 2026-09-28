@@ -344,6 +344,7 @@ where
     let exchange = &owner.exchange;
     let started = Instant::now();
     let deadline_at = started + config.deadline();
+    let head_at = config.response_head_deadline().map(|bound| started + bound);
     let discard_until = started + config.discard_bound();
     let request = async {
         // A head no larger than the credit capacity is one queue item: it is
@@ -386,6 +387,9 @@ where
             () = finished => {}
             () = owner.consumer.cancelled() => owner.consumer_left(),
             () = deadline => owner.fail(Origin::Upstream, HttpErrorCode::DeadlineExceeded),
+            () = exchange.response_head_missed(head_at) => {
+                owner.fail(Origin::Upstream, HttpErrorCode::DeadlineExceeded);
+            }
         }
     };
     tokio::join!(pumps, watchdog);
@@ -490,6 +494,7 @@ async fn response_pump(
                     };
                     match event {
                         ResponseEvent::Head(head) => {
+                            exchange.response_head.cancel();
                             declared_remaining = head.body_length;
                             if declared_remaining == Some(0) {
                                 fin.arm();
