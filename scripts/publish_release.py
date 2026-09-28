@@ -13,8 +13,10 @@ def assets(directory, tag):
         extension = "zip" if target.endswith("windows-msvc") else "tar.gz"
         archive = directory / f"agentuplink-{tag}-{target}.{extension}"
         checksum = directory / f"{archive.name}.sha256"
-        expected = f"{hashlib.sha256(archive.read_bytes()).hexdigest()}  {archive.name}\n"
-        if checksum.read_text() != expected:
+        expected = f"{hashlib.sha256(archive.read_bytes()).hexdigest()}  {archive.name}\n".encode()
+        # Bytes: read_text's universal newlines would accept a CRLF sidecar
+        # that `shasum -c` cannot read (docs/tasks.md M6-C217).
+        if checksum.read_bytes() != expected:
             raise ValueError(f"checksum mismatch for {archive.name}")
         result.extend([archive, checksum])
     return result

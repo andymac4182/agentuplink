@@ -272,17 +272,25 @@ certificates, one for device certificates, one for Redis.
 for ca in relay-ca device-ca redis-ca; do
   openssl req -x509 -newkey rsa:2048 -nodes -days 365 -subj "/CN=agentuplink $ca" \
     -addext basicConstraints=critical,CA:TRUE -addext keyUsage=critical,keyCertSign,cRLSign \
-    -keyout $ca-key.pem -out $ca.pem
+    -addext subjectKeyIdentifier=hash -keyout $ca-key.pem -out $ca.pem
 done
 server_cert() {  # NAME CA SAN DAYS
   openssl req -new -newkey rsa:2048 -nodes -subj "/CN=$1" -keyout $1-key.pem -out $1.csr
-  printf 'basicConstraints=CA:FALSE\nkeyUsage=digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\nsubjectAltName=%s\n' "$3" > $1.ext
+  printf 'basicConstraints=CA:FALSE\nkeyUsage=digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\nsubjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid\nsubjectAltName=%s\n' "$3" > $1.ext
   openssl x509 -req -in $1.csr -CA $2.pem -CAkey $2-key.pem -CAcreateserial -days $4 -extfile $1.ext -out $1.pem
 }
 server_cert relay-server relay-ca DNS:agentuplink-relay.fly.dev 90
 server_cert redis-server redis-ca DNS:agentuplink-redis.internal 365
 openssl rand -hex 24 > redis-password.txt
 ```
+
+The key identifiers (`subjectKeyIdentifier` on the CAs, and
+`subjectKeyIdentifier` plus `authorityKeyIdentifier=keyid` on each leaf) matter
+to strict clients: Python 3.13 and later refuse a server certificate whose
+authority key identifier has no key ID. OpenSSL 3 adds them by default;
+macOS's own `openssl` (LibreSSL) does not, and writes an authority key
+identifier without the key ID unless told (M6-C137). The live relay's
+certificate already carries both, so nothing deployed changes.
 
 **Prefer an ECDSA P-256 relay server certificate (M6-C194).** A full TLS
 handshake with an RSA-2048 server key cost the relay about 605 µs of CPU,
@@ -295,7 +303,7 @@ above with:
 ```text
 openssl req -new -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -subj "/CN=relay-server" \
   -keyout relay-server-key.pem -out relay-server.csr
-printf 'basicConstraints=CA:FALSE\nkeyUsage=digitalSignature\nextendedKeyUsage=serverAuth\nsubjectAltName=%s\n' \
+printf 'basicConstraints=CA:FALSE\nkeyUsage=digitalSignature\nextendedKeyUsage=serverAuth\nsubjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid\nsubjectAltName=%s\n' \
   DNS:agentuplink-relay.fly.dev > relay-server.ext
 openssl x509 -req -in relay-server.csr -CA relay-ca.pem -CAkey relay-ca-key.pem -CAcreateserial \
   -days 90 -extfile relay-server.ext -out relay-server.pem
@@ -1428,7 +1436,7 @@ refuses):
 ```text
 cd ~/agentuplink-fly/tester-2
 DEVICE=<device UUID>
-printf 'basicConstraints=CA:FALSE\nkeyUsage=digitalSignature\nextendedKeyUsage=clientAuth\nsubjectAltName=URI:urn:agent-tunnel:device:%s\n' "$DEVICE" > device.ext
+printf 'basicConstraints=CA:FALSE\nkeyUsage=digitalSignature\nextendedKeyUsage=clientAuth\nsubjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid\nsubjectAltName=URI:urn:agent-tunnel:device:%s\n' "$DEVICE" > device.ext
 openssl x509 -req -in device.csr -CA ../device-ca.pem -CAkey ../device-ca-key.pem \
   -CAcreateserial -days 90 -extfile device.ext -out device-cert.pem
 openssl x509 -in device-cert.pem -noout -text | grep -E 'Version|URI:|TLS Web Client'

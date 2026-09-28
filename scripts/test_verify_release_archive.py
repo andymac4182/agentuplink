@@ -86,6 +86,10 @@ class VerifierTests(unittest.TestCase):
         renamed = self.write("renamed.sha256", good.read_bytes().replace(b"agentuplink-x", b"agentuplink-y"))
         self.assertEqual(v.check_checksums(archive, renamed).witness, "checksum-mismatch")
         self.assertEqual(v.check_checksums(archive, self.dir / "absent.sha256").witness, "checksum-missing")
+        # M6-C217: a CRLF line ending, which a Windows text write produced and
+        # `shasum -c` on macOS or Linux cannot read, is refused on every host.
+        crlf = self.write("crlf.sha256", good.read_bytes().replace(b"\n", b"\r\n"))
+        self.assertEqual(v.check_checksums(archive, crlf).witness, "checksum-mismatch")
 
     def test_target_and_host_names_agree_on_one_vocabulary(self):
         self.assertEqual(v.target_os_arch("aarch64-apple-darwin"), ("macos", "aarch64"))
