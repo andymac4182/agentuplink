@@ -1334,7 +1334,7 @@ the entire hash lapses. Relays skip a record the checkpoint does not name
 (M7-C185), so this is harmless to routing, but a deployment that replaces
 nodes under new `node_id`s eventually has every publish of a new node refused
 as `bound`. Reuse `node_id`s when you replace a node. Retiring a field is task
-row M6-C220, for slice 2's publisher.
+row M6-C221, for slice 2's publisher.
 
 **The Redis ACL the publisher needs.** Measured, not inferred: the publisher
 connected and published under exactly
