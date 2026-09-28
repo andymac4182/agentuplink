@@ -203,8 +203,10 @@ def check_checksums(archive: Path, checksum: Path) -> Result:
     if not checksum.is_file():
         return fail("checksums", "checksum-missing", f"no {checksum.name} beside the archive")
     digest = hashlib.sha256(archive.read_bytes()).hexdigest()
-    expected = f"{digest}  {archive.name}\n"
-    actual = checksum.read_text(encoding="utf-8")
+    expected = f"{digest}  {archive.name}\n".encode()
+    # Bytes, not text: read_text translates a CRLF to LF on Windows, so a
+    # file `shasum -c` cannot read on macOS or Linux passed there (M6-C217).
+    actual = checksum.read_bytes()
     if actual != expected:
         return fail("checksums", "checksum-mismatch",
                     f"{checksum.name} does not state this archive's SHA-256 and name")
