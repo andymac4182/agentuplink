@@ -236,6 +236,8 @@ fn make_profiles(
             )));
         }
         let canary = format!("m1-canary:{service_id}");
+        // The device prefixes every echo response with it (M0-09).
+        crate::c11_capture::record_payload_sentinel(canary.as_bytes())?;
         profiles.push(write_device_profile(
             root,
             device.id,
@@ -545,6 +547,7 @@ async fn verify_echoes(
     let first_service = service_id(harness, first.id)?;
     let first_path = format!("/v1/devices/{}/services/{first_service}/echo", first.id);
     let first_body = first.binary_canary.clone();
+    crate::c11_capture::record_payload_sentinel(&first_body)?;
     let concurrent_one = consumer_request(
         consumer_addr,
         &harness.pki.server_ca.certificate_der,
@@ -591,6 +594,7 @@ async fn verify_echoes(
         )?;
         let path = format!("/v1/devices/{}/services/{service}/echo", device.id);
         let body = device.binary_canary.clone();
+        crate::c11_capture::record_payload_sentinel(&body)?;
         let response = consumer_request(
             consumer_addr,
             &harness.pki.server_ca.certificate_der,

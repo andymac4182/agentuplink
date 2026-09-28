@@ -96,6 +96,9 @@ pub const STREAM_WINDOW_BYTES: usize = 128 * 1024;
 /// The credit-stall download, larger than every buffer on the path.
 pub const DOWNLOAD_BYTES: usize = 6 * 1024 * 1024;
 const UPLOAD_CHUNK: usize = 50_000;
+/// The effect request's body: distinctive, so it is an exact-match
+/// `application_payload` sentinel (M0-09).  The handler discards it.
+const EFFECT_REQUEST_BODY: &[u8] = b"m3-rotation-effect-request-2e9c41d7";
 const UPLOAD_CHUNKS: usize = 4;
 const HEADER_BYTES_AT_FENCE: u8 = 3;
 const SCENARIO_TIMEOUT: Duration = Duration::from_secs(360);
@@ -1728,7 +1731,7 @@ impl Gate<'_> {
             &format!("{}{path}", self.base),
             Some(&self.token),
             &[("content-type", "text/plain")],
-            super::http_forward_real_path::once_stream(b"synthetic-effect"),
+            super::http_forward_real_path::once_stream(EFFECT_REQUEST_BODY),
         )?;
         Ok(tokio::spawn(async move {
             let connection = tokio::spawn(async move {
@@ -2078,6 +2081,10 @@ impl Gate<'_> {
 /// # Errors
 /// Any setup, scenario, validation or cleanup failure.
 pub async fn verify() -> Result<HttpForwardRotationEvidence> {
+    // M0-09: the effect body and the leading slice of the synthetic upload
+    // and download (binary, matched raw).
+    crate::c11_capture::record_payload_sentinel(EFFECT_REQUEST_BODY)?;
+    crate::c11_capture::record_payload_sentinel(&synthetic_chunk(0, 4096))?;
     let options = HarnessOptions::from_env()?
         .http_forward_service(true)
         .rotation(GATE_ROTATION);
