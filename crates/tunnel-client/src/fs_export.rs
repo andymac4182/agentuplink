@@ -1246,7 +1246,7 @@ mod tests {
             12,
             CapabilitySet::from_slice(&[Capability::List]),
             std::time::Instant::now() + std::time::Duration::from_secs(60),
-            SystemTime::now() + std::time::Duration::from_secs(60),
+            std::time::SystemTime::now() + std::time::Duration::from_secs(60),
         );
         let live = authority.current();
         assert_eq!(live.revision, 12);
@@ -1265,7 +1265,7 @@ mod tests {
             .checked_sub(std::time::Duration::from_millis(1))
             .expect("a past instant");
         let authority = super::SharedAuthority::new(Arc::new(StreamAuthority::new(1, grant)));
-        let later = SystemTime::now() + std::time::Duration::from_secs(60);
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
         authority.0.confirm(1, grant, past, later);
         assert!(!authority.current().fresh, "past its confirmed deadline");
         authority.0.confirm(
@@ -1288,7 +1288,7 @@ mod tests {
         let authority = super::SharedAuthority::new(Arc::new(StreamAuthority::new(1, grant)));
         // What a resume from sleep looks like: monotonic time barely moved,
         // wall time is past the deadline.
-        let wall_past = SystemTime::now()
+        let wall_past = std::time::SystemTime::now()
             .checked_sub(std::time::Duration::from_millis(1))
             .expect("a past wall instant");
         authority.0.confirm(
@@ -1323,7 +1323,7 @@ mod tests {
             1,
             grant,
             std::time::Instant::now() + confirmed_for,
-            SystemTime::now() + confirmed_for,
+            std::time::SystemTime::now() + confirmed_for,
         ));
         let (inbound_tx, inbound_rx, _) = tunnel_http_bridge::channel(65_536);
         let (outbound_tx, outbound_rx, _) = tunnel_http_bridge::channel(65_536);

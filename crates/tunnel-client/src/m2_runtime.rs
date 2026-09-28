@@ -13193,6 +13193,111 @@ mod tests {
         assert_eq!(actor.forgotten_stream_through, 0);
     }
 
+    /// M6-C121, the narrowing clause: deferred output behind an emitted,
+    /// unacknowledged C2R terminal is held only if the full validation holds
+    /// with that output and the owner's ACK treated as pending.  Here the
+    /// shape is the measured one but the owner snapshot is invalid in itself
+    /// (M6-C105's probe: more bytes sent than send credit), so the FORGET
+    /// must stay a non-retryable `PROTOCOL_ERROR`, whether refused at once or
+    /// at expiry, and never become the retryable expiry.  Without this test
+    /// the clause had no witness: dropping the full validation from
+    /// `stream_forget_connector_sender_lagging` left every test green
+    /// (verification of M6-C141, 2026-09-28).
+    #[tokio::test]
+    async fn m6c121_deferred_output_behind_an_emitted_terminal_with_an_invalid_snapshot_stays_a_protocol_error()
+     {
+        let stream_id = 50;
+        let mut relay = StreamState::new(stream_id, 1_024).expect("relay sequence");
+        let mut connector = StreamState::new(stream_id, 1_024).expect("connector sequence");
+        let connector_fin = Frame::fin(1, 1, stream_id, 1, 0);
+        connector
+            .send_frame(Direction::ConnectorToRelay, &connector_fin)
+            .expect("connector FIN is admitted");
+        relay
+            .receive_frame(Direction::ConnectorToRelay, &connector_fin)
+            .expect("relay receives connector FIN");
+        relay
+            .mark_delivered(Direction::ConnectorToRelay, 1)
+            .expect("relay delivers connector FIN");
+        for frame in [
+            Frame::data(1, 1, stream_id, 1, 0, b"synth".to_vec()),
+            Frame::fin(1, 1, stream_id, 2, 0),
+        ] {
+            relay
+                .send_frame(Direction::RelayToConnector, &frame)
+                .expect("relay frame is admitted");
+            connector
+                .receive_frame(Direction::RelayToConnector, &frame)
+                .expect("connector receives relay frame");
+        }
+        connector
+            .mark_delivered(Direction::RelayToConnector, 2)
+            .expect("connector delivers relay DATA and FIN");
+        let connector_ack = Frame::ack(1, 1, stream_id, 2);
+        connector
+            .send_frame(Direction::ConnectorToRelay, &connector_ack)
+            .expect("connector final C2R ACK is admitted");
+        relay
+            .receive_frame(Direction::ConnectorToRelay, &connector_ack)
+            .expect("relay observes final C2R ACK");
+        let mut final_state = ResumeDirectionState::from_sequence_snapshot(
+            stream_id,
+            relay.snapshot().direction(Direction::RelayToConnector),
+        )
+        .expect("owner terminal snapshot encodes");
+        assert_eq!(final_state.sent_bytes, 5);
+        final_state.send_credit = 1;
+
+        let (mut actor, _key, _carrier_receiver, _control_receiver) =
+            test_actor_with_carrier(M2_CARRIER_QUEUE_FRAMES);
+        let mut stream = test_stream();
+        stream.sequence = connector;
+        stream.input_fin = true;
+        stream.output_fin = true;
+        actor.streams.insert(stream_id, stream);
+        actor.pending_outputs.push_back(PendingOutput {
+            stream_id,
+            kind: FrameKind::Data,
+            payload: b"deferred".to_vec(),
+            reset_reason: None,
+        });
+        actor.pending_output_bytes = 8;
+        let forget = tunnel_protocol::rotation_control::StreamForget {
+            message_id: "forget-m6c121-deferred-invalid".to_owned(),
+            reply_to: String::new(),
+            session_id: "session".to_owned(),
+            epoch: 1,
+            stream_id,
+            operation_id: "operation".to_owned(),
+            direction: Direction::RelayToConnector,
+            final_state,
+        };
+        assert!(
+            actor.stream_forget_proof_may_converge_with(&forget, true),
+            "the probe has the measured shape: only deferred output and the owner's ACK lag"
+        );
+        let error = match actor
+            .handle_control(ControlMessage::StreamForget(forget))
+            .await
+        {
+            Err(error) => error,
+            Ok(()) => {
+                actor
+                    .pending_forgets
+                    .get_mut(&stream_id)
+                    .expect("a retained proof")
+                    .proof_deadline = Some(Instant::now() - Duration::from_millis(1));
+                actor
+                    .retry_pending_forget_barriers()
+                    .expect_err("an expired proof ends the session")
+            }
+        };
+        assert_eq!(error.code(), "PROTOCOL_ERROR", "{error:?}");
+        assert!(!error.retryable(), "{error:?}");
+        assert!(actor.streams.contains_key(&stream_id));
+        assert_eq!(actor.forgotten_stream_through, 0);
+    }
+
     /// M6-C121, the measured shape: under a consumer flood the owner's
     /// STREAM_FORGET arrived while this connector had emitted its C2R
     /// terminal (not yet acknowledged) and still held deferred output for

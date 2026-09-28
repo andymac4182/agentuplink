@@ -503,3 +503,153 @@ async fn m6c213_route_forwarded_echo_stream_with_a_parked_record_still_gets_the_
     );
     relays.shutdown().await;
 }
+
+impl TwoRelays {
+    /// Task row M6-C144: end the owner's device session and then give this
+    /// owner relay a fresh, live owner claim with no device session behind
+    /// it -- the window in which the ingress has resolved the owner and the
+    /// owner has since lost the device.  The ingress has not resolved a route
+    /// yet, so its first lookup finds this claim.
+    async fn lose_the_device_but_keep_an_owner_claim(&mut self, label: &str) {
+        assert!(
+            self.fixture
+                .handle
+                .disconnect_control(self.key.clone())
+                .await
+        );
+        timeout(BUDGET, async {
+            loop {
+                let snapshot = self
+                    .fixture
+                    .handle
+                    .snapshot()
+                    .await
+                    .expect("owner snapshot");
+                let released = self
+                    .fixture
+                    .catalog
+                    .current_owner(tenant_id(), device_id(), Utc::now())
+                    .await
+                    .expect("read the owner claim")
+                    .is_none();
+                if find_session(&snapshot, device_id()).is_none() && released {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the owner's device session ends and its claim is released");
+        self.fixture
+            .catalog
+            .claim_owner(&OwnerClaimRequest {
+                deployment_incarnation: DEPLOYMENT_INCARNATION.to_owned(),
+                tenant_id: tenant_id(),
+                device_id: device_id(),
+                node_id: DESTINATION_NODE.to_owned(),
+                boot_id: DESTINATION_BOOT.to_owned(),
+                session_id: format!("{label}-claim-without-session"),
+                lease_expires_at: Utc::now() + ChronoDuration::minutes(5),
+            })
+            .await
+            .expect("claim the owner with no device session");
+    }
+
+    /// Send one `http-forward/1` request to the ingress and return the
+    /// response head and body, with no connector involvement.
+    async fn http_forward_answer(&self) -> (String, serde_json::Value) {
+        let body = r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#;
+        let request = format!(
+            "POST /v1/devices/{}/services/{}/http/mcp HTTP/1.1\r\nHost: 127.0.0.1\r\n\
+             Connection: close\r\nAuthorization: Bearer {}\r\n\
+             Content-Type: application/json\r\nAccept: application/json, text/event-stream\r\n\
+             MCP-Protocol-Version: 2026-07-28\r\nContent-Length: {}\r\n\r\n{body}",
+            device_id(),
+            http_service_id(),
+            self.token,
+            body.len(),
+        );
+        let mut socket = TcpStream::connect(self.address).await.expect("connect");
+        socket
+            .write_all(request.as_bytes())
+            .await
+            .expect("write request");
+        let mut response = Vec::new();
+        timeout(BUDGET, socket.read_to_end(&mut response))
+            .await
+            .expect("answered in time")
+            .expect("read response");
+        let response = String::from_utf8(response).expect("UTF-8 response");
+        let (head, body) = response.split_once("\r\n\r\n").expect("head and body");
+        (
+            head.to_owned(),
+            serde_json::from_str(body).unwrap_or_else(|_| panic!("JSON body: {body}")),
+        )
+    }
+}
+
+/// Task row M6-C144, the cluster-owner arm of `handle_peer_http_stream`: the
+/// ingress resolved this relay as the device's owner, but the owner holds no
+/// device session.  The owner must answer the retryable owner-not-ready
+/// refusal, so the ingress's consumer gets `503 PEER_UNAVAILABLE`
+/// `not_dispatched` -- not a closed exchange reported as `unknown`.
+#[tokio::test]
+async fn m6c144_forwarded_http_forward_to_an_owner_without_the_device_is_retryable_not_dispatched()
+{
+    let mut relays = TwoRelays::start("m6c144-http").await;
+    relays
+        .lose_the_device_but_keep_an_owner_claim("m6c144-http")
+        .await;
+    let (head, body) = relays.http_forward_answer().await;
+    assert!(head.starts_with("HTTP/1.1 503"), "{head}\n{body}");
+    assert_eq!(body["code"], "PEER_UNAVAILABLE", "{head}\n{body}");
+    assert_eq!(body["execution"], "not_dispatched", "{head}\n{body}");
+    assert_eq!(body["retryable"], true, "{head}\n{body}");
+    relays.shutdown().await;
+}
+
+/// Task row M6-C144, the cluster-owner arm of the forwarded echo stream
+/// (`handle_peer_consumer_stream`), added after review of #187: the same
+/// state refuses the ingress's consumer before the upgrade with the
+/// retryable `503 PEER_UNAVAILABLE` `not_dispatched` answer, not an
+/// `unknown` outcome.
+#[tokio::test]
+async fn m6c144_forwarded_echo_stream_to_an_owner_without_the_device_is_retryable_not_dispatched() {
+    let mut relays = TwoRelays::start("m6c144-echo").await;
+    relays
+        .lose_the_device_but_keep_an_owner_claim("m6c144-echo")
+        .await;
+    let mut request = format!(
+        "ws://{}/v1/devices/{}/services/{}/stream",
+        relays.address,
+        device_id(),
+        service_id()
+    )
+    .into_client_request()
+    .expect("client request");
+    let headers = request.headers_mut();
+    headers.insert(
+        "Authorization",
+        HeaderValue::from_str(&format!("Bearer {}", relays.token)).expect("header"),
+    );
+    headers.insert(
+        "Sec-WebSocket-Protocol",
+        HeaderValue::from_str(ECHO_STREAM_SUBPROTOCOL).expect("header"),
+    );
+    let socket = TcpStream::connect(relays.address).await.expect("connect");
+    let refused = timeout(BUDGET, tokio_tungstenite::client_async(request, socket))
+        .await
+        .expect("answered in time")
+        .expect_err("the upgrade must be refused, not accepted");
+    let tokio_tungstenite::tungstenite::Error::Http(response) = refused else {
+        panic!("expected an HTTP refusal, got {refused:?}");
+    };
+    assert_eq!(response.status(), 503);
+    let body: serde_json::Value =
+        serde_json::from_slice(response.body().as_deref().expect("refusal body"))
+            .expect("JSON refusal body");
+    assert_eq!(body["code"], "PEER_UNAVAILABLE", "{body}");
+    assert_eq!(body["execution"], "not_dispatched", "{body}");
+    assert_eq!(body["retryable"], true, "{body}");
+    relays.shutdown().await;
+}
