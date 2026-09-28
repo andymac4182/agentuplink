@@ -527,6 +527,20 @@ fn every_subcommand_exits_by_the_published_table() {
             3,
         ),
         (vec!["credentials", "import", "--config", &config], 2),
+        // M0-07: `credentials renew`; its other exits are in `renew_cli.rs`.
+        (vec!["credentials", "renew"], 2),
+        (vec!["credentials", "renew", "--config", &config], 2),
+        (
+            vec![
+                "credentials",
+                "renew",
+                "--config",
+                &config,
+                "--certificate",
+                "absent.pem",
+            ],
+            2,
+        ),
         (vec!["doctor", "--config", &config], 0),
         (vec!["doctor", "--config", &missing], 2),
         (vec!["doctor", "--config", &config, "--network"], 2),

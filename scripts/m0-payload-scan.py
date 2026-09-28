@@ -347,6 +347,32 @@ def bytes_debug_list(data: bytes, closed: bool) -> bytes:
     return (f"[{inner}]" if closed else inner).encode("ascii")
 
 
+def bytes_debug_list_compact(data: bytes) -> bytes:
+    """The same list with no spaces: `104,105`, as `serde_json` renders a
+    `Vec<u8>` (open form, so it matches inside a longer array too)."""
+    return ",".join(str(byte) for byte in data).encode("ascii")
+
+
+def bytes_escape_ascii(data: bytes) -> bytes:
+    """`[u8]::escape_ascii` / `ascii::escape_default`: like `Bytes`'s `Debug`
+    but `\\x00` rather than `\\0`, and a single quote escaped as `\\'`."""
+    out = []
+    for byte in data:
+        if byte == 0x0A:
+            out.append("\\n")
+        elif byte == 0x0D:
+            out.append("\\r")
+        elif byte == 0x09:
+            out.append("\\t")
+        elif byte in (0x5C, 0x22, 0x27):
+            out.append("\\" + chr(byte))
+        elif 0x20 <= byte < 0x7F:
+            out.append(chr(byte))
+        else:
+            out.append(f"\\x{byte:02x}")
+    return "".join(out).encode("ascii")
+
+
 def bytes_debug_escape(data: bytes) -> bytes:
     """The inside of `bytes::Bytes`'s `Debug`: `b"..."` with `\\n`, `\\r`,
     `\\t`, `\\0`, `\\\\`, `\\"` and `\\xNN` escapes."""
@@ -402,10 +428,11 @@ def encodings(value: bytes) -> list[bytes]:
         except UnicodeDecodeError:
             pass
         add(bytes_debug_list(data, closed))
-        escape_form = bytes_debug_escape(data)
-        add(escape_form)
-        for escaped in json_escape(escape_form):
-            add(escaped)
+        add(bytes_debug_list_compact(data))
+        for escape_form in (bytes_debug_escape(data), bytes_escape_ascii(data)):
+            add(escape_form)
+            for escaped in json_escape(escape_form):
+                add(escaped)
         add(data.hex().encode("ascii"))
         add(base64_form(data))
 
@@ -777,6 +804,7 @@ def unit_probes() -> list[str]:
         "json": json.dumps({"f": text}).encode("ascii"),
         "debug list": ("[7, " + ", ".join(str(b) for b in payload) + ", 9]").encode("ascii"),
         "debug b-escape": b'b"' + bytes_debug_escape(payload) + b'"',
+        "compact decimal list (serde Vec<u8>)": ("[7," + ",".join(str(b) for b in payload) + ",9]").encode("ascii"),
         "debug b-escape in json": json.dumps({"f": 'b"' + bytes_debug_escape(payload).decode("ascii") + '"'}).encode("ascii"),
         "str debug": b'"' + str_debug(text) + b'"',
         "str debug in json": json.dumps({"f": '"' + str_debug(text).decode("utf-8") + '"'}).encode("ascii"),
@@ -789,13 +817,21 @@ def unit_probes() -> list[str]:
         found = [h.kind for h in scan_streams(probe, {"s": b"x " + leak + b" y"})]
         if "application_payload" not in found:
             failures.append(f"a {name} leak was not reported")
-        control = leak.replace(payload, other)
         if name in ("raw", "truncated window") and scan_streams(probe, {"s": b"x " + other + b" y"}):
             failures.append(f"a {name} form of a different value was reported")
-        del control
+    # `escape_ascii` differs from `Bytes`'s `Debug` only on NUL and `'`, so
+    # its probe value carries both.
+    nul_quote = b"m0-probe\x00it's-an-escape-ascii-value"
+    leak = b"x " + bytes_escape_ascii(nul_quote) + b" y"
+    if "application_payload" not in [
+        h.kind for h in scan_streams({"application_payload": [nul_quote]}, {"s": leak})
+    ]:
+        failures.append("an escape_ascii leak was not reported")
     for name, render in (
         ("debug list", lambda v: bytes_debug_list(v, closed=True)),
         ("hex", lambda v: v.hex().encode("ascii")),
+        ("compact decimal list", lambda v: bytes_debug_list_compact(v)),
+        ("escape_ascii", lambda v: bytes_escape_ascii(v)),
         ("base64", lambda v: base64.b64encode(v)),
     ):
         if scan_streams(probe, {"s": render(other)}):
