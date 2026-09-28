@@ -122,6 +122,7 @@ where
     let exchange = Exchange::new(to_owner, Execution::NotDispatched, pause, config.progress());
     let started = Instant::now();
     let deadline_at = started + config.deadline();
+    let head_at = config.response_head_deadline().map(|bound| started + bound);
     let discard_until = started + config.discard_bound();
     let cancel = CancellationToken::new();
     // Dropping this future is abandoning the exchange (the connector aborts
@@ -153,6 +154,11 @@ where
             () = finished => {}
             () = exchange.stop.cancelled() => {}
             () = deadline => { exchange.abort(HttpErrorCode::DeadlineExceeded); }
+            // M4-71: a handler that never answers is bounded by the head
+            // bound; one that has answered streams to the absolute deadline.
+            () = exchange.response_head_missed(head_at) => {
+                exchange.abort(HttpErrorCode::DeadlineExceeded);
+            }
         }
         if exchange.stop.is_cancelled() {
             cancel.cancel();
@@ -349,6 +355,7 @@ async fn response_pump<H, F, B, E>(
         exchange.abort(HttpErrorCode::StreamInterrupted);
         return;
     };
+    exchange.response_head.cancel();
     let (parts, body) = response.into_parts();
     let mut body = std::pin::pin!(body);
     let prepared =
