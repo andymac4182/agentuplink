@@ -349,6 +349,12 @@ pub struct CredentialConfig {
     pub client_key: PathBuf,
     #[serde(alias = "ca", alias = "server_ca")]
     pub server_ca: PathBuf,
+    /// The three files' bytes, once [`CredentialConfig::pin`] has read them
+    /// (task row M0-07).  Never part of a profile document: `connect` sets it
+    /// when it starts, so a supervisor keeps the pair it started with until
+    /// it is stopped and started, whatever `credentials renew` does on disk.
+    #[serde(skip)]
+    pub pinned: Option<crate::credentials::PinnedCredentials>,
 }
 
 impl Default for CredentialConfig {
@@ -357,11 +363,19 @@ impl Default for CredentialConfig {
             client_certificate: PathBuf::from("device-cert.pem"),
             client_key: PathBuf::from("device-key.pem"),
             server_ca: PathBuf::from("server-ca.pem"),
+            pinned: None,
         }
     }
 }
 
 impl CredentialConfig {
+    /// Read the certificate chain, private key and server trust once and use
+    /// those bytes for every later session and rotation (M0-07).
+    pub fn pin(&mut self) -> Result<(), crate::credentials::CredentialError> {
+        self.pinned = Some(crate::credentials::PinnedCredentials::read(self)?);
+        Ok(())
+    }
+
     fn validate(&self) -> Result<(), RuntimeConfigError> {
         for (label, path) in [
             ("client certificate", &self.client_certificate),
@@ -396,6 +410,7 @@ impl CredentialConfig {
             client_certificate: resolve(&self.client_certificate),
             client_key: resolve(&self.client_key),
             server_ca: resolve(&self.server_ca),
+            pinned: self.pinned.clone(),
         }
     }
 }
@@ -825,6 +840,7 @@ impl TryFrom<RawRuntimeConfig> for RuntimeConfig {
                 credentials.server_ca,
                 "server CA path is required",
             )?,
+            pinned: None,
         };
         let exports = raw.exports.unwrap_or_else(|| {
             let mut map = BTreeMap::new();
