@@ -130,14 +130,21 @@ pub mod reset_reason {
     pub const ADAPTER_FAILURE: u16 = 4_004;
     /// The operation was cancelled (consumer disconnect or explicit cancel).
     pub const CANCELLED: u16 = 4_005;
+    /// The stream's authorization deadline passed with no confirmation: a
+    /// lapse, not a verdict about the grant (docs/cluster.md step 5, task row
+    /// M4-70).  The relay closes the consumer retryably (1011), where
+    /// [`AUTHORIZATION_EXPIRED`] closes it 1008.  A relay older than this code
+    /// maps it, as it maps any unregistered reason, to the same 1011.
+    pub const AUTHORIZATION_STALE: u16 = 4_006;
 
     /// Every registered code, in ascending order.
-    pub const ALL: [u16; 5] = [
+    pub const ALL: [u16; 6] = [
         AUTHORIZATION_EXPIRED,
         PROTOCOL,
         RECORD_LIMIT,
         ADAPTER_FAILURE,
         CANCELLED,
+        AUTHORIZATION_STALE,
     ];
 
     /// Whether `code` is registered.

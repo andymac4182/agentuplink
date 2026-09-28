@@ -642,7 +642,7 @@ impl M2Actor {
             // Authorization is checked before every chunk reaches the
             // handler; an expired stream is reset, never read further.
             let _ = reply.send(DeviceRead::Closed);
-            return self.expire_stream(stream_id).await;
+            return self.lapse_stream(stream_id).await;
         }
         if invalidated || input_reset {
             let _ = reply.send(DeviceRead::Reset(M2_RESET_PROTOCOL));
@@ -1160,6 +1160,7 @@ mod tests {
             reset_queued: false,
             http: state,
             fs_authority: None,
+            refresh_challenges: 0,
         }
     }
 

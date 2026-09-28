@@ -13129,7 +13129,16 @@ impl RelayActor {
                 ))
             }
         } else if let Some(stream) = session.streams.get_mut(&message.stream_id) {
-            if stream.authorization_in_flight {
+            // A challenge whose answer window has passed may be replaced
+            // (task row M4-70; docs/cluster.md: "replacement retires the
+            // previous nonce permanently").  Its read's result, if it ever
+            // returns, no longer matches `challenge_id` and is dropped.  One
+            // still inside its window is not: at most one read per stream is
+            // started per window, however often a connector challenges.
+            let replaceable = stream
+                .authorization_deadline_ms
+                .is_some_and(|deadline| authorization_started_at_ms >= deadline);
+            if stream.authorization_in_flight && !replaceable {
                 if let Some(http) = stream.http.as_mut() {
                     http.trace.challenges_ignored_in_flight =
                         http.trace.challenges_ignored_in_flight.saturating_add(1);
@@ -13760,10 +13769,25 @@ impl RelayActor {
             self.invalidate_stream_challenge(&key, &challenge, "authorization changed");
             return;
         }
-        let challenge_remaining = challenge
-            .lifetime
-            .checked_sub(challenge.received_at.elapsed())
-            .unwrap_or_default();
+        // Task row M4-53: a refresh is confirmed for the rest of its catalog
+        // snapshot (docs/cluster.md step 2), not for the challenge window.
+        // The window (`challenge_interval`, 2 s by default) bounds only how
+        // late the relay may *answer*: "a challenge times out after two
+        // seconds".  Before M4-53 it also capped the confirmation, so every
+        // live stream refreshed about every half second.
+        //
+        // The snapshot bound is taken twice.  `current.valid_until` is at
+        // most five seconds after the read's start on this relay's wall clock
+        // (the authority script computes it in the caller's frame, so skew
+        // against the Redis clock, up to MAX_CLUSTER_CLOCK_SKEW, never
+        // extends it).  `read_remaining` is the same five seconds on the
+        // monotonic clock, from the challenge's receipt, which precedes the
+        // read's start: a wall-clock step on this relay cannot lengthen a
+        // confirmation either.  The connector anchors the result at its own
+        // challenge start, earlier still.
+        let elapsed = challenge.received_at.elapsed();
+        let window_open = elapsed < challenge.lifetime;
+        let read_remaining = AUTHORIZATION_LIFETIME.saturating_sub(elapsed);
         let snapshot_remaining = (current.valid_until - now_wall)
             .to_std()
             .unwrap_or_default();
@@ -13776,15 +13800,48 @@ impl RelayActor {
         let credential_remaining = (identity.expires_at - now_wall)
             .to_std()
             .unwrap_or_default();
-        let remaining_ms = challenge_remaining
+        let remaining_ms = read_remaining
             .min(snapshot_remaining)
             .min(token_remaining)
             .min(owner_remaining)
             .min(credential_remaining)
             .as_millis()
             .min(5_000) as u64;
-        if remaining_ms == 0 {
-            self.invalidate_stream_challenge(&key, &challenge, "authorization expired");
+        if remaining_ms == 0 || !window_open {
+            // Which bound lapsed decides the answer (task row M4-70), with
+            // the unary path's classification (`lapsed_challenge_code`).  A
+            // lapsed token, snapshot or credential is the authorization
+            // ending: invalidated, and the consumer closed 1008.  A lapsed
+            // owner lease is this relay losing the device, not a verdict
+            // about the grant: invalidated without the 1008.  Only the
+            // challenge window lapsing -- a read slower than the window --
+            // says nothing about anything: the challenge is retired unanswered
+            // and the stream kept.  The connector retries with a fresh
+            // challenge, and ends the stream `AUTHORIZATION_STALE` at its own
+            // lapse deadline if no confirmation lands; nothing is dispatched
+            // meanwhile, as the stream's confirmation has not been renewed.
+            let open = |left: Duration| left >= Duration::from_millis(1);
+            let code = lapsed_challenge_code(
+                ChallengeBounds {
+                    window: window_open && open(read_remaining),
+                    snapshot: open(snapshot_remaining),
+                    token: open(token_remaining),
+                    owner: open(owner_remaining),
+                    credential: open(credential_remaining),
+                },
+                false,
+            );
+            match code {
+                OWNER_UNAVAILABLE_CODE => {
+                    self.invalidate_stream_challenge(&key, &challenge, "owner unavailable");
+                }
+                "AUTHORIZATION_UNAVAILABLE" => {
+                    self.retire_stream_challenge(&key, &challenge);
+                }
+                _ => {
+                    self.invalidate_stream_challenge(&key, &challenge, "authorization expired");
+                }
+            }
             return;
         }
         let confirmation = wire::authorization_confirmed(wire::AuthorizationConfirmation {
@@ -14052,6 +14109,24 @@ impl RelayActor {
             .is_ok();
         self.http_forward_diagnostics
             .record_principal_sessions_end(sent);
+    }
+
+    /// Retire a stream's refresh challenge whose answer window lapsed while
+    /// every authorization bound stayed open (task row M4-70): no answer is
+    /// sent and the stream is kept.  The connector replaces an unanswered
+    /// challenge after its own two-second timeout, and ends the stream
+    /// `AUTHORIZATION_STALE` (a retryable 1011 to the consumer) at its lapse
+    /// deadline if none is confirmed.  The stream's existing confirmation is
+    /// untouched, so this relay's dispatch gate still expires on time.
+    fn retire_stream_challenge(&mut self, key: &SessionKey, challenge: &DeviceChallenge) {
+        if let Some(session) = self.session_mut(key)
+            && let Some(stream) = session.streams.get_mut(&challenge.stream_id)
+            && stream.challenge_id.as_deref() == Some(challenge.challenge_id.as_str())
+        {
+            stream.authorization_in_flight = false;
+            stream.authorization_started_at_ms = None;
+            stream.authorization_deadline_ms = None;
+        }
     }
 
     fn invalidate_stream_challenge(
@@ -21835,6 +21910,350 @@ mod stream_identity_tests {
                 .is_some_and(|until| until <= projected_token_expiry),
             "dispatch gate must not outlive the consumer credential"
         );
+    }
+
+    /// An M2 actor with one admitted echo stream whose refresh challenge
+    /// `challenge_id` is in flight, for the M4-53 and M4-70 tests.
+    struct RefreshFixture {
+        actor: RelayActor,
+        control: ControlRegistration,
+        key: SessionKey,
+        stream_id: u64,
+        service_id: Uuid,
+        grant: GrantSnapshot,
+        identity: DeviceIdentity,
+    }
+
+    async fn refresh_fixture(challenge_id: &str) -> RefreshFixture {
+        let now = Utc::now();
+        let tenant_id = Uuid::from_u128(701);
+        let device_id = Uuid::from_u128(702);
+        let principal_id = Uuid::from_u128(703);
+        let service_id = Uuid::from_u128(704);
+        let identity = DeviceIdentity {
+            tenant_id,
+            device_id,
+            owner_user_id: principal_id,
+            credential_id: Uuid::from_u128(705),
+            spki_fingerprint: "m4-refresh-spki".to_owned(),
+            credential_not_before: now - Duration::minutes(1),
+            expires_at: now + Duration::minutes(10),
+            credential_revoked_at: None,
+            device_active: true,
+            credential_active: true,
+            device_version: 1,
+            owner_epoch: 1,
+            last_seen_at: Some(now),
+        };
+        let consumer = AuthenticatedConsumer {
+            tenant_id,
+            principal_id,
+        };
+        let grant = GrantSnapshot {
+            tenant_id,
+            principal_id,
+            device_id,
+            service_id,
+            revision: 1,
+            permissions: PermissionSet {
+                operations: BTreeSet::from(["echo:invoke".to_owned()]),
+            },
+            constraints: serde_json::json!({}),
+            valid_until: now + Duration::minutes(1),
+            read_started_at: now,
+        };
+        let key = SessionKey {
+            tenant_id,
+            device_id,
+            session_id: "m4-refresh".to_owned(),
+            epoch: 1,
+        };
+        let (mut actor, mut control) = admitted_control_actor(identity.clone(), key.clone());
+        let (data_tx, _data_rx) = mpsc::channel(actor.options.limits.max_queue_messages);
+        let session = actor.sessions.get_mut(&key.scope()).expect("test session");
+        session.profile = super::RuntimeProfile::M2;
+        session.data_tx = Some(data_tx.clone());
+        session.active_carrier = Some(DataCarrier {
+            context: CarrierContext::new(
+                key.session_id.clone(),
+                key.epoch,
+                1,
+                "m4-refresh-data".to_owned(),
+            ),
+            tx: data_tx,
+        });
+        let (open_tx, open_rx) = oneshot::channel();
+        actor.open_echo_stream(
+            consumer,
+            device_id,
+            service_id,
+            grant.clone(),
+            now + Duration::minutes(10),
+            open_tx,
+        );
+        let admitted = open_rx
+            .await
+            .expect("open response")
+            .expect("stream admitted");
+        drop(control.rx.try_recv().expect("OPEN queued"));
+        let started_at_ms = super::monotonic_millis();
+        {
+            let stream = actor
+                .sessions
+                .get_mut(&key.scope())
+                .expect("test session")
+                .streams
+                .get_mut(&admitted.stream_id)
+                .expect("admitted stream");
+            stream.open_pending = false;
+            stream.authorization_in_flight = true;
+            stream.authorization_started_at_ms = Some(started_at_ms);
+            stream.authorization_deadline_ms = Some(started_at_ms + 2_000);
+            stream.challenge_id = Some(challenge_id.to_owned());
+        }
+        RefreshFixture {
+            actor,
+            control,
+            key,
+            stream_id: admitted.stream_id,
+            service_id,
+            grant,
+            identity,
+        }
+    }
+
+    impl RefreshFixture {
+        /// A refresh challenge the relay received `age` ago.
+        fn challenge(&self, challenge_id: &str, age: std::time::Duration) -> DeviceChallenge {
+            DeviceChallenge {
+                message_id: format!("{challenge_id}-message"),
+                stream_id: self.stream_id,
+                service_id: self.service_id.to_string(),
+                challenge_id: challenge_id.to_owned(),
+                nonce: format!("{challenge_id}-nonce"),
+                permission_digest: super::wire::permission_digest(
+                    &self.grant,
+                    &self.service_id.to_string(),
+                ),
+                grant_revision: self.grant.revision,
+                received_at: std::time::Instant::now()
+                    .checked_sub(age)
+                    .expect("a monotonic instant in the past"),
+                lifetime: std::time::Duration::from_secs(2),
+            }
+        }
+
+        /// Apply a read that returned `snapshot` to `challenge`.
+        fn finish(&mut self, challenge: DeviceChallenge, snapshot: GrantSnapshot) {
+            let owner_token = self.actor.sessions[&self.key.scope()].owner.clone();
+            self.actor.finish_stream_challenge(
+                self.key.clone(),
+                challenge,
+                Ok((
+                    Some(snapshot),
+                    Some(OwnerClaim {
+                        token: owner_token,
+                        lease_expires_at: Utc::now() + Duration::minutes(1),
+                    }),
+                    Some(self.identity.clone()),
+                    Some(std::time::Instant::now() + std::time::Duration::from_secs(60)),
+                )),
+            );
+        }
+
+        /// A catalog snapshot read `age` ago: valid five seconds from then.
+        fn snapshot_read(&self, age: std::time::Duration) -> GrantSnapshot {
+            let read_started_at = Utc::now() - Duration::from_std(age).expect("age");
+            GrantSnapshot {
+                valid_until: read_started_at + Duration::seconds(5),
+                read_started_at,
+                ..self.grant.clone()
+            }
+        }
+
+        fn drain(&mut self) -> Vec<tunnel_protocol::ControlMessage> {
+            let mut messages = Vec::new();
+            while let Ok(ControlOutbound::Text(mut text)) = self.control.rx.try_recv() {
+                text.release();
+                messages.push(tunnel_protocol::decode_control(text.as_bytes()).expect("decodes"));
+            }
+            messages
+        }
+
+        fn stream(&self) -> &M2Stream {
+            &self.actor.sessions[&self.key.scope()].streams[&self.stream_id]
+        }
+    }
+
+    /// Task row M4-53: a refresh is confirmed for the rest of its catalog
+    /// snapshot -- up to five seconds from the read's start -- not for the
+    /// two-second challenge window.  Before the fix `remaining_ms` was capped
+    /// by the window, so it was at most 2,000 and every live stream
+    /// refreshed about twice a second.
+    #[tokio::test]
+    async fn a_stream_refresh_is_confirmed_for_its_five_second_snapshot() {
+        let mut fixture = refresh_fixture("m4-53").await;
+        let challenge = fixture.challenge("m4-53", std::time::Duration::from_millis(10));
+        let snapshot = fixture.snapshot_read(std::time::Duration::from_millis(5));
+        fixture.finish(challenge, snapshot);
+        let messages = fixture.drain();
+        let [tunnel_protocol::ControlMessage::AuthorizationConfirmed(confirmed)] =
+            messages.as_slice()
+        else {
+            panic!("one AUTHORIZATION_CONFIRMED, got {messages:?}");
+        };
+        assert!(
+            (4_000..=5_000).contains(&confirmed.remaining_ms),
+            "confirmed for {} ms, not the snapshot's ~4,990",
+            confirmed.remaining_ms
+        );
+        assert!(!fixture.stream().authorization_in_flight && !fixture.stream().terminal);
+    }
+
+    /// Task row M4-53: the confirmation is also bounded on the monotonic
+    /// clock, five seconds from the challenge's receipt, so a snapshot whose
+    /// wall-clock deadline is later than that (a wall-clock step on this
+    /// relay) cannot lengthen it.
+    #[tokio::test]
+    async fn a_stream_refresh_confirmation_is_bounded_on_the_monotonic_clock() {
+        let mut fixture = refresh_fixture("m4-53-mono").await;
+        let challenge = fixture.challenge("m4-53-mono", std::time::Duration::from_millis(1_500));
+        // The wall clock says the snapshot is valid for another minute.
+        let snapshot = fixture.grant.clone();
+        fixture.finish(challenge, snapshot);
+        let messages = fixture.drain();
+        let [tunnel_protocol::ControlMessage::AuthorizationConfirmed(confirmed)] =
+            messages.as_slice()
+        else {
+            panic!("one AUTHORIZATION_CONFIRMED, got {messages:?}");
+        };
+        assert!(
+            confirmed.remaining_ms <= 3_500,
+            "confirmed for {} ms; five seconds from receipt leaves at most 3,500",
+            confirmed.remaining_ms
+        );
+        assert!(confirmed.remaining_ms > 0);
+    }
+
+    /// Task row M4-70: a refresh read slower than the challenge window, while
+    /// the grant, snapshot, token, owner and credential are all still valid,
+    /// is retired unanswered and the stream kept.  Before the fix it was
+    /// invalidated "authorization expired", which publishes 1008 -- the code
+    /// a consumer reads as "your access ended" -- for a stream nobody revoked.
+    #[tokio::test]
+    async fn a_refresh_that_misses_only_its_window_is_retired_not_revoked() {
+        let mut fixture = refresh_fixture("m4-70-late").await;
+        let challenge = fixture.challenge("m4-70-late", std::time::Duration::from_millis(2_300));
+        let snapshot = fixture.snapshot_read(std::time::Duration::from_millis(2_200));
+        fixture.finish(challenge, snapshot);
+        assert!(
+            fixture.drain().is_empty(),
+            "no confirmation and no invalidation"
+        );
+        let stream = fixture.stream();
+        assert!(!stream.terminal, "the stream is kept");
+        assert!(!stream.authorization_in_flight, "the challenge is retired");
+        assert_eq!(stream.authorization_failure_code, None);
+        assert!(!stream.closed.is_cancelled());
+    }
+
+    /// Task row M4-70's other half: a late read whose consumer token has
+    /// lapsed is still the authorization ending, invalidated "authorization
+    /// expired" (the 1008 class) as before.  (A lapsed snapshot never reaches
+    /// this classification: the validity check refuses it "authorization
+    /// changed", the same 1008 class.)
+    #[tokio::test]
+    async fn a_late_refresh_whose_token_lapsed_is_still_invalidated() {
+        let mut fixture = refresh_fixture("m4-70-lapsed").await;
+        {
+            let key = fixture.key.scope();
+            let stream_id = fixture.stream_id;
+            fixture
+                .actor
+                .sessions
+                .get_mut(&key)
+                .expect("session")
+                .streams
+                .get_mut(&stream_id)
+                .expect("stream")
+                .consumer_expires_at = Utc::now() - Duration::milliseconds(100);
+        }
+        let challenge = fixture.challenge("m4-70-lapsed", std::time::Duration::from_millis(2_300));
+        let snapshot = fixture.snapshot_read(std::time::Duration::from_millis(2_200));
+        fixture.finish(challenge, snapshot);
+        let messages = fixture.drain();
+        let [tunnel_protocol::ControlMessage::AuthorizationInvalidated(invalidated)] =
+            messages.as_slice()
+        else {
+            panic!("one AUTHORIZATION_INVALIDATED, got {messages:?}");
+        };
+        assert_eq!(invalidated.reason, "authorization expired");
+        let stream = fixture.stream();
+        assert!(stream.terminal);
+        assert_eq!(
+            stream.authorization_failure_code,
+            Some("AUTHORIZATION_EXPIRED")
+        );
+    }
+
+    /// Task row M4-70: a connector's replacement challenge is taken once the
+    /// in-flight one's answer window has passed, and ignored before; the
+    /// replaced read's result is dropped.
+    #[tokio::test]
+    async fn a_replacement_challenge_is_taken_only_after_the_window() {
+        let mut fixture = refresh_fixture("m4-70-first").await;
+        let replacement = |fixture: &RefreshFixture, id: &str| {
+            let challenge = fixture.challenge(id, std::time::Duration::ZERO);
+            tunnel_protocol::AuthorizationChallenge::new(
+                challenge.message_id,
+                fixture.key.session_id.clone(),
+                fixture.key.epoch,
+                challenge.stream_id,
+                challenge.challenge_id,
+                challenge.nonce,
+                challenge.service_id,
+                challenge.permission_digest,
+                challenge.grant_revision,
+            )
+        };
+        // Inside the first challenge's window: ignored.
+        let early = replacement(&fixture, "m4-70-early");
+        fixture
+            .actor
+            .begin_device_challenge(fixture.key.clone(), early);
+        assert_eq!(
+            fixture.stream().challenge_id.as_deref(),
+            Some("m4-70-first")
+        );
+        // Past it: the replacement is taken.
+        {
+            let key = fixture.key.scope();
+            let stream_id = fixture.stream_id;
+            let stream = fixture
+                .actor
+                .sessions
+                .get_mut(&key)
+                .expect("session")
+                .streams
+                .get_mut(&stream_id)
+                .expect("stream");
+            stream.authorization_deadline_ms = Some(super::monotonic_millis().saturating_sub(1));
+        }
+        let late = replacement(&fixture, "m4-70-second");
+        fixture
+            .actor
+            .begin_device_challenge(fixture.key.clone(), late);
+        assert_eq!(
+            fixture.stream().challenge_id.as_deref(),
+            Some("m4-70-second")
+        );
+        assert!(fixture.stream().authorization_in_flight);
+        // The first read's result no longer matches and is dropped.
+        let first = fixture.challenge("m4-70-first", std::time::Duration::from_millis(10));
+        let snapshot = fixture.snapshot_read(std::time::Duration::from_millis(5));
+        fixture.finish(first, snapshot);
+        assert!(fixture.drain().is_empty());
+        assert!(fixture.stream().authorization_in_flight && !fixture.stream().terminal);
     }
 
     /// A stream that goes terminal while its authorization is in flight must
