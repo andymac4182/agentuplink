@@ -1150,7 +1150,8 @@ client (`packages/client`) retries nothing itself; since M6-C200 it reports
 the refusal as its own code, `CONNECTION_LIMIT`, with `retryAfterMs` read the
 same way (body, then `Retry-After`, then 1 s, capped at 300 s), and a caller or
 SDK wrapper that retries a fresh connect after it must wait `retryAfterMs`
-first ([packages/client/README.md](../packages/client/README.md)). The soak harness (`scripts/m6-soak.py`) deliberately
+first (`packages/client/README.md` in the source tree; the release archive
+does not carry the TypeScript client). The soak harness (`scripts/m6-soak.py`) deliberately
 does not back off unless given `--honor-retry-after`: it models a misbehaving
 client.
 
