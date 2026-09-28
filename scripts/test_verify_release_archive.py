@@ -105,6 +105,34 @@ class VerifierTests(unittest.TestCase):
         for name in ("KERNEL32.dll", "ntdll.dll", "api-ms-win-crt-runtime-l1-1-0.dll"):
             self.assertFalse(v.WINDOWS_REDISTRIBUTABLE.match(name), name)
 
+    def test_the_layout_controls_go_red_as_planted(self):
+        # docs/tasks.md M6-C216: `--self-test` runs only in release.yml, on
+        # real binaries.  The controls that need no binary to execute run
+        # here through `controls()` itself, on an archive packed from this
+        # repository's real documents and examples with synthetic binaries,
+        # so the unexpected-top-level control (and the check it plants
+        # against) is enforced by the packaging tests on every host.
+        from package_release import CI_ONLY_TARGETS, ROOT, TARGETS, binaries_for, package
+        wanted = {"checksum-mismatch", "top-level", "binary-set"}
+        for target in TARGETS + CI_ONLY_TARGETS:
+            with self.subTest(target=target):
+                binaries = self.dir / "bin-src" / target
+                binaries.mkdir(parents=True)
+                for name in binaries_for(target):
+                    (binaries / v.exe(target, name)).write_bytes(b"synthetic binary")
+                archive = package(ROOT, target, "a" * 40, "123", self.dir / "dist" / target,
+                                  {"packages": []}, binaries=binaries)
+                root = self.dir / "unpacked" / target
+                v.unpack(archive, root)
+                checksum = archive.with_name(archive.name + ".sha256")
+                self.assertTrue(v.check_layout(root, archive, target, "a" * 40, "123").ok)
+                ran = v.controls(root, archive, checksum, target, witnesses=wanted)
+                self.assertEqual(sorted(witness for _, witness, _, _ in ran), sorted(wanted))
+                for label, witness, passed, detail in ran:
+                    self.assertIs(passed, True, f"{label} -> want {witness}: {detail}")
+                labels = [label for label, _, _, _ in ran]
+                self.assertIn("an unexpected top-level entry (M6-C216)", labels)
+
 
 if __name__ == "__main__":
     unittest.main()
