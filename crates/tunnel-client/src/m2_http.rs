@@ -42,6 +42,64 @@ pub(super) const HTTP_FORWARD_OPERATION: &str = "http_forward";
 /// does not serve a refusal rather than a surprise.
 pub(super) const FS_STREAM_OPERATION: &str = "fs_9p";
 
+/// How far past the bridge's own terminal bound the actor's operation
+/// deadline for an admitted HTTP exchange lies.  The bridge ends the
+/// exchange itself, with the right code; the actor's deadline is only the
+/// backstop behind it.
+pub(super) const HTTP_OPERATION_BACKSTOP_MARGIN: Duration = Duration::from_secs(5);
+
+/// Settle an admitted `http-forward/1` exchange's bounds (task row M4-71).
+///
+/// Before M4-71 every HTTP exchange took `limits.operation_timeout_ms` (30 s
+/// by default) as both the actor's operation deadline and a clamp on the
+/// bridge's absolute deadline, so a streaming response -- an SSE GET, and so
+/// every MCP standalone GET and ACP connection-scoped stream -- was cut 30 s
+/// after its OPEN however live it was.
+///
+/// The rule now:
+///
+/// * **Until a response head exists** the single-request timeout still
+///   applies: the bridge's response-head bound is what remains of
+///   `head_deadline`, the OPEN's `operation_timeout_ms` measured from its
+///   receipt.  A handler that never answers, or answers too late, fails
+///   `HTTP_DEADLINE_EXCEEDED` exactly when it did before.
+/// * **Once the head exists** only the export's absolute application
+///   deadline (`BridgeConfig::deadline()`, default 300 s, at most 24 h) and
+///   the transport progress budgets bound the exchange.  There is no idle
+///   bound: docs/http-forwarding.md says an SSE connection is not killed
+///   merely because it has no current event.
+/// * The actor's own operation deadline becomes a backstop behind the
+///   bridge's terminal bound (its deadline plus discard grace), so it never
+///   races the bridge's own, correctly coded, deadline failure.
+///
+/// Authorization refresh, revocation and epoch change are untouched: the
+/// refresh tick still re-confirms the stream every grant window and still
+/// expires it the moment a confirmation lapses.
+///
+/// `None` only when the head deadline has already passed or the backstop
+/// overflows; the caller refuses the OPEN then.
+pub(super) fn http_exchange_bounds(
+    config: tunnel_http_bridge::BridgeConfig,
+    head_deadline: DualDeadline,
+    now: Instant,
+    wall_now: SystemTime,
+) -> Option<(tunnel_http_bridge::BridgeConfig, DualDeadline)> {
+    if head_deadline.expired_at(now, wall_now) {
+        return None;
+    }
+    let config = config
+        .with_response_head_deadline(head_deadline.remaining(now))
+        .ok()?;
+    let backstop = DualDeadline::new(
+        now,
+        wall_now,
+        config
+            .discard_bound()
+            .checked_add(HTTP_OPERATION_BACKSTOP_MARGIN)?,
+    )?;
+    Some((config, backstop))
+}
+
 /// Per-stream HTTP state held by the connector actor.
 pub(super) struct DeviceHttpState {
     chunks: VecDeque<Vec<u8>>,
@@ -364,11 +422,10 @@ impl M2Actor {
         let slot = Arc::clone(&body_stats);
         let handler = Arc::clone(&export.handler);
         let service_id = service_id.to_owned();
-        let deadline = Duration::from_millis(self.config.limits.operation_timeout_ms);
-        let config = export
-            .config
-            .with_deadline(export.config.deadline().min(deadline))
-            .unwrap_or(export.config);
+        // The caller settled this exchange's bounds at admission
+        // (`http_exchange_bounds`, M4-71): the head bound, then the export's
+        // absolute deadline.
+        let config = export.config;
         let profile = export.profile;
         let freeze = PauseController::new(self.writes_frozen);
         let pause = freeze.signal();

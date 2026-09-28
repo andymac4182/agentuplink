@@ -203,7 +203,10 @@ const M2_LONG_LIVED_STREAM_LIFETIME: Duration = Duration::from_secs(24 * 60 * 60
 /// How long an admitted operation may run before the connector ends it.
 ///
 /// `limits.operation_timeout_ms` bounds one exchange: a unary echo or one
-/// `http-forward/1` request.  An echo stream and a filesystem session are
+/// `http-forward/1` request.  For an `http-forward/1` request this is only
+/// its bound until admission: once admitted, the timeout bounds the wait for
+/// its response head and the export's absolute deadline bounds the rest
+/// (`m2_http::http_exchange_bounds`, M4-71).  An echo stream and a filesystem session are
 /// long-lived instead, and take the outer bound.  A filesystem session is a
 /// session, not a request: the contract bounds it by the consumer token (the
 /// relay closes it at expiry, and every confirmation is capped at the token's
@@ -4716,7 +4719,37 @@ impl M2Actor {
                 .send_open_rejected_journaled(open, open_refusal::AUTHORIZATION_WINDOW_EXPIRED);
         }
         let auth_deadline = authorization.auth_deadline;
-        let operation_deadline = pending.operation_deadline;
+        let mut operation_deadline = pending.operation_deadline;
+        // M4-71: an HTTP exchange keeps the single-request timeout only until
+        // its response head exists; see `http_exchange_bounds`.
+        let http_export = match http_export {
+            Some(mut http_export) => {
+                let Some((config, backstop)) = m2_http::http_exchange_bounds(
+                    http_export.config,
+                    operation_deadline,
+                    Instant::now(),
+                    SystemTime::now(),
+                ) else {
+                    // The same refusal, for the same condition, as the
+                    // `operation_deadline.expired()` check just above: the
+                    // single-request deadline passed in the microseconds
+                    // between that check and this one.  The only other
+                    // `None` is a backstop overflow, which cannot happen
+                    // (the bridge deadline is at most 24 h).  OPEN refusals
+                    // are a closed protocol table (`open_refusal::ALL`,
+                    // M7-C160) whose codes are metric labels, so a new code
+                    // for this race is not worth a protocol change.
+                    return self.send_open_rejected_journaled(
+                        open,
+                        open_refusal::AUTHORIZATION_WINDOW_EXPIRED,
+                    );
+                };
+                http_export.config = config;
+                operation_deadline = backstop;
+                Some(http_export)
+            }
+            None => None,
+        };
         let opened = ControlMessage::Opened(Opened::new(
             authorization.opened_message_id.clone(),
             open.message_id.clone(),
@@ -11255,6 +11288,162 @@ mod tests {
             expired_after_the_operation_timeout(HTTP_FORWARD_OPERATION).await,
             1,
             "an http-forward/1 request still ends at the single-operation timeout"
+        );
+    }
+
+    /// Task row M4-71: an admitted `http-forward/1` exchange is not ended at
+    /// the single-request timeout.  Before the fix the actor gave it
+    /// `limits.operation_timeout_ms` (30 s by default) as its operation
+    /// deadline and clamped the bridge's absolute deadline to it, so a live
+    /// SSE GET was reset 30 s after its OPEN.  Now the timeout survives only
+    /// as the bridge's response-head bound; the actor's deadline is a
+    /// backstop behind the export's absolute deadline.  The control is the
+    /// same stream carrying the un-admitted deadline, which still expires.
+    #[tokio::test]
+    async fn an_admitted_http_exchange_outlives_the_single_operation_timeout() {
+        const TIMEOUT_MS: u64 = 50;
+        async fn expired_count(admitted: bool) -> (u64, Option<Duration>, Duration) {
+            let (mut actor, _active_key, _carrier_receiver, _control_receiver) =
+                test_actor_with_control_capacity(M2_CARRIER_QUEUE_FRAMES, 16);
+            actor.config.limits.operation_timeout_ms = TIMEOUT_MS;
+            let mut open = test_open(1);
+            open.operation = HTTP_FORWARD_OPERATION.to_owned();
+            let reservation = actor
+                .reserve_pending_open(&open)
+                .expect("the OPEN is within its budget");
+            let pending = actor
+                .prepare_pending_open(open, reservation)
+                .expect("the OPEN is well formed");
+            let export = tunnel_http_bridge::BridgeConfig::default();
+            let (config, backstop) = m2_http::http_exchange_bounds(
+                export,
+                pending.operation_deadline,
+                Instant::now(),
+                SystemTime::now(),
+            )
+            .expect("an unexpired OPEN is admitted");
+            let mut stream = test_stream();
+            stream.operation = HTTP_FORWARD_OPERATION.to_owned();
+            stream.sequence = StreamState::new(1, 1_024).expect("test stream sequence");
+            stream.auth.confirmed = true;
+            stream.auth.refresh_in_flight = false;
+            stream.auth.deadline =
+                DualDeadline::new(Instant::now(), SystemTime::now(), Duration::from_secs(5))
+                    .expect("a confirmed five-second window");
+            stream.auth.operation_deadline = if admitted {
+                backstop
+            } else {
+                pending.operation_deadline
+            };
+            let backstop_remaining = stream.auth.operation_deadline.remaining(Instant::now());
+            actor.streams.insert(1, stream);
+            tokio::time::sleep(Duration::from_millis(TIMEOUT_MS * 2)).await;
+            actor
+                .refresh_authorizations()
+                .await
+                .expect("a refresh tick");
+            (
+                actor.auth_expired_streams,
+                config.response_head_deadline(),
+                if admitted {
+                    backstop_remaining
+                } else {
+                    Duration::ZERO
+                },
+            )
+        }
+
+        let (expired, head, backstop) = expired_count(true).await;
+        assert_eq!(
+            expired, 0,
+            "an admitted http-forward/1 exchange must not expire at the single-request timeout"
+        );
+        let head = head.expect("the single-request timeout survives as the response-head bound");
+        assert!(
+            head > Duration::ZERO && head <= Duration::from_millis(TIMEOUT_MS),
+            "the head bound is what remains of the OPEN's timeout: {head:?}"
+        );
+        assert!(
+            backstop >= tunnel_http_bridge::BridgeConfig::default().discard_bound(),
+            "the actor's deadline lies behind the bridge's own terminal bound: {backstop:?}"
+        );
+        let (expired, _, _) = expired_count(false).await;
+        assert_eq!(
+            expired, 1,
+            "the control: the un-admitted single-request deadline still expires"
+        );
+        let past = DualDeadline::new(Instant::now(), SystemTime::now(), Duration::from_millis(1))
+            .expect("a one-millisecond deadline");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        assert!(
+            m2_http::http_exchange_bounds(
+                tunnel_http_bridge::BridgeConfig::default(),
+                past,
+                Instant::now(),
+                SystemTime::now(),
+            )
+            .is_none(),
+            "an OPEN whose single-request timeout already passed is refused, not admitted"
+        );
+    }
+
+    /// M4-71 through the real admission path: an `http-forward/1` OPEN
+    /// admitted by `handle_control` carries the backstop, not the
+    /// single-request timeout, as its operation deadline.  Deleting the
+    /// assignment of the backstop in `try_admit_open` leaves the 50 ms
+    /// timeout on the stream, and this fails.
+    #[tokio::test]
+    async fn an_admitted_http_open_takes_the_backstop_as_its_operation_deadline() {
+        let (mut actor, _active_key, _carrier_receiver, _control_receiver) =
+            test_actor_with_control_capacity(M2_CARRIER_QUEUE_FRAMES, 16);
+        actor.config.limits.operation_timeout_ms = 50;
+        actor.config.exports.insert(
+            "http-svc".to_owned(),
+            crate::ExportConfig {
+                kind: crate::ExportKind::HttpForward,
+                device_canary: None,
+                mcp: None,
+                acp: None,
+                cua: None,
+                fs: None,
+            },
+        );
+        let profile = tunnel_http_bridge::Profile {
+            request: tunnel_http_forward::RequestPolicy::new(1_024).expect("request policy"),
+            response: tunnel_http_forward::ResponsePolicy::new(1_024).expect("response policy"),
+        };
+        let handler = |_request: http::Request<tunnel_http_bridge::ChannelBody>|
+         -> crate::http_forward::HttpHandlerFuture {
+            Box::pin(async { Err(crate::http_forward::HttpHandlerError) })
+        };
+        actor.http_handlers = HttpHandlers::new().with_export(
+            "http-svc".to_owned(),
+            crate::http_forward::HttpExport {
+                profile: std::sync::Arc::new(profile),
+                config: tunnel_http_bridge::BridgeConfig::default(),
+                handler: std::sync::Arc::new(handler),
+            },
+        );
+        let open = Open::new(
+            "open-message-1",
+            "session",
+            1,
+            1,
+            "operation-1",
+            "http-svc",
+            HTTP_FORWARD_OPERATION,
+            1_024,
+            1_024,
+        );
+        actor
+            .handle_control(ControlMessage::Open(open))
+            .await
+            .expect("the OPEN is admitted");
+        let stream = actor.streams.get(&1).expect("the http stream was admitted");
+        let remaining = stream.auth.operation_deadline.remaining(Instant::now());
+        assert!(
+            remaining >= tunnel_http_bridge::BridgeConfig::default().discard_bound(),
+            "the admitted stream's operation deadline is the backstop, not the 50 ms timeout: {remaining:?}"
         );
     }
 
