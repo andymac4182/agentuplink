@@ -18,9 +18,11 @@ which has no `SHA256SUMS`, `PROVENANCE.txt`, `Cargo.lock` or reconciled
 prints, not left to a reader to infer:
 
   checksums    the adjacent `.sha256` file names the archive and its digest
-  layout       safe member paths; exactly the target's binaries (no relay in
-               a device-half archive: Windows, M6-C83, and every CI-only
-               target, M6-C115); `release.json` agrees with
+  layout       safe member paths; exactly the target's binaries (four in a
+               full archive, including the operator's `tunnel-authority`,
+               M6-C22; no relay or authority in a device-half archive:
+               Windows, M6-C83, and every CI-only target, M6-C115);
+               `release.json` agrees with
                the archive name and the expected commit and run
   targets      every binary's executable format and CPU architecture match
                the triple, and the verifying host is that OS and architecture,
@@ -31,8 +33,10 @@ prints, not left to a reader to infer:
                sentinel; every example the shipped documents name is present
                (M6-C102); every relative link in the shipped documents resolves
   cli          help, version, every subcommand's `--help` (D6), `config check`
-               on the shipped client example, and (Unix) the relay's help and
-               `check-serve-config` on every shipped serving example
+               on the shipped client example, (Unix) the relay's help and
+               `check-serve-config` on every shipped serving example, and
+               (full archives) `tunnel-authority`'s help, version and every
+               subcommand's `--help` (M6-C22)
   portability  every binary's dynamic dependencies are system libraries a
                clean machine of that OS has (ELF DT_NEEDED, Mach-O `otool -L`,
                PE import table)
@@ -81,6 +85,7 @@ CLIENT_SUBCOMMAND_HELP = (
 )
 RELAY_SUBCOMMAND_HELP = (["serve", "--help"], ["check-serve-config", "--help"],
                          ["provision-catalog", "--help"], ["recover", "--help"])
+AUTHORITY_SUBCOMMAND_HELP = (["sign-recovery-approval", "--help"], ["generate-recovery-key", "--help"])
 
 SCOPE = (
     "scope: the CI archive's own contents, executed natively. NOT covered: "
@@ -385,6 +390,24 @@ def check_cli(root: Path, target: str, work: Path) -> Result:
             if completed.returncode != 0:
                 return fail("cli", "serving-config-check", f"check-serve-config on {config.name} exited "
                                                            f"{completed.returncode}: {completed.stderr[:160]}")
+    if "tunnel-authority" in binaries_for(target):
+        # M6-C22: the operator's signing tool ships in every full archive.
+        authority = root / "bin" / "tunnel-authority"
+        completed = probe(authority, ["--help"], work)
+        probes += 1
+        if completed.returncode != 0 or "Usage: tunnel-authority" not in completed.stdout:
+            return fail("cli", "help", f"tunnel-authority --help exited {completed.returncode}")
+        completed = probe(authority, ["--version"], work)
+        probes += 1
+        if completed.returncode != 0 or completed.stdout.strip() != f"tunnel-authority {base.group(1) if base else '?'}":
+            return fail("cli", "version", f"tunnel-authority --version printed {completed.stdout.strip()!r} "
+                                          f"for release {manifest['version']}")
+        for args in AUTHORITY_SUBCOMMAND_HELP:
+            completed = probe(authority, list(args), work)
+            probes += 1
+            if completed.returncode != 0 or "Usage: tunnel-authority" not in completed.stdout:
+                return fail("cli", "subcommand-help",
+                            f"tunnel-authority {' '.join(args)} exited {completed.returncode}")
     result = Result("cli", True, f"{probes} probes from the unpacked archive, including "
                                  f"{len(CLIENT_SUBCOMMAND_HELP)} client subcommand --help, config check "
                                  f"and {len(serving)} serving dry run(s)")
@@ -580,6 +603,18 @@ def controls(root: Path, archive: Path, checksum: Path, target: str,
             relay.unlink()
         return check_layout(copy, archive, target, None, None)
     expect("relay added to a device-only archive / removed from a full one", "binary-set", relay_in_wrong_half)
+
+    def authority_in_wrong_half(tmp):
+        # M6-C22: the operator's signing tool is part of the full bundle only.
+        copy = _copy(root, tmp)
+        authority = copy / "bin" / exe(target, "tunnel-authority")
+        if device_only(target):
+            authority.write_bytes(b"not the authority")
+        else:
+            authority.unlink(missing_ok=True)  # absent already: layout must still refuse
+        return check_layout(copy, archive, target, None, None)
+    expect("authority added to a device-only archive / removed from a full one (M6-C22)", "binary-set",
+           authority_in_wrong_half)
 
     def wrong_arch(tmp):
         copy = _copy(root, tmp)

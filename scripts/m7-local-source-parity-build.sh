@@ -486,6 +486,11 @@ copy_binary tunnel-test-harness
 # target directory the file is always sitting beside the client, which is
 # exactly the masking `docs/testing.md`'s release-artifact gate names.
 copy_binary tunnel-deadman
+# The operator's signing tool (M6-C22) is the bundle's fourth product binary;
+# `m6-release-artifact.py assemble` copies it from here and cross-checks its
+# binary_tunnel-authority_sha256 receipt field.  The workspace build above
+# produces it like every other workspace binary.
+copy_binary tunnel-authority
 assert_client_sentinel_beside "$bin_dir" m7-local-source-parity-build
 
 client_bundle=$bin_dir/tunnel-client
@@ -542,6 +547,7 @@ run_cli_help() {
 
 run_cli_help tunnel-relay "$bin_dir/tunnel-relay" "$output_run/cli-help-tunnel-relay.txt"
 run_cli_help tunnel-test-harness "$bin_dir/tunnel-test-harness" "$output_run/cli-help-tunnel-test-harness.txt"
+run_cli_help tunnel-authority "$bin_dir/tunnel-authority" "$output_run/cli-help-tunnel-authority.txt"
 
 tab=$(printf '\t')
 checksum_file=$output_run/SHA256SUMS
@@ -552,6 +558,7 @@ source_manifest_checksum=$(sha256_file "$source_manifest_snapshot")
     printf '%s  %s\n' "$(sha256_file "$client_version")" cli-version.txt
     printf '%s  %s\n' "$(sha256_file "$output_run/cli-help-tunnel-relay.txt")" cli-help-tunnel-relay.txt
     printf '%s  %s\n' "$(sha256_file "$output_run/cli-help-tunnel-test-harness.txt")" cli-help-tunnel-test-harness.txt
+    printf '%s  %s\n' "$(sha256_file "$output_run/cli-help-tunnel-authority.txt")" cli-help-tunnel-authority.txt
     while IFS="$tab" read -r parity_binary_name parity_binary_sha256 parity_binary_file; do
         printf '%s  %s\n' "$parity_binary_sha256" "bundle/bin/$parity_binary_name"
         printf '%s  %s\n' "$(sha256_file "$output_run/codesign-$parity_binary_name.txt")" "codesign-$parity_binary_name.txt"
@@ -623,6 +630,7 @@ receipt=$output_run/source-parity-receipt.txt
     printf '%s\n' 'client_version=passed'
     printf '%s\n' 'relay_help=passed'
     printf '%s\n' 'test_harness_help=passed'
+    printf '%s\n' 'authority_help=passed'
     printf '%s\n' 'acceptance_invocation=not-run-by-this-script'
 } > "$receipt"
 chmod 0444 "$receipt"

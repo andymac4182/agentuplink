@@ -65,6 +65,13 @@ gate "operator recovery CLI tests" \
 gate "operator recovery workflow tests" \
   cargo test -p tunnel-relay --test recovery_workflow --locked -- --ignored --test-threads=1
 
+# M6-C22: `tunnel-relay recover` accepts an approval `tunnel-authority`
+# signed, and refuses one from the wrong key and one against a stale digest.
+# The test runs both binaries; `tunnel-relay` is found beside
+# `tunnel-authority` in the target directory, so build it first.
+gate "recovery approval from tunnel-authority (M6-C22)" \
+  sh -c 'cargo build -p tunnel-relay --bin tunnel-relay --locked && cargo test -p tunnel-authority --test recover_accepts_authority_approval --locked -- --ignored --test-threads=1'
+
 gate "operator namespace backup rollback recovery" \
   cargo test -p tunnel-relay --test recovery_backup_rollback --locked -- --ignored --test-threads=1
 

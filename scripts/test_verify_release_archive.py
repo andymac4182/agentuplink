@@ -127,11 +127,44 @@ class VerifierTests(unittest.TestCase):
                 checksum = archive.with_name(archive.name + ".sha256")
                 self.assertTrue(v.check_layout(root, archive, target, "a" * 40, "123").ok)
                 ran = v.controls(root, archive, checksum, target, witnesses=wanted)
-                self.assertEqual(sorted(witness for _, witness, _, _ in ran), sorted(wanted))
+                self.assertEqual({witness for _, witness, _, _ in ran}, wanted)
                 for label, witness, passed, detail in ran:
                     self.assertIs(passed, True, f"{label} -> want {witness}: {detail}")
                 labels = [label for label, _, _, _ in ran]
                 self.assertIn("an unexpected top-level entry (M6-C216)", labels)
+                self.assertIn("relay added to a device-only archive / removed from a full one", labels)
+                self.assertIn("authority added to a device-only archive / removed from a full one (M6-C22)",
+                              labels)
+
+    def test_the_binary_set_check_requires_the_authority_in_full_archives_only(self):
+        # M6-C22: tunnel-authority is the fourth binary of every full archive
+        # and absent from every device half.  Literal names, not
+        # binaries_for, so a BINARIES that drops it turns this red.
+        from package_release import CI_ONLY_TARGETS, ROOT, TARGETS, device_only, package
+        full = ["tunnel-authority", "tunnel-client", "tunnel-deadman", "tunnel-relay"]
+        device = ["tunnel-client", "tunnel-deadman"]
+        for target in TARGETS + CI_ONLY_TARGETS:
+            with self.subTest(target=target):
+                names = device if device_only(target) else full
+                binaries = self.dir / "bin-src" / target
+                binaries.mkdir(parents=True)
+                for name in full:
+                    (binaries / v.exe(target, name)).write_bytes(b"synthetic binary")
+                archive = package(ROOT, target, "a" * 40, "123", self.dir / "dist" / target,
+                                  {"packages": []}, binaries=binaries)
+                root = self.dir / "unpacked" / target
+                v.unpack(archive, root)
+                self.assertEqual(sorted(p.name for p in (root / "bin").iterdir()),
+                                 sorted(v.exe(target, name) for name in names))
+                self.assertTrue(v.check_layout(root, archive, target, None, None).ok)
+                authority = root / "bin" / v.exe(target, "tunnel-authority")
+                if device_only(target):
+                    authority.write_bytes(b"planted authority")
+                else:
+                    authority.unlink()
+                result = v.check_layout(root, archive, target, None, None)
+                self.assertFalse(result.ok)
+                self.assertEqual(result.witness, "binary-set")
 
 
 if __name__ == "__main__":

@@ -12,10 +12,12 @@ import zipfile
 from pathlib import Path, PurePosixPath
 
 ROOT = Path(__file__).resolve().parents[1]
-BINARIES = ("tunnel-client", "tunnel-relay", "tunnel-deadman")
+BINARIES = ("tunnel-client", "tunnel-relay", "tunnel-deadman", "tunnel-authority")
 # The relay ships only for Unix targets: it has never run on Windows, and
 # docs/architecture.md promises Linux relay images and Windows *device*
 # binaries (task row M6-C83). A Windows bundle is the device half.
+# tunnel-authority, the operator's signing tool (M6-C22), is Unix-only like
+# the relay and ships only in the full bundle.
 DEVICE_BINARIES = ("tunnel-client", "tunnel-deadman")
 
 
@@ -395,7 +397,7 @@ def package(root, target, sha, run, output, metadata, binaries=None):
             if windows
             else "Keep tunnel-client and tunnel-deadman together. This is a client-only CI build (not a published release target): it carries no relay.\n"
             if device_only(target, root)
-            else "Keep all three binaries together, including tunnel-deadman.\n"
+            else "Keep all four binaries together, including tunnel-deadman. tunnel-authority is the operator's signing tool: run it on the authority host, not on a relay host.\n"
         )
         (staging / "README.txt").write_text("Agent Uplink development build. Not production-certified.\n" + keep + "Configure identity, relay and grants before connecting. Start with docs/operator.md in this archive; it and the documents it links describe this build's source commit.\nLinux builds require a compatible glibc (Ubuntu 24.04 build host).\nmacOS binaries are not code-signed or notarized; Windows binaries are not Authenticode-signed.\nSetup and support: https://agentuplink.dev/docs/setup\n")
         if windows:

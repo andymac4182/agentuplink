@@ -703,3 +703,151 @@ async fn m7_membership_directory_reads_all_nodes_with_per_node_versions() {
     ));
     catalog.cleanup_fixture_namespace().await.ok();
 }
+
+/// The Redis ACL rules the membership publisher needs (task row M6-C22):
+/// `RedisMembershipPublisher::connect` runs `PING` and `INFO server` on each
+/// of its seven connections, and `publish_signed_membership_for_node` runs one
+/// `EVAL` whose script calls `HGET`, `HLEN`, `HSET` and `EXPIRE` on the one
+/// directory key.  docs/operator.md section 3.3 states this list.
+const PUBLISHER_ACL_COMMANDS: [&str; 7] =
+    ["ping", "info", "eval", "hget", "hlen", "hset", "expire"];
+
+fn acl_rules(namespace: &str, secret: &str, commands: &[&str]) -> Vec<String> {
+    let mut rules = vec![
+        "reset".to_owned(),
+        "on".to_owned(),
+        format!(">{secret}"),
+        format!("~tunnel-catalog:{namespace}:membership:operator:*"),
+        "-@all".to_owned(),
+    ];
+    rules.extend(commands.iter().map(|command| format!("+{command}")));
+    rules
+}
+
+/// `redis://HOST:PORT/DB` with this ACL user's name and secret spliced in.
+fn url_as(base: &str, user: &str, secret: &str) -> String {
+    let rest = base
+        .strip_prefix("redis://")
+        .expect("a plaintext redis:// fixture URL");
+    let rest = rest.rsplit_once('@').map_or(rest, |(_, host)| host);
+    let mut url = String::from("redis://");
+    url.push_str(user);
+    url.push(':');
+    url.push_str(secret);
+    url.push('@');
+    url.push_str(rest);
+    url
+}
+
+async fn publish_as(url: &str, namespace: &str, node_id: &str) -> Result<(), String> {
+    let publisher = RedisMembershipPublisher::connect(url, namespace)
+        .await
+        .map_err(|error| format!("connect: {error}"))?;
+    publisher
+        .publish_signed_membership_for_node(
+            node_id,
+            &SignedMembershipRecord {
+                version: 1,
+                bytes: format!(r#"{{"node_id":"{node_id}"}}"#).into_bytes(),
+            },
+        )
+        .await
+        .map_err(|error| format!("publish: {error}"))
+}
+
+#[tokio::test]
+#[ignore = "requires TUNNEL_CATALOG_REDIS_URL Redis primary fixture"]
+async fn m6c22_membership_publisher_runs_under_the_documented_acl_and_needs_every_rule() {
+    let url = std::env::var("TUNNEL_CATALOG_REDIS_URL")
+        .expect("M7 Redis tests require TUNNEL_CATALOG_REDIS_URL");
+    let namespace = format!("test-publisher-acl-{}", Uuid::new_v4().simple());
+    let user = format!("test-m6c22-publisher-{}", Uuid::new_v4().simple());
+    // Synthetic, generated per run, never written anywhere but this Redis.
+    let secret = Uuid::new_v4().simple().to_string();
+    let catalog = RedisCatalog::connect(&url, &namespace)
+        .await
+        .expect("connect catalog");
+    let admin = redis::Client::open(url.as_str()).expect("admin client");
+    let mut admin = admin
+        .get_multiplexed_async_connection()
+        .await
+        .expect("admin connection");
+
+    let outcome: Result<(), String> = async {
+        // The full list: the publisher connects and publishes.
+        let mut command = redis::cmd("ACL");
+        command.arg("SETUSER").arg(&user);
+        for rule in acl_rules(&namespace, &secret, &PUBLISHER_ACL_COMMANDS) {
+            command.arg(rule);
+        }
+        command
+            .query_async::<()>(&mut admin)
+            .await
+            .map_err(|error| format!("ACL SETUSER: {error}"))?;
+        let scoped = url_as(&url, &user, &secret);
+        publish_as(&scoped, &namespace, "relay-acl")
+            .await
+            .map_err(|error| format!("the documented ACL was not enough: {error}"))?;
+        let published = catalog
+            .read_signed_memberships()
+            .await
+            .map_err(|error| format!("read back: {error}"))?;
+        if published.len() != 1 {
+            return Err(format!(
+                "expected one published record, read {}",
+                published.len()
+            ));
+        }
+        // Scoped: the same user cannot read or write any other key in the
+        // namespace.
+        let mut scoped_connection = redis::Client::open(scoped.as_str())
+            .map_err(|error| error.to_string())?
+            .get_multiplexed_async_connection()
+            .await
+            .map_err(|error| error.to_string())?;
+        let outside = format!("tunnel-catalog:{namespace}:meta:deployment_incarnation");
+        let read = redis::cmd("HGET")
+            .arg(&outside)
+            .arg("x")
+            .query_async::<Option<String>>(&mut scoped_connection)
+            .await;
+        if read.is_ok() {
+            return Err("the publisher ACL could read outside membership:operator:*".into());
+        }
+        // Minimal: without any one rule, the publisher fails.
+        for (index, dropped) in PUBLISHER_ACL_COMMANDS.iter().enumerate() {
+            let kept: Vec<&str> = PUBLISHER_ACL_COMMANDS
+                .iter()
+                .copied()
+                .filter(|command| command != dropped)
+                .collect();
+            let mut command = redis::cmd("ACL");
+            command.arg("SETUSER").arg(&user);
+            for rule in acl_rules(&namespace, &secret, &kept) {
+                command.arg(rule);
+            }
+            command
+                .query_async::<()>(&mut admin)
+                .await
+                .map_err(|error| format!("ACL SETUSER: {error}"))?;
+            if publish_as(&scoped, &namespace, &format!("relay-without-{index}"))
+                .await
+                .is_ok()
+            {
+                return Err(format!("the publisher still worked without +{dropped}"));
+            }
+        }
+        Ok(())
+    }
+    .await;
+
+    let _ = redis::cmd("ACL")
+        .arg("DELUSER")
+        .arg(&user)
+        .query_async::<i64>(&mut admin)
+        .await;
+    catalog.cleanup_fixture_namespace().await.ok();
+    if let Err(message) = outcome {
+        panic!("{message}");
+    }
+}
