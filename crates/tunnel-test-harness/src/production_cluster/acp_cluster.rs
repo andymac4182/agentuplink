@@ -3019,8 +3019,16 @@ impl Gate<'_> {
         let relay = self.cluster.relay("relay-c")?;
         super::publish_verified_pins(&relay.membership, &relay.pins)?;
         // The route has to be answering again before the next case starts, or
-        // that case would be measuring this one's recovery.
+        // that case would be measuring this one's recovery.  Peer readiness
+        // alone is not that (see `wait_route_answers`): after the pins are
+        // republished the ingress can still refuse `PEER_UNTRUSTED` or
+        // `CLUSTER_UNREADY` for a moment, and `owner-loss`'s first POST met
+        // exactly that once the M4-53 revocation case shifted the later cases
+        // by about a second (the #247 CI follow-up).  So settle the route too,
+        // with a probe that has no side effect and is not a case refusal.
         self.wait_peers_ready().await?;
+        let settle_probes = self.probe_until_route_answers().await?;
+        eprintln!("ACP cluster peer-path-loss route settle probes={settle_probes}");
         Ok(())
     }
 
