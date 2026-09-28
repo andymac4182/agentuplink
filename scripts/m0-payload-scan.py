@@ -209,12 +209,13 @@ GATES = (
     Gate("M4", "verify-m4-fs-process-restart", EVERY_KIND, min_managed=4),
     Gate("M4", "verify-m4-fs-data-recovery", EVERY_KIND),
     Gate("M4", "verify-m4-fs-data-recovery-lost-ack", EVERY_KIND),
-    # Its one payload is `(i % 251) | 0x80`: every byte has the high bit set,
-    # which the gate's region classifier depends on, so no byte of it is text.
-    # It is still matched in its Debug, hex and base64 encodings.
+    # These three move only `fs_rotation_write::payload_bytes`, whose byte `i`
+    # is `(i % 251) | 0x80`: every byte has the high bit set, which the gates'
+    # region classifier depends on, so no byte of it is text.  Their payloads
+    # are still matched in their Debug, hex and base64 encodings.
     Gate("M4", "verify-m4-fs-rotation-write", EVERY_KIND, text_domain=False),
-    Gate("M4", "verify-m4-fs-write-restart", EVERY_KIND, min_managed=4),
-    Gate("M4", "verify-m4-fs-rename-restart", EVERY_KIND, min_managed=4),
+    Gate("M4", "verify-m4-fs-write-restart", EVERY_KIND, min_managed=4, text_domain=False),
+    Gate("M4", "verify-m4-fs-rename-restart", EVERY_KIND, min_managed=4, text_domain=False),
     Gate("M8", "verify-m8-acp-real-path", EVERY_KIND),
     Gate("M8", "verify-m8-acp-cluster", EVERY_KIND),
 )

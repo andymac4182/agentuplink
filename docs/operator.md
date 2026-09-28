@@ -1734,7 +1734,7 @@ Two harness gates check that diagnostics carry no payloads.
 `verify-m7-c11-diagnostics` covers the M7 gates, and
 `scripts/m0-payload-scan.py` (M0-04, M0-08) covers the M1, M2, M3, M4 and M8
 gates. Each gate's synthetic credentials, payloads, paths and endpoints are
-recorded, and the relay's own logs are searched for them at `debug`. That
+recorded, and the relay's own logs are searched for them, in several encodings, at `trace`. That
 is evidence for the paths those gates drive with synthetic data, not a proof
 for every input or log level. Computer-use (M5) is not part of this alpha, so
 no shipped path handles typed text. Treat logs as sensitive regardless.
