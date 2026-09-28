@@ -1273,3 +1273,144 @@ async fn a_consumer_that_leaves_before_any_head_still_yields_a_report() {
     assert_eq!(device.error, Some(HttpErrorCode::Cancelled));
     assert_eq!(device.execution, Execution::Dispatched);
 }
+
+/// Task row M4-71: the response-head bound applied by one endpoint.
+const HEAD_BOUND: Duration = Duration::from_millis(150);
+
+fn head_bounded() -> BridgeConfig {
+    BridgeConfig::default()
+        .with_response_head_deadline(HEAD_BOUND)
+        .unwrap()
+}
+
+/// M4-71: a streaming response outlives the device's response-head bound.
+/// The SSE head arrives at once, then the stream stays open and silent for
+/// longer than the bound between events and ends cleanly at four times it.
+/// Before M4-71 the connector clamped the device's absolute deadline to the
+/// single-request timeout, which cut exactly this stream.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_streaming_response_outlives_the_response_head_bound() {
+    const EVENTS: [&[u8]; 3] = [b"data: first\n\n", b"data: second\n\n", b"data: third\n\n"];
+    let (tx, body) = test_body(1);
+    let started = tokio::time::Instant::now();
+    let running = exchange_with(
+        request("GET", "/events", &[], empty_body()),
+        link(STREAM_CREDIT),
+        head_bounded(),
+        head_bounded(),
+        profile(),
+        move |_request: Request<ChannelBody>| async move {
+            tokio::spawn(async move {
+                for event in EVENTS {
+                    tx.send(data(event)).await.unwrap();
+                    tokio::time::sleep(HEAD_BOUND * 4 / 3).await;
+                }
+            });
+            Ok::<_, TestError>(
+                Response::builder()
+                    .status(200)
+                    .header("content-type", "text/event-stream")
+                    .body(body)
+                    .unwrap(),
+            )
+        },
+    )
+    .await;
+    assert_eq!(running.response.status(), StatusCode::OK);
+    let received = within(collect(running.response.into_body()))
+        .await
+        .expect("the stream ends cleanly, not at the head bound");
+    assert_eq!(received, EVENTS.concat());
+    assert!(
+        started.elapsed() >= HEAD_BOUND * 3,
+        "the stream must have outlived the head bound several times over"
+    );
+    let device = within(running.device).await.unwrap();
+    assert_eq!(device.error, None);
+    assert_eq!(device.response, Outcome::Complete);
+    let owner = within(running.handle.report()).await;
+    assert_eq!(owner.error, None);
+    assert_eq!(owner.response, Outcome::Complete);
+}
+
+/// M4-71: a handler that never answers still fails at the device's
+/// response-head bound, long before the absolute deadline (300 s here).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_handler_that_never_answers_misses_the_response_head_bound() {
+    let started = tokio::time::Instant::now();
+    let running = exchange_with(
+        request("POST", "/upload", &[], empty_body()),
+        link(STREAM_CREDIT),
+        BridgeConfig::default(),
+        head_bounded(),
+        profile(),
+        |_request: Request<ChannelBody>| async move {
+            std::future::pending::<()>().await;
+            Ok::<_, TestError>(Response::new(empty_body()))
+        },
+    )
+    .await;
+    assert_eq!(running.response.status(), StatusCode::GATEWAY_TIMEOUT);
+    let error = running.response.extensions().get::<GatewayError>().copied();
+    assert_eq!(
+        error.map(|error| error.code),
+        Some(HttpErrorCode::DeadlineExceeded)
+    );
+    assert!(started.elapsed() < Duration::from_secs(10));
+    let device = within(running.device).await.unwrap();
+    assert_eq!(device.error, Some(HttpErrorCode::DeadlineExceeded));
+    assert_eq!(device.execution, Execution::Dispatched);
+}
+
+/// M4-71: the owner endpoint honours the same bound when the device never
+/// sends a `RESPONSE_HEAD`, and the device then learns of it by RESET.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_owner_without_a_response_head_misses_the_response_head_bound() {
+    let started = tokio::time::Instant::now();
+    let running = exchange_with(
+        request("POST", "/upload", &[], empty_body()),
+        link(STREAM_CREDIT),
+        head_bounded(),
+        BridgeConfig::default(),
+        profile(),
+        |_request: Request<ChannelBody>| async move {
+            std::future::pending::<()>().await;
+            Ok::<_, TestError>(Response::new(empty_body()))
+        },
+    )
+    .await;
+    assert_eq!(running.response.status(), StatusCode::GATEWAY_TIMEOUT);
+    assert!(started.elapsed() < Duration::from_secs(10));
+    let owner = within(running.handle.report()).await;
+    assert_eq!(owner.error, Some(HttpErrorCode::DeadlineExceeded));
+    let device = within(running.device).await.unwrap();
+    assert!(
+        device.error.is_some(),
+        "the device must see the owner's RESET"
+    );
+}
+
+/// The bound is validated like the absolute deadline and never outlives it.
+#[test]
+fn the_response_head_bound_is_finite_and_capped_by_the_deadline() {
+    assert!(
+        BridgeConfig::default()
+            .with_response_head_deadline(Duration::ZERO)
+            .is_err()
+    );
+    assert!(
+        BridgeConfig::default()
+            .with_response_head_deadline(tunnel_http_bridge::MAX_DEADLINE + Duration::from_secs(1))
+            .is_err()
+    );
+    assert_eq!(BridgeConfig::default().response_head_deadline(), None);
+    let capped = BridgeConfig::default()
+        .with_deadline(Duration::from_secs(2))
+        .unwrap()
+        .with_response_head_deadline(Duration::from_secs(60))
+        .unwrap();
+    assert_eq!(
+        capped.response_head_deadline(),
+        Some(Duration::from_secs(2))
+    );
+}
