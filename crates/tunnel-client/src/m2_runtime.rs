@@ -169,15 +169,19 @@ const M2_AUTH_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 const M2_AUTH_REFRESH_MARGIN: Duration = Duration::from_millis(1_500);
 /// A refresh challenge still unanswered after this long is retired and
 /// replaced with a fresh nonce (task row M4-70): docs/cluster.md's "a
-/// challenge times out after two seconds and its nonce is retired".  The
-/// retry never extends the refresh's lapse deadline, which stays anchored at
-/// the first unanswered challenge.
-const M2_AUTH_CHALLENGE_TIMEOUT: Duration = Duration::from_secs(2);
+/// challenge times out after two seconds and its nonce is retired", plus a
+/// quarter second so the replacement reaches the relay after the relay's own
+/// two-second window for the first one has passed (the relay ignores a
+/// replacement inside that window).  The retry never extends the refresh's
+/// lapse deadline, which is the previous confirmation's deadline.
+const M2_AUTH_CHALLENGE_TIMEOUT: Duration = Duration::from_millis(2_250);
 /// The most challenges one refresh may send before its lapse deadline
-/// (task row M4-70): the first and two retries.  With the five-second
-/// `limits.grant_timeout_ms` ceiling and the two-second challenge timeout the
-/// deadline admits at most three anyway (at 0 s, 2 s and 4 s); the cap keeps
-/// the bound explicit for any shorter configuration.
+/// (task row M4-70).  The lapse deadline is the previous confirmation's
+/// deadline (docs/cluster.md: an unanswered challenge never extends an
+/// earlier confirmation), about three seconds after a refresh that started
+/// two seconds into a five-second confirmation, so in practice a refresh
+/// sends its first challenge and at most one retry, at 2.25 s.  The cap keeps
+/// the bound explicit for any other timing.
 const M2_AUTH_REFRESH_MAX_CHALLENGES: u8 = 3;
 /// An authorization the relay invalidated: the grant is gone, moved or its
 /// snapshot, token or credential lapsed.  The relay closes the consumer 1008.
@@ -1545,6 +1549,16 @@ struct M2Stream {
     /// `M2_AUTH_REFRESH_MAX_CHALLENGES`.  Only a refresh is retried: the
     /// relay answers an admission challenge through a different path.
     refresh_challenges: u8,
+    /// The challenge IDs a retry of the refresh in flight retired (task row
+    /// M4-70; at most `M2_AUTH_REFRESH_MAX_CHALLENGES - 1`).  An invalidation
+    /// naming one is still honoured -- it can only narrow access -- while a
+    /// confirmation naming one is discarded.  Cleared on confirmation.
+    retired_challenges: Vec<String>,
+    /// When the last accepted confirmation ends, on the monotonic clock
+    /// (task row M4-53, review of #247).  A refresh in flight never moves it;
+    /// the HTTP read path and the filesystem authority refuse to dispatch past
+    /// it even before the actor's lapse pass runs.
+    confirmed_until: Option<Instant>,
 }
 
 /// Consume as many complete length-prefixed echo records as are available.
@@ -4819,6 +4833,8 @@ impl M2Actor {
             http: None,
             fs_authority: None,
             refresh_challenges: 0,
+            retired_challenges: Vec::new(),
+            confirmed_until: Some(auth_deadline.monotonic),
         };
         let mut stream = stream;
         if let Some(http_export) = http_export {
@@ -4833,9 +4849,10 @@ impl M2Actor {
             // created confirmed, because the OPEN only reaches here after the
             // stream's authorization context was admitted; every later
             // confirmation and every invalidation moves it.
-            let authority = std::sync::Arc::new(crate::fs_export::StreamAuthority::new(
+            let authority = std::sync::Arc::new(crate::fs_export::StreamAuthority::new_until(
                 authorization.grant_revision,
                 granted,
+                auth_deadline.monotonic,
             ));
             stream.fs_authority = Some(std::sync::Arc::clone(&authority));
             stream.http = Some(self.start_fs_exchange(
@@ -5087,27 +5104,40 @@ impl M2Actor {
             if !valid {
                 (VecDeque::new(), 0)
             } else {
-                // The challenge deadline was created before its fresh nonce
-                // was sent. Confirmation may shorten that immutable window to
-                // the relay's grant, but can never move it forward. The
+                // The confirmation runs from the confirmed challenge's own
+                // start, which predates the relay's catalog read, for the
+                // relay's `remaining_ms` capped at `limits.grant_timeout_ms`.
+                // It is a fresh authorization, so it is not capped by the
+                // refresh's lapse deadline (the previous confirmation's end),
+                // which only bounded how long the refresh could wait.  It can
+                // never start earlier than the challenge was sent.  The
                 // separate operation deadline remains unchanged below.
-                match stream.auth.deadline.shorten(Duration::from_millis(
-                    confirmed
-                        .remaining_ms
-                        .min(self.config.limits.grant_timeout_ms),
-                )) {
+                match DualDeadline::new(
+                    stream.auth.deadline.started,
+                    stream.auth.deadline.started_wall,
+                    Duration::from_millis(
+                        confirmed
+                            .remaining_ms
+                            .min(self.config.limits.grant_timeout_ms),
+                    ),
+                ) {
                     Some(deadline) => {
                         stream.auth.deadline = deadline;
                         stream.auth.confirmed = true;
                         stream.auth.refresh_in_flight = false;
                         stream.refresh_challenges = 0;
+                        stream.retired_challenges.clear();
+                        stream.confirmed_until = Some(deadline.monotonic);
                         stream.auth.nonce.clear();
                         // The provider reads this before every host call, so a
                         // renewed confirmation reaches it at the same instant
                         // the actor takes it.
                         if let Some(authority) = stream.fs_authority.as_ref() {
-                            authority
-                                .confirm(stream.auth.grant_revision, authority.current_grant());
+                            authority.confirm(
+                                stream.auth.grant_revision,
+                                authority.current_grant(),
+                                deadline.monotonic,
+                            );
                         }
                         if let Some(http) = stream.http.as_mut() {
                             http.note_confirmation();
@@ -5229,6 +5259,17 @@ impl M2Actor {
             let Some(stream) = self.streams.get(&stream_id) else {
                 continue;
             };
+            // docs/cluster.md: "an unanswered challenge never extends an
+            // earlier confirmation" and step 5, "stop dispatch when the prior
+            // snapshot expires".  The refresh may wait for its answer only
+            // until the previous confirmation ends (task row M4-53, review of
+            // #247).  Before, this deadline was the challenge's start plus
+            // `limits.grant_timeout_ms`, which the HTTP read path and the
+            // filesystem authority then took as the stream's live deadline:
+            // queued work could run about 7 s after the last authorizing
+            // read.  `min` keeps this challenge's start, from which a
+            // confirmation is measured.
+            let auth_deadline = auth_deadline.min(stream.auth.deadline);
             // This must name exactly the operations the selection above
             // names.  A stream selected for refresh and then dropped here has
             // its challenge built and discarded on every tick, so its grant
@@ -5365,7 +5406,8 @@ impl M2Actor {
                     let Some(stream) = self.streams.get_mut(&stream_id) else {
                         continue;
                     };
-                    stream.auth.challenge_id = challenge_id;
+                    let retired = std::mem::replace(&mut stream.auth.challenge_id, challenge_id);
+                    stream.retired_challenges.push(retired);
                     stream.auth.nonce = nonce;
                     stream.auth.deadline = auth_deadline;
                     stream.refresh_challenges = stream.refresh_challenges.saturating_add(1);
@@ -5464,7 +5506,17 @@ impl M2Actor {
         if self
             .streams
             .get(&invalidated.stream_id)
-            .is_some_and(|stream| stream.auth.challenge_id == invalidated.challenge_id)
+            .is_some_and(|stream| {
+                // Any challenge of the refresh in flight, current or retired
+                // by a retry (task row M4-70, review of #247): an
+                // invalidation can only narrow access, so dropping one for a
+                // retired nonce would fail open.
+                stream.auth.challenge_id == invalidated.challenge_id
+                    || stream
+                        .retired_challenges
+                        .iter()
+                        .any(|retired| *retired == invalidated.challenge_id)
+            })
         {
             // The relay's "the refresh answered too late, nothing lapsed but
             // the window" is a lapse too (task row M4-70), reset
@@ -9205,9 +9257,26 @@ impl M2Actor {
     /// that retries runs full admission against the catalog again, so the
     /// retryable code widens no access.  The stream still ends at the same
     /// deadline as before, so the revocation bound is unchanged.
+    ///
+    /// An **operation** deadline that passed while the authorization is still
+    /// inside its own is not a lapse of authorization at all: it is the
+    /// exchange running out of time, and is reset `ADAPTER_FAILURE` (4004,
+    /// "the application adapter failed, timed out, or rejected the
+    /// exchange"), which the relay also closes retryably (review of #247).
     async fn lapse_stream(&mut self, stream_id: u64) -> Result<(), ClientError> {
-        self.end_unauthorized_stream(stream_id, M2_RESET_AUTH_STALE)
-            .await
+        let now = Instant::now();
+        let wall_now = SystemTime::now();
+        let operation_timed_out = self.streams.get(&stream_id).is_some_and(|stream| {
+            !stream.auth.deadline.expired_at(now, wall_now)
+                && stream.confirmed_until.is_none_or(|until| now < until)
+                && stream.auth.operation_deadline.expired_at(now, wall_now)
+        });
+        let reason = if operation_timed_out {
+            tunnel_protocol::reset_reason::ADAPTER_FAILURE
+        } else {
+            M2_RESET_AUTH_STALE
+        };
+        self.end_unauthorized_stream(stream_id, reason).await
     }
 
     async fn end_unauthorized_stream(
@@ -10653,10 +10722,10 @@ mod tests {
         let mut stream = confirmed_stream_aged(
             1,
             FS_STREAM_OPERATION,
-            Duration::from_millis(2_100),
+            Duration::from_millis(2_300),
             Duration::from_secs(5),
         );
-        // A refresh sent 2.1 s ago and still unanswered.
+        // A refresh sent 2.3 s ago and still unanswered.
         stream.auth.confirmed = false;
         stream.auth.refresh_in_flight = true;
         stream.refresh_challenges = 1;
@@ -10693,10 +10762,10 @@ mod tests {
         stream.refresh_challenges = M2_AUTH_REFRESH_MAX_CHALLENGES;
         stream.auth.deadline = DualDeadline::new(
             Instant::now()
-                .checked_sub(Duration::from_millis(2_100))
+                .checked_sub(Duration::from_millis(2_300))
                 .expect("past"),
             SystemTime::now(),
-            Duration::from_millis(2_900),
+            Duration::from_millis(2_700),
         )
         .expect("deadline");
         actor
@@ -10758,6 +10827,197 @@ mod tests {
         assert!(stream.auth.confirmed && !stream.auth.refresh_in_flight);
         assert_eq!(stream.refresh_challenges, 0);
         assert_eq!(actor.expire_stream_calls, 0);
+    }
+
+    /// Task row M4-53 (review of #247): a refresh may wait for its answer
+    /// only until the previous confirmation ends.  Before the fix sending the
+    /// refresh replaced the stream's deadline with the challenge's start plus
+    /// `limits.grant_timeout_ms`, three seconds past the previous
+    /// confirmation, and the HTTP read path and filesystem authority took
+    /// that as the live deadline.
+    #[tokio::test]
+    async fn a_refresh_never_extends_the_previous_confirmation() {
+        let (mut actor, _active_key, _carrier_receiver, mut control_receiver) =
+            test_actor_with_control_capacity(M2_CARRIER_QUEUE_FRAMES, 16);
+        let stream = confirmed_stream_aged(
+            1,
+            FS_STREAM_OPERATION,
+            Duration::from_millis(2_050),
+            Duration::from_secs(5),
+        );
+        let previous = stream.auth.deadline.monotonic;
+        actor.streams.insert(1, stream);
+        actor
+            .refresh_authorizations()
+            .await
+            .expect("a refresh tick");
+        assert_eq!(queued_challenges(&mut control_receiver).len(), 1);
+        let stream = &actor.streams[&1];
+        assert!(stream.auth.refresh_in_flight);
+        assert!(
+            stream.auth.deadline.monotonic <= previous,
+            "the refresh's lapse deadline passes the previous confirmation"
+        );
+
+        // A confirmation of that refresh is a fresh authorization, measured
+        // from the refresh challenge's start, not capped by the lapse.
+        let session_id = actor.session.session_id.clone();
+        let epoch = actor.session.epoch;
+        let challenge_id = actor.streams[&1].auth.challenge_id.clone();
+        let nonce = actor.streams[&1].auth.nonce.clone();
+        let started = actor.streams[&1].auth.deadline.started;
+        actor
+            .handle_authorization_confirmed(AuthorizationConfirmed::new(
+                message_id(),
+                message_id(),
+                session_id,
+                epoch,
+                1,
+                challenge_id,
+                nonce,
+                "permission",
+                1,
+                5_000,
+            ))
+            .await
+            .expect("the confirmation is accepted");
+        let stream = &actor.streams[&1];
+        assert!(stream.auth.confirmed);
+        assert_eq!(
+            stream.auth.deadline.monotonic,
+            started + Duration::from_secs(5)
+        );
+        assert_eq!(
+            stream.confirmed_until,
+            Some(started + Duration::from_secs(5))
+        );
+    }
+
+    /// Task row M4-53 (review of #247): no buffered HTTP chunk reaches the
+    /// handler after the last confirmation ended, although a refresh is still
+    /// in flight and its own deadline (as sent before the fix) lay later.
+    /// Before the fix `http_read` checked expiry only for a confirmed stream.
+    #[tokio::test]
+    async fn no_http_chunk_is_read_past_the_previous_confirmation() {
+        let (mut actor, _key, mut receiver, _control_receiver) =
+            test_actor_with_carrier(M2_CARRIER_QUEUE_FRAMES);
+        let (notifier, _signal) = tunnel_http_bridge::reset_signal_pair();
+        let mut stream = confirmed_stream_aged(
+            5,
+            HTTP_FORWARD_OPERATION,
+            Duration::from_millis(3_100),
+            Duration::from_secs(3),
+        );
+        stream.http = Some(m2_http::DeviceHttpState::new(
+            notifier,
+            1024,
+            tunnel_http_bridge::PauseController::new(false),
+            None,
+        ));
+        // The last confirmation ended 100 ms ago; a refresh is in flight with
+        // the pre-fix deadline, two seconds away.
+        stream.confirmed_until = Some(
+            Instant::now()
+                .checked_sub(Duration::from_millis(100))
+                .expect("past"),
+        );
+        stream.auth.confirmed = false;
+        stream.auth.refresh_in_flight = true;
+        stream.refresh_challenges = 1;
+        stream.auth.deadline =
+            DualDeadline::new(Instant::now(), SystemTime::now(), Duration::from_secs(2))
+                .expect("deadline");
+        actor.streams.insert(5, stream);
+        actor.http_dispatch_payload(5, b"synthetic-chunk".to_vec());
+        let (reply_tx, reply_rx) = oneshot::channel();
+        actor
+            .handle_http_request(crate::http_forward::HttpActorRequest::Read {
+                stream_id: 5,
+                reply: reply_tx,
+            })
+            .await
+            .expect("a read");
+        let read = reply_rx.await.expect("a read answer");
+        assert!(
+            matches!(read, crate::http_forward::DeviceRead::Closed),
+            "the buffered chunk was read past the confirmation: {read:?}"
+        );
+        assert_eq!(
+            queued_reset_reasons(&mut receiver),
+            vec![tunnel_protocol::reset_reason::AUTHORIZATION_STALE]
+        );
+    }
+
+    /// Task row M4-70 (review of #247): an invalidation for a challenge a
+    /// retry retired still ends the stream.  Before the fix it was dropped,
+    /// which failed open.
+    #[tokio::test]
+    async fn an_invalidation_for_a_retired_challenge_still_ends_the_stream() {
+        let (mut actor, _key, mut receiver, _control_receiver) =
+            test_actor_with_carrier(M2_CARRIER_QUEUE_FRAMES);
+        let mut stream = confirmed_stream_aged(
+            3,
+            "echo_stream",
+            Duration::from_millis(100),
+            Duration::from_secs(3),
+        );
+        stream.auth.confirmed = false;
+        stream.auth.refresh_in_flight = true;
+        stream.refresh_challenges = 2;
+        stream.auth.challenge_id = "replacement".to_owned();
+        stream.retired_challenges = vec!["first".to_owned()];
+        actor.streams.insert(3, stream);
+        let invalidated = AuthorizationInvalidated::new(
+            message_id(),
+            actor.session.session_id.clone(),
+            actor.session.epoch,
+            3,
+            "first".to_owned(),
+            1,
+            "grant unavailable".to_owned(),
+        );
+        actor
+            .handle_authorization_invalidated(invalidated)
+            .await
+            .expect("an invalidation");
+        assert!(actor.streams[&3].auth.invalidated);
+        assert_eq!(
+            queued_reset_reasons(&mut receiver),
+            vec![tunnel_protocol::reset_reason::AUTHORIZATION_EXPIRED]
+        );
+    }
+
+    /// Review of #247: an operation deadline that passes inside a live
+    /// authorization is the exchange timing out, reset `ADAPTER_FAILURE`, not
+    /// an authorization lapse.
+    #[tokio::test]
+    async fn an_operation_timeout_is_not_reported_as_an_authorization_lapse() {
+        let (mut actor, _key, mut receiver, _control_receiver) =
+            test_actor_with_carrier(M2_CARRIER_QUEUE_FRAMES);
+        let mut stream = confirmed_stream_aged(
+            7,
+            HTTP_FORWARD_OPERATION,
+            Duration::from_millis(100),
+            Duration::from_secs(5),
+        );
+        stream.confirmed_until = Some(stream.auth.deadline.monotonic);
+        stream.auth.operation_deadline = DualDeadline::new(
+            Instant::now()
+                .checked_sub(Duration::from_millis(20))
+                .expect("past"),
+            SystemTime::now(),
+            Duration::from_millis(1),
+        )
+        .expect("a lapsed operation deadline");
+        actor.streams.insert(7, stream);
+        actor
+            .refresh_authorizations()
+            .await
+            .expect("a refresh tick");
+        assert_eq!(
+            queued_reset_reasons(&mut receiver),
+            vec![tunnel_protocol::reset_reason::ADAPTER_FAILURE]
+        );
     }
 
     /// The RESET reasons the connector queued on the data carrier.
@@ -11733,6 +11993,8 @@ mod tests {
             http: None,
             fs_authority: None,
             refresh_challenges: 0,
+            retired_challenges: Vec::new(),
+            confirmed_until: None,
         }
     }
 

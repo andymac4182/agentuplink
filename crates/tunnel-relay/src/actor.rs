@@ -14151,6 +14151,15 @@ impl RelayActor {
             && let Some(stream) = session.streams.get_mut(&challenge.stream_id)
         {
             stream.authorization_failure_code = Some(Self::authorization_failure_code(reason));
+            // A late refresh read that still authorized says nothing about
+            // the grant (task row M4-70): an echo consumer is told the
+            // retryable `AUTHORIZATION_UNAVAILABLE`, as the unary path
+            // answers a window-only lapse (M6-C211), never a revocation.
+            let waiter_code = if reason == STALE_STREAM_CHALLENGE_REASON {
+                "AUTHORIZATION_UNAVAILABLE"
+            } else {
+                "AUTHORIZATION_REVOKED"
+            };
             stream.authorization_in_flight = false;
             stream.authorization_started_at_ms = None;
             stream.authorization_deadline_ms = None;
@@ -14168,7 +14177,7 @@ impl RelayActor {
             stream.budget_bytes = stream.budget_bytes.saturating_sub(pending_bytes);
             for (_, waiter) in std::mem::take(&mut stream.pending_records) {
                 let _ = waiter.send(Err(EchoOutcome::Failure {
-                    code: "AUTHORIZATION_REVOKED",
+                    code: waiter_code,
                     execution: "not_dispatched",
                 }));
             }
@@ -14177,7 +14186,7 @@ impl RelayActor {
                 .saturating_add(stream.response_records.len());
             for waiter in std::mem::take(&mut stream.response_records) {
                 let _ = waiter.send(Err(EchoOutcome::Failure {
-                    code: "AUTHORIZATION_REVOKED",
+                    code: waiter_code,
                     execution: "unknown",
                 }));
             }
@@ -22142,6 +22151,22 @@ mod stream_identity_tests {
     #[tokio::test]
     async fn a_refresh_that_misses_only_its_window_ends_stale_not_revoked() {
         let mut fixture = refresh_fixture("m4-70-late").await;
+        // A consumer record held while the refresh was in flight.
+        let (waiter_tx, waiter_rx) = oneshot::channel();
+        {
+            let key = fixture.key.scope();
+            let stream_id = fixture.stream_id;
+            fixture
+                .actor
+                .sessions
+                .get_mut(&key)
+                .expect("session")
+                .streams
+                .get_mut(&stream_id)
+                .expect("stream")
+                .pending_records
+                .push_back((b"held".to_vec(), waiter_tx));
+        }
         let challenge = fixture.challenge("m4-70-late", std::time::Duration::from_millis(2_300));
         let snapshot = fixture.snapshot_read(std::time::Duration::from_millis(2_200));
         fixture.finish(challenge, snapshot);
@@ -22159,6 +22184,14 @@ mod stream_identity_tests {
             Some("AUTHORIZATION_STALE")
         );
         assert!(stream.closed.is_cancelled());
+        // The held echo record is answered retryably, not as a revocation.
+        match waiter_rx.await.expect("the held record is answered") {
+            Err(super::EchoOutcome::Failure { code, execution }) => {
+                assert_eq!(code, "AUTHORIZATION_UNAVAILABLE");
+                assert_eq!(execution, "not_dispatched");
+            }
+            other => panic!("unexpected answer {other:?}"),
+        }
     }
 
     /// Task row M4-70's other half: a late read whose consumer token has
