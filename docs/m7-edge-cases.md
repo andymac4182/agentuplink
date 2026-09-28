@@ -378,6 +378,15 @@ are task rows, not new matrix rows, and the 98-row matrix count is unchanged.
 - **M7-C188** (verified local; hosted M7 on the PR pending): the chaos fixture's membership re-signer spends a record version once a publish of it was attempted, so a publish that timed out in a Redis pause but committed on resume can no longer stall it on a same-version conflict and let two relays' records lapse mid-run (the intermittent `verify-m7-chaos` failure on main `ed43e2b1`). Harness defect; it predates #230/#233, and M7-C187 and the own-lapsed-record rule behaved as designed.
 - **M7-C189** (verified local; hosted M7 on the PR pending): `RedisMembershipPublisher` reports a publish whose reply is lost after dispatch as `WriteOutcomeUnknown` instead of a definite `Database` failure, extending EC-014's typed unknown outcome to membership publication.
 
+## Rotation-gate sequence-advance precondition task row (M7-C217)
+
+This row is tracked in [tasks.md](tasks.md). It extends EC-042 (an established
+WebSocket crosses a planned rotation) and EC-039 (drain proof uses immutable
+per-stream fences). It is a task row, not a new matrix row, and the 98-row
+matrix count is unchanged.
+
+- **M7-C217** (verified local; hosted M7 green on PR #241 run 36359568039, job 108733924828 at `80f45237` -- PR-run evidence, not main): the partial-response I08 gate now exchanges one witnessed, checksummed record between consecutive rotations while the owner shows no attempt, so M2-06's strict fence-advance check measures the product rather than whether the concurrent burst's first request beat the next freeze (hosted run 36354897882 `relay 4->4 connector 2->4`). A later fence below a witnessed sequence is named as a product reset; for this gate those witness bounds imply and shadow M2-06's strict-advance check, which still binds the synthetic gate. Harness defect; the relay fenced and sequenced correctly.
+
 ## M7 completion rule
 
 The matrix is complete only when every applicable row has a concrete test or
@@ -501,3 +510,5 @@ re-verification event times must match the row's `Completed at` timestamp.
 - 2026-09-28T01:37:00+10:00: M7-C187 re-verified with new scope after the review of #233 (the carve-out's expiry bound and version condition are now tested); the matrix count and row statuses are unchanged; completions are recorded in [tasks.md](tasks.md#completion-history).
 - 2026-09-28T03:20:37+10:00: Task-row links M7-C181, M7-C182, M7-C184, M7-C185, M7-C186 and M7-C187 (and M7-C178, supplementary only: its failure is intermittent and passed hosted unfixed, so `Completed at` is unchanged) gain hosted evidence: the full `scripts/m7-harness-verify.sh` passed on main `a03ad7a4` (run 36334353317, job 108662234191), recorded under M6-C188 in [tasks.md](tasks.md#completion-history). The matrix count and row statuses are unchanged.
 - 2026-09-28T04:51:48+10:00: Task-row links M7-C188 and M7-C189 added and verified local (first completions): the chaos fixture's re-signer no longer reuses a record version after an ambiguous publish, and the membership publisher reports a lost reply as `WriteOutcomeUnknown` (EC-014 coverage extended to membership publication). The matrix count and row statuses are unchanged; completions are recorded in [tasks.md](tasks.md#completion-history).
+- 2026-09-28T09:40:48+10:00: Task-row link M7-C217 added and verified local (first completion): the partial-response I08 gate witnesses one record exchange between consecutive rotations, so M2-06's strict fence-advance check no longer depends on the concurrent burst beating the next freeze (hosted run 36354897882). Extends EC-042 and EC-039; the matrix count and row statuses are unchanged; completions are recorded in [tasks.md](tasks.md#completion-history).
+- 2026-09-28T10:37:10+10:00: M7-C217 re-verified with new scope after the Opus review of #241 (bounded re-sample when the next attempt begins after the exchange; witness bounds documented as shadowing M2-06's strict-advance check for the partial gate); hosted M7 green on PR run 36359568039 at `80f45237` (PR-run evidence, not main). The matrix count and row statuses are unchanged; completions are recorded in [tasks.md](tasks.md#completion-history).
