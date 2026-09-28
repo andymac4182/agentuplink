@@ -186,6 +186,10 @@ const M2_RESET_AUTH_EXPIRED: u16 = tunnel_protocol::reset_reason::AUTHORIZATION_
 /// confirmation, which says nothing about the grant.  The relay closes the
 /// consumer 1011, which a consumer may retry through a fresh admission.
 const M2_RESET_AUTH_STALE: u16 = tunnel_protocol::reset_reason::AUTHORIZATION_STALE;
+/// The relay's invalidation reason for a refresh read that answered after its
+/// challenge window with every authorization bound still open (task row
+/// M4-70; the relay's `STALE_STREAM_CHALLENGE_REASON`).
+const AUTHORIZATION_STALE_REASON: &str = "authorization stale";
 const M2_RESET_PROTOCOL: u16 = tunnel_protocol::reset_reason::PROTOCOL;
 const M2_RESET_RECORD_LIMIT: u16 = tunnel_protocol::reset_reason::RECORD_LIMIT;
 const OWNER_FENCE_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
@@ -5462,7 +5466,14 @@ impl M2Actor {
             .get(&invalidated.stream_id)
             .is_some_and(|stream| stream.auth.challenge_id == invalidated.challenge_id)
         {
-            self.expire_stream(invalidated.stream_id).await?;
+            // The relay's "the refresh answered too late, nothing lapsed but
+            // the window" is a lapse too (task row M4-70), reset
+            // `AUTHORIZATION_STALE` like the connector's own.
+            if invalidated.reason == AUTHORIZATION_STALE_REASON {
+                self.lapse_stream(invalidated.stream_id).await?;
+            } else {
+                self.expire_stream(invalidated.stream_id).await?;
+            }
         }
         Ok(())
     }
@@ -10818,6 +10829,37 @@ mod tests {
         assert_eq!(
             queued_reset_reasons(&mut receiver),
             vec![tunnel_protocol::reset_reason::AUTHORIZATION_EXPIRED]
+        );
+
+        // The relay's "authorization stale" -- a read that answered after its
+        // window, nothing revoked -- is a lapse: 4006.
+        let mut late = confirmed_stream_aged(
+            11,
+            "echo_stream",
+            Duration::from_millis(2_100),
+            Duration::from_secs(5),
+        );
+        late.auth.confirmed = false;
+        late.auth.refresh_in_flight = true;
+        late.refresh_challenges = 1;
+        late.auth.challenge_id = "late-challenge".to_owned();
+        actor.streams.insert(11, late);
+        let stale = AuthorizationInvalidated::new(
+            message_id(),
+            actor.session.session_id.clone(),
+            actor.session.epoch,
+            11,
+            "late-challenge".to_owned(),
+            1,
+            AUTHORIZATION_STALE_REASON.to_owned(),
+        );
+        actor
+            .handle_authorization_invalidated(stale)
+            .await
+            .expect("a stale invalidation resets the stream");
+        assert_eq!(
+            queued_reset_reasons(&mut receiver),
+            vec![tunnel_protocol::reset_reason::AUTHORIZATION_STALE]
         );
     }
 

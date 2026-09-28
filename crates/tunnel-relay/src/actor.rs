@@ -2565,6 +2565,14 @@ pub(crate) type StreamOpenRefusal = Arc<std::sync::OnceLock<&'static str>>;
 /// revocation.
 pub(crate) const OWNER_UNAVAILABLE_CODE: &str = "PEER_UNAVAILABLE";
 
+/// The invalidation reason for a stream refresh whose read answered after the
+/// challenge window while every authorization bound was still open (task row
+/// M4-70).  It is not one of the three reasons that publish the consumer's
+/// 1008, so the consumer is closed 1011, retryable; the connector answers it
+/// with RESET `AUTHORIZATION_STALE`.  The wire string is shared with
+/// `tunnel_client` (`AUTHORIZATION_STALE_REASON`).
+pub(crate) const STALE_STREAM_CHALLENGE_REASON: &str = "authorization stale";
+
 /// Which bounds of a unary challenge's authorization are still open.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ChallengeBounds {
@@ -13815,11 +13823,13 @@ impl RelayActor {
             // owner lease is this relay losing the device, not a verdict
             // about the grant: invalidated without the 1008.  Only the
             // challenge window lapsing -- a read slower than the window --
-            // says nothing about anything: the challenge is retired unanswered
-            // and the stream kept.  The connector retries with a fresh
-            // challenge, and ends the stream `AUTHORIZATION_STALE` at its own
-            // lapse deadline if no confirmation lands; nothing is dispatched
-            // meanwhile, as the stream's confirmation has not been renewed.
+            // says nothing about the grant: the stream still ends at once
+            // (a suspended or delayed device fails closed, EC-055), but as
+            // "authorization stale", `AUTHORIZATION_STALE`, which publishes
+            // no 1008, so the consumer is closed 1011 and may retry through
+            // a fresh admission.  The connector resets it
+            // `AUTHORIZATION_STALE` too.  Before M4-70 this was
+            // "authorization expired", the 1008 of a revocation.
             let open = |left: Duration| left >= Duration::from_millis(1);
             let code = lapsed_challenge_code(
                 ChallengeBounds {
@@ -13836,7 +13846,11 @@ impl RelayActor {
                     self.invalidate_stream_challenge(&key, &challenge, "owner unavailable");
                 }
                 "AUTHORIZATION_UNAVAILABLE" => {
-                    self.retire_stream_challenge(&key, &challenge);
+                    self.invalidate_stream_challenge(
+                        &key,
+                        &challenge,
+                        STALE_STREAM_CHALLENGE_REASON,
+                    );
                 }
                 _ => {
                     self.invalidate_stream_challenge(&key, &challenge, "authorization expired");
@@ -13901,6 +13915,7 @@ impl RelayActor {
     fn authorization_failure_code(reason: &str) -> &'static str {
         match reason {
             "authorization expired" => "AUTHORIZATION_EXPIRED",
+            STALE_STREAM_CHALLENGE_REASON => "AUTHORIZATION_STALE",
             "authorization changed" => "AUTHORIZATION_CHANGED",
             "authorization unavailable" | "control unavailable" => "AUTHORIZATION_UNAVAILABLE",
             "grant unavailable" => "GRANT_UNAVAILABLE",
@@ -14109,24 +14124,6 @@ impl RelayActor {
             .is_ok();
         self.http_forward_diagnostics
             .record_principal_sessions_end(sent);
-    }
-
-    /// Retire a stream's refresh challenge whose answer window lapsed while
-    /// every authorization bound stayed open (task row M4-70): no answer is
-    /// sent and the stream is kept.  The connector replaces an unanswered
-    /// challenge after its own two-second timeout, and ends the stream
-    /// `AUTHORIZATION_STALE` (a retryable 1011 to the consumer) at its lapse
-    /// deadline if none is confirmed.  The stream's existing confirmation is
-    /// untouched, so this relay's dispatch gate still expires on time.
-    fn retire_stream_challenge(&mut self, key: &SessionKey, challenge: &DeviceChallenge) {
-        if let Some(session) = self.session_mut(key)
-            && let Some(stream) = session.streams.get_mut(&challenge.stream_id)
-            && stream.challenge_id.as_deref() == Some(challenge.challenge_id.as_str())
-        {
-            stream.authorization_in_flight = false;
-            stream.authorization_started_at_ms = None;
-            stream.authorization_deadline_ms = None;
-        }
     }
 
     fn invalidate_stream_challenge(
@@ -22137,24 +22134,31 @@ mod stream_identity_tests {
 
     /// Task row M4-70: a refresh read slower than the challenge window, while
     /// the grant, snapshot, token, owner and credential are all still valid,
-    /// is retired unanswered and the stream kept.  Before the fix it was
-    /// invalidated "authorization expired", which publishes 1008 -- the code
-    /// a consumer reads as "your access ended" -- for a stream nobody revoked.
+    /// still ends the stream at once (a delayed device fails closed), but as
+    /// "authorization stale" -- `AUTHORIZATION_STALE`, which publishes no
+    /// 1008.  Before the fix it was invalidated "authorization expired",
+    /// which publishes 1008 -- the code a consumer reads as "your access
+    /// ended" -- for a stream nobody revoked.
     #[tokio::test]
-    async fn a_refresh_that_misses_only_its_window_is_retired_not_revoked() {
+    async fn a_refresh_that_misses_only_its_window_ends_stale_not_revoked() {
         let mut fixture = refresh_fixture("m4-70-late").await;
         let challenge = fixture.challenge("m4-70-late", std::time::Duration::from_millis(2_300));
         let snapshot = fixture.snapshot_read(std::time::Duration::from_millis(2_200));
         fixture.finish(challenge, snapshot);
-        assert!(
-            fixture.drain().is_empty(),
-            "no confirmation and no invalidation"
-        );
+        let messages = fixture.drain();
+        let [tunnel_protocol::ControlMessage::AuthorizationInvalidated(invalidated)] =
+            messages.as_slice()
+        else {
+            panic!("one AUTHORIZATION_INVALIDATED, got {messages:?}");
+        };
+        assert_eq!(invalidated.reason, super::STALE_STREAM_CHALLENGE_REASON);
         let stream = fixture.stream();
-        assert!(!stream.terminal, "the stream is kept");
-        assert!(!stream.authorization_in_flight, "the challenge is retired");
-        assert_eq!(stream.authorization_failure_code, None);
-        assert!(!stream.closed.is_cancelled());
+        assert!(stream.terminal, "the stream still fails closed");
+        assert_eq!(
+            stream.authorization_failure_code,
+            Some("AUTHORIZATION_STALE")
+        );
+        assert!(stream.closed.is_cancelled());
     }
 
     /// Task row M4-70's other half: a late read whose consumer token has

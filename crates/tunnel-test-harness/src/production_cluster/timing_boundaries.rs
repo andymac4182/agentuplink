@@ -1308,6 +1308,7 @@ struct AuthorizationPauseObservation {
 }
 
 struct AuthorizationChallengeBarrier {
+    challenge_started_ms: u64,
     challenge_deadline_ms: u64,
     admission_deadline_ms: u64,
 }
@@ -1399,6 +1400,7 @@ async fn wait_for_authorization_challenge(
                 ));
             }
             return Ok(AuthorizationChallengeBarrier {
+                challenge_started_ms: started,
                 challenge_deadline_ms,
                 admission_deadline_ms,
             });
@@ -1435,10 +1437,19 @@ async fn wait_for_authorization_deadline(
         if snapshot.monotonic_now_ms >= target_ms {
             return Ok(());
         }
-        if target_ms != challenge_deadline_ms && snapshot.monotonic_now_ms >= challenge_deadline_ms
+        // The previous confirmation cannot outlive five seconds from the
+        // refresh challenge's start: the connector refreshes it two seconds
+        // after its own challenge started (task row M4-53), so it ends about
+        // three seconds after this challenge started -- after the relay's
+        // two-second answer window, which this gate holds open by delaying
+        // the read's result.  Before M4-53 the refresh started with 1.5 s
+        // left, so the old admission ended inside the window.
+        let lifetime_ms = u64::try_from(AUTHORIZATION_LIFETIME.as_millis()).unwrap_or(u64::MAX);
+        if target_ms != challenge_deadline_ms
+            && snapshot.monotonic_now_ms >= barrier.challenge_started_ms.saturating_add(lifetime_ms)
         {
             return Err(HarnessError::Timeout(
-                "timing old authorization admission did not expire before the challenge deadline"
+                "timing old authorization admission did not expire within five seconds of the refresh challenge"
                     .into(),
             ));
         }
@@ -1766,6 +1777,19 @@ async fn run_authorization_expiry(
                     && session.epoch == owner_before.token.epoch
             })
             .collect::<Vec<_>>();
+        if let Some(stream) = authorization_stream(
+            &owner_snapshot,
+            &owner_before.token.session_id,
+            owner_before.token.epoch,
+            authorization_stream_id,
+        ) {
+            eprintln!(
+                "timing auth: stream terminal={} authorization_failure_code={:?} sessions={}",
+                stream.terminal,
+                stream.authorization_failure_code,
+                matching_sessions.len()
+            );
+        }
         let typed_expiry_cause_observed = matching_sessions.len() == 1
             && authorization_stream(
                 &owner_snapshot,
@@ -1774,8 +1798,23 @@ async fn run_authorization_expiry(
                 authorization_stream_id,
             )
             .is_some_and(|stream| {
-                stream.authorization_failure_code == Some("AUTHORIZATION_EXPIRED")
-                    && stream.terminal
+                // Since task row M4-53 the previous confirmation and its
+                // catalog snapshot both end about three seconds after this
+                // refresh challenge started, a second after its answer
+                // window.  The probe, sent once that confirmation ended,
+                // meets the owner's own snapshot check first
+                // (`AUTHORIZATION_EXPIRED`: the prior snapshot lapsed with
+                // its refresh held; observed on every local run).  Were the
+                // snapshot to outlive the admission deadline by the few
+                // milliseconds between the wall and monotonic clocks, the
+                // probe would be held instead and the released late read
+                // would end the stream `AUTHORIZATION_STALE` (task row
+                // M4-70).  Either is the typed authorization cause; a close
+                // with neither is not.
+                matches!(
+                    stream.authorization_failure_code,
+                    Some("AUTHORIZATION_EXPIRED" | "AUTHORIZATION_STALE")
+                ) && stream.terminal
             });
         let dispatch_after = owner_snapshot.lifetime_application_dispatches;
         Ok::<_, HarnessError>(AuthorizationPauseObservation {
