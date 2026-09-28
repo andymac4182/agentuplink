@@ -34,14 +34,16 @@ recording its payloads fails here instead of scanning nothing.
   every fixed credential shape, into a copy of that gate's own captured stderr
   and requires every plant to be reported -- the scanner is shown able to go
   red on this run's own data.
-* A *declared-witness control* per milestone (`WITNESSES`) runs a real gate
-  again with `M0_PAYLOAD_SCAN_PLANT=application_payload`: the harness then
-  leaks its first recorded payload once, through its tracing subscriber
-  (`c11_capture::plant_witness_leak`), the path an in-process relay diagnostic
-  takes.  The control is RED only if the scan goes red **with the witness it
-  declared** -- an `application_payload` hit in `harness_stderr`, on a line
-  carrying the plant's tracing target -- and the child itself passed.  Green,
-  a hit anywhere else, or a failed child is a wrong witness and fails the run.
+* A *declared-witness control* per gate runs that gate again with
+  `M0_PAYLOAD_SCAN_PLANT=application_payload`: the harness then leaks its
+  first recorded payload once (`c11_capture::plant_witness_leak`) -- through
+  its tracing subscriber, the path an in-process relay diagnostic takes, or,
+  for a binary value no JSON formatter can carry verbatim, raw to stderr
+  behind the same target name.  The control is RED only if the scan goes red
+  **with the witness it declared** -- an `application_payload` hit in
+  `harness_stderr`, attributed to the plant's target -- and the child itself
+  passed.  Green, a hit anywhere else, or a failed child is a wrong witness
+  and fails the run.
 
 Usage (after `cargo build --locked --workspace --bins`, with TEST_REDIS_URL):
 
@@ -155,22 +157,35 @@ GATES = (
     Gate("M2", "verify-m2", EVERY_KIND),
     Gate("M2", "verify-m2-faults", EVERY_KIND),
     Gate("M3", "verify-m3-http-forward-real-path", EVERY_KIND),
+    Gate("M3", "verify-m3-http-forward-rotation", EVERY_KIND),
     Gate("M3", "verify-m3-mcp-cloud-client", EVERY_KIND),
     Gate("M3", "verify-m3-mcp-isolation", EVERY_KIND),
     Gate("M4", "verify-m4-fs-real-path", EVERY_KIND),
+    Gate("M4", "verify-m4-fs-write-path", EVERY_KIND),
     Gate("M4", "verify-m4-fs-client-e2e", EVERY_KIND),
+    Gate("M4", "verify-m4-fs-rotation", EVERY_KIND),
+    Gate("M4", "verify-m4-fs-consumer-loss", EVERY_KIND),
+    Gate("M4", "verify-m4-fs-epoch-change", EVERY_KIND),
+    Gate("M4", "verify-m4-fs-process-restart", EVERY_KIND),
+    Gate("M4", "verify-m4-fs-data-recovery", EVERY_KIND),
+    Gate("M4", "verify-m4-fs-data-recovery-lost-ack", EVERY_KIND),
+    Gate("M4", "verify-m4-fs-rotation-write", EVERY_KIND),
+    Gate("M4", "verify-m4-fs-write-restart", EVERY_KIND),
+    Gate("M4", "verify-m4-fs-rename-restart", EVERY_KIND),
     Gate("M8", "verify-m8-acp-real-path", EVERY_KIND),
     Gate("M8", "verify-m8-acp-cluster", EVERY_KIND),
 )
-#: One declared-witness control per milestone, each on that milestone's
-#: cheapest gate.  The declared witness is (kind, stream role).
-WITNESSES = (
-    ("M1", "verify"),
-    ("M2", "verify-m2"),
-    ("M3", "verify-m3-http-forward-real-path"),
-    ("M4", "verify-m4-fs-client-e2e"),
-    ("M8", "verify-m8-acp-real-path"),
+#: Gates of these milestones deliberately outside the scan, with the reason
+#: printed on every run so the boundary is visible rather than silent.
+EXCLUDED = (
+    ("M2", "verify-m2-default", "the verify-m2 code path at the 300 s rotation policy (about 17 minutes); its recording sites are the ones verify-m2 exercises"),
+    ("M3", "process_residue", "a cargo test of the stdio export's process-tree residue; it moves no application payload"),
+    ("M4", "verify-m6-ts-connection-limit", "an M6 listener-limit gate in the M4 script; it moves no application payload"),
+    ("M8", "m8_relay_rekey_process", "a cargo test of peer-key rotation on SIGHUP, not a harness gate; it moves no application payload"),
 )
+#: Every gate carries its own declared-witness control: the same gate is run
+#: again with one recorded payload planted, and must go red with exactly that
+#: witness.  The declared witness is (kind, stream role).
 WITNESS_DECLARED = ("application_payload", "harness_stderr")
 
 
@@ -265,6 +280,16 @@ class Hit:
     witness_line: bool = False
 
 
+PLANT_RAW_PREFIX = PLANT_TARGET + b" raw="
+
+
+def planted_at(data: bytes, offset: int) -> bool:
+    """Whether a hit at `offset` is the witness plant: on the line carrying
+    the plant's target (a tracing line, or the raw plant, whose value starts
+    right behind its prefix on that same line)."""
+    return PLANT_TARGET in line_at(data, offset)
+
+
 def line_at(data: bytes, offset: int) -> bytes:
     start = data.rfind(b"\n", 0, offset) + 1
     end = data.find(b"\n", offset)
@@ -282,13 +307,13 @@ def scan_streams(
                     index = data.find(form)
                     while index >= 0:
                         hits.append(
-                            Hit(kind, role, index, PLANT_TARGET in line_at(data, index))
+                            Hit(kind, role, index, planted_at(data, index))
                         )
                         index = data.find(form, index + 1)
         for label, pattern in GENERIC_SHAPES.items():
             for match in pattern.finditer(data):
                 hits.append(
-                    Hit(label, role, match.start(), PLANT_TARGET in line_at(data, match.start()))
+                    Hit(label, role, match.start(), planted_at(data, match.start()))
                 )
     # One leak can match both its raw and its escaped form at one offset.
     unique = {(hit.kind, hit.role, hit.offset): hit for hit in hits}
@@ -532,6 +557,13 @@ def unit_probes() -> list[str]:
     hits = scan_streams(sentinels, {"harness_stderr": witness_line})
     if len(hits) != 1 or not hits[0].witness_line:
         failures.append("a planted line was not attributed to the plant")
+    raw = b"noise\n" + PLANT_RAW_PREFIX + b"synthetic-credential-A\n"
+    hits = scan_streams(sentinels, {"harness_stderr": raw})
+    if len(hits) != 1 or not hits[0].witness_line:
+        failures.append("a raw plant was not attributed to the plant")
+    unplanted = scan_streams(sentinels, {"harness_stderr": b"x raw=synthetic-credential-A"})
+    if len(unplanted) != 1 or unplanted[0].witness_line:
+        failures.append("an unplanted leak was attributed to the plant")
     detected, planted = self_test(sentinels, clean)
     if detected != planted or planted < 5:
         failures.append(f"the self-test detected {detected} of {planted}")
@@ -574,11 +606,11 @@ def main() -> int:
         print(f"m0-payload-scan: unknown gate(s): {', '.join(unknown)}", file=sys.stderr)
         return 2
     gates = [known[name] for name in args.gate] if args.gate else list(GATES)
-    witnesses = [] if args.no_witness else [
-        known[command] for _, command in WITNESSES if not args.gate or command in args.gate
-    ]
+    witnesses = [] if args.no_witness else list(gates)
     if args.witness_only:
         gates = []
+    elif args.no_witness:
+        witnesses = []
 
     if args.keep:
         args.keep.mkdir(mode=0o700, parents=True, exist_ok=False)
@@ -589,6 +621,8 @@ def main() -> int:
         workdir = Path(cleanup.name)
     os.chmod(workdir, 0o700)
     print(f"m0-payload-scan: log_filter={LOG_FILTER}", flush=True)
+    for milestone, command, reason in EXCLUDED:
+        print(f"m0-payload-scan: not scanned milestone={milestone} gate={command}: {reason}", flush=True)
     failed = False
     totals = {"streams": 0, "bytes": 0, "sentinels": {kind: 0 for kind in KIND_ORDER}}
     try:

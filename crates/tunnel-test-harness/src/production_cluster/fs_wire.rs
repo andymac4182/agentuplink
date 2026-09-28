@@ -215,6 +215,9 @@ impl NinepClient {
 
     /// Send one frame as exactly one binary message.
     pub(crate) async fn send_frame(&mut self, frame: &Frame) -> Result<()> {
+        if let Message::Twrite { data, .. } = &frame.message {
+            crate::c11_capture::record_wire_payload_sentinel(data)?;
+        }
         let bytes = frame
             .to_bytes(self.msize)
             .map_err(|error| HarnessError::Http(format!("9P encode refused: {error:?}")))?;
@@ -238,6 +241,9 @@ impl NinepClient {
                     let frame = decode_exact(&bytes, MAX_MESSAGE_BYTES).map_err(|error| {
                         HarnessError::Http(format!("9P decode refused: {error:?}"))
                     })?;
+                    if let Message::Rread { data } = &frame.message {
+                        crate::c11_capture::record_wire_payload_sentinel(data)?;
+                    }
                     return Ok(Event::Frame(frame));
                 }
                 Some(Ok(WsMessage::Close(frame))) => {

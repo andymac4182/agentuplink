@@ -89,6 +89,30 @@ pub(crate) fn record_payload_sentinel(value: &[u8]) -> Result<()> {
 /// The leading slice recorded for a payload larger than this.
 const PAYLOAD_SENTINEL_SLICE: usize = 4096;
 
+/// Record one application body seen on a wire funnel shared by many gates,
+/// such as the 9P client's `Twrite` and `Rread` data (M0-09).
+///
+/// A funnel sees every body, generic ones included, so only a body that can
+/// be an exact-match sentinel is recorded: at least [`WIRE_SENTINEL_MIN`]
+/// bytes and not one repeated byte.  Its leading [`WIRE_SENTINEL_SLICE`]
+/// bytes are recorded, which keeps the manifest bounded across a gate that
+/// moves many chunks while still matching any verbatim leak of a chunk.
+pub(crate) fn record_wire_payload_sentinel(value: &[u8]) -> Result<()> {
+    if capture_dir().is_none() || value.len() < WIRE_SENTINEL_MIN {
+        return Ok(());
+    }
+    if value.iter().all(|byte| *byte == value[0]) {
+        return Ok(());
+    }
+    record_sentinel(
+        "application_payload",
+        &value[..value.len().min(WIRE_SENTINEL_SLICE)],
+    )
+}
+
+const WIRE_SENTINEL_MIN: usize = 64;
+const WIRE_SENTINEL_SLICE: usize = 256;
+
 /// Hold, for the rest of this C11 child, the TCP port whose number equals the
 /// UDP private endpoint `address`.
 ///
@@ -259,26 +283,35 @@ static WITNESS_PLANTED: AtomicBool = AtomicBool::new(false);
 ///
 /// Only a capture child whose parent set `M0_PAYLOAD_SCAN_PLANT` to a
 /// sentinel kind does anything here.  The first recorded value of that kind
-/// is emitted once, through the process's own tracing subscriber -- the path
-/// an in-process relay or client diagnostic takes -- so the scan must go red
-/// on the gate's own stderr.  Ordinary acceptance runs never set the variable,
-/// and the scanner removes it from every clean run's environment.
+/// is emitted once.  A UTF-8 value goes through the process's own tracing
+/// subscriber -- the path an in-process relay or client diagnostic takes --
+/// so the scan must go red on the gate's own stderr.  A binary value cannot
+/// cross a JSON formatter verbatim, so it is written raw to stderr behind the
+/// same target name.  Ordinary acceptance runs never set the variable, and
+/// the scanner removes it from every clean run's environment.
 fn plant_witness_leak(kind: &'static str, value: &[u8]) {
     if std::env::var(WITNESS_PLANT_ENV).ok().as_deref() != Some(kind) {
         return;
     }
-    let Ok(text) = std::str::from_utf8(value) else {
-        return;
-    };
     if WITNESS_PLANTED.swap(true, Ordering::SeqCst) {
         return;
     }
-    tracing::warn!(
-        target: WITNESS_PLANT_TARGET,
-        kind,
-        planted = text,
-        "M0-08 witness control: planted a recorded sentinel"
-    );
+    match std::str::from_utf8(value) {
+        Ok(text) => tracing::warn!(
+            target: WITNESS_PLANT_TARGET,
+            kind,
+            planted = text,
+            "M0-08 witness control: planted a recorded sentinel"
+        ),
+        Err(_) => {
+            let mut line = Vec::with_capacity(value.len() + 64);
+            line.extend_from_slice(WITNESS_PLANT_TARGET.as_bytes());
+            line.extend_from_slice(b" raw=");
+            line.extend_from_slice(value);
+            line.push(b'\n');
+            let _ = std::io::stderr().lock().write_all(&line);
+        }
+    }
 }
 
 /// Persist both joined output streams from one ManagedProcess. Each process
