@@ -17,16 +17,32 @@ with a private capture directory (`C11_INNER_CAPTURE_DIR`), so that
 
 It then searches **every** captured stream -- the gate's own stdout and
 stderr, each managed-process stream and each snapshot -- for every recorded
-value (raw and JSON-escaped, because tracing's JSON formatter escapes field
-values) and for fixed credential shapes that need no manifest (a PEM header, a
-JWT-shaped token, an `Authorization: Bearer` header).  Any hit fails the gate.
-Only a category, a stream role and an offset are ever printed: never a value,
-and never a captured stream.
+value in every encoding a diagnostic could plausibly give it (`encodings`):
+raw; JSON-escaped (tracing's JSON formatter escapes field values); Rust
+`Debug` of a string, and of a byte slice in both its decimal-list and `b"..."`
+forms, each also JSON-escaped; lowercase hex; standard base64; and, for a long
+value, the same encodings of its leading 32-byte window, so a truncated leak
+still matches.  It also searches for fixed credential shapes that need no
+manifest (a PEM header, a JWT-shaped token, an `Authorization: Bearer`
+header).  Any hit fails the gate.  Only a category, a stream role and an offset
+are ever printed: never a value, and never a captured stream.
+
+**What it cannot see**, so a green is read at its real size: an encoding not in
+that list (compression, encryption, another base64 alphabet, a re-ordered
+field), a leak shorter than the recorded value's 32-byte window, a value the
+fixture did not record, and -- because tombstones are applied to the manifest
+before scanning and streams carry no timestamps -- any disclosure of a
+`private_endpoint` that was later retired: a retired value is dropped from the
+whole scan, and each report line prints `retired=` so that gap is counted.
 
 **An empty domain is visible, never green.**  Each gate's report line prints
-its sentinel count per kind, its stream count and its bytes; and each gate
-declares the kinds it must record (`requires`), so a fixture that stops
-recording its payloads fails here instead of scanning nothing.
+its sentinel count per kind, its stream count and its bytes.  Each gate
+declares the kinds it must record (`requires`), the minimum number of managed
+streams and relay snapshots its capture hooks write, and whether it must record
+a text (UTF-8) payload; and every gate must show at least one `DEBUG` or
+`TRACE` event from `tunnel_relay` in its scanned stderr.  So a fixture that
+stops recording, a capture hook that stops writing, or a log level that stops
+reaching the scan fails here instead of scanning nothing.
 
 **Two kinds of control, so a green is evidence.**
 
@@ -36,25 +52,29 @@ recording its payloads fails here instead of scanning nothing.
   red on this run's own data.
 * A *declared-witness control* per gate runs that gate again with
   `M0_PAYLOAD_SCAN_PLANT=application_payload`: the harness then leaks its
-  first recorded payload once (`c11_capture::plant_witness_leak`) -- through
-  its tracing subscriber, the path an in-process relay diagnostic takes, or,
-  for a binary value no JSON formatter can carry verbatim, raw to stderr
-  behind the same target name.  The control is RED only if the scan goes red
-  **with the witness it declared** -- an `application_payload` hit in
-  `harness_stderr`, inside the bytes the plant wrote -- and the child itself
-  passed.  Green, a hit anywhere else, or a failed child is a wrong witness
-  and fails the run.
+  first recorded payload once (`c11_capture::plant_witness_leak`) as a
+  `DEBUG` event under `tunnel_relay::m0_payload_scan_witness`, formatted with
+  `?value` -- the decimal byte list a careless `debug!(?body)` would print.
+  So each control shows that a `tunnel_relay` target at `debug` reaches the
+  scanned stream and that the scanner matches a `Debug`-formatted byte slice
+  inside JSON tracing output, binary or text.  The control is RED only if the
+  scan goes red **with the witness it declared** -- every hit an
+  `application_payload` in `harness_stderr` on the plant's own line -- and the
+  child itself passed.  Green, a hit anywhere else, or a failed child is a
+  wrong witness and fails the run.
 
 Usage (after `cargo build --locked --workspace --bins`, with TEST_REDIS_URL):
 
     python3 scripts/m0-payload-scan.py [--harness PATH] [--gate NAME ...]
-                                       [--no-witness] [--keep DIR]
+                                       [--no-witness | --witness-only]
+                                       [--keep DIR]
     python3 scripts/m0-payload-scan.py --unit     # scanner unit probes only
 """
 
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import os
 import re
@@ -103,10 +123,11 @@ GENERIC_PLANTS = {
 }
 
 #: The level the children's tracing subscriber runs at.  The relay's own
-#: default is `info`; the product crates run one level more verbose here, so a
-#: diagnostic that would only appear when an operator turns logging up is still
-#: in the scanned domain.  Third-party crates stay at `info`: their debug
-#: output is wire-level framing an operator is not expected to enable.
+#: default is `info`; the product crates run at `trace` here, the most verbose
+#: level, so a diagnostic that would only appear when an operator turns logging
+#: all the way up is still in the scanned domain.  Third-party crates stay at
+#: `info`: their debug output is wire-level framing an operator is not expected
+#: to enable.
 #:
 #: `rmcp` is the one exception, at `warn`.  It is not product code: it is the
 #: off-the-shelf MCP SDK that `verify-m3-mcp-cloud-client` drives *as the
@@ -119,7 +140,7 @@ GENERIC_PLANTS = {
 LOG_FILTER = ",".join(
     ["info", "rmcp=warn"]
     + [
-        f"{crate}=debug"
+        f"{crate}=trace"
         for crate in (
             "tunnel_relay",
             "tunnel_client",
@@ -153,29 +174,47 @@ class Gate:
     command: str
     #: Sentinel kinds the fixture must record, so an empty domain fails.
     requires: tuple[str, ...]
+    #: The fewest managed-process streams (stdout and stderr each count) and
+    #: relay/proxy snapshot files the capture hooks must write.  Set to what
+    #: each gate writes today, so a hook that stops writing fails the gate.
+    min_managed: int = 0
+    min_snapshots: int = 8
+    #: Whether the gate must record at least one UTF-8 payload, so its
+    #: payload domain can match a text log line, not only an encoded one.
+    text_domain: bool = True
+    #: Whether the gate's in-process relay emits at least one `DEBUG` or
+    #: `TRACE` event, which the scan then requires to see.
+    relay_debug: bool = True
 
 
 EVERY_KIND = KIND_ORDER
 GATES = (
-    Gate("M1", "verify", EVERY_KIND),
-    Gate("M2", "verify-m2", EVERY_KIND),
-    Gate("M2", "verify-m2-faults", EVERY_KIND),
+    Gate("M1", "verify", EVERY_KIND, min_managed=2, min_snapshots=1),
+    # The M2 echo path emits `tunnel_relay` events only at `info` and above:
+    # measured on 2026-09-28 with the product crates at `trace`, 12 and 19
+    # relay events and none finer than INFO.  Its witness control still shows
+    # a `tunnel_relay` target at `debug` reaches the scanned stderr.
+    Gate("M2", "verify-m2", EVERY_KIND, min_snapshots=1, relay_debug=False),
+    Gate("M2", "verify-m2-faults", EVERY_KIND, min_snapshots=1, relay_debug=False),
     Gate("M3", "verify-m3-http-forward-real-path", EVERY_KIND),
     Gate("M3", "verify-m3-http-forward-rotation", EVERY_KIND),
     Gate("M3", "verify-m3-mcp-cloud-client", EVERY_KIND),
-    Gate("M3", "verify-m3-mcp-isolation", EVERY_KIND),
+    Gate("M3", "verify-m3-mcp-isolation", EVERY_KIND, min_snapshots=7),
     Gate("M4", "verify-m4-fs-real-path", EVERY_KIND),
     Gate("M4", "verify-m4-fs-write-path", EVERY_KIND),
     Gate("M4", "verify-m4-fs-client-e2e", EVERY_KIND),
     Gate("M4", "verify-m4-fs-rotation", EVERY_KIND),
     Gate("M4", "verify-m4-fs-consumer-loss", EVERY_KIND),
     Gate("M4", "verify-m4-fs-epoch-change", EVERY_KIND),
-    Gate("M4", "verify-m4-fs-process-restart", EVERY_KIND),
+    Gate("M4", "verify-m4-fs-process-restart", EVERY_KIND, min_managed=4),
     Gate("M4", "verify-m4-fs-data-recovery", EVERY_KIND),
     Gate("M4", "verify-m4-fs-data-recovery-lost-ack", EVERY_KIND),
-    Gate("M4", "verify-m4-fs-rotation-write", EVERY_KIND),
-    Gate("M4", "verify-m4-fs-write-restart", EVERY_KIND),
-    Gate("M4", "verify-m4-fs-rename-restart", EVERY_KIND),
+    # Its one payload is `(i % 251) | 0x80`: every byte has the high bit set,
+    # which the gate's region classifier depends on, so no byte of it is text.
+    # It is still matched in its Debug, hex and base64 encodings.
+    Gate("M4", "verify-m4-fs-rotation-write", EVERY_KIND, text_domain=False),
+    Gate("M4", "verify-m4-fs-write-restart", EVERY_KIND, min_managed=4),
+    Gate("M4", "verify-m4-fs-rename-restart", EVERY_KIND, min_managed=4),
     Gate("M8", "verify-m8-acp-real-path", EVERY_KIND),
     Gate("M8", "verify-m8-acp-cluster", EVERY_KIND),
 )
@@ -260,20 +299,128 @@ def read_capture(capture: Path) -> tuple[dict[str, list[bytes]], int, dict[str, 
 # Scanning
 
 
-def variants(value: bytes) -> list[bytes]:
-    """The exact value, plus its JSON-escaped form when that differs."""
-    forms = [value]
+#: A value longer than this is also searched for by its leading window.
+WINDOW_BYTES = 32
+
+
+def json_escape(data: bytes) -> list[bytes]:
+    """JSON string-escaped forms of `data`, when it is text: tracing's JSON
+    formatter escapes every field value this way.  Both escapers are kept
+    (non-ASCII as itself, and as `\\uXXXX`)."""
     try:
-        text = value.decode("utf-8")
+        text = data.decode("utf-8")
     except UnicodeDecodeError:
-        return forms
-    escaped = json.dumps(text, ensure_ascii=False)[1:-1].encode("utf-8")
-    if escaped != value:
-        forms.append(escaped)
-    ascii_escaped = json.dumps(text)[1:-1].encode("ascii")
-    if ascii_escaped not in forms:
-        forms.append(ascii_escaped)
+        return []
+    return [
+        json.dumps(text, ensure_ascii=False)[1:-1].encode("utf-8"),
+        json.dumps(text)[1:-1].encode("ascii"),
+    ]
+
+
+def str_debug(text: str) -> bytes:
+    """The inside of Rust's `format!("{:?}", text)` for a `str`."""
+    out = []
+    for char in text:
+        code = ord(char)
+        if char == "\t":
+            out.append("\\t")
+        elif char == "\r":
+            out.append("\\r")
+        elif char == "\n":
+            out.append("\\n")
+        elif char in "\\\"":
+            out.append("\\" + char)
+        elif char == "\0":
+            out.append("\\0")
+        elif code < 0x20 or code == 0x7F:
+            out.append(f"\\u{{{code:x}}}")
+        else:
+            out.append(char)
+    return "".join(out).encode("utf-8")
+
+
+def bytes_debug_list(data: bytes, closed: bool) -> bytes:
+    """Rust's `Debug` of `&[u8]` / `Vec<u8>`: `[104, 105]`.  An open form (no
+    brackets) matches the value inside a longer slice's list, too."""
+    inner = ", ".join(str(byte) for byte in data)
+    return (f"[{inner}]" if closed else inner).encode("ascii")
+
+
+def bytes_debug_escape(data: bytes) -> bytes:
+    """The inside of `bytes::Bytes`'s `Debug`: `b"..."` with `\\n`, `\\r`,
+    `\\t`, `\\0`, `\\\\`, `\\"` and `\\xNN` escapes."""
+    out = []
+    for byte in data:
+        if byte == 0x0A:
+            out.append("\\n")
+        elif byte == 0x0D:
+            out.append("\\r")
+        elif byte == 0x09:
+            out.append("\\t")
+        elif byte == 0x00:
+            out.append("\\0")
+        elif byte in (0x5C, 0x22):
+            out.append("\\" + chr(byte))
+        elif 0x20 <= byte < 0x7F:
+            out.append(chr(byte))
+        else:
+            out.append(f"\\x{byte:02x}")
+    return "".join(out).encode("ascii")
+
+
+def base64_form(data: bytes) -> bytes:
+    """Standard base64 of `data`, cut to the characters that do not depend on
+    whatever follows it, so the value still matches inside a longer encoding
+    that starts where it does."""
+    encoded = base64.b64encode(data).rstrip(b"=")
+    whole = (len(data) // 3) * 4
+    return encoded[:whole] if len(data) % 3 else encoded
+
+
+def encodings(value: bytes) -> list[bytes]:
+    """Every form of `value` the scan searches for (see the module docstring).
+
+    A form shorter than 12 bytes is dropped: the shortest recorded values are
+    endpoints such as `127.0.0.1:NNNNN`, and a shorter encoded form would match
+    unrelated text."""
+    forms: list[bytes] = []
+
+    def add(form: bytes) -> None:
+        if len(form) >= 12 and form not in forms:
+            forms.append(form)
+
+    def encode(data: bytes, closed: bool) -> None:
+        add(data)
+        for escaped in json_escape(data):
+            add(escaped)
+        try:
+            debug = str_debug(data.decode("utf-8"))
+            add(debug)
+            for escaped in json_escape(debug):
+                add(escaped)
+        except UnicodeDecodeError:
+            pass
+        add(bytes_debug_list(data, closed))
+        escape_form = bytes_debug_escape(data)
+        add(escape_form)
+        for escaped in json_escape(escape_form):
+            add(escaped)
+        add(data.hex().encode("ascii"))
+        add(base64_form(data))
+
+    encode(value, closed=False)
+    if len(value) > WINDOW_BYTES:
+        encode(value[:WINDOW_BYTES], closed=False)
     return forms
+
+
+def needles(sentinels: dict[str, list[bytes]]) -> list[tuple[str, bytes]]:
+    return [
+        (kind, form)
+        for kind in KIND_ORDER
+        for value in sentinels.get(kind, ())
+        for form in encodings(value)
+    ]
 
 
 @dataclass
@@ -284,23 +431,14 @@ class Hit:
     witness_line: bool = False
 
 
-RAW_PLANT = re.compile(re.escape(PLANT_TARGET) + rb" raw_len=([0-9]{1,7}) raw=")
-
-
-def plant_spans(data: bytes) -> list[tuple[int, int]]:
-    """The byte ranges the witness plant wrote: a raw plant's value, whose
-    length it declares because binary bytes may hold newlines, or the whole
-    tracing line that carries the plant's target."""
+def plant_lines(data: bytes) -> list[tuple[int, int]]:
+    """The byte ranges of every line carrying the witness plant's target."""
     spans = []
     index = data.find(PLANT_TARGET)
     while index >= 0:
-        raw = RAW_PLANT.match(data, index)
-        if raw:
-            spans.append((raw.end(), raw.end() + int(raw.group(1))))
-        else:
-            start = data.rfind(b"\n", 0, index) + 1
-            end = data.find(b"\n", index)
-            spans.append((start, end if end >= 0 else len(data)))
+        start = data.rfind(b"\n", 0, index) + 1
+        end = data.find(b"\n", index)
+        spans.append((start, end if end >= 0 else len(data)))
         index = data.find(PLANT_TARGET, index + 1)
     return spans
 
@@ -313,23 +451,20 @@ def scan_streams(
     sentinels: dict[str, list[bytes]], streams: dict[str, bytes]
 ) -> list[Hit]:
     hits: list[Hit] = []
+    forms = needles(sentinels)
     for role, data in streams.items():
-        spans = plant_spans(data)
-        for kind in KIND_ORDER:
-            for value in sentinels.get(kind, ()):
-                for form in variants(value):
-                    index = data.find(form)
-                    while index >= 0:
-                        hits.append(
-                            Hit(kind, role, index, planted_at(spans, index))
-                        )
-                        index = data.find(form, index + 1)
+        spans = plant_lines(data)
+        for kind, form in forms:
+            index = data.find(form)
+            while index >= 0:
+                hits.append(Hit(kind, role, index, planted_at(spans, index)))
+                index = data.find(form, index + 1)
         for label, pattern in GENERIC_SHAPES.items():
             for match in pattern.finditer(data):
                 hits.append(
                     Hit(label, role, match.start(), planted_at(spans, match.start()))
                 )
-    # One leak can match both its raw and its escaped form at one offset.
+    # One leak can match several forms (and its window) at one offset.
     unique = {(hit.kind, hit.role, hit.offset): hit for hit in hits}
     return sorted(unique.values(), key=lambda hit: (hit.role, hit.offset, hit.kind))
 
@@ -346,6 +481,8 @@ def self_test(sentinels: dict[str, list[bytes]], base: bytes) -> tuple[int, int]
             continue
         value = values[0]
         cases.append((kind, value))
+        cases.append((kind, b"[" + bytes_debug_list(value, closed=True) + b"]"))
+        cases.append((kind, value.hex().encode("ascii")))
         try:
             text = value.decode("utf-8")
             cases.append((kind, json.dumps({"field": text}).encode("ascii")))
@@ -440,7 +577,7 @@ def redacted_tail(run: GateRun, lines: int = 20) -> str:
     data = run.streams.get("harness_stderr", b"")
     for kind in KIND_ORDER:
         for value in sorted(run.sentinels.get(kind, ()), key=len, reverse=True):
-            for form in variants(value):
+            for form in encodings(value):
                 data = data.replace(form, f"[{kind}]".encode())
     for label, pattern in GENERIC_SHAPES.items():
         data = pattern.sub(f"[{label}]".encode(), data)
@@ -465,6 +602,25 @@ def tracing_crates(data: bytes) -> dict[str, int]:
     return dict(sorted(counts.items()))
 
 
+def relay_detail_events(data: bytes) -> int:
+    """`DEBUG` and `TRACE` events from `tunnel_relay` in the scanned stderr,
+    excluding the witness plant's own event."""
+    count = 0
+    for line in data.splitlines():
+        if not line.startswith(b"{") or PLANT_TARGET in line:
+            continue
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        target = str(event.get("target", ""))
+        if target.split("::", 1)[0] == "tunnel_relay" and event.get("level") in ("DEBUG", "TRACE"):
+            count += 1
+    return count
+
+
 def describe(run: GateRun) -> str:
     counts = ",".join(f"{kind}:{len(run.sentinels.get(kind, []))}" for kind in KIND_ORDER)
     managed = [r for r in run.streams if r.startswith("managed:")]
@@ -482,7 +638,9 @@ def describe(run: GateRun) -> str:
         f"harness_stdout={len(run.streams.get('harness_stdout', b''))} "
         f"harness_stderr={len(run.streams.get('harness_stderr', b''))} "
         f"managed={len(managed)}/{size(managed)} snapshots={len(snapshots)}/{size(snapshots)} "
-        f"tracing_events={events or 'none'} hits={len(run.hits)}"
+        f"tracing_events={events or 'none'} "
+        f"relay_debug_events={relay_detail_events(run.streams.get('harness_stderr', b''))} "
+        f"text_payloads={len(text_payloads(run))} hits={len(run.hits)}"
     )
 
 
@@ -491,6 +649,20 @@ def hit_summary(hits: list[Hit]) -> str:
         f"{hit.kind}@{hit.role}+{hit.offset}{'(plant)' if hit.witness_line else ''}"
         for hit in hits[:20]
     ) + (f", ... {len(hits) - 20} more" if len(hits) > 20 else "")
+
+
+def text_payloads(run: GateRun) -> list[bytes]:
+    """Recorded payloads that are valid UTF-8 text of at least 16 bytes."""
+    found = []
+    for value in run.sentinels.get("application_payload", ()):
+        if len(value) < 16:
+            continue
+        try:
+            value.decode("utf-8")
+        except UnicodeDecodeError:
+            continue
+        found.append(value)
+    return found
 
 
 def check_clean(run: GateRun) -> list[str]:
@@ -504,8 +676,23 @@ def check_clean(run: GateRun) -> list[str]:
             failures.append(f"empty domain: the fixture recorded no {kind} sentinel")
     # Every gate runs its relays in process, so their diagnostics must be seen
     # in the scanned stderr; none seen means the domain lost them.
-    if run.streams and not tracing_crates(run.streams.get("harness_stderr", b"")).get("tunnel_relay"):
+    stderr = run.streams.get("harness_stderr", b"")
+    if not tracing_crates(stderr).get("tunnel_relay"):
         failures.append("empty domain: no in-process tunnel_relay diagnostic reached the scanned stderr")
+    if run.gate.relay_debug and not relay_detail_events(stderr):
+        failures.append("empty domain: no DEBUG or TRACE tunnel_relay event reached the scanned stderr")
+    managed = sum(1 for role in run.streams if role.startswith("managed:"))
+    snapshots = sum(1 for role in run.streams if role.startswith("snapshot:"))
+    if managed < run.gate.min_managed:
+        failures.append(
+            f"empty domain: {managed} managed-process streams captured, the gate writes at least {run.gate.min_managed}"
+        )
+    if snapshots < run.gate.min_snapshots:
+        failures.append(
+            f"empty domain: {snapshots} snapshots captured, the gate writes at least {run.gate.min_snapshots}"
+        )
+    if run.gate.text_domain and not text_payloads(run):
+        failures.append("empty domain: no UTF-8 application_payload was recorded")
     if run.hits:
         failures.append(f"scan hits (category@stream+offset): {hit_summary(run.hits)}")
     return failures
@@ -567,23 +754,81 @@ def unit_probes() -> list[str]:
     for label, sample in GENERIC_PLANTS.items():
         if [h.kind for h in scan_streams({}, {"s": sample})] != [label]:
             failures.append(f"the {label} shape was not reported")
-    witness_line = b'{"target":"m0_payload_scan_witness","fields":{"planted":"synthetic-credential-A"}}'
+    witness_line = (
+        b'{"level":"DEBUG","target":"tunnel_relay::m0_payload_scan_witness",'
+        b'"fields":{"planted":"synthetic-credential-A"}}'
+    )
     hits = scan_streams(sentinels, {"harness_stderr": witness_line})
     if len(hits) != 1 or not hits[0].witness_line:
         failures.append("a planted line was not attributed to the plant")
-    # A binary plant may hold newlines; every hit inside its declared length
-    # is the plant's, and a hit just past it is not.
-    planted_value = b"x\nsynthetic-credential-A"
-    raw = (
-        b"noise\n" + PLANT_TARGET + b" raw_len=%d raw=" % len(planted_value)
-        + planted_value + b"\nsynthetic-credential-A\n"
-    )
-    hits = scan_streams(sentinels, {"harness_stderr": raw})
-    if [hit.witness_line for hit in hits] != [True, False]:
-        failures.append("a raw plant's span was not attributed exactly")
     unplanted = scan_streams(sentinels, {"harness_stderr": b"x raw=synthetic-credential-A"})
     if len(unplanted) != 1 or unplanted[0].witness_line:
         failures.append("an unplanted leak was attributed to the plant")
+
+    # One probe per encoding: a leak in that form alone must be reported, and
+    # the same form of a different value must not be.
+    payload = b'm0-probe "payload"\n\x01tail-of-a-long-synthetic-value-0123456789'
+    other = b'm0-probe "PAYLOAD"\n\x01tail-of-a-long-synthetic-value-9876543210'
+    probe = {"application_payload": [payload]}
+    text = payload.decode("utf-8")
+    forms = {
+        "raw": payload,
+        "json": json.dumps({"f": text}).encode("ascii"),
+        "debug list": ("[7, " + ", ".join(str(b) for b in payload) + ", 9]").encode("ascii"),
+        "debug b-escape": b'b"' + bytes_debug_escape(payload) + b'"',
+        "debug b-escape in json": json.dumps({"f": 'b"' + bytes_debug_escape(payload).decode("ascii") + '"'}).encode("ascii"),
+        "str debug": b'"' + str_debug(text) + b'"',
+        "str debug in json": json.dumps({"f": '"' + str_debug(text).decode("utf-8") + '"'}).encode("ascii"),
+        "hex": b"0x" + payload.hex().encode("ascii"),
+        "base64": base64.b64encode(payload + b"trailing"),
+        "truncated window": payload[:WINDOW_BYTES] + b"...",
+        "truncated debug list": ("[" + ", ".join(str(b) for b in payload[:WINDOW_BYTES]) + ", ..]").encode("ascii"),
+    }
+    for name, leak in forms.items():
+        found = [h.kind for h in scan_streams(probe, {"s": b"x " + leak + b" y"})]
+        if "application_payload" not in found:
+            failures.append(f"a {name} leak was not reported")
+        control = leak.replace(payload, other)
+        if name in ("raw", "truncated window") and scan_streams(probe, {"s": b"x " + other + b" y"}):
+            failures.append(f"a {name} form of a different value was reported")
+        del control
+    for name, render in (
+        ("debug list", lambda v: bytes_debug_list(v, closed=True)),
+        ("hex", lambda v: v.hex().encode("ascii")),
+        ("base64", lambda v: base64.b64encode(v)),
+    ):
+        if scan_streams(probe, {"s": render(other)}):
+            failures.append(f"the {name} form of a different value was reported")
+
+    # The empty-domain rules: a broken capture hook, a missing debug level,
+    # and a gate with no text payload each fail check_clean.
+    good_stderr = (
+        b'{"level":"DEBUG","target":"tunnel_relay::actor","fields":{"message":"m"}}\n'
+    )
+    gate = Gate("M0", "probe", ("application_payload",), min_managed=2, min_snapshots=1)
+    base_streams = {
+        "harness_stderr": good_stderr,
+        "managed:a.stdout": b"",
+        "managed:a.stderr": b"",
+        "snapshot:s.bin": b"x",
+    }
+
+    def run_with(streams: dict[str, bytes], payloads: list[bytes]) -> GateRun:
+        return GateRun(gate, False, 0, 0.0, {"application_payload": payloads}, 0, dict(streams))
+
+    text_value = [b"a-long-enough-text-payload"]
+    if check_clean(run_with(base_streams, text_value)):
+        failures.append("a complete synthetic capture was refused")
+    cases = {
+        "a missing managed stream": {k: v for k, v in base_streams.items() if k != "managed:a.stderr"},
+        "a missing snapshot": {k: v for k, v in base_streams.items() if k != "snapshot:s.bin"},
+        "no DEBUG relay event": {**base_streams, "harness_stderr": good_stderr.replace(b"DEBUG", b"INFO")},
+    }
+    for name, streams in cases.items():
+        if not check_clean(run_with(streams, text_value)):
+            failures.append(f"{name} was not refused")
+    if not check_clean(run_with(base_streams, [b"\xff\xfe" * 20])):
+        failures.append("a gate with no text payload was not refused")
     detected, planted = self_test(sentinels, clean)
     if detected != planted or planted < 5:
         failures.append(f"the self-test detected {detected} of {planted}")
@@ -597,8 +842,9 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--harness", type=Path)
     parser.add_argument("--gate", action="append", default=[])
-    parser.add_argument("--no-witness", action="store_true")
-    parser.add_argument("--witness-only", action="store_true")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--no-witness", action="store_true")
+    mode.add_argument("--witness-only", action="store_true")
     parser.add_argument("--keep", type=Path, help="keep captures in this private directory")
     parser.add_argument("--unit", action="store_true", help="run the scanner unit probes only")
     args = parser.parse_args()
@@ -629,8 +875,9 @@ def main() -> int:
     witnesses = [] if args.no_witness else list(gates)
     if args.witness_only:
         gates = []
-    elif args.no_witness:
-        witnesses = []
+    if not gates and not witnesses:
+        print("m0-payload-scan: nothing selected to run", file=sys.stderr)
+        return 2
 
     if args.keep:
         args.keep.mkdir(mode=0o700, parents=True, exist_ok=False)
@@ -676,6 +923,8 @@ def main() -> int:
     finally:
         if cleanup is not None:
             cleanup.cleanup()
+    if not gates and not witnesses:
+        failed = True
     sentinel_totals = ",".join(f"{k}:{v}" for k, v in totals["sentinels"].items())
     print(
         f"m0-payload-scan: {'FAILED' if failed else 'PASS'} gates={len(gates)} "

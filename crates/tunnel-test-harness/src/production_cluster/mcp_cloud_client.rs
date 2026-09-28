@@ -770,10 +770,25 @@ fn text_of(result: &CallToolResult) -> Option<String> {
         .find_map(|block| block.as_text().map(|text| text.text.clone()))
 }
 
-fn call_request(tool: &'static str, value: serde_json::Value) -> ClientRequest {
-    ClientRequest::CallToolRequest(Request::new(
+fn call_request(tool: &'static str, value: serde_json::Value) -> Result<ClientRequest> {
+    record_argument_sentinel(&value)?;
+    Ok(ClientRequest::CallToolRequest(Request::new(
         CallToolRequestParams::new(tool).with_arguments(arguments(value)),
-    ))
+    )))
+}
+
+/// M0-09: the request side of a tool call.  The argument object's compact
+/// JSON text is what the consumer sends inside the `tools/call` body, so it
+/// is recorded as an `application_payload` sentinel when it is long enough to
+/// be distinctive; `{"steps":6}` and the like are left out.
+fn record_argument_sentinel(value: &serde_json::Value) -> Result<()> {
+    const MIN_ARGUMENT_SENTINEL: usize = 16;
+    let text = serde_json::to_string(value)
+        .map_err(|error| HarnessError::Process(format!("tool arguments: {error}")))?;
+    if text.len() >= MIN_ARGUMENT_SENTINEL {
+        crate::c11_capture::record_payload_sentinel(text.as_bytes())?;
+    }
+    Ok(())
 }
 
 fn call_result(response: rmcp::model::ServerResult) -> Option<CallToolResult> {
@@ -1490,6 +1505,7 @@ impl Gate<'_> {
             meta.insert("io.agent-tunnel.test/marker".to_owned(), marker.clone());
             let mut params = CallToolRequestParams::new("echo")
                 .with_arguments(arguments(serde_json::json!({"a": 1, "b": "synthetic"})));
+            record_argument_sentinel(&serde_json::json!({"a": 1, "b": "synthetic"}))?;
             params.meta = Some(meta);
             let echoed = timeout(WAIT, client.call_tool(params))
                 .await
@@ -1528,7 +1544,7 @@ impl Gate<'_> {
         let outcome = async {
             let handle = client
                 .send_cancellable_request(
-                    call_request("progress", serde_json::json!({"steps": PROGRESS_STEPS})),
+                    call_request("progress", serde_json::json!({"steps": PROGRESS_STEPS}))?,
                     PeerRequestOptions::no_options(),
                 )
                 .await
@@ -1614,7 +1630,7 @@ impl Gate<'_> {
                     call_request(
                         "sleep",
                         serde_json::json!({"label": label, "descendant": combo.stdio()}),
-                    ),
+                    )?,
                     PeerRequestOptions::no_options(),
                 )
                 .await
@@ -1714,7 +1730,7 @@ impl Gate<'_> {
                     call_request(
                         "crash",
                         serde_json::json!({"label": label, "descendant": combo.stdio()}),
-                    ),
+                    )?,
                     PeerRequestOptions::no_options(),
                 )
                 .await
@@ -1921,7 +1937,7 @@ impl Gate<'_> {
                             "bytes": STREAM_EVENT_BYTES,
                             "gates": STREAM_GATES,
                         }),
-                    ),
+                    )?,
                     PeerRequestOptions::no_options(),
                 )
                 .await

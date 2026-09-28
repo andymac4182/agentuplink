@@ -323,7 +323,10 @@ jobs:
           --health-retries 20
           --memory 256m
     env:
-      RUST_LOG: info
+      # `rmcp`, the MCP SDK the cloud-client gate drives as its consumer, logs
+      # every notification it receives in full at `info`, which printed the
+      # fixture's synthetic stream payloads into this public job log (M0-09).
+      RUST_LOG: info,rmcp=warn
       TEST_REDIS_URL: redis://127.0.0.1:6379/
       TUNNEL_CATALOG_REDIS_URL: redis://127.0.0.1:6379/
     steps:
@@ -459,10 +462,11 @@ jobs:
   # paths and endpoints it used, and scans every captured stream -- the gate's
   # own stdout and stderr (where the in-process relays' and clients' tracing
   # lands), each managed process's streams and each typed snapshot -- for them
-  # and for fixed credential shapes.  It fails on any hit, on a gate that
-  # records no sentinel of a kind it declares, and on any of its five planted
-  # controls (one per milestone) that does not go red with its declared
-  # witness.  It runs as its own job, beside the milestone jobs rather than
+  # and for fixed credential shapes.  It fails on any hit, on a gate whose
+  # domain is empty (no sentinel of a declared kind, fewer managed streams or
+  # snapshots than the gate writes, no DEBUG relay event, no text payload),
+  # and on any of its 21 planted controls -- one per gate -- that does not go
+  # red with its declared witness.  It runs as its own job, beside the milestone jobs rather than
   # inside them, so it adds no time to their critical path and M8's gates run
   # in hosted CI at all.
   #
@@ -504,5 +508,5 @@ jobs:
         run: python3 scripts/m0-payload-scan.py --unit
       - name: Build runnable workspace binaries
         run: cargo +1.95.0 build --workspace --bins --locked
-      - name: Scan the M1, M2, M3, M4 and M8 gates, with one planted witness per milestone
+      - name: Scan the M1, M2, M3, M4 and M8 gates, with 21 planted witnesses, one per gate
         run: python3 scripts/m0-payload-scan.py
