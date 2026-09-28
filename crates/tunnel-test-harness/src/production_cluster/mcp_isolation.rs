@@ -1031,6 +1031,16 @@ impl Consumer {
     ) -> Result<Answer> {
         use std::sync::atomic::Ordering;
         let frames = collect_frames(body).await?;
+        // M0-09: every JSON-RPC body this gate sends is a whole synthetic
+        // request; record it before it leaves.  The leaf values (`alice`,
+        // `dup`, ...) are too common to match alone, the whole body is not.
+        let whole: Vec<u8> = frames
+            .iter()
+            .flat_map(|frame| frame.iter().copied())
+            .collect();
+        if whole.len() >= 32 {
+            crate::c11_capture::record_payload_sentinel(&whole)?;
+        }
         let mut resends = 0;
         loop {
             let answer = self
