@@ -356,7 +356,9 @@ pub fn load_client_config(
 #[derive(Clone, PartialEq, Eq)]
 pub struct PinnedCredentials {
     certificate_pem: std::sync::Arc<[u8]>,
-    key_pem: std::sync::Arc<[u8]>,
+    /// Wiped when the last clone is dropped. This covers only this copy:
+    /// the TLS configuration built from it holds its own parsed key.
+    key_pem: std::sync::Arc<zeroize::Zeroizing<Vec<u8>>>,
     server_ca_pem: std::sync::Arc<[u8]>,
 }
 
@@ -367,7 +369,7 @@ impl PinnedCredentials {
         let read = |path: &Path| fs::read(path).map_err(CredentialError::Io);
         Ok(Self {
             certificate_pem: read(&credentials.client_certificate)?.into(),
-            key_pem: read(&credentials.client_key)?.into(),
+            key_pem: std::sync::Arc::new(zeroize::Zeroizing::new(read(&credentials.client_key)?)),
             server_ca_pem: read(&credentials.server_ca)?.into(),
         })
     }

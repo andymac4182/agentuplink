@@ -44,6 +44,9 @@ tokio-util = { version = "0.7", features = ["rt"] }
 toml.workspace = true
 url = "2.5"
 uuid = { version = "1.18", features = ["v4"] }
+# M0-07 review: wipe the pinned private-key bytes on drop (already locked,
+# a transitive dependency of rustls-pki-types and others).
+zeroize = "1.8"
 # M4 gate 4: the device half of the filesystem endpoint.
 tunnel-fs-core = { path = "../tunnel-fs-core" }
 tunnel-fs-ninep = { path = "../tunnel-fs-ninep" }

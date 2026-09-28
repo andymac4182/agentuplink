@@ -24,6 +24,17 @@ describing a procedure the code does not have.**
 > at the original expiry. `credentials renew` (M0-07) now replaces the
 > device's own key and certificate safely, but nothing yet registers the new
 > key in the relay's catalog, so it does not lift this limitation.
+> **Do not complete a renewal on a device you need admitted:** after its
+> next restart the relay refuses it (exit `3`) until you roll back. The
+> previous pair is kept as `<key>.renew-previous` -- **the old private key**,
+> mode `0600` in the key's `0700` directory, never deleted automatically --
+> and `<cert>.renew-previous`. To roll back: stop `connect`
+> (`tunnel-client disconnect --config PATH` or the service manager), rename
+> `<cert>.renew-previous` back to `<cert>` and then `<key>.renew-previous`
+> back to `<key>`, and start it again. Delete the `.renew-previous` files
+> only once the relay has admitted the renewed pair after a restart and the
+> old certificate is revoked or expired
+> ([runtime.md](runtime.md#credential-renewal)).
 > **Re-enrol the device before its certificate expires**, as a new device:
 >
 > 1. Create a new key and CSR in a new profile and have it issued, as in
@@ -361,6 +372,12 @@ the new key needs a catalog credential that no shipped command can add for an
 existing device (M6-C56, deferred by owner decision), so the relay refuses the
 renewed pair until then. **Re-enrol before the certificate expires**; see the
 known limitation at the top of this guide.
+
+`connect` reads its certificate, private key **and server CA file** once, when
+it starts, and uses those bytes for its whole life (M0-07). A change to any of
+the three -- a renewal, or a relay server-CA rollover written into the
+profile's `server_ca` file -- takes effect only when `connect` is stopped and
+started again; plan a CA rollover so the new bundle is in place, then restart.
 
 `credentials import` never leaves the profile half-updated by a **refusal**
 (M6-C55). It checks both destinations before writing either, writes each under

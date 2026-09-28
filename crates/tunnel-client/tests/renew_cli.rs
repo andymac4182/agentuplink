@@ -279,6 +279,7 @@ fn a_renewal_requests_then_swaps_in_the_new_pair() {
     let result = &json(&completed)["result"];
     assert_eq!(result["state"], "renewed", "{result}");
     assert_eq!(result["restart_required"], true);
+    assert_eq!(result["relay_registration_required"], true);
     assert_eq!(result["already_installed"], false);
     assert_eq!(result["certificate_count"], 1);
     assert!(result["recovered"].is_null());
@@ -367,6 +368,24 @@ fn every_renew_exit_follows_the_published_table() {
     assert_eq!(output.status.code(), Some(2), "{}", text(&output));
     assert_eq!(error_code(&output), "RENEWAL_NOT_PENDING");
     profile.assert_redacted(&output);
+
+    // The CSR output is a command-line argument: an existing file, or one
+    // of the profile's own credential files, is a usage error, and nothing
+    // is written.
+    let existing = profile.path("existing.csr");
+    fs::write(&existing, "operator's file\n").expect("existing CSR path");
+    let credential = profile.certificate.display().to_string();
+    for into in [existing.display().to_string(), credential] {
+        let output = profile.renew(&["--csr-out", &into, "--json"]);
+        assert_eq!(output.status.code(), Some(2), "{into}: {}", text(&output));
+        assert_eq!(error_code(&output), "INVALID_INVOCATION", "{into}");
+        assert!(!profile.pending_key.exists(), "{into}: a key was written");
+    }
+    assert_eq!(profile.pair(), before);
+    assert_eq!(
+        fs::read_to_string(&existing).expect("existing"),
+        "operator's file\n"
+    );
 
     // A pending renewal is never silently replaced.
     let pending = profile.request();

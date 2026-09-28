@@ -517,25 +517,84 @@ fn sync_error(step: &'static str, error: CredentialError) -> RenewalError {
     }
 }
 
-/// Resolve an interrupted swap, under the renewal lock, for `connect`.
+/// Resolve an interrupted swap, under the renewal lock.
 ///
 /// Does nothing -- and takes no lock, so creates no file -- unless a
 /// renewal has left something behind, so a profile that has never been
 /// renewed, or whose directory is read-only, starts exactly as before.
-#[cfg(unix)]
 pub fn recover(credentials: &CredentialConfig) -> Result<Option<Recovery>, RenewalError> {
+    recover_then(credentials, || ()).map(|(recovery, ())| recovery)
+}
+
+/// [`recover`], then run `then` **while still holding the renewal lock**, so
+/// what `then` reads cannot straddle a swap another process is making. With
+/// no renewal files present `then` runs without the lock: a swap in progress
+/// always leaves the pending key or the kept previous certificate on disk.
+#[cfg(unix)]
+pub fn recover_then<T>(
+    credentials: &CredentialConfig,
+    then: impl FnOnce() -> T,
+) -> Result<(Option<Recovery>, T), RenewalError> {
     let files = RenewalFiles::new(credentials);
     if !files.has_renewal_artifacts() || files.check_layout().is_err() {
-        return Ok(None);
+        return Ok((None, then()));
     }
     let _lock = lock(&files)?;
-    recover_locked(&files)
+    let recovery = recover_locked(&files)?;
+    Ok((recovery, then()))
 }
 
 /// Renewal is Unix-only; elsewhere there is nothing to recover.
 #[cfg(not(unix))]
-pub fn recover(_credentials: &CredentialConfig) -> Result<Option<Recovery>, RenewalError> {
-    Ok(None)
+pub fn recover_then<T>(
+    _credentials: &CredentialConfig,
+    then: impl FnOnce() -> T,
+) -> Result<(Option<Recovery>, T), RenewalError> {
+    Ok((None, then()))
+}
+
+/// Why [`pin_for_supervisor`] could not pin.
+#[derive(Debug)]
+pub enum PinError {
+    /// A credential file could not be read: what a session would report.
+    Credential(CredentialError),
+    /// Recovering an interrupted renewal failed.
+    Renewal(RenewalError),
+}
+
+/// Pin a supervisor's credentials (M0-07): read the three files, and if the
+/// key and certificate read do not match -- a swap interrupted between its
+/// renames, **or** a renewal that completed between this read of the
+/// certificate and this read of the key -- resolve any renewal and read
+/// them again under the renewal lock. The pinned bytes are always the
+/// second read in that case, whatever recovery found (review of #243: a
+/// renewal finishing between the two reads left the disk pair matching,
+/// recovery had nothing to do, and the mismatched first read stayed pinned
+/// for the life of the process).
+pub fn pin_for_supervisor(
+    credentials: &mut CredentialConfig,
+) -> Result<Option<Recovery>, PinError> {
+    let first = crate::credentials::PinnedCredentials::read(credentials);
+    pin_after(credentials, first)
+}
+
+/// [`pin_for_supervisor`] with its first read supplied, so the race can be
+/// reproduced deterministically.
+fn pin_after(
+    credentials: &mut CredentialConfig,
+    first: Result<crate::credentials::PinnedCredentials, CredentialError>,
+) -> Result<Option<Recovery>, PinError> {
+    let first = first.map_err(PinError::Credential)?;
+    if first.pair_matches() {
+        credentials.pinned = Some(first);
+        return Ok(None);
+    }
+    let (recovery, read) = recover_then(credentials, || {
+        crate::credentials::PinnedCredentials::read(credentials)
+    })
+    .map_err(PinError::Renewal)?;
+    credentials.pinned = Some(read.map_err(PinError::Credential)?);
+    Ok(recovery)
 }
 
 /// The current pair's chain, or why there is no valid current pair.
@@ -591,6 +650,12 @@ pub fn begin(
         .map_err(|error| sync_error("generating the key", error))?;
     write_new(&files.pending_key, key_pem.as_bytes(), true)
         .map_err(|error| sync_error("writing the pending key", error))?;
+    // The key's name is durable before the CSR exists, so a CSR an operator
+    // carries away always has its key on disk after a crash.
+    if let Err(error) = sync_parent(&files.pending_key) {
+        let _ = fs::remove_file(&files.pending_key);
+        return Err(sync_error("writing the pending key", error));
+    }
     if let Err(error) = write_new(csr_out, csr_pem.as_bytes(), false) {
         // Leave nothing behind: a retry must not be refused as pending.
         let _ = fs::remove_file(&files.pending_key);
@@ -599,8 +664,6 @@ pub fn begin(
             other => sync_error("writing the CSR", other),
         });
     }
-    sync_parent(&files.pending_key)
-        .map_err(|error| sync_error("writing the pending key", error))?;
     Ok(RenewalRequest {
         discarded_pending: pending,
         recovered,
@@ -748,6 +811,13 @@ fn validity(leaf: &CertificateDer<'_>) -> Result<(i64, i64), RenewalError> {
 /// verify to those certificates with the TLS stack's own client-certificate
 /// verifier -- the check the relay makes, anchored on what this profile
 /// already trusts rather than on anything the issued file supplies.
+///
+/// **For a leaf-only profile this is a mistake guard, not a trust
+/// boundary.** Without the issuer's certificate there is nothing to verify a
+/// signature against, and a name and a key identifier are public values
+/// anyone can copy into a certificate of their own. It catches the operator
+/// handing over a certificate from the wrong CA; the relay's own chain
+/// verification is what refuses a forged one.
 #[cfg(unix)]
 fn verify_issuer_continuity(
     current: &[CertificateDer<'static>],
@@ -1387,6 +1457,36 @@ mod tests {
         let profile = Profile::new(&issuer, false);
         assert_eq!(recover(&profile.config.credentials).expect("recover"), None);
         assert!(!profile.files.lock.exists(), "a lock file was created");
+    }
+
+    /// Review of #243: `connect` read the certificate, a renewal completed,
+    /// then `connect` read the key -- a mismatched first read of a disk pair
+    /// that now matches, with renewal files present. Recovery has nothing to
+    /// do, and the pin must still be the matching second read.
+    #[test]
+    fn a_renewal_completing_between_the_pin_reads_is_pinned_consistently() {
+        let issuer = Issuer::new("synthetic renewal issuer");
+        let profile = Profile::new(&issuer, false);
+        let pending = profile.begin();
+        fs::write(&profile.issued, issuer.issue(&pending, DEVICE)).expect("issued");
+        profile.complete().expect("renewal completes");
+        // What the racing reads saw: the new certificate, the old key.
+        let mut straddled = profile.config.credentials.clone();
+        straddled.client_key = profile.files.previous_key.clone();
+        let first = crate::credentials::PinnedCredentials::read(&straddled).expect("first read");
+        assert!(!first.pair_matches(), "the fixture must straddle the swap");
+        assert!(profile.files.has_renewal_artifacts());
+
+        let mut credentials = profile.config.credentials.clone();
+        let recovered = pin_after(&mut credentials, Ok(first)).expect("pin");
+        assert_eq!(recovered, None, "the disk pair already matched");
+        let pinned = credentials.pinned.clone().expect("pinned");
+        assert!(pinned.pair_matches(), "a mismatched pair stayed pinned");
+        assert_eq!(
+            pinned,
+            crate::credentials::PinnedCredentials::read(&profile.config.credentials)
+                .expect("disk pair")
+        );
     }
 
     #[test]

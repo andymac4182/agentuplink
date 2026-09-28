@@ -1467,19 +1467,56 @@ RENEWAL_CASES: list[Case] = [
     ),
     Case(
         "connect does not pin its credentials",
-        [(MAIN, "    config.credentials.pin().map_err(pin_error)?;\n    let matches", "    let matches")],
-        frozenset({"a_running_connect_keeps_the_pair_it_started_with"}),
-    ),
-    Case(
-        "connect does not resolve an interrupted renewal",
         [
             (
                 MAIN,
-                "    match renewal::recover(&config.credentials) {",
-                "    match Ok::<_, RenewalError>(None::<renewal::Recovery>) {",
+                "    match renewal::pin_for_supervisor(&mut config.credentials) {",
+                "    match Ok::<Option<renewal::Recovery>, PinError>(None) {",
+            )
+        ],
+        frozenset({"a_running_connect_keeps_the_pair_it_started_with"}),
+    ),
+    Case(
+        # Recovery aimed at a profile with no renewal files: the pin still
+        # happens, but an interrupted swap is never resolved.
+        "connect does not resolve an interrupted renewal",
+        [
+            (
+                RENEWAL,
+                "    let (recovery, read) = recover_then(credentials, || {",
+                "    let (recovery, read) = recover_then(&CredentialConfig::default(), || {",
             )
         ],
         frozenset({KILLED_AT_EVERY_STEP}),
+    ),
+    Case(
+        # Review of #243: a renewal completing between the pin's two reads
+        # left the first, mismatched read pinned for the process's life.
+        "a mismatched first pin read is kept when recovery has nothing to do",
+        [
+            (
+                RENEWAL,
+                "    credentials.pinned = Some(read.map_err(PinError::Credential)?);",
+                "    let _ = read;\n    credentials.pinned = Some(first);",
+            )
+        ],
+        frozenset(
+            {"renewal::tests::a_renewal_completing_between_the_pin_reads_is_pinned_consistently"}
+        ),
+    ),
+    Case(
+        # Review of #243: the CSR output is a command-line argument.
+        "a refused CSR output path exits as a credential failure",
+        [
+            (
+                MAIN,
+                "            RenewalError::CsrExists | RenewalError::CsrOutputIsCredential => {\n"
+                "                Self::InvalidInvocation",
+                "            RenewalError::CsrExists | RenewalError::CsrOutputIsCredential => {\n"
+                "                Self::CredentialError",
+            )
+        ],
+        frozenset({"tests::renewal_failures_map_to_the_published_table", EXIT_TABLE}),
     ),
 ]
 

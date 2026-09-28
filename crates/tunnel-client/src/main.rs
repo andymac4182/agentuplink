@@ -264,6 +264,10 @@ impl Cause {
         match error {
             RenewalError::Pending { .. } => Self::RenewalPending,
             RenewalError::NotPending => Self::RenewalNotPending,
+            // The CSR output path is a command-line argument: fix it.
+            RenewalError::CsrExists | RenewalError::CsrOutputIsCredential => {
+                Self::InvalidInvocation
+            }
             RenewalError::Locked => Self::RenewalLocked,
             // The profile names its files in a way rename cannot renew.
             RenewalError::Unsupported(_) => Self::ConfigError,
@@ -271,8 +275,6 @@ impl Cause {
             RenewalError::UnsupportedPlatform
             | RenewalError::NoCurrentCredential(_)
             | RenewalError::PendingKeyUnusable(_)
-            | RenewalError::CsrExists
-            | RenewalError::CsrOutputIsCredential
             | RenewalError::IssuedUnreadable(_)
             | RenewalError::Refused(_)
             | RenewalError::IssuerChanged(_)
@@ -599,6 +601,10 @@ struct RenewCompleteResult {
     /// Always `true`: a running `connect` keeps the pair it started with
     /// until it is stopped and started.
     restart_required: bool,
+    /// Always `true`: the relay admits the new key only once its catalog
+    /// holds a credential for it, which no shipped command adds yet (task
+    /// row M6-C56). Until then a restart presents a key the relay refuses.
+    relay_registration_required: bool,
 }
 
 /// `tunnel-client credentials renew` (task row M0-07; M0-03 decision
@@ -652,6 +658,7 @@ fn run_renew(config_path: &Path, step: RenewStep, json: bool) -> Result<(), CliE
                         already_installed: renewed.already_installed,
                         recovered: renewed.recovered.map(renewal::Recovery::name),
                         restart_required: true,
+                        relay_registration_required: true,
                     },
                 );
             } else {
@@ -689,26 +696,20 @@ fn run_renew(config_path: &Path, step: RenewStep, json: bool) -> Result<(), CliE
 /// file, so a profile never renewed starts exactly as before; a read error
 /// is the credential error the first session would have reported.
 fn pin_credentials(config: &mut ConnectConfig) -> Result<(), CliError> {
-    let pin_error = |error| CliError::from_client(ClientError::Credential(error));
-    config.credentials.pin().map_err(pin_error)?;
-    let matches = config
-        .credentials
-        .pinned
-        .as_ref()
-        .is_some_and(tunnel_client::credentials::PinnedCredentials::pair_matches);
-    if matches {
-        return Ok(());
-    }
-    match renewal::recover(&config.credentials) {
+    use renewal::PinError;
+    match renewal::pin_for_supervisor(&mut config.credentials) {
         Ok(None) => Ok(()),
         Ok(Some(recovery)) => {
             eprintln!(
                 "tunnel-client: resolved an interrupted credential renewal ({})",
                 recovery.name()
             );
-            config.credentials.pin().map_err(pin_error)
+            Ok(())
         }
-        Err(error) => Err(CliError::from_renewal(&error)),
+        Err(PinError::Credential(error)) => {
+            Err(CliError::from_client(ClientError::Credential(error)))
+        }
+        Err(PinError::Renewal(error)) => Err(CliError::from_renewal(&error)),
     }
 }
 
@@ -3707,11 +3708,11 @@ mod tests {
                 3,
                 false,
             ),
-            (RenewalError::CsrExists, "CREDENTIAL_ERROR", 3, false),
+            (RenewalError::CsrExists, "INVALID_INVOCATION", 2, false),
             (
                 RenewalError::CsrOutputIsCredential,
-                "CREDENTIAL_ERROR",
-                3,
+                "INVALID_INVOCATION",
+                2,
                 false,
             ),
             (
