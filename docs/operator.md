@@ -307,7 +307,7 @@ $ cp examples/m1-client.toml trial/client.toml
 $ tunnel-client config check --config trial/client.toml
 Runtime client configuration is valid.
 $ tunnel-client doctor --config trial/client.toml --json; echo "exit=$?"
-{"schema_version":1,"command":"doctor","ok":false,...,"process_containment":{"status":"ok","code":"PROCESS_CONTAINMENT_SENTINEL_PRESENT"}},"error":{"code":"CREDENTIAL_MISSING",...}}
+{"schema_version":1,"command":"doctor","ok":false,...,"process_containment":{"status":"ok","code":"PROCESS_CONTAINMENT_SENTINEL_PRESENT"},...},"error":{"code":"CREDENTIAL_MISSING",...}}
 exit=3
 $ tunnel-client credentials create --config trial/client.toml --csr-out device.csr
 Created local credential request at trial/device.csr and private key at trial/credentials/device-key.pem.
@@ -340,12 +340,20 @@ writes anything (section 2.3):
 
 ```console
 $ mkdir -m 700 trial-ca
-$ openssl req -x509 -newkey rsa:2048 -nodes -days 2 -subj "/CN=Synthetic trial CA" -addext basicConstraints=critical,CA:TRUE -addext keyUsage=critical,keyCertSign,cRLSign -keyout trial-ca/ca-key.pem -out trial-ca/ca.pem
+$ openssl req -x509 -newkey rsa:2048 -nodes -days 2 -subj "/CN=Synthetic trial CA" -addext basicConstraints=critical,CA:TRUE -addext keyUsage=critical,keyCertSign,cRLSign -addext subjectKeyIdentifier=hash -keyout trial-ca/ca-key.pem -out trial-ca/ca.pem
 $ printf 'basicConstraints=CA:FALSE\nkeyUsage=digitalSignature\nextendedKeyUsage=clientAuth\nsubjectAltName=URI:urn:agent-tunnel:device:33333333-3333-4333-8333-333333333333\n' > trial-ca/device-ext.cnf
 $ openssl x509 -req -in trial/device.csr -CA trial-ca/ca.pem -CAkey trial-ca/ca-key.pem -CAcreateserial -days 1 -extfile trial-ca/device-ext.cnf -out trial/device-cert.pem
 $ openssl x509 -in trial/device-cert.pem -noout -subject
 ...device/33333333-3333-4333-8333-333333333333
 ```
+
+The CA's three extensions matter to clients outside this bundle: Python 3.13
+and later verify strictly and refuse a CA without `basicConstraints` or
+`keyUsage`, and a certificate whose authority key identifier carries no key
+ID. macOS's own `openssl` (LibreSSL) writes the identifier without the key ID
+unless the CA has a subject key identifier (M6-C137). Certificates you sign from this CA for a server should
+also carry `subjectKeyIdentifier=hash` and `authorityKeyIdentifier=keyid` in
+their extension file.
 
 Import the signed certificate with the CA bundle that the device should trust
 for the **relay's** device listener. In a real deployment that is a separate
@@ -464,7 +472,7 @@ either key. Reproduce with
 A P-256 key and certificate from OpenSSL (use `keyUsage=digitalSignature`;
 `keyEncipherment` is for RSA):
 
-```
+```text
 openssl req -new -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
   -subj "/CN=relay.example" -keyout relay-server-key.pem -out relay-server.csr
 ```
@@ -1135,7 +1143,7 @@ M7-C83 (membership re-signs).
 keep-alive connection counts for as long as it stays open. A connection over
 the limit is answered, not reset:
 
-```
+```text
 HTTP/1.1 503 Service Unavailable
 retry-after: 1
 connection: close
@@ -1547,7 +1555,12 @@ old relays are stopped; the relay cannot verify it.
 ## 5. Metrics, logs and audit retention
 
 **There is no audit log in this alpha, and metrics are a minimal, opt-in,
-private surface** (M6-C24). The public consumer and device listeners do not
+private surface** (M6-C24). Both are the alpha's stated scope, decided on
+2026-09-28 under the owner's delegation: the series listed below are the
+alpha's metrics set, and an audit log is post-alpha work (M6-C218). Until
+then the relay's JSON log on stderr, which names tenants, devices and
+operations by identifier and carries no payloads, is the record to keep. The
+public consumer and device listeners do not
 serve `/metrics`, and a gate asserts that it stays off them
 (`crates/tunnel-test-harness/src/production_cluster/i04_fail_closed.rs`).
 
@@ -1567,7 +1580,8 @@ that at once; each must send its request within 2 s, serves one request
 (no keep-alive) and is closed after 10 s at most, so an idle client cannot
 hold one open. **A relay binary older than this change refuses a configuration
 that names `metrics_bind`** (unknown field), so remove the key before rolling
-back. That includes the image currently deployed on Fly, `main-77bfd28`
+back. That includes the Fly image `main-77bfd28`; the image deployed there
+since 2026-09-27, `main-a8f105d`, contains this change
 ([deploy-fly.md](deploy-fly.md)).
 
 The series, all prefixed `tunnel_relay_`: `build_info{version}`, `ready`
@@ -1779,7 +1793,7 @@ the profile's `device_id` does not name the certificate's device:
 
 ```console
 $ tunnel-client doctor --config trial/absent.toml --json; echo "exit=$?"
-{"schema_version":1,"command":"doctor","ok":false,"result":{"config":{"status":"failed","code":"INVALID_CONFIG"},"credential_key_match":{"status":"not_run"},...,"process_containment":{"status":"ok","code":"PROCESS_CONTAINMENT_SENTINEL_PRESENT"}},"error":{"code":"INVALID_CONFIG",...}}
+{"schema_version":1,"command":"doctor","ok":false,"result":{"config":{"status":"failed","code":"INVALID_CONFIG"},"credential_key_match":{"status":"not_run"},...,"process_containment":{"status":"ok","code":"PROCESS_CONTAINMENT_SENTINEL_PRESENT"},...},"error":{"code":"INVALID_CONFIG",...}}
 exit=2
 ```
 
