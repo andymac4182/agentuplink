@@ -829,7 +829,7 @@ mod tests {
             // The head bound lost: the bridge's absolute deadline answered.
             ("no_head_at_the_timeout", |e| e.no_head_elapsed_ms = 120_000),
             ("no_head_code", |e| {
-                e.no_head_code = "HTTP_STREAM_INTERRUPTED".into()
+                e.no_head_code = "HTTP_BODY_LIMIT".into()
             }),
             ("no_head_handler_cancelled", |e| {
                 e.no_head_handler_cancelled = false;
