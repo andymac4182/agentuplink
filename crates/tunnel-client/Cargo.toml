@@ -72,6 +72,8 @@ tokio = { version = "1.47", features = ["test-util"] }
 # M6-C25: signs a genuine X.509 v1 certificate at test time; no v1 generator
 # in the tree can, and no key material is committed.
 ring = "0.17.14"
+# M4-71: an in-crate test builds an http-forward/1 profile to admit an OPEN.
+tunnel-http-forward = { path = "../tunnel-http-forward" }
 
 # `reconnect_cli.rs` resets a connection mid-handshake (`SO_LINGER` 0).
 [target.'cfg(unix)'.dev-dependencies]
