@@ -5936,7 +5936,8 @@ async fn m4_47_on_m1_a_unary_response_the_data_lane_cannot_hold_keeps_the_fence(
     fixture.authorize_unary_echo(stream_id);
     assert_eq!(sequenced(&drain_data(&mut fixture.old_rx)).len(), 2);
     m4_47_make_m1(&mut fixture);
-    let room = m4_47_saturate_data_lane(&fixture);
+    // The session is fenced, so the saturating charge is not given back.
+    let _saturated = m4_47_saturate_data_lane(&fixture);
 
     fixture
         .connector_frame(Frame::data(
@@ -5953,7 +5954,6 @@ async fn m4_47_on_m1_a_unary_response_the_data_lane_cannot_hold_keeps_the_fence(
         !fixture.session_alive(),
         "an M1 session keeps the fence: it cannot abandon the exchange"
     );
-    drop(room);
 }
 
 /// Task row M4-47, site 3 on an M1 session (review of #242).  The relay has
