@@ -214,6 +214,40 @@ class PackagingTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             package(self.root, TARGETS[0], self.sha, "123", self.output, {"packages": []})
 
+    def test_an_example_named_outside_examples_is_refused(self):
+        # M6-C216: an example ships at its repository path, so a named path
+        # that leaves `examples/` would add a top-level entry.  Each target
+        # here exists, so only the containment rule can refuse it.
+        (self.root / "packages" / "client").mkdir(parents=True)
+        (self.root / "packages" / "client" / "README.md").write_text("# Client\n")
+        for named in ("examples/../packages/client/README.md", "examples/./m1-client.toml",
+                      "examples/../packages/"):
+            with self.subTest(named=named):
+                (self.root / GUIDE).write_text(GUIDE_TEXT + f"\nThen `{named}`.\n")
+                with self.assertRaises(ValueError):
+                    release_examples(self.root, TARGETS[0])
+
+    def test_an_example_linked_out_of_examples_is_refused(self):
+        # A symbolic link under `examples/` that points outside it.
+        outside = self.root / "packages"
+        outside.mkdir()
+        (outside / "x.toml").write_text("# outside")
+        try:
+            (self.root / "examples" / "linked.toml").symlink_to(outside / "x.toml")
+        except OSError:
+            self.skipTest("this host cannot create symbolic links")
+        (self.root / GUIDE).write_text(GUIDE_TEXT + "\nThen `examples/linked.toml`.\n")
+        with self.assertRaises(ValueError):
+            release_examples(self.root, TARGETS[0])
+        # The same link inside a named directory (`examples/service/` is
+        # named by the synthetic runtime document).
+        (self.root / "examples" / "linked.toml").unlink()
+        (self.root / GUIDE).write_text(GUIDE_TEXT)
+        release_examples(self.root, TARGETS[0])
+        (self.root / "examples" / "service" / "linked.service").symlink_to(outside / "x.toml")
+        with self.assertRaises(ValueError):
+            release_examples(self.root, TARGETS[0])
+
     def test_the_real_documents_examples_all_ship(self):
         # Against this repository: every example the real shipped documents
         # name exists, and the real guide's section 2.3 records examples are

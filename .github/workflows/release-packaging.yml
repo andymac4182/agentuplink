@@ -3,12 +3,13 @@ name: Release packaging tests
 # examples and checks the archive's top level against the verifier's
 # (docs/tasks.md M6-C216), so any shipped document or example can change the
 # result: the guide's links decide which documents ship, and every shipped
-# document's text decides which examples do.
+# document's text decides which examples do.  `docs/**`, not `docs/*.md`:
+# GitHub's `*` does not match `/`.  `LICENSE` because `package()` copies it.
 on:
   push:
-    paths: ['scripts/*release*.py', '.github/workflows/release*.yml', 'docs/*.md', 'examples/**', 'Cargo.toml']
+    paths: ['scripts/*release*.py', '.github/workflows/release*.yml', 'docs/**', 'examples/**', 'Cargo.toml', 'LICENSE']
   pull_request:
-    paths: ['scripts/*release*.py', '.github/workflows/release*.yml', 'docs/*.md', 'examples/**', 'Cargo.toml']
+    paths: ['scripts/*release*.py', '.github/workflows/release*.yml', 'docs/**', 'examples/**', 'Cargo.toml', 'LICENSE']
 permissions:
   contents: read
 jobs:

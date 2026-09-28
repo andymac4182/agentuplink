@@ -276,12 +276,26 @@ def release_examples(root, target):
     """The example files one target's archive carries, as repository paths."""
     texts = [(root / document).read_bytes().decode("utf-8") for document in release_documents(root)]
     shipped = set()
+    examples = (root / "examples").resolve()
     for named in named_examples(texts):
+        # Every example ships at its repository path, so one that leaves
+        # `examples/` -- `examples/../packages/x`, or a symbolic link out --
+        # would add a top-level entry the archive's fixed layout refuses
+        # (docs/tasks.md M6-C216).  The pattern always starts `examples/`,
+        # so an absolute path cannot be named; `..` and `.` segments can.
+        if any(part in ("..", ".") for part in named.rstrip("/").split("/")):
+            raise ValueError(f"the shipped documents name {named!r}, which leaves examples/")
         path = root / named
+        if not path.resolve().is_relative_to(examples):
+            raise ValueError(f"the shipped documents name {named!r}, which resolves outside examples/")
         if named.endswith("/") or path.is_dir():
             if not path.is_dir():
                 raise ValueError(f"the shipped documents name {named!r}, which is not a directory")
             files = [f for f in sorted(path.rglob("*")) if f.is_file()]
+            outside = [f for f in files if not f.resolve().is_relative_to(examples)]
+            if outside:
+                raise ValueError(f"{named!r} holds {outside[0].relative_to(root).as_posix()!r}, "
+                                 "which resolves outside examples/")
             if not files:
                 raise ValueError(f"the shipped documents name {named!r}, which is empty")
             shipped.update(f.relative_to(root).as_posix() for f in files)
