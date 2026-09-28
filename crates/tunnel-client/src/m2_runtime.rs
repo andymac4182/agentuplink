@@ -4886,6 +4886,7 @@ impl M2Actor {
                 authorization.grant_revision,
                 granted,
                 auth_deadline.monotonic,
+                auth_deadline.wall,
             ));
             stream.fs_authority = Some(std::sync::Arc::clone(&authority));
             stream.http = Some(self.start_fs_exchange(
@@ -5170,6 +5171,7 @@ impl M2Actor {
                                 stream.auth.grant_revision,
                                 authority.current_grant(),
                                 deadline.monotonic,
+                                deadline.wall,
                             );
                         }
                         if let Some(http) = stream.http.as_mut() {
@@ -5192,7 +5194,19 @@ impl M2Actor {
                 )
             });
             match state {
+                // The deadline passed before a valid confirmation landed: a
+                // lapse, reset `AUTHORIZATION_STALE` (task row M4-70).
                 Some((false, true)) => return self.lapse_stream(stream_id).await,
+                // Inside its deadline, yet the confirmation was refused:
+                // its digest, revision or nonce does not match the challenge
+                // in flight, its `remaining_ms` is outside `1..=5000`, or the
+                // stream was already invalidated.  (A confirmation for a
+                // challenge a retry retired never reaches here; it is
+                // discarded above.)  Such a confirmation cannot authorize
+                // this context, and the stream cannot be confirmed by any
+                // later one for the same nonce, so it ends as before M4-70:
+                // `AUTHORIZATION_EXPIRED`, the invalidation class.  It is
+                // not a lapse, because no deadline passed.
                 Some((false, false)) => return self.expire_stream(stream_id).await,
                 _ => {}
             }

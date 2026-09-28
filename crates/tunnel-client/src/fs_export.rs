@@ -37,7 +37,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::Instant;
+use std::time::{Instant, SystemTime};
 
 #[cfg(unix)]
 use bytes::Bytes;
@@ -168,6 +168,8 @@ pub struct StreamAuthority {
     fresh: AtomicBool,
     /// The instant the counts below are measured from.
     origin: Instant,
+    /// The same origin on the wall clock.
+    origin_wall: SystemTime,
     /// When the last confirmation ends, in nanoseconds after `origin`;
     /// `u64::MAX` for no deadline (task row M4-53).
     ///
@@ -177,6 +179,14 @@ pub struct StreamAuthority {
     /// run its lapse pass (docs/cluster.md step 5, "stop dispatch when the
     /// prior snapshot expires").
     until_nanos: AtomicU64,
+    /// The same deadline on the wall clock, in nanoseconds after
+    /// `origin_wall` (review of #247).  The monotonic clock excludes system
+    /// sleep on Linux and macOS, so after a resume it alone would let one
+    /// queued host call run before the actor's next tick noticed; docs/
+    /// cluster.md step 5 requires the check "after any process suspension".
+    /// Both halves must hold, as for the actor's `DualDeadline`, and a wall
+    /// clock stepped back before the origin also counts as stale.
+    until_wall_nanos: AtomicU64,
 }
 
 impl StreamAuthority {
@@ -189,41 +199,71 @@ impl StreamAuthority {
             grant: AtomicU64::new(pack(grant)),
             fresh: AtomicBool::new(true),
             origin: Instant::now(),
+            origin_wall: SystemTime::now(),
             until_nanos: AtomicU64::new(u64::MAX),
+            until_wall_nanos: AtomicU64::new(u64::MAX),
         }
     }
 
     /// The authority for a stream admitted at `revision` with `grant`,
-    /// confirmed until `until`.
+    /// confirmed until `until` on the monotonic clock and `until_wall` on
+    /// the wall clock.
     #[must_use]
-    pub fn new_until(revision: u64, grant: CapabilitySet, until: Instant) -> Self {
+    pub fn new_until(
+        revision: u64,
+        grant: CapabilitySet,
+        until: Instant,
+        until_wall: SystemTime,
+    ) -> Self {
         let authority = Self::new(revision, grant);
-        authority.set_until(until);
+        authority.set_until(until, until_wall);
         authority
     }
 
-    fn set_until(&self, until: Instant) {
+    fn set_until(&self, until: Instant, until_wall: SystemTime) {
         let nanos = until
             .checked_duration_since(self.origin)
             .map_or(0, |elapsed| {
                 u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX - 1)
             });
+        let wall_nanos = until_wall
+            .duration_since(self.origin_wall)
+            .map_or(0, |elapsed| {
+                u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX - 1)
+            });
         self.until_nanos.store(nanos, Ordering::Release);
+        self.until_wall_nanos.store(wall_nanos, Ordering::Release);
     }
 
-    /// Record that the authorization context is confirmed until `until`.
-    pub fn confirm(&self, revision: u64, grant: CapabilitySet, until: Instant) {
+    /// Record that the authorization context is confirmed until `until`
+    /// (monotonic) and `until_wall` (wall clock).
+    pub fn confirm(
+        &self,
+        revision: u64,
+        grant: CapabilitySet,
+        until: Instant,
+        until_wall: SystemTime,
+    ) {
         self.revision.store(revision, Ordering::Release);
         self.grant.store(pack(grant), Ordering::Release);
-        self.set_until(until);
+        self.set_until(until, until_wall);
         self.fresh.store(true, Ordering::Release);
     }
 
-    /// Whether the last confirmation is still inside its deadline.
+    /// Whether the last confirmation is still inside its deadline on both
+    /// clocks.
     fn within_deadline(&self) -> bool {
         let until = self.until_nanos.load(Ordering::Acquire);
-        until == u64::MAX
-            || u64::try_from(self.origin.elapsed().as_nanos()).unwrap_or(u64::MAX) < until
+        let until_wall = self.until_wall_nanos.load(Ordering::Acquire);
+        let monotonic_ok = until == u64::MAX
+            || u64::try_from(self.origin.elapsed().as_nanos()).unwrap_or(u64::MAX) < until;
+        let wall_ok = until_wall == u64::MAX
+            || SystemTime::now()
+                .duration_since(self.origin_wall)
+                .is_ok_and(|elapsed| {
+                    u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX) < until_wall
+                });
+        monotonic_ok && wall_ok
     }
 
     /// The capabilities this session currently carries.
@@ -1206,6 +1246,7 @@ mod tests {
             12,
             CapabilitySet::from_slice(&[Capability::List]),
             std::time::Instant::now() + std::time::Duration::from_secs(60),
+            SystemTime::now() + std::time::Duration::from_secs(60),
         );
         let live = authority.current();
         assert_eq!(live.revision, 12);
@@ -1224,14 +1265,42 @@ mod tests {
             .checked_sub(std::time::Duration::from_millis(1))
             .expect("a past instant");
         let authority = super::SharedAuthority::new(Arc::new(StreamAuthority::new(1, grant)));
-        authority.0.confirm(1, grant, past);
+        let later = SystemTime::now() + std::time::Duration::from_secs(60);
+        authority.0.confirm(1, grant, past, later);
         assert!(!authority.current().fresh, "past its confirmed deadline");
         authority.0.confirm(
             1,
             grant,
             std::time::Instant::now() + std::time::Duration::from_secs(60),
+            later,
         );
         assert!(authority.current().fresh);
+    }
+
+    /// Review of #247: the wall-clock half.  The monotonic clock excludes
+    /// system sleep on Linux and macOS, so after a resume the monotonic
+    /// deadline can still look open while the wall clock -- which kept
+    /// running through the sleep -- has passed it.  Either half passing makes
+    /// the authority stale.
+    #[test]
+    fn an_authority_past_its_wall_clock_deadline_is_stale() {
+        let grant = CapabilitySet::from_slice(&[Capability::Read]);
+        let authority = super::SharedAuthority::new(Arc::new(StreamAuthority::new(1, grant)));
+        // What a resume from sleep looks like: monotonic time barely moved,
+        // wall time is past the deadline.
+        let wall_past = SystemTime::now()
+            .checked_sub(std::time::Duration::from_millis(1))
+            .expect("a past wall instant");
+        authority.0.confirm(
+            1,
+            grant,
+            std::time::Instant::now() + std::time::Duration::from_secs(60),
+            wall_past,
+        );
+        assert!(
+            !authority.current().fresh,
+            "past its wall-clock deadline although the monotonic one is open"
+        );
     }
 
     /// Task row M4-53 (review of #247): a 9P request that arrives after the
@@ -1254,6 +1323,7 @@ mod tests {
             1,
             grant,
             std::time::Instant::now() + confirmed_for,
+            SystemTime::now() + confirmed_for,
         ));
         let (inbound_tx, inbound_rx, _) = tunnel_http_bridge::channel(65_536);
         let (outbound_tx, outbound_rx, _) = tunnel_http_bridge::channel(65_536);
