@@ -15,8 +15,12 @@ SCRIPT = Path(__file__).resolve().parent / "m6-release-artifact.py"
 GUIDE = Path(__file__).resolve().parents[1] / "docs" / "operator.md"
 
 
-def inventory(guide):
-    return subprocess.run([sys.executable, str(SCRIPT), "docs-inventory", "--guide", str(guide)],
+RUNTIME = GUIDE.with_name("runtime.md")
+
+
+def inventory(guide, *extra):
+    return subprocess.run([sys.executable, str(SCRIPT), "docs-inventory", "--guide", str(guide),
+                           *extra],
                           capture_output=True, text=True, timeout=120)
 
 
@@ -50,6 +54,21 @@ class DocsInventory(unittest.TestCase):
         done = self.planted("```console\n$ mkdir -m 700 trial-ca", "```text\n$ mkdir -m 700 trial-ca")
         self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
         self.assertIn("witness=docs-count-mismatch", done.stdout)
+
+    def test_a_deleted_exit_code_row_is_red(self):
+        # The exit-7 row of runtime.md's client exit-code table removed: the
+        # source still produces 7, so the table no longer covers it.
+        text = RUNTIME.read_text(encoding="utf-8")
+        lines = text.split("\n")
+        rows = [i for i, line in enumerate(lines) if line.startswith("| 7 |")]
+        self.assertEqual(len(rows), 1, "runtime.md should hold exactly one exit-7 row")
+        del lines[rows[0]]
+        tmp = Path(tempfile.mkdtemp())
+        runtime = tmp / "runtime.md"
+        runtime.write_text("\n".join(lines), encoding="utf-8")
+        done = inventory(GUIDE, "--runtime-doc", str(runtime))
+        self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+        self.assertIn("witness=exit-code-table-mismatch", done.stdout)
 
 
 if __name__ == "__main__":

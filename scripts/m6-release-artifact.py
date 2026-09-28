@@ -4602,6 +4602,7 @@ def main() -> int:
         "docs-inventory",
         help="the bundle-free half of `docs`: fence tags, pinned counts, exit table")
     inventory.add_argument("--guide", default=str(DOCS_OPERATOR))
+    inventory.add_argument("--runtime-doc", default=str(DOCS_RUNTIME))
 
     verify = sub.add_parser("verify")
     verify.add_argument("--bundle", required=True)
@@ -4634,7 +4635,7 @@ def main() -> int:
         return cmd_verify(args)
     if args.command == "docs-inventory":
         failed, session, shape, prose = check_docs_inventory(
-            Path(args.guide), DOCS_RUNTIME, DOCS_CLIENT_MAIN)
+            Path(args.guide), Path(args.runtime_doc), DOCS_CLIENT_MAIN)
         if failed is not None:
             print(failed.render())
             return 1
