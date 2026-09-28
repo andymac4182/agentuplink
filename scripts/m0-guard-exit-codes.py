@@ -1270,11 +1270,225 @@ OPS_GATE_CASES: list[Case] = [
     ),
 ]
 
+
+#: Task row M0-07, `credentials renew`: the rules the row's acceptance names
+#: -- a crash-safe swap that never leaves the profile without a valid pair,
+#: import's checks plus the current issuer's, the stale-pending rule, owner-
+#: only modes, redaction, the exit table, and a supervisor that keeps its
+#: pair until a stop and start.  Each value case names the tests that must
+#: redden; the swap and recovery cases each have a unit and a real-process
+#: witness.
+RENEWAL = CLIENT / "src" / "renewal.rs"
+CREDENTIALS_RS = CLIENT / "src" / "credentials.rs"
+KILLED_AT_EVERY_STEP = "a_renewal_killed_at_any_swap_step_recovers_to_one_valid_pair"
+STOPPED_AT_EVERY_STEP = (
+    "renewal::tests::an_interrupted_swap_recovers_to_one_valid_pair_at_every_step"
+)
+REFUSALS = "renewal::tests::a_refused_certificate_leaves_the_old_pair_untouched"
+EXIT_TABLE = "every_renew_exit_follows_the_published_table"
+
+RENEWAL_CASES: list[Case] = [
+    Case(
+        # Without the roll-forward, a swap killed between its two renames
+        # leaves the new certificate beside the old key for good.
+        "recovery does not roll an interrupted swap forward",
+        [
+            (
+                RENEWAL,
+                "    if present(&files.pending_key) && pair_matches(&files.pending_key, &files.certificate) {",
+                "    if false && present(&files.pending_key) && pair_matches(&files.pending_key, &files.certificate) {",
+            )
+        ],
+        frozenset(
+            {
+                STOPPED_AT_EVERY_STEP,
+                KILLED_AT_EVERY_STEP,
+                "a_rerun_of_renew_completes_a_swap_killed_between_the_renames",
+            }
+        ),
+    ),
+    Case(
+        # The order is the design: renaming the key first leaves, after a
+        # kill between the renames, the new key beside the old certificate
+        # with the pending key gone -- a state no recovery can resolve.
+        "the swap renames the key before the certificate",
+        [
+            (
+                RENEWAL,
+                "    fs::rename(&files.staged_certificate, &files.certificate)\n"
+                "        .map_err(io_error(\"installing the certificate\"))?;",
+                "    fs::rename(&files.pending_key, &files.key)\n"
+                "        .map_err(io_error(\"installing the certificate\"))?;",
+            ),
+            (
+                RENEWAL,
+                "    if let Err(error) = fs::rename(&files.pending_key, &files.key) {",
+                "    if let Err(error) = fs::rename(&files.staged_certificate, &files.certificate) {",
+            ),
+        ],
+        frozenset({STOPPED_AT_EVERY_STEP, KILLED_AT_EVERY_STEP}),
+    ),
+    Case(
+        "the issued certificate is not checked against the pending key",
+        [
+            (
+                RENEWAL,
+                "    verify_certificate_key(&chain, pending).map_err(RenewalError::Refused)?;",
+                "    let _ = (&chain, pending);",
+            )
+        ],
+        frozenset({REFUSALS, EXIT_TABLE}),
+    ),
+    Case(
+        # The whole issuer-continuity check: a certificate from another
+        # issuer is then swapped in, and the relay refuses the device.
+        "the issued certificate is not checked against the current issuer",
+        [
+            (
+                RENEWAL,
+                "    let (old, new) = (parse(&current[0])?, parse(&issued[0])?);",
+                "    if issued.len() < usize::MAX {\n        return Ok(());\n    }\n"
+                "    let (old, new) = (parse(&current[0])?, parse(&issued[0])?);",
+            )
+        ],
+        frozenset(
+            {
+                REFUSALS,
+                EXIT_TABLE,
+                "renewal::tests::an_impostor_copying_the_issuer_name_and_key_id_is_refused_by_the_chain",
+            }
+        ),
+    ),
+    Case(
+        # The authority key identifier alone: a same-name issuer with another
+        # key, against a profile whose file carries no issuer certificate.
+        "the authority key identifier is not compared",
+        [
+            (
+                RENEWAL,
+                "    if let Some(expected) = authority_key(&old)\n",
+                "    if let Some(expected) = authority_key(&old).filter(|_| false)\n",
+            )
+        ],
+        frozenset({REFUSALS}),
+    ),
+    Case(
+        # The chain verification alone: a forger copying the issuer's name
+        # and key identifier is caught only by the signature.
+        "the chain is not verified to the current issuer",
+        [(RENEWAL, "    let anchors = &current[1..];", "    let anchors = &current[..0];")],
+        frozenset(
+            {"renewal::tests::an_impostor_copying_the_issuer_name_and_key_id_is_refused_by_the_chain"}
+        ),
+    ),
+    Case(
+        # M0-07's stale-pending rule: the issuer may already hold the CSR.
+        "a pending renewal is replaced silently",
+        [
+            (
+                RENEWAL,
+                "    if pending && !discard_pending {",
+                "    if pending && !discard_pending && false {",
+            )
+        ],
+        frozenset(
+            {"renewal::tests::a_pending_renewal_is_never_replaced_without_discard", EXIT_TABLE}
+        ),
+    ),
+    Case(
+        "the pending key is written with the default mode",
+        [
+            (
+                RENEWAL,
+                "    write_new(&files.pending_key, key_pem.as_bytes(), true)",
+                "    write_new(&files.pending_key, key_pem.as_bytes(), false)",
+            )
+        ],
+        frozenset(
+            {
+                "renewal::tests::begin_writes_an_owner_only_pending_key_and_leaves_the_pair_untouched",
+                "a_renewal_requests_then_swaps_in_the_new_pair",
+            }
+        ),
+    ),
+    Case(
+        "a held renewal lock is ignored",
+        [
+            (
+                RENEWAL,
+                "                Err(rustix::io::Errno::WOULDBLOCK) => return Err(RenewalError::Locked),",
+                "                Err(rustix::io::Errno::WOULDBLOCK) => return Ok(Self { _file: file }),",
+            )
+        ],
+        frozenset({"renewal::tests::a_held_renewal_lock_refuses_a_second_renewal", EXIT_TABLE}),
+    ),
+    Case(
+        # Redaction: the issued file sits in the canary directory.
+        "a renewal refusal names the issued file's path",
+        [
+            (
+                RENEWAL,
+                '        CredentialError::NoCertificates(_) => format!("{role} holds no certificate"),',
+                "        CredentialError::NoCertificates(path) => {\n"
+                '            format!("{role} holds no certificate: {}", path.display())\n'
+                "        }",
+            )
+        ],
+        frozenset({EXIT_TABLE}),
+    ),
+    Case(
+        "a pending renewal exits as a credential failure",
+        [
+            (
+                MAIN,
+                "            Self::RenewalPending | Self::RenewalNotPending => 2,",
+                "            Self::RenewalNotPending => 2,\n            Self::RenewalPending => 3,",
+            )
+        ],
+        frozenset({"tests::renewal_failures_map_to_the_published_table", EXIT_TABLE}),
+    ),
+    Case(
+        # Pinning ignored: every session re-reads the files, so a renewal (or
+        # anything else) under a running supervisor reaches it mid-life.
+        "sessions re-read the credential files instead of the pinned bytes",
+        [
+            (
+                CREDENTIALS_RS,
+                "    let pinned = match &credentials.pinned {",
+                "    let pinned = match &None::<PinnedCredentials> {",
+            )
+        ],
+        frozenset(
+            {
+                "credentials::tests::pinned_credentials_are_used_without_reading_the_files_again",
+                "a_running_connect_keeps_the_pair_it_started_with",
+            }
+        ),
+    ),
+    Case(
+        "connect does not pin its credentials",
+        [(MAIN, "    config.credentials.pin().map_err(pin_error)?;\n    let matches", "    let matches")],
+        frozenset({"a_running_connect_keeps_the_pair_it_started_with"}),
+    ),
+    Case(
+        "connect does not resolve an interrupted renewal",
+        [
+            (
+                MAIN,
+                "    match renewal::recover(&config.credentials) {",
+                "    match Ok::<_, RenewalError>(None::<renewal::Recovery>) {",
+            )
+        ],
+        frozenset({KILLED_AT_EVERY_STEP}),
+    ),
+]
+
 SUITES: list[Suite] = [
     Suite("m0c03-exit-codes", [CLIENT], CARGO_TEST, CASES),
     Suite("m0c03-classifier", [HARNESS], HARNESS_TEST, HARNESS_CASES),
     Suite("m0c06-recovery-debug", [RELAY], RELAY_RECOVERY_TEST, RECOVERY_DEBUG_CASES),
     Suite("m6-06-ops-gate", [CLIENT], CARGO_TEST, OPS_GATE_CASES),
+    Suite("m0-07-renewal", [CLIENT], CARGO_TEST, RENEWAL_CASES),
 ]
 
 #: Cases whose green result is itself the measurement.  Empty today, and kept

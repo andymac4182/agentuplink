@@ -14,6 +14,7 @@ use tokio_util::sync::CancellationToken;
 use tunnel_client::{
     ClientError, ConnectConfig, ConnectOptions, M1_TRANSPORT_FAILURE_POLICY,
     credentials::{create_csr, import_certificate},
+    renewal::{self, RenewalError},
 };
 use tunnel_core::ClientConfig;
 
@@ -42,6 +43,12 @@ enum Command {
         certificate: PathBuf,
         server_ca: PathBuf,
     },
+    /// `credentials renew` (M0-07): request a renewal, or complete one.
+    RenewCredentials {
+        config: PathBuf,
+        step: RenewStep,
+        json: bool,
+    },
     Doctor {
         path: PathBuf,
         json: bool,
@@ -56,6 +63,18 @@ enum Command {
         json: bool,
         timeout: std::time::Duration,
     },
+}
+
+/// The two steps of `credentials renew` (M0-07).
+#[derive(Debug, Eq, PartialEq)]
+enum RenewStep {
+    /// `--csr-out PATH [--discard-pending]`: write a pending key and its CSR.
+    Request {
+        csr_out: PathBuf,
+        discard_pending: bool,
+    },
+    /// `--certificate PATH`: check the issued certificate and swap it in.
+    Complete { certificate: PathBuf },
 }
 
 /// Every terminal cause `tunnel-client` can report, as a closed set.
@@ -101,6 +120,12 @@ enum Cause {
     SupervisorLockFailed,
     /// The local supervisor IPC failed its same-user check (M6-06).
     IpcUnauthorized,
+    /// `credentials renew --csr-out`: a renewal is already pending (M0-07).
+    RenewalPending,
+    /// `credentials renew --certificate`: no renewal is pending (M0-07).
+    RenewalNotPending,
+    /// Another renewal holds the profile's renewal lock (M0-07).
+    RenewalLocked,
 }
 
 impl Cause {
@@ -128,6 +153,9 @@ impl Cause {
             Self::SupervisorRunning => "SUPERVISOR_RUNNING",
             Self::SupervisorLockFailed => "SUPERVISOR_LOCK_FAILED",
             Self::IpcUnauthorized => "IPC_UNAUTHORIZED",
+            Self::RenewalPending => "RENEWAL_PENDING",
+            Self::RenewalNotPending => "RENEWAL_NOT_PENDING",
+            Self::RenewalLocked => "RENEWAL_LOCKED",
         }
     }
 
@@ -175,6 +203,13 @@ impl Cause {
     ///   service unit (a relay's stale `OWNER_BUSY` heals by waiting), while
     ///   a second supervisor never heals by restarting, so the unit lists `9`
     ///   in `RestartPreventExitStatus`.
+    /// * `RENEWAL_PENDING` and `RENEWAL_NOT_PENDING` (M0-07) are `2`:
+    ///   nothing was attempted, and the fix is the command line -- complete
+    ///   the pending renewal or discard it, or request one first. A renewal
+    ///   certificate that fails a check is `CREDENTIAL_ERROR`, `3`, exactly
+    ///   as `credentials import` reports it. `RENEWAL_LOCKED` is `7`: another
+    ///   renewal holds the lock for a few file operations, so waiting and
+    ///   retrying is the action, and a `connect` that met it is restarted.
     /// * `1` — genuinely unexpected: a protocol violation, a failed
     ///   supervisor, or a signal subsystem error. After this change `1`
     ///   means what it says.
@@ -187,10 +222,12 @@ impl Cause {
     fn exit_code(self) -> u8 {
         match self {
             Self::InvalidInvocation | Self::ConfigError | Self::InvalidConfig => 2,
+            Self::RenewalPending | Self::RenewalNotPending => 2,
             Self::CredentialError | Self::IpcUnauthorized => 3,
             Self::TransportError | Self::SessionClosed | Self::AuthorizationStale => 4,
             Self::DeadlineExceeded => 5,
             Self::OwnerBusy | Self::ResourceExhausted => 7,
+            Self::RenewalLocked => 7,
             Self::SupervisorRunning | Self::SupervisorLockFailed => 9,
             Self::SupervisorAbsent => 8,
             Self::Cancelled => 130,
@@ -222,6 +259,30 @@ impl Cause {
 }
 
 impl Cause {
+    /// Classify a renewal failure (M0-07). Exhaustive, no fallback.
+    fn from_renewal(error: &RenewalError) -> Self {
+        match error {
+            RenewalError::Pending { .. } => Self::RenewalPending,
+            RenewalError::NotPending => Self::RenewalNotPending,
+            RenewalError::Locked => Self::RenewalLocked,
+            // The profile names its files in a way rename cannot renew.
+            RenewalError::Unsupported(_) => Self::ConfigError,
+            // Every credential refusal is `credentials import`'s own class.
+            RenewalError::UnsupportedPlatform
+            | RenewalError::NoCurrentCredential(_)
+            | RenewalError::PendingKeyUnusable(_)
+            | RenewalError::CsrExists
+            | RenewalError::CsrOutputIsCredential
+            | RenewalError::IssuedUnreadable(_)
+            | RenewalError::Refused(_)
+            | RenewalError::IssuerChanged(_)
+            | RenewalError::UntrustedChain(_)
+            | RenewalError::ServerTrust(_)
+            | RenewalError::Io { .. }
+            | RenewalError::Interrupted(_) => Self::CredentialError,
+        }
+    }
+
     /// Classify a supervisor IPC failure (M6-06). Exhaustive, no fallback.
     fn from_ipc(error: tunnel_client::supervisor_ipc::IpcError) -> Self {
         use tunnel_client::supervisor_ipc::IpcError;
@@ -260,6 +321,14 @@ impl CliError {
             cause: Cause::from_client(&error),
             message: error.to_string(),
             retryable: error.retryable(),
+        }
+    }
+
+    fn from_renewal(error: &RenewalError) -> Self {
+        Self {
+            cause: Cause::from_renewal(error),
+            message: error.to_string(),
+            retryable: matches!(error, RenewalError::Locked),
         }
     }
 
@@ -491,6 +560,7 @@ async fn run(command: Command) -> Result<(), CliError> {
             }
             Ok(())
         }
+        Command::RenewCredentials { config, step, json } => run_renew(&config, step, json),
         Command::Doctor { .. } => unreachable!("doctor is handled before the async command runner"),
         Command::Status { path, json } => run_status(&path, json).await,
         Command::Disconnect {
@@ -498,6 +568,145 @@ async fn run(command: Command) -> Result<(), CliError> {
             json,
             timeout,
         } => run_disconnect(&path, json, timeout).await,
+    }
+}
+
+/// What `credentials renew --csr-out --json` reports (M0-07). No path, key
+/// or certificate body: the operator named the paths on the command line.
+#[derive(Serialize)]
+struct RenewRequestResult {
+    /// Always `pending`: a key and CSR are written; the pair is unchanged.
+    state: &'static str,
+    discarded_pending: bool,
+    /// An interrupted earlier swap resolved first: `rolled_forward`,
+    /// `rolled_back`, or absent.
+    recovered: Option<&'static str>,
+}
+
+/// What `credentials renew --certificate --json` reports (M0-07).
+#[derive(Serialize)]
+struct RenewCompleteResult {
+    /// Always `renewed`: the new pair is in place.
+    state: &'static str,
+    certificate_count: usize,
+    not_before_unix: i64,
+    not_after_unix: i64,
+    /// `notBefore` is still ahead of this host's clock (M6-C54).
+    not_yet_valid: bool,
+    /// The swap had already completed with this certificate.
+    already_installed: bool,
+    recovered: Option<&'static str>,
+    /// Always `true`: a running `connect` keeps the pair it started with
+    /// until it is stopped and started.
+    restart_required: bool,
+}
+
+/// `tunnel-client credentials renew` (task row M0-07; M0-03 decision
+/// (3)(a)): see `tunnel_client::renewal` for the two steps and the swap.
+fn run_renew(config_path: &Path, step: RenewStep, json: bool) -> Result<(), CliError> {
+    let runtime = load_runtime_config(config_path)?;
+    let from_renewal = |error: RenewalError| CliError::from_renewal(&error);
+    match step {
+        RenewStep::Request {
+            csr_out,
+            discard_pending,
+        } => {
+            let csr_out = resolve_cli_path(config_path, &csr_out);
+            let request =
+                renewal::begin(&runtime, &csr_out, discard_pending).map_err(from_renewal)?;
+            if json {
+                print_ok_json(
+                    "credentials renew",
+                    RenewRequestResult {
+                        state: "pending",
+                        discarded_pending: request.discarded_pending,
+                        recovered: request.recovered.map(renewal::Recovery::name),
+                    },
+                );
+            } else {
+                if request.discarded_pending {
+                    println!("Discarded the earlier pending renewal.");
+                }
+                println!(
+                    "Wrote a renewal request to {} and a pending private key beside the \
+                     current one; the current credential is unchanged. Have the issuer sign \
+                     the request, then run `tunnel-client credentials renew --config PATH \
+                     --certificate PATH`.",
+                    csr_out.display()
+                );
+            }
+            Ok(())
+        }
+        RenewStep::Complete { certificate } => {
+            let certificate = resolve_cli_path(config_path, &certificate);
+            let renewed = renewal::complete(&runtime, &certificate).map_err(from_renewal)?;
+            if json {
+                print_ok_json(
+                    "credentials renew",
+                    RenewCompleteResult {
+                        state: "renewed",
+                        certificate_count: renewed.certificate_count,
+                        not_before_unix: renewed.not_before_unix,
+                        not_after_unix: renewed.not_after_unix,
+                        not_yet_valid: renewed.not_yet_valid_until.is_some(),
+                        already_installed: renewed.already_installed,
+                        recovered: renewed.recovered.map(renewal::Recovery::name),
+                        restart_required: true,
+                    },
+                );
+            } else {
+                println!(
+                    "{} the renewed credential ({} certificate(s), valid until unix time {}). \
+                     A running `tunnel-client connect` keeps the previous pair until it is \
+                     stopped and started (`tunnel-client disconnect`, or the service manager).",
+                    if renewed.already_installed {
+                        "Already installed"
+                    } else {
+                        "Installed"
+                    },
+                    renewed.certificate_count,
+                    renewed.not_after_unix
+                );
+            }
+            if let Some(not_before) = renewed.not_yet_valid_until {
+                eprintln!(
+                    "tunnel-client: warning: the renewed client certificate is not valid \
+                     until unix time {not_before} on this host's clock; `connect` retries \
+                     until then (check this host's clock if the issuer's is correct)"
+                );
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Pin the profile's credentials for the life of this supervisor (M0-07),
+/// first resolving a renewal interrupted between its two renames.
+///
+/// A pair that already matches is pinned without touching any lock or
+/// file, so a profile never renewed starts exactly as before; a read error
+/// is the credential error the first session would have reported.
+fn pin_credentials(config: &mut ConnectConfig) -> Result<(), CliError> {
+    let pin_error = |error| CliError::from_client(ClientError::Credential(error));
+    config.credentials.pin().map_err(pin_error)?;
+    let matches = config
+        .credentials
+        .pinned
+        .as_ref()
+        .is_some_and(tunnel_client::credentials::PinnedCredentials::pair_matches);
+    if matches {
+        return Ok(());
+    }
+    match renewal::recover(&config.credentials) {
+        Ok(None) => Ok(()),
+        Ok(Some(recovery)) => {
+            eprintln!(
+                "tunnel-client: resolved an interrupted credential renewal ({})",
+                recovery.name()
+            );
+            config.credentials.pin().map_err(pin_error)
+        }
+        Err(error) => Err(CliError::from_renewal(&error)),
     }
 }
 
@@ -1084,6 +1293,11 @@ impl Cause {
             | Self::SupervisorRunning
             | Self::SupervisorLockFailed
             | Self::IpcUnauthorized => ReconnectClass::Terminal,
+            // Renewal causes arise in `credentials renew`, or in `connect`
+            // before its first attempt (recovering an interrupted renewal).
+            Self::RenewalPending | Self::RenewalNotPending | Self::RenewalLocked => {
+                ReconnectClass::Terminal
+            }
         }
     }
 }
@@ -1186,9 +1400,15 @@ fn unix_now() -> i64 {
 /// `notBefore` and the earliest `notAfter`, as unix seconds, the rule
 /// `doctor` applies -- or `None` if it cannot be read.
 fn device_certificate_window(config: &ConnectConfig) -> Option<(i64, i64)> {
-    let chain =
-        tunnel_client::credentials::load_certificates(&config.credentials.client_certificate)
-            .ok()?;
+    // The pinned chain when there is one (M0-07): the certificate this
+    // supervisor presents, not whatever a renewal has since put on disk.
+    let chain = match &config.credentials.pinned {
+        Some(pinned) => pinned.certificate_chain().ok()?,
+        None => {
+            tunnel_client::credentials::load_certificates(&config.credentials.client_certificate)
+                .ok()?
+        }
+    };
     let mut window: Option<(i64, i64)> = None;
     for certificate in &chain {
         let (not_before, not_after) = doctor::certificate_validity(certificate.as_ref()).ok()?;
@@ -1521,10 +1741,14 @@ async fn run_connect(path: PathBuf, json: bool, no_reconnect: bool) -> Result<()
     // request in any phase reaches the orderly path below instead of the
     // inherited disposition.
     let mut stop = StopSignals::install()?;
-    let config = load_runtime_config(&path)?;
+    let mut config = load_runtime_config(&path)?;
     let mut publisher = SupervisorPublisher::start(&config)?;
     stop.attach_disconnect(publisher.disconnect.take());
-    let result = run_supervised(&config, &mut stop, &publisher, json, no_reconnect).await;
+    // M0-07: after the profile lock, before the first attempt.
+    let result = match pin_credentials(&mut config) {
+        Ok(()) => run_supervised(&config, &mut stop, &publisher, json, no_reconnect).await,
+        Err(error) => Err(error),
+    };
     publisher.update(|status| {
         status.state = "stopping".to_owned();
         status.session = None;
@@ -2349,6 +2573,7 @@ fn diagnostic_command(command: &Command) -> Option<&'static str> {
         Command::Connect { json: true, .. } => Some("connect"),
         Command::Status { json: true, .. } => Some("status"),
         Command::Disconnect { json: true, .. } => Some("disconnect"),
+        Command::RenewCredentials { json: true, .. } => Some("credentials renew"),
         _ => None,
     }
 }
@@ -2554,7 +2779,7 @@ fn parse_path_and_json(args: &[OsString], command: &str) -> Result<(PathBuf, boo
 fn parse_credentials_command(args: &[OsString]) -> Result<Command, CliError> {
     let subcommand = args
         .get(1)
-        .ok_or_else(|| CliError::usage("credentials requires create or import"))?;
+        .ok_or_else(|| CliError::usage("credentials requires create, import or renew"))?;
     match subcommand.to_str() {
         Some("create") => {
             let (config, csr_out) = parse_required_paths(&args[2..], &["--config", "--csr-out"])?;
@@ -2569,8 +2794,77 @@ fn parse_credentials_command(args: &[OsString]) -> Result<Command, CliError> {
                 server_ca: values[2].clone(),
             })
         }
-        _ => Err(CliError::usage("credentials requires create or import")),
+        Some("renew") => parse_renew_command(&args[2..]),
+        _ => Err(CliError::usage(
+            "credentials requires create, import or renew",
+        )),
     }
+}
+
+/// `credentials renew --config PATH (--csr-out PATH [--discard-pending] |
+/// --certificate PATH) [--json]` (M0-07). Exactly one step per invocation.
+fn parse_renew_command(args: &[OsString]) -> Result<Command, CliError> {
+    let mut config = None;
+    let mut csr_out = None;
+    let mut certificate = None;
+    let mut discard_pending = false;
+    let mut json = false;
+    let mut index = 0;
+    while index < args.len() {
+        let Some(flag) = args[index].to_str() else {
+            return Err(CliError::usage("arguments must be valid UTF-8"));
+        };
+        index += 1;
+        let slot = match flag {
+            "--json" if !json => {
+                json = true;
+                continue;
+            }
+            "--discard-pending" if !discard_pending => {
+                discard_pending = true;
+                continue;
+            }
+            "--config" => &mut config,
+            "--csr-out" => &mut csr_out,
+            "--certificate" => &mut certificate,
+            _ => {
+                return Err(CliError::usage(format!(
+                    "credentials renew: unknown or repeated option {flag}"
+                )));
+            }
+        };
+        if slot.is_some() {
+            return Err(CliError::usage(format!(
+                "credentials renew: {flag} given twice"
+            )));
+        }
+        let value = args
+            .get(index)
+            .ok_or_else(|| CliError::usage(format!("{flag} requires PATH")))?;
+        *slot = Some(PathBuf::from(value));
+        index += 1;
+    }
+    let config =
+        config.ok_or_else(|| CliError::usage("credentials renew: --config is required"))?;
+    let step = match (csr_out, certificate) {
+        (Some(csr_out), None) => RenewStep::Request {
+            csr_out,
+            discard_pending,
+        },
+        (None, Some(certificate)) if !discard_pending => RenewStep::Complete { certificate },
+        (None, Some(_)) => {
+            return Err(CliError::usage(
+                "credentials renew: --discard-pending applies only with --csr-out",
+            ));
+        }
+        _ => {
+            return Err(CliError::usage(
+                "credentials renew requires exactly one of --csr-out PATH (request) or \
+                 --certificate PATH (complete)",
+            ));
+        }
+    };
+    Ok(Command::RenewCredentials { config, step, json })
 }
 
 fn parse_required_paths(
@@ -2653,7 +2947,9 @@ Usage:\n\
   tunnel-client disconnect --config PATH [--json] [--timeout SECONDS]\n\
   tunnel-client connect --config PATH [--json] [--no-reconnect]\n\
   tunnel-client credentials create --config PATH --csr-out PATH\n\
-  tunnel-client credentials import --config PATH --certificate PATH --server-ca PATH\n\n\
+  tunnel-client credentials import --config PATH --certificate PATH --server-ca PATH\n\
+  tunnel-client credentials renew --config PATH --csr-out PATH [--discard-pending] [--json]\n\
+  tunnel-client credentials renew --config PATH --certificate PATH [--json]\n\n\
 connect holds one mTLS control socket and one mTLS data socket and replaces\n\
 the data socket on the profile's [rotation] interval. A transport failure\n\
 ends the session; connect then starts a fresh one with bounded, jittered\n\
@@ -3364,6 +3660,112 @@ mod tests {
         assert_eq!(internal, 1, "unexpected internal failure");
     }
 
+    /// `credentials renew` (M0-07): every renewal failure's code, status
+    /// and retry flag, as `docs/runtime.md`'s table publishes them. A
+    /// refused certificate is `credentials import`'s own class, `3`; the
+    /// two pending-state refusals are `2`, fixed on the command line; a held
+    /// lock is `7`, wait and retry.
+    #[test]
+    fn renewal_failures_map_to_the_published_table() {
+        use tunnel_client::credentials::CredentialError;
+        use tunnel_client::renewal::{RenewalError, SwapStep};
+        let io = || std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        let cases = [
+            (
+                RenewalError::Pending {
+                    since_unix: Some(1),
+                },
+                "RENEWAL_PENDING",
+                2,
+                false,
+            ),
+            (RenewalError::NotPending, "RENEWAL_NOT_PENDING", 2, false),
+            (RenewalError::Locked, "RENEWAL_LOCKED", 7, true),
+            (
+                RenewalError::Unsupported("layout"),
+                "CONFIG_ERROR",
+                2,
+                false,
+            ),
+            (
+                RenewalError::UnsupportedPlatform,
+                "CREDENTIAL_ERROR",
+                3,
+                false,
+            ),
+            (
+                RenewalError::NoCurrentCredential(CredentialError::KeyMismatch("x".into())),
+                "CREDENTIAL_ERROR",
+                3,
+                false,
+            ),
+            (
+                RenewalError::PendingKeyUnusable(CredentialError::InvalidPem("x".into())),
+                "CREDENTIAL_ERROR",
+                3,
+                false,
+            ),
+            (RenewalError::CsrExists, "CREDENTIAL_ERROR", 3, false),
+            (
+                RenewalError::CsrOutputIsCredential,
+                "CREDENTIAL_ERROR",
+                3,
+                false,
+            ),
+            (
+                RenewalError::IssuedUnreadable(io()),
+                "CREDENTIAL_ERROR",
+                3,
+                false,
+            ),
+            (
+                RenewalError::Refused(CredentialError::KeyMismatch("x".into())),
+                "CREDENTIAL_ERROR",
+                3,
+                false,
+            ),
+            (
+                RenewalError::IssuerChanged("x"),
+                "CREDENTIAL_ERROR",
+                3,
+                false,
+            ),
+            (
+                RenewalError::UntrustedChain("x".into()),
+                "CREDENTIAL_ERROR",
+                3,
+                false,
+            ),
+            (
+                RenewalError::ServerTrust(CredentialError::InvalidPem("x".into())),
+                "CREDENTIAL_ERROR",
+                3,
+                false,
+            ),
+            (
+                RenewalError::Io {
+                    step: "x",
+                    error: io(),
+                },
+                "CREDENTIAL_ERROR",
+                3,
+                false,
+            ),
+            (
+                RenewalError::Interrupted(SwapStep::KeyInstalled),
+                "CREDENTIAL_ERROR",
+                3,
+                false,
+            ),
+        ];
+        for (error, code, status, retryable) in cases {
+            let cli = CliError::from_renewal(&error);
+            assert_eq!(cli.code(), code, "{error:?}");
+            assert_eq!(cli.exit_code(), status, "{error:?}");
+            assert_eq!(cli.retryable, retryable, "{error:?}");
+        }
+    }
+
     /// Every status this binary can produce must be in the vocabulary the
     /// library publishes, because other crates classify against that.
     ///
@@ -3385,7 +3787,7 @@ mod tests {
     /// exhaustive match with no fallback arm into this array, and the test
     /// below requires the two to agree, so a new variant now fails to build
     /// until it is listed here.
-    const ALL_CAUSES: [Cause; 18] = [
+    const ALL_CAUSES: [Cause; 21] = [
         Cause::InvalidInvocation,
         Cause::ConfigError,
         Cause::InvalidConfig,
@@ -3404,6 +3806,9 @@ mod tests {
         Cause::SupervisorRunning,
         Cause::IpcUnauthorized,
         Cause::SupervisorLockFailed,
+        Cause::RenewalPending,
+        Cause::RenewalNotPending,
+        Cause::RenewalLocked,
     ];
 
     fn cause_index(cause: Cause) -> usize {
@@ -3426,6 +3831,9 @@ mod tests {
             Cause::SupervisorRunning => 15,
             Cause::IpcUnauthorized => 16,
             Cause::SupervisorLockFailed => 17,
+            Cause::RenewalPending => 18,
+            Cause::RenewalNotPending => 19,
+            Cause::RenewalLocked => 20,
         }
     }
 
