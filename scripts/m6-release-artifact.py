@@ -1687,7 +1687,10 @@ DOCS_PINNED_SECTIONS: dict[str, tuple[int, int, int]] = {
     "4. Service installation, upgrade, backup and recovery": (0, 0, 3),
     "6. Diagnostics": (4, 7, 0),
 }
-DOCS_PINNED_PROSE_FENCES = 0
+# M6-C219: two untagged fences (the P-256 key example, section 2.2, from
+# acc45776, and the CONNECTION_LIMIT answer, section 3.2, from d59f4316)
+# kept this check red on main; both are prose and now tagged `text`.
+DOCS_PINNED_PROSE_FENCES = 2
 MIN_EXIT_CAUSES = 10
 MIN_EXIT_TABLE_ROWS = 6
 DOCS_SESSION_TIMEOUT = 300
@@ -2417,11 +2420,10 @@ def _issue_token(key: Path, subject: str, work: Path, env: dict[str, str]) -> st
 def _echo(port: int, ca: Path, path: str, token: str, body: bytes) -> tuple[int, bytes]:
     import http.client
     import ssl
+    # Default (strict on Python 3.13+) verification: the guide's rehearsal CA
+    # carries basicConstraints and keyUsage (M6-C137), so a strict client
+    # accepts a relay chained to it, as a tester's Python client would.
     context = ssl.create_default_context(cafile=str(ca))
-    # The rehearsal CA is the guide's `openssl req -x509` one, which carries
-    # no key identifiers on some openssl builds; Python's strict mode would
-    # refuse it where the relay's and the client's verifiers accept it.
-    context.verify_flags &= ~getattr(ssl, "VERIFY_X509_STRICT", 0)
     connection = http.client.HTTPSConnection("127.0.0.1", port, context=context, timeout=10)
     try:
         connection.request("POST", path, body=body, headers={
