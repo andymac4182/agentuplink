@@ -535,11 +535,19 @@ def _decoy(path: Path, exit_code: int) -> None:
         path.chmod(0o755)
 
 
-def controls(root: Path, archive: Path, checksum: Path, target: str) -> list[tuple[str, str, bool | None, str]]:
-    """(control, witness wanted, passed or None if skipped, detail) per planted defect."""
+def controls(root: Path, archive: Path, checksum: Path, target: str,
+             witnesses: set[str] | None = None) -> list[tuple[str, str, bool | None, str]]:
+    """(control, witness wanted, passed or None if skipped, detail) per planted defect.
+
+    `witnesses` runs only the controls wanting those witnesses; the unit
+    tests use it to run the host-independent controls on synthetic binaries
+    outside the release workflow (docs/tasks.md M6-C216).
+    """
     out = []
 
     def expect(label, witness, check):
+        if witnesses is not None and witness not in witnesses:
+            return
         with tempfile.TemporaryDirectory(prefix="verify-control-") as tmp:
             result = check(Path(tmp))
         if result is None:
@@ -553,6 +561,15 @@ def controls(root: Path, archive: Path, checksum: Path, target: str) -> list[tup
         bad.write_text("0" * 64 + f"  {archive.name}\n")
         return check_checksums(archive, bad)
     expect("checksum names another digest", "checksum-mismatch", flipped_checksum)
+
+    def unexpected_top_level(tmp):
+        # A document shipped from outside docs/ lands at a new top-level
+        # directory, as `packages/` did from 0d30a4e2 (docs/tasks.md M6-C216).
+        copy = _copy(root, tmp)
+        (copy / "packages" / "client").mkdir(parents=True)
+        (copy / "packages" / "client" / "README.md").write_text("# not part of the archive\n")
+        return check_layout(copy, archive, target, None, None)
+    expect("an unexpected top-level entry (M6-C216)", "top-level", unexpected_top_level)
 
     def relay_in_wrong_half(tmp):
         copy = _copy(root, tmp)
