@@ -485,6 +485,46 @@ SECRET_ALLOWLIST: tuple[Allow, ...] = (
             "since the integration commit that added this entry."
         ),
     ),
+    # The three entries below are the self-test plants of the M0-08
+    # cross-milestone payload scan, scripts/m0-payload-scan.py, as committed
+    # on branch fix-m0-scan in ed7375a2, 48b6f93c and e2e0208a (blobs
+    # 3340b5067fb0, 55efadd887bc, a787e57fd1b2) and still reachable in
+    # history.  The script now splits each literal across a `+`, so the
+    # working tree no longer matches; rewriting history instead would mean a
+    # force-push, which this repository never does.  Each entry is scoped to
+    # that path and one exact digest, following the M6-C72 precedent above.
+    Allow(
+        pattern_name="pem-private-key",
+        digest="3021d90eb9437b2d8f30e8363695c4418b5e5f1870801b5c317e9398ee0f572d",
+        path_regex=r"^scripts/m0-payload-scan\.py$",
+        reason=(
+            "Synthetic M0-08 scan fixture: the bare header line of a PEM block, "
+            "with no key body, planted into a synthetic stream to prove the "
+            "payload scan's credential-shape check reports it. Committed before "
+            "the literal was split; reviewed 2026-09-28."
+        ),
+    ),
+    Allow(
+        pattern_name="jwt",
+        digest="5d71405f5c132b9007ea0521f6bc0bb19102f85babf63b8aab2fc48cce574a95",
+        path_regex=r"^scripts/m0-payload-scan\.py$",
+        reason=(
+            "Synthetic M0-08 scan fixture: a JWT-shaped string whose segments "
+            "are the base64 of `{\"synthetic`, `{\"synthetic_sub` and `synthetic_sig`; "
+            "it signs nothing and authorises nothing. Committed before the "
+            "literal was split; reviewed 2026-09-28."
+        ),
+    ),
+    Allow(
+        pattern_name="http-auth-header",
+        digest="e4141ddb377cc31aae5a4123c0f37bb705b3b26eac463c0a9fd0f8cb59c10115",
+        path_regex=r"^scripts/m0-payload-scan\.py$",
+        reason=(
+            "Synthetic M0-08 scan fixture: an Authorization header carrying the "
+            "placeholder token `synthetic-m0-08-token`, which no service issues. "
+            "Committed before the literal was split; reviewed 2026-09-28."
+        ),
+    ),
 )
 
 
