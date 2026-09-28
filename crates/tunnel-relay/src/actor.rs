@@ -2636,9 +2636,12 @@ fn lapsed_challenge_code(bounds: ChallengeBounds, held_by_freeze: bool) -> &'sta
 /// M6-C210): the owner sent the OPEN before QUIESCE, the connector dequeued it
 /// from its deferred-OPEN queue after QUIESCE stopped its admission, and
 /// nothing ran.  It gets the answer a new request gets during the same
-/// freeze, `ROTATION_FREEZE` with its retry hint.  A `GOAWAY` outside a
-/// freeze (the connector shutting down) and every other refusal stay
-/// `DEVICE_REJECTED`.
+/// freeze, `ROTATION_FREEZE` with its retry hint.  So is a `GOAWAY` while the
+/// attempt is still `preparing` (the #247 CI follow-up): the connector freezes
+/// its own admission once its candidate data socket fails and waits for this
+/// owner's ABORT, before this owner has frozen anything, so the caller passes
+/// `attempt_in_progress`, not `attempt_frozen`.  A `GOAWAY` with no attempt
+/// in progress and every other refusal stay `DEVICE_REJECTED`.
 fn connector_open_refusal_code(code: &str, attempt_frozen: bool) -> &'static str {
     if code == "RESOURCE_EXHAUSTED" {
         "RESOURCE_EXHAUSTED"
@@ -12621,7 +12624,7 @@ impl RelayActor {
                     // active carrier has already answered every pending echo.
                     let code = connector_open_refusal_code(
                         &rejected.code,
-                        freeze_hold::attempt_frozen(session),
+                        freeze_hold::attempt_in_progress(session),
                     );
                     matched = "unary";
                     relay_code = code;
@@ -12670,7 +12673,7 @@ impl RelayActor {
                         if let Some(session) = self.session_mut(&key) {
                             let code = connector_open_refusal_code(
                                 &rejected.code,
-                                freeze_hold::attempt_frozen(session),
+                                freeze_hold::attempt_in_progress(session),
                             );
                             let queue_budget = session.queue_budget.clone();
                             if let Some(stream) = session.streams.get_mut(&rejected.stream_id) {

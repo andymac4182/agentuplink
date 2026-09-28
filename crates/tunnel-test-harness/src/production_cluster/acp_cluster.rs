@@ -848,15 +848,23 @@ impl Gate<'_> {
         let mut status = client.status();
         {
             let status = status.borrow_and_update();
-            freeze.record(&status.phase, status.rotations_completed);
+            freeze.record(
+                &status.phase,
+                status.rotations_completed,
+                status.rotation_admission_frozen,
+            );
         }
         self.freeze_task = Some(tokio::spawn(async move {
             while status.changed().await.is_ok() {
-                let (phase, rotations) = {
+                let (phase, rotations, admission_frozen) = {
                     let status = status.borrow_and_update();
-                    (status.phase.clone(), status.rotations_completed)
+                    (
+                        status.phase.clone(),
+                        status.rotations_completed,
+                        status.rotation_admission_frozen,
+                    )
                 };
-                freeze.record(&phase, rotations);
+                freeze.record(&phase, rotations, admission_frozen);
             }
         }));
         let session = timeout(STARTUP_TIMEOUT, client.wait_ready())

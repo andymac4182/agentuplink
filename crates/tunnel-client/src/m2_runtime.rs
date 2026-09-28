@@ -2732,6 +2732,15 @@ impl M2Actor {
             queue_frames: self.pending_outputs.len(),
             queue_bytes: self.aggregate_retained_bytes(),
             rotations_completed: self.rotations_completed,
+            rotation_admission_frozen: !self.accepting
+                && matches!(
+                    rotation_status.phase,
+                    RotationPhase::Preparing
+                        | RotationPhase::Quiescing
+                        | RotationPhase::Draining
+                        | RotationPhase::Committing
+                        | RotationPhase::Aborting
+                ),
             fs: self.fs_counters,
             open_refusals_sent: self.open_refusals_sent,
             recovery_attempt,
@@ -20037,6 +20046,15 @@ mod tests {
         assert!(actor.pending_candidate.is_none());
         assert_eq!(actor.rotation.phase(), RotationPhase::Preparing);
         assert!(actor.writes_frozen && !actor.accepting);
+        // #247 CI follow-up: the freeze is reported, although the phase is
+        // still `preparing`, so an observer can tell the connector's GOAWAY
+        // for an OPEN now belongs to the rotation attempt.
+        let status = last_published_status(&actor);
+        assert_eq!(status.phase, "preparing");
+        assert!(
+            status.rotation_admission_frozen,
+            "a candidate failure in preparing reports its admission freeze"
+        );
 
         // The owner's QUIESCE for that attempt arrives after the close.
         let quiesce = RotateQuiesce {

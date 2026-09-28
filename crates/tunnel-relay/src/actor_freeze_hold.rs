@@ -145,6 +145,28 @@ pub(super) fn attempt_frozen(session: &DeviceSession) -> bool {
     })
 }
 
+/// True while a scheduled rotation attempt is in progress, from PREPARE
+/// until COMMITTED or until its abort completes.  Wider than
+/// [`attempt_frozen`]: a connector freezes its own OPEN admission in
+/// `preparing` once its candidate data socket fails, while it waits for this
+/// owner to decide ABORT, and refuses an OPEN the owner already sent with
+/// `GOAWAY`.  That refusal belongs to the attempt, not to a draining
+/// connector, so it maps to the retryable `ROTATION_FREEZE`
+/// ([`super::connector_open_refusal_code`]).  Only the refusal mapping uses
+/// this; the admission hold still starts at QUIESCE.
+pub(super) fn attempt_in_progress(session: &DeviceSession) -> bool {
+    session.rotation.as_ref().is_some_and(|rotation| {
+        matches!(
+            rotation.state.phase(),
+            RotationPhase::Preparing
+                | RotationPhase::Quiescing
+                | RotationPhase::Draining
+                | RotationPhase::Committing
+                | RotationPhase::Aborting
+        )
+    })
+}
+
 /// What was held, with everything ordinary admission needs.
 pub(super) enum HeldKind {
     /// A consumer stream OPEN: the echo stream, `http-forward/1` or the

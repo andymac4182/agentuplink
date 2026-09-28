@@ -4742,9 +4742,14 @@ async fn m6c204_a_roster_open_refused_goaway_during_a_freeze_is_a_retryable_rota
     assert!(fixture.session_alive());
 }
 
-/// M6-C204 control: a `GOAWAY` while no attempt freezes admission (here the
-/// attempt is only preparing, so it is the connector shutting down) stays
+/// M6-C204 control: a `GOAWAY` with no rotation attempt in progress stays
 /// `DEVICE_REJECTED`, and so does any other refusal during a freeze.
+///
+/// Revised by the #247 CI follow-up: a `GOAWAY` while the attempt is only
+/// `preparing` is the attempt's refusal -- the connector freezes admission
+/// once its candidate fails and waits for the owner's ABORT -- so it is the
+/// retryable `ROTATION_FREEZE`.  This control used to call it the connector
+/// shutting down and expect `DEVICE_REJECTED`.
 #[tokio::test]
 async fn m6c204_a_goaway_outside_a_freeze_and_other_refusals_stay_device_rejected() {
     let mut fixture = FreezeFixture::new("m6c204-control", false);
@@ -4756,8 +4761,42 @@ async fn m6c204_a_goaway_outside_a_freeze_and_other_refusals_stay_device_rejecte
         .await;
     assert_eq!(
         unary_failure(&mut receiver),
+        Some((
+            super::freeze_hold::ROTATION_FREEZE_ECHO_CODE,
+            "not_dispatched"
+        )),
+        "a GOAWAY while the attempt is preparing belongs to the attempt"
+    );
+
+    // With no attempt at all, a GOAWAY is the connector draining.
+    let rotation = {
+        let key = fixture.key.scope();
+        fixture
+            .actor
+            .sessions
+            .get_mut(&key)
+            .expect("fixture session")
+            .rotation
+            .take()
+    };
+    let (stream_id, operation_id, open_id, mut receiver) =
+        fixture.admit_unary_echo(UNARY_BODY).await;
+    fixture
+        .connector_rejected_goaway(stream_id, &operation_id, &open_id)
+        .await;
+    assert_eq!(
+        unary_failure(&mut receiver),
         Some(("DEVICE_REJECTED", "not_dispatched"))
     );
+    {
+        let key = fixture.key.scope();
+        fixture
+            .actor
+            .sessions
+            .get_mut(&key)
+            .expect("fixture session")
+            .rotation = rotation;
+    }
 
     let (stream_id, operation_id, open_id, mut receiver) =
         fixture.admit_unary_echo(UNARY_BODY).await;
@@ -5274,31 +5313,45 @@ async fn m6c210_a_roster_stream_open_refused_goaway_during_a_freeze_is_answered_
     }
 }
 
-/// M6-C210 control: a `GOAWAY` outside a freeze (the connector shutting down)
-/// and any other refusal during one keep `DEVICE_REJECTED`, and the
-/// connector's capacity refusal keeps `RESOURCE_EXHAUSTED`.  All of them are
+/// M6-C210 control: a `GOAWAY` with no rotation attempt in progress and any
+/// other refusal during one keep `DEVICE_REJECTED`, and the connector's
+/// capacity refusal keeps `RESOURCE_EXHAUSTED`.  All of them are
 /// `not_dispatched`: the OPEN was refused, so nothing ran.
+///
+/// Revised by the #247 CI follow-up: a `GOAWAY` while an attempt is still
+/// `preparing` is the attempt's refusal too -- the connector freezes its own
+/// admission once its candidate fails and waits for this owner's ABORT -- so
+/// it is the retryable `ROTATION_FREEZE`, not `DEVICE_REJECTED`.  Before the
+/// fix this case expected `DEVICE_REJECTED`, which `verify-m8-acp-cluster`
+/// reported as an unexplained refusal.
 #[tokio::test]
 async fn m6c210_other_stream_open_refusals_keep_their_answers() {
     let goaway = tunnel_protocol::open_refusal::CONNECTOR_DRAINING;
-    for (label, freeze, code, reason, expected) in [
+    for (label, mode, code, reason, expected) in [
         (
-            "m6c210-goaway-unfrozen",
-            false,
+            "m6c210-goaway-preparing",
+            "preparing",
+            goaway.code(),
+            goaway.reason(),
+            super::freeze_hold::ROTATION_FREEZE_ECHO_CODE,
+        ),
+        (
+            "m6c210-goaway-no-attempt",
+            "none",
             goaway.code(),
             goaway.reason(),
             "DEVICE_REJECTED",
         ),
         (
             "m6c210-export-denied",
-            true,
+            "frozen",
             "EXPORT_DENIED",
             "service is not locally allowlisted",
             "DEVICE_REJECTED",
         ),
         (
             "m6c210-capacity",
-            true,
+            "frozen",
             "RESOURCE_EXHAUSTED",
             "stream limit reached",
             "RESOURCE_EXHAUSTED",
@@ -5306,10 +5359,19 @@ async fn m6c210_other_stream_open_refusals_keep_their_answers() {
     ] {
         let mut fixture = FreezeFixture::new(label, true);
         fixture.make_pending_unauthorized();
-        if freeze {
-            fixture.quiesce();
-        } else {
-            assert_eq!(fixture.phase(), RotationPhase::Preparing);
+        let freeze = mode == "frozen";
+        match mode {
+            "frozen" => fixture.quiesce(),
+            "preparing" => assert_eq!(fixture.phase(), RotationPhase::Preparing),
+            _ => {
+                let key = fixture.key.scope();
+                fixture
+                    .actor
+                    .sessions
+                    .get_mut(&key)
+                    .expect("fixture session")
+                    .rotation = None;
+            }
         }
         let mut record = fixture.write(b"never-sent");
         let closed = fixture.stream().closed.clone();
