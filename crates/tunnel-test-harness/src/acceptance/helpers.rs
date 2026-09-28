@@ -180,6 +180,7 @@ pub(crate) fn write_device_profile(
             client_certificate: certificate_path.clone(),
             client_key: key_path.clone(),
             server_ca: server_ca_path.clone(),
+            pinned: None,
         },
         exports: [(
             service_id.to_string(),

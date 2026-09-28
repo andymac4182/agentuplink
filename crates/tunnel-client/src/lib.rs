@@ -19,6 +19,7 @@ pub mod cua_export;
 pub mod fs_export;
 pub mod http_forward;
 mod m2_runtime;
+pub mod renewal;
 mod rotation_hooks;
 /// Local, read-only supervisor status IPC (M6-06).
 pub mod supervisor_ipc;

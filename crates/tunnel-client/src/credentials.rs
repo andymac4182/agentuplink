@@ -64,25 +64,35 @@ pub fn create_csr(
     ensure_parent(&key_path, true)?;
     ensure_parent(&csr_path, false)?;
 
+    let (key_pem, csr_pem) = generate_request(&config.device_id)?;
+
+    // Write the key first with create_new.  If the second write fails, the
+    // key is deliberately left as a pending credential and can be retried
+    // without silently replacing it.
+    write_new(&key_path, key_pem.as_bytes(), true)?;
+    write_new(&csr_path, csr_pem.as_bytes(), false)?;
+    Ok(CsrOutput { key_path, csr_path })
+}
+
+/// A fresh local ECDSA key and a PEM CSR for it naming `device/<device_id>`,
+/// as `(key PEM, CSR PEM)`.  Shared by `credentials create` and
+/// `credentials renew` (M0-07), so a renewal request is the same request an
+/// enrolment makes.
+#[cfg(unix)]
+pub(crate) fn generate_request(device_id: &str) -> Result<(String, String), CredentialError> {
     let key_pair =
         KeyPair::generate().map_err(|error| CredentialError::Provision(error.to_string()))?;
     let mut params = CertificateParams::default();
     params
         .distinguished_name
-        .push(DnType::CommonName, format!("device/{}", config.device_id));
+        .push(DnType::CommonName, format!("device/{device_id}"));
     let csr = params
         .serialize_request(&key_pair)
         .map_err(|error| CredentialError::Provision(error.to_string()))?;
     let csr_pem = csr
         .pem()
         .map_err(|error| CredentialError::Provision(error.to_string()))?;
-
-    // Write the key first with create_new.  If the second write fails, the
-    // key is deliberately left as a pending credential and can be retried
-    // without silently replacing it.
-    write_new(&key_path, key_pair.serialize_pem().as_bytes(), true)?;
-    write_new(&csr_path, csr_pem.as_bytes(), false)?;
-    Ok(CsrOutput { key_path, csr_path })
+    Ok((key_pair.serialize_pem(), csr_pem))
 }
 
 /// Validate and import an externally issued certificate and server trust
@@ -170,7 +180,7 @@ fn import_certificate_at(
 /// every freshly issued certificate, so refusing it would turn clock skew
 /// into a failed import, and `connect` retries it until it is valid.
 #[cfg(unix)]
-fn check_import_validity(
+pub(crate) fn check_import_validity(
     leaf: &CertificateDer<'_>,
     now_unix: i64,
 ) -> Result<Option<i64>, CredentialError> {
@@ -188,7 +198,7 @@ fn check_import_validity(
 }
 
 #[cfg(unix)]
-fn unix_now() -> i64 {
+pub(crate) fn unix_now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .ok()
@@ -307,19 +317,105 @@ pub fn import_certificate(
 /// caller receives the same strict profile: TLS 1.3 only, server certificate
 /// and DNS verification enabled, client certificate required, no session
 /// resumption and no early data.
+///
+/// When the credentials are [pinned](CredentialConfig::pin) the pinned bytes
+/// are used and no file is read, so every session and every data-socket
+/// rotation of one supervisor uses the pair it started with (M0-07).
 pub fn load_client_config(
     credentials: &CredentialConfig,
 ) -> Result<std::sync::Arc<rustls::ClientConfig>, CredentialError> {
-    let certificate_pem = fs::read(&credentials.client_certificate).map_err(CredentialError::Io)?;
-    let private_key_pem = fs::read(&credentials.client_key).map_err(CredentialError::Io)?;
-    let server_ca_pem = fs::read(&credentials.server_ca).map_err(CredentialError::Io)?;
+    let read;
+    let pinned = match &credentials.pinned {
+        Some(pinned) => pinned,
+        None => {
+            read = PinnedCredentials::read(credentials)?;
+            &read
+        }
+    };
     tunnel_transport::load_client_config_from_pem_with_alpn(
-        &certificate_pem,
-        &private_key_pem,
-        &server_ca_pem,
+        &pinned.certificate_pem,
+        &pinned.key_pem,
+        &pinned.server_ca_pem,
         &[b"http/1.1"],
     )
     .map_err(|error| CredentialError::Tls(error.to_string()))
+}
+
+/// The bytes of a profile's certificate chain, private key and server trust,
+/// read once (task row M0-07).
+///
+/// `connect` pins these when it starts.  Before M0-07 every session and
+/// every data-socket rotation re-read the three files, so a credential
+/// replaced on disk under a running supervisor was picked up piecemeal at
+/// the next rotation or reconnect -- and one read between the two renames of
+/// a renewal would have paired the new certificate with the old key.  The
+/// operator contract is that configuration and credentials take effect only
+/// through a stop and a start; pinning is what makes that true.
+///
+/// `Debug` shows only lengths: the key bytes must never reach a log.
+#[derive(Clone, PartialEq, Eq)]
+pub struct PinnedCredentials {
+    certificate_pem: std::sync::Arc<[u8]>,
+    /// Wiped when the last clone is dropped. This covers only this copy:
+    /// the TLS configuration built from it holds its own parsed key.
+    key_pem: std::sync::Arc<zeroize::Zeroizing<Vec<u8>>>,
+    server_ca_pem: std::sync::Arc<[u8]>,
+}
+
+impl PinnedCredentials {
+    /// Read the three files the profile names, with the same errors a
+    /// session's own read reports.
+    pub fn read(credentials: &CredentialConfig) -> Result<Self, CredentialError> {
+        let read = |path: &Path| fs::read(path).map_err(CredentialError::Io);
+        Ok(Self {
+            certificate_pem: read(&credentials.client_certificate)?.into(),
+            key_pem: std::sync::Arc::new(zeroize::Zeroizing::new(read(&credentials.client_key)?)),
+            server_ca_pem: read(&credentials.server_ca)?.into(),
+        })
+    }
+
+    /// The pinned certificate chain.
+    pub fn certificate_chain(&self) -> Result<Vec<CertificateDer<'static>>, CredentialError> {
+        certificates_from_pem(&self.certificate_pem)
+    }
+
+    /// Whether the pinned private key is the pinned certificate's, by the
+    /// check `credentials import` applies.
+    #[must_use]
+    pub fn pair_matches(&self) -> bool {
+        let Ok(chain) = self.certificate_chain() else {
+            return false;
+        };
+        private_key_from_pem(&self.key_pem)
+            .is_ok_and(|key| verify_certificate_key(&chain, key).is_ok())
+    }
+}
+
+impl fmt::Debug for PinnedCredentials {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PinnedCredentials")
+            .field("certificate_bytes", &self.certificate_pem.len())
+            .field("key", &"<redacted>")
+            .field("server_ca_bytes", &self.server_ca_pem.len())
+            .finish()
+    }
+}
+
+/// Parse every certificate in a PEM buffer.
+pub(crate) fn certificates_from_pem(
+    pem: &[u8],
+) -> Result<Vec<CertificateDer<'static>>, CredentialError> {
+    certs(&mut BufReader::new(pem))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| CredentialError::InvalidPem(error.to_string()))
+}
+
+/// Parse the first private key in a PEM buffer.
+pub(crate) fn private_key_from_pem(pem: &[u8]) -> Result<PrivateKeyDer<'static>, CredentialError> {
+    private_key(&mut BufReader::new(pem))
+        .map_err(|error| CredentialError::InvalidPem(error.to_string()))?
+        .ok_or_else(|| CredentialError::InvalidPem("no private key in the PEM input".into()))
 }
 
 /// Read certificates from a PEM file, retaining owned DER bytes.
@@ -341,7 +437,7 @@ pub fn load_private_key(path: impl AsRef<Path>) -> Result<PrivateKeyDer<'static>
 }
 
 #[cfg(unix)]
-fn ensure_parent(path: &Path, private: bool) -> Result<(), CredentialError> {
+pub(crate) fn ensure_parent(path: &Path, private: bool) -> Result<(), CredentialError> {
     match path.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => {
             fs::create_dir_all(parent).map_err(CredentialError::Io)?;
@@ -366,7 +462,7 @@ fn ensure_parent(path: &Path, private: bool) -> Result<(), CredentialError> {
 }
 
 #[cfg(unix)]
-fn write_new(path: &Path, bytes: &[u8], private: bool) -> Result<(), CredentialError> {
+pub(crate) fn write_new(path: &Path, bytes: &[u8], private: bool) -> Result<(), CredentialError> {
     #[cfg(not(unix))]
     if private {
         return Err(CredentialError::UnsupportedPlatform(
@@ -556,7 +652,7 @@ fn stage_and_link_with(
 
 /// Sync the directory holding `path`, so a new link survives a crash.
 #[cfg(unix)]
-fn sync_parent(path: &Path) -> Result<(), CredentialError> {
+pub(crate) fn sync_parent(path: &Path) -> Result<(), CredentialError> {
     let parent = match path.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => parent,
         _ => Path::new("."),
@@ -1491,12 +1587,52 @@ mod tests {
     }
 
     #[test]
+    fn pinned_credentials_are_used_without_reading_the_files_again() {
+        let dir = tempdir().expect("temporary directory");
+        let key = rcgen::KeyPair::generate().expect("key");
+        let certificate = rcgen::CertificateParams::default()
+            .self_signed(&key)
+            .expect("certificate")
+            .pem();
+        let mut credentials = CredentialConfig {
+            client_certificate: dir.path().join("cert.pem"),
+            client_key: dir.path().join("key.pem"),
+            server_ca: dir.path().join("ca.pem"),
+            pinned: None,
+        };
+        fs::write(&credentials.client_certificate, &certificate).expect("certificate");
+        fs::write(&credentials.client_key, key.serialize_pem()).expect("key");
+        fs::write(&credentials.server_ca, &certificate).expect("CA");
+        credentials.pin().expect("pin");
+        let pinned = credentials.pinned.clone().expect("pinned");
+        assert!(pinned.pair_matches());
+        assert!(
+            !format!("{pinned:?}").contains("PRIVATE"),
+            "Debug shows the key"
+        );
+        for path in [
+            &credentials.client_certificate,
+            &credentials.client_key,
+            &credentials.server_ca,
+        ] {
+            fs::remove_file(path).expect("remove");
+        }
+        assert!(
+            load_client_config(&credentials).is_ok(),
+            "the files were read"
+        );
+        credentials.pinned = None;
+        assert!(load_client_config(&credentials).is_err());
+    }
+
+    #[test]
     fn client_config_rejects_missing_material() {
         let dir = tempdir().expect("temporary directory");
         let credentials = CredentialConfig {
             client_certificate: dir.path().join("missing-cert.pem"),
             client_key: dir.path().join("missing-key.pem"),
             server_ca: dir.path().join("missing-ca.pem"),
+            pinned: None,
         };
         assert!(load_client_config(&credentials).is_err());
     }
