@@ -305,8 +305,10 @@ fn plant_witness_leak(kind: &'static str, value: &[u8]) {
         ),
         Err(_) => {
             let mut line = Vec::with_capacity(value.len() + 64);
+            // The length lets the scanner attribute every hit inside the
+            // planted bytes to the plant, although they may contain newlines.
             line.extend_from_slice(WITNESS_PLANT_TARGET.as_bytes());
-            line.extend_from_slice(b" raw=");
+            line.extend_from_slice(format!(" raw_len={} raw=", value.len()).as_bytes());
             line.extend_from_slice(value);
             line.push(b'\n');
             let _ = std::io::stderr().lock().write_all(&line);

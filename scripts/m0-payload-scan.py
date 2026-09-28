@@ -41,7 +41,7 @@ recording its payloads fails here instead of scanning nothing.
   for a binary value no JSON formatter can carry verbatim, raw to stderr
   behind the same target name.  The control is RED only if the scan goes red
   **with the witness it declared** -- an `application_payload` hit in
-  `harness_stderr`, attributed to the plant's target -- and the child itself
+  `harness_stderr`, inside the bytes the plant wrote -- and the child itself
   passed.  Green, a hit anywhere else, or a failed child is a wrong witness
   and fails the run.
 
@@ -280,20 +280,29 @@ class Hit:
     witness_line: bool = False
 
 
-PLANT_RAW_PREFIX = PLANT_TARGET + b" raw="
+RAW_PLANT = re.compile(re.escape(PLANT_TARGET) + rb" raw_len=([0-9]{1,7}) raw=")
 
 
-def planted_at(data: bytes, offset: int) -> bool:
-    """Whether a hit at `offset` is the witness plant: on the line carrying
-    the plant's target (a tracing line, or the raw plant, whose value starts
-    right behind its prefix on that same line)."""
-    return PLANT_TARGET in line_at(data, offset)
+def plant_spans(data: bytes) -> list[tuple[int, int]]:
+    """The byte ranges the witness plant wrote: a raw plant's value, whose
+    length it declares because binary bytes may hold newlines, or the whole
+    tracing line that carries the plant's target."""
+    spans = []
+    index = data.find(PLANT_TARGET)
+    while index >= 0:
+        raw = RAW_PLANT.match(data, index)
+        if raw:
+            spans.append((raw.end(), raw.end() + int(raw.group(1))))
+        else:
+            start = data.rfind(b"\n", 0, index) + 1
+            end = data.find(b"\n", index)
+            spans.append((start, end if end >= 0 else len(data)))
+        index = data.find(PLANT_TARGET, index + 1)
+    return spans
 
 
-def line_at(data: bytes, offset: int) -> bytes:
-    start = data.rfind(b"\n", 0, offset) + 1
-    end = data.find(b"\n", offset)
-    return data[start : end if end >= 0 else len(data)]
+def planted_at(spans: list[tuple[int, int]], offset: int) -> bool:
+    return any(start <= offset < end for start, end in spans)
 
 
 def scan_streams(
@@ -301,19 +310,20 @@ def scan_streams(
 ) -> list[Hit]:
     hits: list[Hit] = []
     for role, data in streams.items():
+        spans = plant_spans(data)
         for kind in KIND_ORDER:
             for value in sentinels.get(kind, ()):
                 for form in variants(value):
                     index = data.find(form)
                     while index >= 0:
                         hits.append(
-                            Hit(kind, role, index, planted_at(data, index))
+                            Hit(kind, role, index, planted_at(spans, index))
                         )
                         index = data.find(form, index + 1)
         for label, pattern in GENERIC_SHAPES.items():
             for match in pattern.finditer(data):
                 hits.append(
-                    Hit(label, role, match.start(), planted_at(data, match.start()))
+                    Hit(label, role, match.start(), planted_at(spans, match.start()))
                 )
     # One leak can match both its raw and its escaped form at one offset.
     unique = {(hit.kind, hit.role, hit.offset): hit for hit in hits}
@@ -557,10 +567,16 @@ def unit_probes() -> list[str]:
     hits = scan_streams(sentinels, {"harness_stderr": witness_line})
     if len(hits) != 1 or not hits[0].witness_line:
         failures.append("a planted line was not attributed to the plant")
-    raw = b"noise\n" + PLANT_RAW_PREFIX + b"synthetic-credential-A\n"
+    # A binary plant may hold newlines; every hit inside its declared length
+    # is the plant's, and a hit just past it is not.
+    planted_value = b"x\nsynthetic-credential-A"
+    raw = (
+        b"noise\n" + PLANT_TARGET + b" raw_len=%d raw=" % len(planted_value)
+        + planted_value + b"\nsynthetic-credential-A\n"
+    )
     hits = scan_streams(sentinels, {"harness_stderr": raw})
-    if len(hits) != 1 or not hits[0].witness_line:
-        failures.append("a raw plant was not attributed to the plant")
+    if [hit.witness_line for hit in hits] != [True, False]:
+        failures.append("a raw plant's span was not attributed exactly")
     unplanted = scan_streams(sentinels, {"harness_stderr": b"x raw=synthetic-credential-A"})
     if len(unplanted) != 1 or unplanted[0].witness_line:
         failures.append("an unplanted leak was attributed to the plant")

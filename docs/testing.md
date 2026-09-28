@@ -693,6 +693,36 @@ Snapshot implemented CLI help, flag precedence, versioned JSON/NDJSON, stdout/st
 
 For each runtime runbook, inject the corresponding DNS, trust, mTLS, ticket, drain-gap, peer UDP, ownership, and registry failure. Assert diagnostics identify the failed layer, include safe correlation/deadline/fence information, and remain bounded during pressure. Scan planted secrets and payload markers out of logs, JSON, status and diagnostic bundles. No diagnostic test accesses a real desktop or changes a filesystem export as a probe.
 
+### Cross-milestone payload scan (`scripts/m0-payload-scan.py`)
+
+Task rows M0-04, M0-08 and M0-09. The M7 success and fault summaries are scanned by `verify-m7-c11-diagnostics` (M7-C11); this script keeps the same property for the M1, M2, M3, M4 and M8 harness gates, and runs as the `m0-payload-scan` CI job.
+
+- **What runs.** Every gate in the script's `GATES` table runs as `tunnel-test-harness <gate>` with its own private `C11_INNER_CAPTURE_DIR`. That covers M1 `verify`; M2 `verify-m2` and `verify-m2-faults`; all four M3 harness gates; all twelve M4 filesystem gates; and both M8 ACP gates. `EXCLUDED` names the few gates left out, and every run prints them with the reason.
+- **What is recorded.** The fixtures write the exact synthetic values they used to `sentinels.bin`: credentials, paths and endpoints as before, and since M0-09 their application bodies. Those are the M1 canaries, the M2 echo records and canary, the http-forward bodies, the MCP stream events and requests, the file content and every 9P `Twrite`/`Rread` body at the shared client funnel, and the ACP prompt context and agent replies. Only distinctive values are recorded, because the scan matches exact bytes.
+- **Where the logs go.** In-process relays and clients log through the harness's JSON tracing subscriber into its stderr. The children run with the product crates at `debug` and everything else at `info`.
+  - `rmcp` runs at `warn`. It is the off-the-shelf consumer SDK, not product code, and at `info` it logs every notification it receives, whole.
+  - Each report line counts the tracing events by crate. A gate with no `tunnel_relay` event fails, because its relay diagnostics never reached the scan.
+- **What is scanned.** The scan covers the gate's stdout and stderr, every managed-process stream and every typed snapshot. It looks for each recorded value, raw and JSON-escaped, and for three credential shapes that need no manifest: a PEM header, a JWT-shaped token and an `Authorization: Bearer` header.
+  - Any hit fails the gate.
+  - The output names only a category, a stream role and an offset.
+  - A failed child's stderr tail is printed with every recorded value redacted.
+- **An empty domain fails.** Each gate declares the sentinel kinds it must record, and a gate that records none of a declared kind fails. The report line prints the count per kind, the number of streams and the bytes.
+- **Controls.**
+  - A self-test per gate plants every recorded kind, raw and escaped, and every credential shape into that gate's own captured stderr. It requires every plant to be found.
+  - A declared-witness control per gate runs the gate again with `M0_PAYLOAD_SCAN_PLANT=application_payload`. The harness then leaks its first recorded payload once (`c11_capture::plant_witness_leak`). A UTF-8 payload goes through tracing; a binary one is written raw to stderr behind the same target name.
+  - The control is `RED` only when every hit is an `application_payload` in `harness_stderr` inside the bytes the plant wrote, and the child itself passed. A raw plant declares its length, because binary bytes can contain newlines. Anything else is a wrong witness and fails the run.
+  - `--unit` runs the scanner's pure probes: the manifest tombstones, malformed manifests, escaping, attribution and the self-test.
+
+Run it after `cargo build --locked --workspace --bins`, with `TEST_REDIS_URL` set. `verify-m4-fs-client-e2e` needs Node 24.
+
+```sh
+python3 scripts/m0-payload-scan.py              # every gate, then every witness
+python3 scripts/m0-payload-scan.py --gate verify --gate verify-m2
+python3 scripts/m0-payload-scan.py --unit
+```
+
+Captures are deleted on exit unless `--keep DIR` names a new private directory. They hold the fixture's synthetic keys and tokens, so CI publishes no artifact (M7-C112).
+
 ## Initial cluster and coordination gates
 
 Use three real relay processes, one supported authoritative Redis primary with separate durable-catalog and ephemeral-coordination namespaces, synthetic signed membership records, and real private mTLS HTTP/3. Force control, active data, candidate data and consumer ingress onto different nodes over successive scenarios. Consumer/device ingress forwards directly to one owner; internal routing never adds device sockets or another forwarding hop. An all-local routing fixture cannot satisfy this gate.
