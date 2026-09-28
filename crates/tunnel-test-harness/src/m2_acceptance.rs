@@ -207,6 +207,8 @@ async fn run_scenario(harness: &mut RunningHarness, plan: RunPlan) -> Result<()>
             "M2 device canary exceeds the 256-byte response bound".to_owned(),
         ));
     }
+    // The device prefixes every echo response with its canary (M0-09).
+    crate::c11_capture::record_payload_sentinel(canary.as_bytes())?;
     let profile_directory = tempfile::tempdir().map_err(HarnessError::Io)?;
     let mut profile = write_device_profile(
         profile_directory.path(),
@@ -2795,6 +2797,11 @@ impl ConsumerStream {
         let frame_len = u32::try_from(payload.len()).map_err(|_| {
             HarnessError::InvalidInput("M2 request length does not fit a u32".to_owned())
         })?;
+        // M0-09: every generated echo record carries a UUID, so it is an
+        // exact-match sentinel; the fixed framing probes are not recorded.
+        if payload.starts_with(b"m2-record-") {
+            crate::c11_capture::record_payload_sentinel(payload)?;
+        }
         let mut frame = Vec::with_capacity(4 + payload.len());
         frame.extend_from_slice(&frame_len.to_be_bytes());
         frame.extend_from_slice(payload);
