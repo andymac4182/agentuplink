@@ -132,6 +132,11 @@ pub use acp_cluster::{
     AcpClusterEvidence, CLUSTER_CASES, validate_acp_cluster_evidence, verify as verify_acp_cluster,
 };
 
+mod http_forward_long_lived;
+pub use http_forward_long_lived::{
+    HttpForwardLongLivedEvidence, validate_http_forward_long_lived_evidence,
+    verify as verify_http_forward_long_lived,
+};
 mod http_forward_real_path;
 pub use http_forward_real_path::{
     HttpForwardRealPathEvidence, validate_http_forward_real_path_evidence,

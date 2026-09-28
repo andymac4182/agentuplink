@@ -31,6 +31,10 @@ pub(crate) struct Exchange {
     pub stop: CancellationToken,
     pub request_terminal: CancellationToken,
     pub response_terminal: CancellationToken,
+    /// Cancelled once a response head exists at this endpoint: the device's
+    /// handler returned its response, or the owner decoded the device's
+    /// `RESPONSE_HEAD`.  It ends the response-head bound (M4-71).
+    pub response_head: CancellationToken,
     state: Mutex<State>,
     execution: AtomicU8,
     /// This endpoint's sending direction.
@@ -51,6 +55,7 @@ impl Exchange {
             stop: CancellationToken::new(),
             request_terminal: CancellationToken::new(),
             response_terminal: CancellationToken::new(),
+            response_head: CancellationToken::new(),
             state: Mutex::new(State {
                 request: Outcome::Pending,
                 response: Outcome::Pending,
@@ -95,6 +100,20 @@ impl Exchange {
     }
 
     /// Mark a direction complete unless it already aborted.
+    /// Resolve when the response-head bound `at` passes with no response
+    /// head at this endpoint; never when `at` is `None` or once the head
+    /// exists (M4-71).
+    pub async fn response_head_missed(&self, at: Option<tokio::time::Instant>) {
+        let Some(at) = at else {
+            return std::future::pending().await;
+        };
+        tokio::select! {
+            biased;
+            () = self.response_head.cancelled() => std::future::pending().await,
+            () = tokio::time::sleep_until(at) => {}
+        }
+    }
+
     pub fn complete(&self, dir: Dir) {
         {
             let mut state = self.lock();
