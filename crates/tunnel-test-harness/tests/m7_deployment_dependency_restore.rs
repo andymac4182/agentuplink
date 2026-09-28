@@ -1249,6 +1249,7 @@ fn write_client_config(
             client_certificate: certificate_path,
             client_key: key_path,
             server_ca: server_ca_path,
+            pinned: None,
         },
         exports: BTreeMap::from([(
             service_id.to_string(),

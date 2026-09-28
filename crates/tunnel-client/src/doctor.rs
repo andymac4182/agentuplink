@@ -118,6 +118,48 @@ pub(crate) struct DoctorResult {
     /// distinct from `..._SENTINEL_MISSING` because the operator's fix
     /// differs.
     pub(crate) process_containment: CapabilityCheck,
+    /// Whether a `credentials renew` is pending or was interrupted between
+    /// its two renames (task row M0-07). Reported, never failed: a pending
+    /// renewal is an operator's work in progress, and an interrupted one is
+    /// resolved by the next `connect` or `credentials renew` -- the key-match
+    /// check above already fails while it stands. Placed last so the fields
+    /// before it keep their order. `doctor` changes nothing to find this.
+    pub(crate) renewal: RenewalCheck,
+}
+
+/// `doctor`'s view of a renewal (M0-07): `none`, `pending` or
+/// `interrupted`, a closed code, and when the pending key was written.
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct RenewalCheck {
+    pub(crate) status: &'static str,
+    pub(crate) code: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) pending_since_unix: Option<i64>,
+}
+
+impl RenewalCheck {
+    fn not_run() -> Self {
+        Self {
+            status: "not_run",
+            code: "RENEWAL_NOT_CHECKED",
+            pending_since_unix: None,
+        }
+    }
+
+    fn of(config: &ConnectConfig) -> Self {
+        use tunnel_client::renewal::{RenewalStatus, inspect};
+        let state = inspect(&config.credentials);
+        let (status, code) = match state.status {
+            RenewalStatus::None => ("none", "RENEWAL_NONE"),
+            RenewalStatus::Pending => ("pending", "RENEWAL_PENDING"),
+            RenewalStatus::Interrupted => ("interrupted", "RENEWAL_INTERRUPTED"),
+        };
+        Self {
+            status,
+            code,
+            pending_since_unix: state.pending_since_unix,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -191,6 +233,7 @@ pub(crate) fn inspect(
                 device_identity: not_run(),
                 supervisor_ipc,
                 process_containment,
+                renewal: RenewalCheck::not_run(),
             };
             return inspection(
                 result,
@@ -216,6 +259,7 @@ pub(crate) fn inspect(
         device_identity,
         supervisor_ipc,
         process_containment,
+        renewal: RenewalCheck::of(&config),
     };
 
     let failure = first_credential_failure(&result);
