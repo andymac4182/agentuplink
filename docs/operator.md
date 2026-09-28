@@ -1753,10 +1753,14 @@ credentials: they include local socket addresses and deadline timestamps.
 - Public error responses carry a code from an allowlist, which the
   fail-closed gate asserts (M7-I04), rather than backend error text.
 
-Diagnostics across the whole system are **not** yet proven payload-free.
-M0-04 is in progress, and M0-06 records that one redaction test cannot tell
-redaction from deletion. Computer-use (M5) is not part of this alpha, so no
-shipped path handles typed text. Treat logs as sensitive regardless.
+Two harness gates check that diagnostics carry no payloads.
+`verify-m7-c11-diagnostics` covers the M7 gates, and
+`scripts/m0-payload-scan.py` (M0-04, M0-08) covers the M1, M2, M3, M4 and M8
+gates. Each gate's synthetic credentials, payloads, paths and endpoints are
+recorded, and the relay's own logs are searched for them, in several encodings, at `trace`. That
+is evidence for the paths those gates drive with synthetic data, not a proof
+for every input or log level. Computer-use (M5) is not part of this alpha, so
+no shipped path handles typed text. Treat logs as sensitive regardless.
 
 ## 6. Diagnostics
 

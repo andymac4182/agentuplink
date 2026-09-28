@@ -13,7 +13,7 @@ use std::{
     io::Write,
     net::{SocketAddr, TcpListener},
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
     sync::{Mutex, OnceLock},
 };
 
@@ -54,9 +54,15 @@ pub(crate) fn capture_dir() -> Option<PathBuf> {
 /// in the same run, including a managed child's own ephemeral client socket.
 /// The scanner compares exact bytes, so a recycled port would be reported as a
 /// leak of an endpoint that no longer exists. Retiring the value when its
-/// socket closes removes that false positive without weakening the scan for
-/// any endpoint that is still live: a real disclosure happens while the
-/// endpoint is in use, and remains recorded and matched.
+/// socket closes removes that false positive.
+///
+/// **What it costs, stated exactly.** Both readers (the C11 adapter and
+/// `scripts/m0-payload-scan.py`) apply the tombstones to the manifest before
+/// scanning, and the captured streams carry no timestamps, so a retired value
+/// is dropped from the *whole* scan: a disclosure of that endpoint made while
+/// it was still live is not matched either.  Only endpoints still recorded at
+/// the end of the run are scanned.  The M0-08 scanner reports how many values
+/// were retired, so the gap is counted rather than hidden.
 ///
 /// The manifest is append-only, so this writes a tombstone the reader applies
 /// in order.
@@ -67,6 +73,69 @@ pub(crate) fn retire_sentinel(kind: &'static str, value: &[u8]) -> Result<()> {
 pub(crate) fn record_sentinel(kind: &'static str, value: &[u8]) -> Result<()> {
     record_manifest_entry(kind, value, false)
 }
+
+/// Record one synthetic application request or response body (M0-09).
+///
+/// Only distinctive values are worth recording: the scan matches exact bytes,
+/// so a short or common value ("ok", a byte fill) would match unrelated
+/// diagnostics.  Callers therefore record the fixture's own distinctive
+/// payloads -- a value carrying a UUID or a long generated body -- and leave
+/// generic probes out.  A value over the manifest's per-record bound is
+/// recorded by its leading slice, which any verbatim leak of it contains.
+pub(crate) fn record_payload_sentinel(value: &[u8]) -> Result<()> {
+    if value.is_empty() {
+        return Ok(());
+    }
+    let slice = &value[..value.len().min(PAYLOAD_SENTINEL_SLICE)];
+    record_sentinel("application_payload", slice)?;
+    record_text_prefix(slice)
+}
+
+/// Also record the leading UTF-8 run of a binary payload (M0-08 review).
+///
+/// A binary value can only match a text log in an encoded form; its leading
+/// valid UTF-8 run -- the `0..127` part of the M4 `i % 251` file ramp, for
+/// instance -- is what a relay would print as text, JSON-escaped.  Recording
+/// it gives every gate with such a payload a text domain as well.
+fn record_text_prefix(value: &[u8]) -> Result<()> {
+    let valid = match std::str::from_utf8(value) {
+        Ok(_) => return Ok(()),
+        Err(error) => error.valid_up_to(),
+    };
+    if valid >= TEXT_PREFIX_MIN {
+        record_sentinel("application_payload", &value[..valid])?;
+    }
+    Ok(())
+}
+
+/// The shortest leading UTF-8 run worth recording on its own.
+const TEXT_PREFIX_MIN: usize = 32;
+
+/// The leading slice recorded for a payload larger than this.
+const PAYLOAD_SENTINEL_SLICE: usize = 4096;
+
+/// Record one application body seen on a wire funnel shared by many gates,
+/// such as the 9P client's `Twrite` and `Rread` data (M0-09).
+///
+/// A funnel sees every body, generic ones included, so only a body that can
+/// be an exact-match sentinel is recorded: at least [`WIRE_SENTINEL_MIN`]
+/// bytes and not one repeated byte.  Its leading [`WIRE_SENTINEL_SLICE`]
+/// bytes are recorded, which keeps the manifest bounded across a gate that
+/// moves many chunks while still matching any verbatim leak of a chunk.
+pub(crate) fn record_wire_payload_sentinel(value: &[u8]) -> Result<()> {
+    if capture_dir().is_none() || value.len() < WIRE_SENTINEL_MIN {
+        return Ok(());
+    }
+    if value.iter().all(|byte| *byte == value[0]) {
+        return Ok(());
+    }
+    let slice = &value[..value.len().min(WIRE_SENTINEL_SLICE)];
+    record_sentinel("application_payload", slice)?;
+    record_text_prefix(slice)
+}
+
+const WIRE_SENTINEL_MIN: usize = 64;
+const WIRE_SENTINEL_SLICE: usize = 256;
 
 /// Hold, for the rest of this C11 child, the TCP port whose number equals the
 /// UDP private endpoint `address`.
@@ -219,8 +288,47 @@ fn record_manifest_entry(kind: &'static str, value: &[u8], retired: bool) -> Res
             .and_then(|_| file.write_all(value))
             .map_err(|_| HarnessError::Process("C11 sentinel manifest write failed".into()))?;
         recorded.insert(key);
+        if !retired {
+            plant_witness_leak(kind, value);
+        }
         Ok(())
     })
+}
+
+/// Names the one sentinel kind the M0-08 witness control plants.
+const WITNESS_PLANT_ENV: &str = "M0_PAYLOAD_SCAN_PLANT";
+/// The tracing target of the planted event.  `scripts/m0-payload-scan.py`
+/// attributes a witness hit to the plant only when it lies on a line carrying
+/// this target, so a genuine leak is never credited to the control.
+const WITNESS_PLANT_TARGET: &str = "tunnel_relay::m0_payload_scan_witness";
+static WITNESS_PLANTED: AtomicBool = AtomicBool::new(false);
+
+/// The M0-08 declared-witness control: deliberately leak one recorded value.
+///
+/// Only a capture child whose parent set `M0_PAYLOAD_SCAN_PLANT` to a
+/// sentinel kind does anything here.  The first recorded value of that kind
+/// is emitted once, as a `DEBUG` event under the target
+/// `tunnel_relay::m0_payload_scan_witness`, with the value formatted by
+/// `Debug` (`planted = ?value`, the decimal byte list a careless
+/// `debug!(?body)` in the relay would print).  So the control proves three
+/// things at once: a `tunnel_relay` target at `debug` reaches the scanned
+/// stream, the scanner matches a `Debug`-formatted byte slice inside JSON
+/// tracing output, and it does so for binary payloads as well as text.
+/// Ordinary acceptance runs never set the variable, and the scanner removes
+/// it from every clean run's environment.
+fn plant_witness_leak(kind: &'static str, value: &[u8]) {
+    if std::env::var(WITNESS_PLANT_ENV).ok().as_deref() != Some(kind) {
+        return;
+    }
+    if WITNESS_PLANTED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    tracing::debug!(
+        target: WITNESS_PLANT_TARGET,
+        kind,
+        planted = ?value,
+        "M0-08 witness control: planted a recorded sentinel"
+    );
 }
 
 /// Persist both joined output streams from one ManagedProcess. Each process

@@ -114,8 +114,8 @@ use tunnel_relay::{MembershipReadiness, PeerInvalidationReason};
 
 use super::acp_real_path::{
     AcpConsumer, FreezeWatch, HeldStream, MEMBERSHIP_RECORD_LIFETIME, MEMBERSHIP_RESIGN_SPACING,
-    MIN_RETRY_HINT_MS, RefusalLedger, acp_request, device_config_text, fixture_binary_path,
-    json_stream, process_alive, session_id, stop_reason,
+    MIN_RETRY_HINT_MS, PROMPT_CONTEXT, RefusalLedger, acp_request, device_config_text,
+    fixture_binary_path, json_stream, process_alive, session_id, stop_reason,
 };
 use super::membership_hint_drop::{INCOMING_SPKI, TARGET_NODE, target_peer_spki};
 
@@ -1641,7 +1641,10 @@ impl Gate<'_> {
                     "method": "session/prompt",
                     "params": {
                         "sessionId": session,
-                        "prompt": [{"type": "text", "text": text}],
+                        "prompt": [
+                            {"type": "text", "text": text},
+                            {"type": "text", "text": PROMPT_CONTEXT},
+                        ],
                     },
                 }),
             )
@@ -2295,7 +2298,10 @@ impl Gate<'_> {
                     "method": "session/prompt",
                     "params": {
                         "sessionId": session,
-                        "prompt": [{"type": "text", "text": "ok"}],
+                        "prompt": [
+                            {"type": "text", "text": "ok"},
+                            {"type": "text", "text": PROMPT_CONTEXT},
+                        ],
                     },
                 }),
             )
@@ -4823,6 +4829,7 @@ pub fn validate_acp_cluster_evidence(evidence: &AcpClusterEvidence) -> Result<()
 /// # Errors
 /// Any setup, scenario, validation or cleanup failure.
 pub async fn verify() -> Result<AcpClusterEvidence> {
+    super::acp_real_path::record_acp_payload_sentinels()?;
     let options = HarnessOptions::from_env()?
         .acp_services(true)
         .acp_services_tenant_b(true)

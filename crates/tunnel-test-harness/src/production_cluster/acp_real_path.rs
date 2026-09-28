@@ -112,6 +112,25 @@ pub const MEMBERSHIP_RESIGN_SPACING: Duration = Duration::from_secs(15);
 pub const MEMBERSHIP_RECORD_LIFETIME: Duration = Duration::from_secs(60);
 
 /// The relay's own retry hint for an owner-not-ready refusal.
+/// A distinctive second text block carried by every prompt this gate and the
+/// cluster gate send (M0-09).  The fixture agent reads only the first block,
+/// its directive, so this changes no behaviour; it gives the prompt direction
+/// an exact-match `application_payload` sentinel, since the directives
+/// themselves (`ok`, `permission`) are too common to match alone.
+pub(super) const PROMPT_CONTEXT: &str = "m8-acp-prompt-context-4f7a2c91";
+/// The fixture agent's own reply text: the default turn's message chunk and
+/// the permission request's tool title.
+const AGENT_REPLIES: [&str; 2] = ["synthetic listing", "Read the synthetic fixture listing"];
+
+/// Record the ACP gates' synthetic prompt and reply payloads (M0-09).
+pub(super) fn record_acp_payload_sentinels() -> Result<()> {
+    crate::c11_capture::record_payload_sentinel(PROMPT_CONTEXT.as_bytes())?;
+    for reply in AGENT_REPLIES {
+        crate::c11_capture::record_payload_sentinel(reply.as_bytes())?;
+    }
+    Ok(())
+}
+
 pub(super) const MIN_RETRY_HINT_MS: u64 = 250;
 /// Margin above the handshake window, so a resend budget derived from the
 /// rotation policy is not tight against it.
@@ -1142,7 +1161,10 @@ impl Gate<'_> {
                     "method": "session/prompt",
                     "params": {
                         "sessionId": conversation.session,
-                        "prompt": [{"type": "text", "text": text}],
+                        "prompt": [
+                            {"type": "text", "text": text},
+                            {"type": "text", "text": PROMPT_CONTEXT},
+                        ],
                     },
                 }),
             )
@@ -2243,6 +2265,7 @@ pub fn validate_acp_real_path_evidence(evidence: &AcpRealPathEvidence) -> Result
 /// # Errors
 /// Any setup, scenario, validation or cleanup failure.
 pub async fn verify() -> Result<AcpRealPathEvidence> {
+    record_acp_payload_sentinels()?;
     let options = HarnessOptions::from_env()?
         .acp_services(true)
         .rotation(ACP_GATE_ROTATION);
