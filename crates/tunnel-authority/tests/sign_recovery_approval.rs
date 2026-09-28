@@ -579,3 +579,68 @@ fn help_and_version_answer_without_touching_anything() {
         format!("tunnel-authority {}", env!("CARGO_PKG_VERSION"))
     );
 }
+
+/// A relay's recovery fence never goes down, so a mistyped large version
+/// would block every smaller approval on it for good (review of #249).
+#[test]
+fn approval_versions_are_capped_and_a_jump_needs_the_flag() {
+    let scratch = Scratch::new();
+    let keys = generate(&scratch, "keys", KEY_ID);
+    let observation = write_observation(
+        &scratch,
+        "observation.json",
+        &observation_text(DEPLOYMENT, INCARNATION, DIGEST),
+    );
+    let out_dir = scratch.private_dir("out");
+    let signed = |version: &str, jump: bool, name: &str| {
+        let out = out_dir.join(name);
+        let mut args = vec![
+            "sign-recovery-approval",
+            "--key",
+            arg(&keys.key),
+            "--key-id",
+            KEY_ID,
+            "--observation",
+            arg(&observation),
+            "--deployment-id",
+            DEPLOYMENT,
+            "--deployment-incarnation",
+            INCARNATION,
+            "--approval-version",
+            version,
+            "--out",
+            arg(&out),
+        ];
+        if jump {
+            args.push("--allow-version-jump");
+        }
+        (authority(&args), out)
+    };
+    // The unflagged ceiling itself is accepted.
+    let (output, out) = signed("1000", false, "a.json");
+    assert!(output.status.success(), "1000 is accepted");
+    assert_eq!(json(&output)["result"]["approval_version"], 1000);
+    assert!(out.exists());
+    // Above it, only with the flag.
+    let (output, out) = signed("1001", false, "b.json");
+    assert_refused(&output, 2, "INVALID_INVOCATION");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("--allow-version-jump"),
+        "the refusal names the flag"
+    );
+    assert!(!out.exists());
+    let (output, _) = signed("1001", true, "c.json");
+    assert!(output.status.success(), "1001 with --allow-version-jump");
+    // 2^53-1 is the hard cap, flag or not.
+    let (output, _) = signed("9007199254740991", true, "d.json");
+    assert!(output.status.success(), "2^53-1 with the flag");
+    assert_eq!(
+        json(&output)["result"]["approval_version"],
+        9_007_199_254_740_991_u64
+    );
+    for too_large in ["9007199254740992", "18446744073709551615"] {
+        let (output, out) = signed(too_large, true, "e.json");
+        assert_refused(&output, 2, "INVALID_INVOCATION");
+        assert!(!out.exists(), "{too_large}: nothing written");
+    }
+}

@@ -3510,6 +3510,7 @@ dependencies = [
  "tunnel-catalog",
  "tunnel-transport",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]

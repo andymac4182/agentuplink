@@ -1327,6 +1327,15 @@ publisher must publish at least one record every 60 seconds or every relay
 loses every record at once; in practice it re-signs each record before it
 expires (the design refreshes every 20 seconds).
 
+**Nothing ever removes a node's field.** No catalog path runs `HDEL` on the
+directory (and the ACL below does not grant it), and every publish renews the
+whole hash, so every `node_id` ever published keeps one of the 32 slots until
+the entire hash lapses. Relays skip a record the checkpoint does not name
+(M7-C185), so this is harmless to routing, but a deployment that replaces
+nodes under new `node_id`s eventually has every publish of a new node refused
+as `bound`. Reuse `node_id`s when you replace a node. Retiring a field is task
+row M6-C220, for slice 2's publisher.
+
 **The Redis ACL the publisher needs.** Measured, not inferred: the publisher
 connected and published under exactly
 
@@ -1360,9 +1369,21 @@ whole exchange must finish within `checkpoint_timeout_seconds` (at most 2).
 **The checkpoint response** (`MembershipIssuer::sign_checkpoint` and
 `sign_checkpoint_bytes`; checked by `MembershipVerifier::verify_checkpoint`).
 Status exactly `200`; a body of 1 byte to 16 KiB that is exactly the canonical
-signed checkpoint. Any other status is a failure: `5xx`, `408` and `429` count
-as a shared outage, any other `4xx` counts against the relay
-([cluster.md](cluster.md), M7-C186).
+signed checkpoint. Any other status is a failure. **The signature protects the
+content only: a non-`200` status is unsigned**, so the only thing protecting it
+is TLS server authentication against `checkpoint_authority_trust_path`. A
+proxy or load balancer in front of the authority, or anyone holding a
+certificate that bundle trusts, can answer every relay with any status. Today
+`5xx`, `408`, `429`, and every `1xx` and `3xx` count as a shared outage; any
+other `4xx` counts toward the relay's prolonged-unready surrender
+([cluster.md](cluster.md), M7-C186). Because the relay presents no client
+certificate, a `4xx` cannot mean "this relay is refused": the same answer
+reaches every relay, and every relay would surrender its devices at about
+95 s. **Return a `4xx` other than `408` and `429` only for a deployment or
+incarnation the authority does not serve**, answer any trouble of your own
+with a `5xx`, and keep anything that can rewrite statuses (a WAF, an API
+gateway) out of the path. Making surrender depend on signed evidence only
+is task row M7-C218.
 
 | Field, in order | Rule |
 | --- | --- |
@@ -1387,7 +1408,7 @@ directory with mode `0700`.
 | `redis_namespace` | The relay's `redis_namespace` |
 | `redis_run_id` | The Redis `run_id` (`INFO server`) that `recover` observes when it runs |
 | `deployment_incarnation` | The candidate: the relay's `[recovery] deployment_incarnation` |
-| `approval_version` | At least 1 and higher than the relay's recovery fence (`recovery.fence_path`). `recover` writes the fence **before** it activates, so a version is consumed even when activation then fails |
+| `approval_version` | 1 to 2^53−1 and higher than the relay's recovery fence (`recovery.fence_path`). `recover` writes the fence **before** it activates, so a version is consumed even when activation then fails, and a version typed too high permanently raises the floor for every later approval on that relay. `tunnel-authority` refuses a version above 2^53−1, and one above 1000 unless `--allow-version-jump` is given |
 | `nonce` | 16 to 128 characters from `A-Z a-z 0-9 - _ .`, equal to `recover --expected-nonce`, which the operator takes from the authority, never from the file |
 | `catalog_digest` | The 64 lower-case hex SHA-256 of the durable catalog as `recovery-observe` reports it. `recover` observes again and refuses a mismatch (`recovery approval does not match the live catalog observation`), so **any durable catalog write after the observation voids the approval** |
 | `issued_at`, `not_before`, `expires_at` | `expires_at - issued_at` at most 60 s; verified with 5 s of skew, but **activation requires `not_before` <= now <= `expires_at` strictly**, on the relay's clock and on Redis `TIME` (`check_approval_window` and the activation script in `crates/tunnel-catalog/src/redis/recovery.rs`) |
@@ -1729,7 +1750,10 @@ configuration they are given. The approval comes from
    deployment and the candidate incarnation you mean to approve (a mismatch
    with the observation is refused before anything is signed), and an
    approval version higher than any you have issued for this deployment and
-   namespace. The approval is valid for 60 seconds from signing (from 5
+   namespace. Take the next unused one: a relay's fence never goes down, so
+   a mistyped large version blocks every smaller one on that relay for good.
+   `sign-recovery-approval` therefore refuses versions above 1000 unless you
+   add `--allow-version-jump`, and any above 2^53−1. The approval is valid for 60 seconds from signing (from 5
    seconds before, so an authority clock slightly ahead is harmless), and the
    command prints the nonce `recover` must be given.
 4. Carry the approval to the relay host into a directory with mode `0700`,

@@ -288,13 +288,17 @@ impl CheckpointAuthorityError {
     /// **Coordinator decision under the owner's delegation (2026-09-27).**
     /// Shared: the authority unreachable or failing -- a transport failure,
     /// a deadline, a 5xx, `408 Request Timeout`, `429 Too Many Requests`, or
-    /// an unusable answer. Specific to this relay, so it counts toward the
-    /// prolonged-unready surrender: any other 4xx (for example `401`/`403`
-    /// refusing a decommissioned relay's client certificate -- exempting it
-    /// would recreate M7-C181 through the authority) and this relay's own
-    /// invalid endpoint, request or trust bundle. A TLS-level refusal of the
-    /// client certificate surfaces as `Transport` and cannot be told apart
-    /// from an unreachable authority, so it stays shared.
+    /// an unusable answer (and any 1xx or 3xx status). Counted toward the
+    /// prolonged-unready surrender: any other 4xx and this relay's own
+    /// invalid endpoint, request or trust bundle.
+    ///
+    /// **Correction (review of #249):** a 4xx is *not* evidence about this
+    /// relay. The checkpoint client presents no client certificate
+    /// ([`HttpsCheckpointAuthority::new`] uses `with_no_client_auth`), so the
+    /// authority cannot single a relay out, and the status is unsigned: a
+    /// proxy in front of the authority can send the same 4xx to every relay
+    /// and surrender the whole cluster. Surrender resting on signed evidence
+    /// only is task row M7-C218; the classification is unchanged until then.
     #[must_use]
     pub const fn is_shared_outage(&self) -> bool {
         match self {

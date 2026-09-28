@@ -22,6 +22,8 @@ serde.workspace = true
 serde_json = "1.0"
 sha2 = "0.10"
 tunnel-catalog = { path = "../tunnel-catalog" }
+# The private key bytes are wiped when dropped (review of #249).
+zeroize = "1.8"
 
 [target.'cfg(unix)'.dev-dependencies]
 rcgen = "0.13"

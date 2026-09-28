@@ -494,6 +494,26 @@ async fn relay_recover_accepts_an_authority_approval_and_refuses_wrong_key_and_s
         "recovery approval was rejected",
     );
 
+    // 5. The fence itself: a *fresh* approval (new observation, new nonce)
+    // at the consumed version is refused, and the same observation signed one
+    // version higher is accepted -- the version was the only difference.
+    // (Re-activating the already-active candidate commits again.)
+    let observation = authority.path("observation-3.json");
+    observe(&config, &observation).await;
+    let approval = relay.path("approval-fence.json");
+    let nonce = sign(&key, &observation, 1, &approval).await;
+    assert_recover_refused(
+        &recover(&config, &approval, &nonce).await,
+        "recovery approval was rejected",
+    );
+    let approval = relay.path("approval-above-fence.json");
+    let nonce = sign(&key, &observation, 2, &approval).await;
+    let above = success_json(
+        "recover above the fence",
+        &recover(&config, &approval, &nonce).await,
+    );
+    assert_eq!(above["approval_version"], 2);
+
     cleanup(&fixture).await;
     forwarder.shutdown().await;
 }

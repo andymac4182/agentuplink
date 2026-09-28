@@ -49,6 +49,7 @@ use tunnel_catalog::{
     RecoveryApproval, RecoveryApprovalIssuer, RecoveryApprovalVerifier, RecoveryPolicy,
     TrustedRecoveryKey,
 };
+use zeroize::Zeroizing;
 
 /// The schema of every JSON object this binary prints.
 pub const OUTPUT_SCHEMA_VERSION: u16 = 1;
@@ -66,6 +67,15 @@ pub const MAX_LIFETIME_SECONDS: i64 = 60;
 pub const PRIVATE_KEY_FILE_MODE: u32 = 0o600;
 /// The private key directory's required mode.
 pub const PRIVATE_KEY_DIRECTORY_MODE: u32 = 0o700;
+/// The highest approval version accepted at all: the largest integer every
+/// JSON reader represents exactly (2^53 - 1).
+pub const MAX_APPROVAL_VERSION: u64 = (1 << 53) - 1;
+/// The highest approval version accepted without `--allow-version-jump`. The
+/// authority keeps no issuing state, so it cannot see the relay's fence; a
+/// relay's fence never goes down, so a mistyped large version permanently
+/// blocks every smaller approval on that relay. Versions are expected to be
+/// issued one at a time, so anything above this is refused as a likely typo.
+pub const MAX_UNFLAGGED_APPROVAL_VERSION: u64 = 1_000;
 /// An approval file is written with the mode `tunnel-relay recover` requires
 /// of it (`RECOVERY_CONTROL_FILE_MODE`).
 pub const APPROVAL_FILE_MODE: u32 = 0o600;
@@ -102,12 +112,14 @@ document {\"schema_version\":1,\"keys\":[{\"key_id\":ID,\"public_key\":HEX}]} to
 [recovery] trusted_keys_path. Neither file may exist; nothing is overwritten.
 ";
 
-const SIGN_USAGE: &str = "Usage: tunnel-authority sign-recovery-approval --key PATH --key-id ID --observation PATH --deployment-id ID --deployment-incarnation INC --approval-version N --out PATH [--lifetime-seconds S]
+const SIGN_USAGE: &str = "Usage: tunnel-authority sign-recovery-approval --key PATH --key-id ID --observation PATH --deployment-id ID --deployment-incarnation INC --approval-version N --out PATH [--lifetime-seconds S] [--allow-version-jump]
 
 Sign one recovery approval for the `tunnel-relay recovery-observe` result in
 --observation. --deployment-id and --deployment-incarnation are your statement
 of what you approve and must equal the observation's. --approval-version must
-be higher than every version the relay has consumed. The key file must be mode
+be higher than every version the relay has consumed, and at most 1000 unless
+--allow-version-jump is given (never above 2^53-1): the relay's fence never
+goes down, so a mistyped large version blocks recovery on it for good. The key file must be mode
 0600 in a directory with mode 0700. The approval is written to --out (mode
 0600), which must not exist. The approval expires --lifetime-seconds after it
 is signed (1..=60, default 60): run `tunnel-relay recover` with the printed
@@ -375,6 +387,7 @@ pub struct SignArgs {
     pub approval_version: u64,
     pub out: PathBuf,
     pub lifetime_seconds: i64,
+    pub allow_version_jump: bool,
 }
 
 impl SignArgs {
@@ -387,6 +400,7 @@ impl SignArgs {
         let mut version = None;
         let mut out = None;
         let mut lifetime = None;
+        let mut allow_version_jump = false;
         let mut index = 0;
         while index < args.len() {
             match args[index].as_str() {
@@ -409,6 +423,13 @@ impl SignArgs {
                 "--lifetime-seconds" => {
                     take_value(args, &mut index, "--lifetime-seconds", &mut lifetime)?
                 }
+                "--allow-version-jump" => {
+                    if allow_version_jump {
+                        return Err(Failure::invocation("--allow-version-jump was given twice"));
+                    }
+                    allow_version_jump = true;
+                    index += 1;
+                }
                 other => {
                     return Err(Failure::invocation(format!(
                         "unknown sign-recovery-approval argument {other:?}"
@@ -419,10 +440,17 @@ impl SignArgs {
         let approval_version = required(version, "--approval-version")?
             .parse::<u64>()
             .ok()
-            .filter(|version| *version > 0)
+            .filter(|version| (1..=MAX_APPROVAL_VERSION).contains(version))
             .ok_or_else(|| {
-                Failure::invocation("--approval-version must be a whole number of at least 1")
+                Failure::invocation(
+                    "--approval-version must be a whole number from 1 to 9007199254740991 (2^53-1)",
+                )
             })?;
+        if approval_version > MAX_UNFLAGGED_APPROVAL_VERSION && !allow_version_jump {
+            return Err(Failure::invocation(format!(
+                "--approval-version {approval_version} is above {MAX_UNFLAGGED_APPROVAL_VERSION}; a relay's fence never goes down, so a mistyped version blocks every smaller one for good. Pass --allow-version-jump if it is intended"
+            )));
+        }
         let lifetime_seconds = match lifetime {
             None => MAX_LIFETIME_SECONDS,
             Some(value) => value
@@ -442,6 +470,7 @@ impl SignArgs {
             approval_version,
             out: PathBuf::from(required(out, "--out")?),
             lifetime_seconds,
+            allow_version_jump,
         })
     }
 }
@@ -507,7 +536,7 @@ fn check_key_file_metadata(metadata: &Metadata) -> Result<(), Failure> {
 /// a regular file with mode `0600` in a directory with mode `0700`. The file
 /// is opened without following a symbolic link and re-checked on the open
 /// handle, so a file swapped after the path check is refused too.
-pub fn read_private_key(path: &Path) -> Result<Vec<u8>, Failure> {
+pub fn read_private_key(path: &Path) -> Result<Zeroizing<Vec<u8>>, Failure> {
     check_key_directory(path)?;
     let metadata = fs::symlink_metadata(path).map_err(|error| {
         if error.kind() == io::ErrorKind::NotFound {
@@ -546,7 +575,9 @@ pub fn read_private_key(path: &Path) -> Result<Vec<u8>, Failure> {
             "the private key file changed while it was opened",
         ));
     }
-    let mut bytes = Vec::new();
+    // Sized up front so `read_to_end` never reallocates and leaves a copy of
+    // key bytes behind in freed memory.
+    let mut bytes = Zeroizing::new(Vec::with_capacity(MAX_KEY_FILE_BYTES as usize + 1));
     file.take(MAX_KEY_FILE_BYTES + 1)
         .read_to_end(&mut bytes)
         .map_err(|_| {
@@ -667,6 +698,7 @@ pub fn generate_recovery_key(args: &GenerateArgs) -> Result<GeneratedKey, Failur
     }
     let (issuer, pkcs8) = RecoveryApprovalIssuer::generate(args.key_id.as_str())
         .map_err(|_| Failure::invocation("--key-id must be 1..=128 bytes with no spaces"))?;
+    let pkcs8 = Zeroizing::new(pkcs8);
     let public_key = hex(&issuer
         .public_key()
         .map_err(|_| Failure::new(FailureKind::Internal, "the generated key is unusable"))?);
