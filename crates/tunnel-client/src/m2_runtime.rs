@@ -5514,8 +5514,7 @@ impl M2Actor {
                 stream.auth.challenge_id == invalidated.challenge_id
                     || stream
                         .retired_challenges
-                        .iter()
-                        .any(|retired| *retired == invalidated.challenge_id)
+                        .contains(&invalidated.challenge_id)
             })
         {
             // The relay's "the refresh answered too late, nothing lapsed but
