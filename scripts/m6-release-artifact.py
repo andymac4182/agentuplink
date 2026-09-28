@@ -1901,8 +1901,8 @@ def stage_archive(bundle: Path, work: Path, archive: Path | None = None) -> str:
     archive = work / name
     with tarfile.open(archive, "w:gz") as tar:
         tar.add(bundle, arcname=DOCS_ARCHIVE_NAME)
-    (work / f"{archive.name}.sha256").write_text(
-        f"{sha256_file(archive)}  {archive.name}\n")
+    (work / f"{archive.name}.sha256").write_bytes(
+        f"{sha256_file(archive)}  {archive.name}\n".encode())
     return ("an archive and sidecar this check made from the directory -- so the "
             "guide's archive-checksum step could not fail for a real download's reason")
 
@@ -2070,6 +2070,45 @@ def check_exit_table(runtime_doc: Path, client_main: Path) -> Result | None:
     return None
 
 
+def check_docs_inventory(doc: Path, runtime_doc: Path, client_main: Path,
+                         pins: dict[str, tuple[int, int, int]] | None = None
+                         ) -> tuple[Result | None, list, list, int]:
+    """The bundle-free half of `docs` (M6-C219): every fence classified by the
+    allowlist, the per-section and prose-fence pins, and the exit-code table
+    against the client source.  Returns (failure or None, session, shape, prose).
+    `docs-inventory` runs this alone in hosted CI on every guide change, so an
+    untagged fence or a count drift is caught without a maintainer bundle."""
+    try:
+        session, shape, prose = classify_doc(read_exact(doc))
+        measured: dict[str, list[int]] = {}
+        for command in session:
+            counts = measured.setdefault(command.section, [0, 0, 0])
+            counts[0] += 1
+            counts[1] += len(assertions(command))
+        for command in shape:
+            measured.setdefault(command.section, [0, 0, 0])[2] += 1
+    except DocFormatError as error:
+        return Result("docs", False, summary=str(error), witness=error.witness), [], [], 0
+    pins = DOCS_PINNED_SECTIONS if pins is None else pins
+    drift = []
+    for section in sorted(set(pins) | set(measured)):
+        want = pins.get(section, (0, 0, 0))
+        got = tuple(measured.get(section, [0, 0, 0]))
+        if got != want:
+            drift.append(f"{section!r}: pinned executed/assertions/shape-only {want}, "
+                         f"measured {got}")
+    if prose != DOCS_PINNED_PROSE_FENCES:
+        drift.append(f"prose fences: pinned {DOCS_PINNED_PROSE_FENCES}, measured {prose}")
+    if drift:
+        return (Result("docs", False,
+                       summary="the guide's inventory moved from its pins -- "
+                               + "; ".join(drift)
+                               + ". Update DOCS_PINNED_SECTIONS in the same change as "
+                                 "an intended edit; an unintended one is what this catches",
+                       witness="docs-count-mismatch"), session, shape, prose)
+    return check_exit_table(runtime_doc, client_main), session, shape, prose
+
+
 def check_docs(bundle: Path, doc: Path | None = None, runtime_doc: Path | None = None,
                client_main: Path | None = None, archive: Path | None = None,
                pins: dict[str, tuple[int, int, int]] | None = None) -> Result:
@@ -2092,38 +2131,9 @@ def check_docs(bundle: Path, doc: Path | None = None, runtime_doc: Path | None =
             return Result("docs", False, ran=False,
                           summary=f"{needed} is not present; this check reads the guide "
                                   f"and the client source from a repository checkout")
-    try:
-        session, shape, prose = classify_doc(read_exact(doc))
-        measured: dict[str, list[int]] = {}
-        for command in session:
-            counts = measured.setdefault(command.section, [0, 0, 0])
-            counts[0] += 1
-            counts[1] += len(assertions(command))
-        for command in shape:
-            measured.setdefault(command.section, [0, 0, 0])[2] += 1
-    except DocFormatError as error:
-        return Result("docs", False, summary=str(error), witness=error.witness)
-    pins = DOCS_PINNED_SECTIONS if pins is None else pins
-    drift = []
-    for section in sorted(set(pins) | set(measured)):
-        want = pins.get(section, (0, 0, 0))
-        got = tuple(measured.get(section, [0, 0, 0]))
-        if got != want:
-            drift.append(f"{section!r}: pinned executed/assertions/shape-only {want}, "
-                         f"measured {got}")
-    if prose != DOCS_PINNED_PROSE_FENCES:
-        drift.append(f"prose fences: pinned {DOCS_PINNED_PROSE_FENCES}, measured {prose}")
-    if drift:
-        return Result("docs", False,
-                      summary="the guide's inventory moved from its pins -- "
-                              + "; ".join(drift)
-                              + ". Update DOCS_PINNED_SECTIONS in the same change as "
-                                "an intended edit; an unintended one is what this catches",
-                      witness="docs-count-mismatch")
-
-    table = check_exit_table(runtime_doc, client_main)
-    if table is not None:
-        return table
+    failed, session, shape, prose = check_docs_inventory(doc, runtime_doc, client_main, pins)
+    if failed is not None:
+        return failed
 
     with tempfile.TemporaryDirectory() as tmp:
         home = Path(tmp) / "home"
@@ -4027,7 +4037,7 @@ def control_docs_real_archive_sidecar_mismatch(bundle: Path) -> tuple[bool, str]
         archive = Path(tmp) / f"{DOCS_ARCHIVE_NAME}.tar.gz"
         with tarfile.open(archive, "w:gz") as tar:
             tar.add(bundle, arcname=DOCS_ARCHIVE_NAME)
-        (Path(tmp) / f"{archive.name}.sha256").write_text(f"{'0' * 64}  {archive.name}\n")
+        (Path(tmp) / f"{archive.name}.sha256").write_bytes(f"{'0' * 64}  {archive.name}\n".encode())
         return _expect_red_at(f"docs/operator.md:{command.line} ", bundle,
                               "documented-command-failed", archive=archive)
 
@@ -4451,8 +4461,9 @@ def cmd_bundle(args: argparse.Namespace) -> int:
     with tarfile.open(archive, "w:gz") as tar:
         tar.add(out, arcname=out.name)
     archive_digest = sha256_file(archive)
-    archive.with_suffix(archive.suffix + ".sha256").write_text(
-        f"{archive_digest}  {archive.name}\n"
+    # Bytes, so the sidecar is LF-terminated on every host (M6-C217).
+    archive.with_suffix(archive.suffix + ".sha256").write_bytes(
+        f"{archive_digest}  {archive.name}\n".encode()
     )
 
     print(f"bundle at {out}: {len(sums)} files, {len(digests)} binaries, "
@@ -4587,6 +4598,11 @@ def main() -> int:
     bundle_cmd.add_argument("--out", required=True)
     bundle_cmd.add_argument("--profile", default="release")
 
+    inventory = sub.add_parser(
+        "docs-inventory",
+        help="the bundle-free half of `docs`: fence tags, pinned counts, exit table")
+    inventory.add_argument("--guide", default=str(DOCS_OPERATOR))
+
     verify = sub.add_parser("verify")
     verify.add_argument("--bundle", required=True)
     verify.add_argument("--check", choices=sorted(CHECKS))
@@ -4616,6 +4632,17 @@ def main() -> int:
         return cmd_bundle(args)
     if args.command == "verify":
         return cmd_verify(args)
+    if args.command == "docs-inventory":
+        failed, session, shape, prose = check_docs_inventory(
+            Path(args.guide), DOCS_RUNTIME, DOCS_CLIENT_MAIN)
+        if failed is not None:
+            print(failed.render())
+            return 1
+        print(f"ok      docs-inventory: {args.guide}: every fence tagged from the allowlist; "
+              f"{len(session)} executed commands, {len(shape)} shape-only, {prose} prose "
+              f"fence(s), each section on its pin; the client exit-code table agrees "
+              f"with Cause. NOT run: the session itself (needs a bundle, `verify`)")
+        return 0
     parser.print_help()
     return 2
 

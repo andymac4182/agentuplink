@@ -349,9 +349,9 @@ $ openssl x509 -in trial/device-cert.pem -noout -subject
 
 The CA's three extensions matter to clients outside this bundle: Python 3.13
 and later verify strictly and refuse a CA without `basicConstraints` or
-`keyUsage`, and a certificate without an authority key identifier, which
-macOS's own `openssl` (LibreSSL) writes only when the CA has a subject key
-identifier (M6-C137). Certificates you sign from this CA for a server should
+`keyUsage`, and a certificate whose authority key identifier carries no key
+ID. macOS's own `openssl` (LibreSSL) writes the identifier without the key ID
+unless the CA has a subject key identifier (M6-C137). Certificates you sign from this CA for a server should
 also carry `subjectKeyIdentifier=hash` and `authorityKeyIdentifier=keyid` in
 their extension file.
 
