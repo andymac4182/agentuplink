@@ -13,7 +13,9 @@
 //!   longer in total than both the connector's timeout and the relay's own
 //!   `operation_timeout` (30 s by default).  It must end cleanly and
 //!   byte-exact, and the connector must count no expired stream.  Before
-//!   M4-71 the connector reset it about 2 s after its OPEN.
+//!   M4-71 the connector reset it about 2 s after its OPEN.  The fixture's
+//!   background membership re-signer runs throughout, and at least one
+//!   same-key re-sign must land inside the stream.
 //! * `no-head`: a POST whose handler never answers.  It must fail at the
 //!   connector's timeout, not at the bridge's absolute deadline, and the
 //!   handler must be cancelled.  Through this non-owner ingress the failure
@@ -67,7 +69,7 @@ pub const SSE_EVENT_COUNT: usize = 12;
 /// it can only be the response-head bound.
 pub const HEAD_TIMEOUT_SLACK: Duration = Duration::from_secs(10);
 /// A consumer retry is allowed only for a `503` that proves nothing was
-/// dispatched (a peer route re-forming after the membership re-sign).
+/// dispatched (a peer route still forming, or a rotation-freeze refusal).
 const NOT_DISPATCHED_RETRIES: usize = 10;
 /// Payload-free marker of the gate's own run in its printed evidence.
 const GATE: &str = "m4-71 http-forward long-lived";
@@ -102,6 +104,10 @@ pub struct HttpForwardLongLivedEvidence {
     pub sse_ended_cleanly: bool,
     pub sse_duration_ms: u128,
     pub sse_retries: usize,
+    /// relay-c's highest membership record version before and after `sse`:
+    /// the background re-signer ran at least once during the stream.
+    pub membership_version_before_sse: u64,
+    pub membership_version_after_sse: u64,
     pub sse_device_response: Option<String>,
     pub sse_device_error: Option<String>,
     /// The connector's `stream_auth.expired_streams`, before and after `sse`.
@@ -164,6 +170,12 @@ pub fn validate_http_forward_long_lived_evidence(
                 && evidence.sse_bytes_expected > 0,
         ),
         ("sse_ended_cleanly", evidence.sse_ended_cleanly),
+        // A retry would mean the long stream was not the first dispatch.
+        ("sse_first_attempt", evidence.sse_retries == 0),
+        (
+            "sse_spanned_a_resign",
+            evidence.membership_version_after_sse > evidence.membership_version_before_sse,
+        ),
         (
             "sse_outlived_both_timeouts",
             evidence.sse_duration_ms > timeout_ms
@@ -537,14 +549,19 @@ async fn exercise(
     )?;
     let base = format!("/v1/devices/{device_id}/services/{service_id}/http");
 
-    // The fixture's membership records live 60 s and a re-sign invalidates
-    // in-flight peer hops, so re-sign once, with nothing in flight, before
-    // the long case: it then has a whole record lifetime to run in.
-    cluster.resign_membership_now().await?;
+    // This fixture signs its 60-second membership records once and runs no
+    // background publisher unless asked (production re-signs every 20 s), so
+    // a gate that outlives one record would see peer trust lapse.  Run the
+    // fixture's background re-signer, as production would: its 15 s rounds
+    // fall inside the 33 s SSE, which therefore also shows an http-forward
+    // stream surviving routine same-key re-signs (M7-C80 re-binds the
+    // admission rather than invalidating it).
+    cluster.start_membership_resigning().await?;
     wait_peers_ready(cluster).await?;
 
     // `sse`
     evidence.expired_streams_before_sse = client.status_snapshot().stream_auth.expired_streams;
+    evidence.membership_version_before_sse = membership_version(cluster);
     let before = device_diagnostics.snapshot().len();
     let sse = send(
         ingress_addr,
@@ -573,11 +590,12 @@ async fn exercise(
         }
     }
     evidence.expired_streams_after_sse = client.status_snapshot().stream_auth.expired_streams;
-
-    // The long case used most of the records' 60 s; re-sign again, with
-    // nothing in flight, so the short cases cannot straddle their expiry.
-    cluster.resign_membership_now().await?;
-    wait_peers_ready(cluster).await?;
+    evidence.membership_version_after_sse = membership_version(cluster);
+    if let Some(failure) = cluster.membership_resign_failure() {
+        return Err(HarnessError::Process(format!(
+            "{GATE}: the membership re-signer failed: {failure}"
+        )));
+    }
 
     // `no-head`
     let no_head = send(
@@ -618,6 +636,23 @@ async fn exercise(
         .windows(b"late-unary-answer".len())
         .any(|window| window == b"late-unary-answer");
     Ok(())
+}
+
+/// The highest membership record version relay-c's verifier holds.
+fn membership_version(cluster: &ProductionCluster) -> u64 {
+    cluster
+        .relay("relay-c")
+        .ok()
+        .and_then(|relay| {
+            relay
+                .membership
+                .snapshot()
+                .memberships
+                .iter()
+                .map(|membership| membership.record_version)
+                .max()
+        })
+        .unwrap_or(0)
 }
 
 async fn wait_peers_ready(cluster: &ProductionCluster) -> Result<()> {
@@ -777,6 +812,8 @@ mod tests {
             sse_ended_cleanly: true,
             sse_duration_ms: 33_100,
             sse_retries: 0,
+            membership_version_before_sse: 3,
+            membership_version_after_sse: 5,
             sse_device_response: Some("Complete".into()),
             sse_device_error: None,
             expired_streams_before_sse: 0,
@@ -813,7 +850,7 @@ mod tests {
     /// Each rule rejects the evidence of the defect it guards.
     #[test]
     fn each_rule_rejects_its_defect() {
-        let cases: [(&str, Mutation); 10] = [
+        let cases: [(&str, Mutation); 12] = [
             // The pre-M4-71 shape: the connector reset the stream at its
             // timeout, so the body errored after about 2 s.
             ("sse_ended_cleanly", |e| {
@@ -821,6 +858,10 @@ mod tests {
                 e.sse_duration_ms = 2_100;
             }),
             ("sse_byte_exact", |e| e.sse_byte_exact = false),
+            ("sse_first_attempt", |e| e.sse_retries = 1),
+            ("sse_spanned_a_resign", |e| {
+                e.membership_version_after_sse = 3
+            }),
             ("sse_outlived_both_timeouts", |e| e.sse_duration_ms = 20_000),
             ("sse_device_complete", |e| {
                 e.sse_device_response = Some("Aborted".into());

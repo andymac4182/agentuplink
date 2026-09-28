@@ -1676,7 +1676,7 @@ pub(crate) async fn main() -> ExitCode {
                         &evidence,
                     )?;
                     println!(
-                        "M4-71 http-forward long-lived passed: owner={} ingress={} non_owner_ingress={} connector_operation_timeout_ms={} relay_operation_timeout_ms={} bridge_deadline_ms={} sse_status={} sse_events={} sse_bytes={}/{} sse_byte_exact={} sse_ended_cleanly={} sse_duration_ms={} sse_retries={} sse_device_response={:?} expired_streams={}->{} no_head_status={} no_head_code={} no_head_elapsed_ms={} no_head_retries={} no_head_handler_cancelled={} late_unary_status={} late_unary_code={} late_unary_elapsed_ms={} late_unary_retries={} late_unary_answer_seen={}",
+                        "M4-71 http-forward long-lived passed: owner={} ingress={} non_owner_ingress={} connector_operation_timeout_ms={} relay_operation_timeout_ms={} bridge_deadline_ms={} sse_status={} sse_events={} sse_bytes={}/{} sse_byte_exact={} sse_ended_cleanly={} sse_duration_ms={} sse_retries={} sse_device_response={:?} membership_version={}->{} expired_streams={}->{} no_head_status={} no_head_code={} no_head_elapsed_ms={} no_head_retries={} no_head_handler_cancelled={} late_unary_status={} late_unary_code={} late_unary_elapsed_ms={} late_unary_retries={} late_unary_answer_seen={}",
                         evidence.owner_node,
                         evidence.ingress_node,
                         evidence.non_owner_ingress,
@@ -1692,6 +1692,8 @@ pub(crate) async fn main() -> ExitCode {
                         evidence.sse_duration_ms,
                         evidence.sse_retries,
                         evidence.sse_device_response,
+                        evidence.membership_version_before_sse,
+                        evidence.membership_version_after_sse,
                         evidence.expired_streams_before_sse,
                         evidence.expired_streams_after_sse,
                         evidence.no_head_status,

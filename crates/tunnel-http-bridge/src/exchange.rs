@@ -99,7 +99,6 @@ impl Exchange {
         }
     }
 
-    /// Mark a direction complete unless it already aborted.
     /// Resolve when the response-head bound `at` passes with no response
     /// head at this endpoint; never when `at` is `None` or once the head
     /// exists (M4-71).
@@ -114,6 +113,7 @@ impl Exchange {
         }
     }
 
+    /// Mark a direction complete unless it already aborted.
     pub fn complete(&self, dir: Dir) {
         {
             let mut state = self.lock();

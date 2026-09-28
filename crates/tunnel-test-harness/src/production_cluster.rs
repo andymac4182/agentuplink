@@ -5074,11 +5074,16 @@ impl ProductionCluster {
     /// Issue one membership re-signing round now, and return once every
     /// running relay's verifier retains the new version for every node.
     ///
-    /// A newer record version invalidates every peer admission bound to the
-    /// old one, and with it every in-flight peer stream.  A gate whose
-    /// streams must not straddle a refresh therefore re-signs at its own case
-    /// boundaries instead of on a background timer.  It cannot be combined
-    /// with [`Self::start_membership_resigning`].
+    /// Since M7-C80 a same-key re-sign at a higher version does not interrupt
+    /// in-flight peer streams: `revalidate_active` re-binds an unchanged
+    /// admission to the new version and extends its deadline
+    /// (docs/cluster.md, the re-signed-record row).  This fixture signs its
+    /// 60-second records once at bootstrap and runs no background publisher
+    /// unless a gate starts [`Self::start_membership_resigning`] (production
+    /// re-signs every 20 s), so a gate that outlives one record must refresh
+    /// membership itself, with this call at its case boundaries or with the
+    /// background re-signer.  It cannot be combined with
+    /// [`Self::start_membership_resigning`].
     async fn resign_membership_now(&mut self) -> Result<u64> {
         self.resign_membership_burst(1).await
     }

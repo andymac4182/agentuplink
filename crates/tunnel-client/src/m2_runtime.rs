@@ -4668,6 +4668,15 @@ impl M2Actor {
                     Instant::now(),
                     SystemTime::now(),
                 ) else {
+                    // The same refusal, for the same condition, as the
+                    // `operation_deadline.expired()` check just above: the
+                    // single-request deadline passed in the microseconds
+                    // between that check and this one.  The only other
+                    // `None` is a backstop overflow, which cannot happen
+                    // (the bridge deadline is at most 24 h).  OPEN refusals
+                    // are a closed protocol table (`open_refusal::ALL`,
+                    // M7-C160) whose codes are metric labels, so a new code
+                    // for this race is not worth a protocol change.
                     return self.send_open_rejected_journaled(
                         open,
                         open_refusal::AUTHORIZATION_WINDOW_EXPIRED,
@@ -10556,6 +10565,66 @@ mod tests {
             )
             .is_none(),
             "an OPEN whose single-request timeout already passed is refused, not admitted"
+        );
+    }
+
+    /// M4-71 through the real admission path: an `http-forward/1` OPEN
+    /// admitted by `handle_control` carries the backstop, not the
+    /// single-request timeout, as its operation deadline.  Deleting the
+    /// assignment of the backstop in `try_admit_open` leaves the 50 ms
+    /// timeout on the stream, and this fails.
+    #[tokio::test]
+    async fn an_admitted_http_open_takes_the_backstop_as_its_operation_deadline() {
+        let (mut actor, _active_key, _carrier_receiver, _control_receiver) =
+            test_actor_with_control_capacity(M2_CARRIER_QUEUE_FRAMES, 16);
+        actor.config.limits.operation_timeout_ms = 50;
+        actor.config.exports.insert(
+            "http-svc".to_owned(),
+            crate::ExportConfig {
+                kind: crate::ExportKind::HttpForward,
+                device_canary: None,
+                mcp: None,
+                acp: None,
+                cua: None,
+                fs: None,
+            },
+        );
+        let profile = tunnel_http_bridge::Profile {
+            request: tunnel_http_forward::RequestPolicy::new(1_024).expect("request policy"),
+            response: tunnel_http_forward::ResponsePolicy::new(1_024).expect("response policy"),
+        };
+        let handler = |_request: http::Request<tunnel_http_bridge::ChannelBody>|
+         -> crate::http_forward::HttpHandlerFuture {
+            Box::pin(async { Err(crate::http_forward::HttpHandlerError) })
+        };
+        actor.http_handlers = HttpHandlers::new().with_export(
+            "http-svc".to_owned(),
+            crate::http_forward::HttpExport {
+                profile: std::sync::Arc::new(profile),
+                config: tunnel_http_bridge::BridgeConfig::default(),
+                handler: std::sync::Arc::new(handler),
+            },
+        );
+        let open = Open::new(
+            "open-message-1",
+            "session",
+            1,
+            1,
+            "operation-1",
+            "http-svc",
+            HTTP_FORWARD_OPERATION,
+            1_024,
+            1_024,
+        );
+        actor
+            .handle_control(ControlMessage::Open(open))
+            .await
+            .expect("the OPEN is admitted");
+        let stream = actor.streams.get(&1).expect("the http stream was admitted");
+        let remaining = stream.auth.operation_deadline.remaining(Instant::now());
+        assert!(
+            remaining >= tunnel_http_bridge::BridgeConfig::default().discard_bound(),
+            "the admitted stream's operation deadline is the backstop, not the 50 ms timeout: {remaining:?}"
         );
     }
 
