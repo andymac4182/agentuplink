@@ -13604,12 +13604,20 @@ impl RelayActor {
         // exchange is abandoned so the connector's confirmed stream is ended
         // by the relay's RESET (M7-C94).  A closed carrier, or a refusal
         // after the DATA went out, keeps the fence.
+        // Only an M2 session can end the confirmed stream after refusing
+        // the call: its abandon path sends the relay's RESET (M7-C94).  An
+        // M1 connector never sweeps a stream the relay stops using, so on M1
+        // a refusal here would permanently spend one of its `max_streams`
+        // slots; M1 keeps the fence, as site 2 does.
+        let ends_refused_stream = self
+            .session_for(&key)
+            .is_some_and(|session| session.profile.supports_rotation());
         match queue_data_pair(&data_tx, &queue_budget, frame, fin) {
             Ok(()) => {}
             Err(PairRefusal {
                 refusal: QueueRefusal::Budget | QueueRefusal::Full,
                 first_queued: false,
-            }) => {
+            }) if ends_refused_stream => {
                 self.fail_pending(
                     &key,
                     challenge.stream_id,

@@ -5914,3 +5914,136 @@ async fn m4_47_a_unary_request_refused_by_backpressure_is_not_dispatched_and_kee
     assert_eq!(forgets[0].operation_id, operation_id);
     fixture.session().queue_budget.release(room);
 }
+
+/// Make the fixture's session an M1 session, whose connector keeps no OPEN
+/// journal and never ends a stream the relay stops using.
+fn m4_47_make_m1(fixture: &mut FreezeFixture) {
+    fixture
+        .actor
+        .sessions
+        .get_mut(&fixture.key.scope())
+        .expect("fixture session")
+        .profile = super::RuntimeProfile::M1;
+}
+
+/// Task row M4-47, site 2 on an M1 session (review of #242): M1 has no
+/// abandon path, so a response the data lane cannot hold keeps the fence
+/// rather than answering the consumer and leaving the exchange behind.
+#[tokio::test]
+async fn m4_47_on_m1_a_unary_response_the_data_lane_cannot_hold_keeps_the_fence() {
+    let mut fixture = FreezeFixture::new("m4-47-m1-unary-response", false);
+    let (stream_id, _, _, _receiver) = fixture.admit_unary_echo(UNARY_BODY).await;
+    fixture.authorize_unary_echo(stream_id);
+    assert_eq!(sequenced(&drain_data(&mut fixture.old_rx)).len(), 2);
+    m4_47_make_m1(&mut fixture);
+    let room = m4_47_saturate_data_lane(&fixture);
+
+    fixture
+        .connector_frame(Frame::data(
+            1,
+            fixture.attempt.old_generation,
+            stream_id,
+            1,
+            2,
+            UNARY_REPLY.to_vec(),
+        ))
+        .await;
+
+    assert!(
+        !fixture.session_alive(),
+        "an M1 session keeps the fence: it cannot abandon the exchange"
+    );
+    drop(room);
+}
+
+/// Task row M4-47, site 3 on an M1 session (review of #242).  The relay has
+/// already queued AUTHORIZATION_CONFIRMED, and an M1 connector never sweeps a
+/// stream the relay stops using, so answering only the call would leak one of
+/// its `max_streams` slots per refusal.  M1 keeps the fence: the call fails
+/// `REVERSE_CHANNEL_UNAVAILABLE` and the device's sockets are closed.
+#[tokio::test]
+async fn m4_47_on_m1_a_unary_request_refused_by_backpressure_keeps_the_fence() {
+    let mut fixture = FreezeFixture::new("m4-47-m1-unary-request", false);
+    let (stream_id, _, _, mut receiver) = fixture.admit_unary_echo(UNARY_BODY).await;
+    m4_47_make_m1(&mut fixture);
+    let room = m4_47_saturate_data_lane(&fixture);
+
+    fixture.authorize_unary_echo(stream_id);
+
+    assert!(matches!(
+        receiver.try_recv(),
+        Ok(EchoOutcome::Failure {
+            code: "REVERSE_CHANNEL_UNAVAILABLE",
+            execution: "unknown"
+        })
+    ));
+    let items = drain_data(&mut fixture.old_rx);
+    assert!(
+        items.iter().any(|item| matches!(item, Observed::Close)),
+        "the M1 device's data socket is closed"
+    );
+    assert!(
+        sequenced(&items).is_empty(),
+        "no request DATA, FIN or RESET"
+    );
+    fixture.session().queue_budget.release(room);
+}
+
+/// Task row M4-47, site 3, the full-writer branch (review of #242): the
+/// carrier's bounded channel has fewer than the two free slots the request's
+/// DATA and FIN need, with budget to spare.  The call is refused
+/// `RESOURCE_EXHAUSTED`, `not_dispatched`, neither frame is queued, the
+/// session stays up, and the relay's RESET for the confirmed stream takes the
+/// free slot.
+#[tokio::test]
+async fn m4_47_a_unary_request_refused_by_a_full_writer_is_not_dispatched() {
+    let mut fixture = FreezeFixture::new("m4-47-unary-request-full", false);
+    let (stream_id, _, _, mut receiver) = fixture.admit_unary_echo(UNARY_BODY).await;
+    fixture
+        .actor
+        .sessions
+        .get_mut(&fixture.key.scope())
+        .and_then(|session| session.pending.get_mut(&stream_id))
+        .expect("finite echo is pending")
+        .abandon
+        .admitted = true;
+    let data_tx = fixture
+        .session()
+        .data_tx
+        .clone()
+        .expect("the old carrier is the writer");
+    let mut fillers = 0_usize;
+    // Leave exactly one slot: room for the DATA but not its FIN, the case
+    // a per-frame check would half-send.
+    while data_tx.capacity() > 1 {
+        let (barrier, _) = oneshot::channel();
+        data_tx
+            .try_send(DataOutbound::Barrier(barrier))
+            .expect("a free slot");
+        fillers += 1;
+    }
+    assert!(fillers > 0 && data_tx.capacity() == 1);
+    assert!(!fixture.session().queue_budget.data_exhausted());
+
+    fixture.authorize_unary_echo(stream_id);
+
+    assert!(fixture.session_alive(), "a full writer is backpressure");
+    assert!(matches!(
+        receiver.try_recv(),
+        Ok(EchoOutcome::Failure {
+            code: "RESOURCE_EXHAUSTED",
+            execution: "not_dispatched"
+        })
+    ));
+    let items = drain_data(&mut fixture.old_rx);
+    assert_eq!(
+        items.len(),
+        fillers + 1,
+        "only the relay's RESET joined the fillers, in the one free slot"
+    );
+    assert_eq!(
+        sequenced(&items),
+        vec![(FrameKind::Reset, 1, fixture.attempt.old_generation)],
+        "no request DATA or FIN; the refused call's stream is ended with RESET"
+    );
+}

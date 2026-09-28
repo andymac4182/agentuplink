@@ -10388,15 +10388,6 @@ mod tests {
         assert_eq!(actor.control_queue.budget.current(), 0);
     }
 
-    /// A filesystem stream's authorization refresh must actually be sent.
-    ///
-    /// `refresh_authorizations` selects `FS_STREAM_OPERATION` alongside
-    /// `echo_stream` and `HTTP_FORWARD_OPERATION`, builds the challenge, and
-    /// then re-validates the stream before queueing it.  When that second
-    /// match omitted the filesystem operation the challenge was built and
-    /// silently dropped every tick, so a filesystem session could never renew
-    /// its grant and expired at its admission deadline while it was still in
-    /// use.  This is the regression test for docs/tasks.md row **M4-22**.
     /// Task row M4-55: a filesystem session is not ended at one request's
     /// deadline.  Before the fix `prepare_pending_open` gave an `fs_9p` OPEN
     /// `limits.operation_timeout_ms` (30 s by default) as its operation
@@ -10448,6 +10439,15 @@ mod tests {
         );
     }
 
+    /// A filesystem stream's authorization refresh must actually be sent.
+    ///
+    /// `refresh_authorizations` selects `FS_STREAM_OPERATION` alongside
+    /// `echo_stream` and `HTTP_FORWARD_OPERATION`, builds the challenge, and
+    /// then re-validates the stream before queueing it.  When that second
+    /// match omitted the filesystem operation the challenge was built and
+    /// silently dropped every tick, so a filesystem session could never renew
+    /// its grant and expired at its admission deadline while it was still in
+    /// use.  This is the regression test for docs/tasks.md row **M4-22**.
     #[tokio::test]
     async fn filesystem_stream_authorization_refresh_is_queued() {
         let (mut actor, _active_key, _carrier_receiver, mut control_receiver) =
