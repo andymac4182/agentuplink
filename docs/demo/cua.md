@@ -4,6 +4,43 @@ Status: written for task rows M5-C20 to M5-C28 on 2026-09-26, on branch
 `feat-cua-demo`. It covers a Linux guest only; macOS and Windows guests are
 not built yet (see [What is not covered](#what-is-not-covered)).
 
+## Reuse an already prepared synthetic guest
+
+`scripts/m5-cua-demo-reuse.sh` uses an existing running Tart Linux fixture VM;
+it never clones, stops or deletes that VM. It needs the same ARM64 client built
+with `--features cua`, deadman, host relay, existing probe SSH identity and
+fixture provisioning as the original demo. It starts its own dedicated Redis
+using an existing `redis-server` binary. Do not run it against a personal desktop.
+
+Before setting `CUA_REUSE_APPROVED=1`, approve the specific VM, IP and new guest
+workspace, ephemeral test PKI and loopback listeners. Certificates last one day,
+tokens 15 minutes; keys and bearer headers stay in the run's protected secrets
+directory. The guest workspace must not exist already. Host ports are fixed:
+consumer 18443, device 18444, Redis 16398 and Redis TLS 18445. The temporary SSH
+reverse forward binds guest `127.0.0.1:18444` to host `127.0.0.1:18444` and uses
+the existing login. No system trust, firewall, SSH policy or autostart changes.
+
+```bash
+CUA_REUSE_APPROVED=1 CUA_VM=approved-fixture-vm \
+CUA_GUEST_IP=192.168.64.25 CUA_GUEST_WORKSPACE=/home/cua/cua-demo-reuse \
+TEST_REDIS_URL=redis://127.0.0.1:16398/0 \
+REDIS_BIN=/path/to/existing/redis-server GUEST_BIN_DIR=/path/to/arm64/binaries \
+RELAY_BIN=/path/to/tunnel-relay scripts/m5-cua-demo-reuse.sh /path/to/evidence
+```
+
+The runner first requires HTTP 401 for an unauthenticated request at the exact
+relay route. The consumer calls only the relay's HTTP/2 computer route. It checks fixture
+markers before input, both unleased and post-release refusal, lease acquire and
+release, exact application text/click state, and superseded-capture refusal.
+`--reset-entry` replaces an already populated synthetic Tk entry for repeat runs.
+The runner supervises curl process groups, bounds each guest command to 30
+seconds, and stops host jobs before guest cleanup. It cleans up its own
+processes, forwards and credentials on exit or INT/TERM, retaining the guest
+workspace when cleanup cannot be verified or ownership cannot be established. SIGKILL
+or loss of guest access requires inspecting the task-owned resources before
+reusing that workspace. Offline CI checks do not access a desktop; VM acceptance
+remains a separate local gate, with no rotation, cluster or full-M5 claim.
+
 A consumer on your Mac takes a screenshot of a synthetic app, clicks it and
 types into it. The app runs in a **disposable Linux VM**, and every request
 goes consumer → local `tunnel-relay` → `tunnel-client` in the VM → the pinned

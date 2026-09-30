@@ -36,6 +36,11 @@ jobs:
           persist-credentials: false
       - name: Install Rust 1.95.0
         run: rustup toolchain install 1.95.0 --profile minimal --component rustfmt --component clippy
+      - name: Check CUA reuse tooling without desktop access
+        if: runner.os == 'Linux'
+        run: |
+          bash -n scripts/m5-cua-demo-reuse.sh
+          python3 scripts/test_m5_cua_demo_consumer.py
       - name: Check formatting
         run: cargo +1.95.0 fmt --all -- --check
       - name: Check lints
