@@ -114,6 +114,47 @@ class ConsumerControls(unittest.TestCase):
             finally:
                 Path(consumer.header_file).unlink()
 
+    def test_constructor_failure_removes_header(self):
+        with tempfile.TemporaryDirectory() as root:
+            args = SimpleNamespace(consumer_port=18443, device="synthetic", service="synthetic",
+                                   token="synthetic", token_file=str(Path(root) / "token"))
+            with patch.object(demo.os, "fdopen", side_effect=RuntimeError("synthetic header failure")):
+                with self.assertRaises(RuntimeError):
+                    demo.Consumer(args)
+            self.assertEqual(list(Path(root).glob("m5-cua-demo-auth.*")), [])
+
+    @unittest.skipIf(os.name == "nt", "POSIX process groups")
+    def test_bounded_child_timeout_kills_descendants(self):
+        with tempfile.TemporaryDirectory() as root:
+            marker = Path(root) / "child"
+            code = "import subprocess,time,sys; p=subprocess.Popen([sys.executable,'-c','import time;time.sleep(30)']);open(sys.argv[1],'w').write(str(p.pid));time.sleep(30)"
+            with self.assertRaises(subprocess.TimeoutExpired):
+                demo.supervised([sys.executable, "-c", code, str(marker)], timeout=.5)
+            pid = int(marker.read_text())
+            status = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True)
+            self.assertTrue(not status.stdout.strip() or status.stdout.strip().startswith("Z"))
+
+    @unittest.skipIf(os.name == "nt", "POSIX process groups")
+    def test_inflight_child_is_joined_on_both_signals(self):
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            with self.subTest(signum=signum), tempfile.TemporaryDirectory() as root:
+                marker = Path(root) / "child"
+                code = "import importlib.util,sys,signal;spec=importlib.util.spec_from_file_location('demo',sys.argv[1]);demo=importlib.util.module_from_spec(spec);spec.loader.exec_module(demo);demo.cmd_bounded(type('Args',(),{'timeout':30,'argv':[sys.executable,'-c',\"import os,time,sys;open(sys.argv[1],'w').write(str(os.getpid()));time.sleep(30)\",sys.argv[2]]})())"
+                child = subprocess.Popen([sys.executable, "-c", code, demo.__file__, str(marker)])
+                try:
+                    import time
+                    deadline = time.monotonic() + 5
+                    while not marker.exists() and time.monotonic() < deadline:
+                        time.sleep(.02)
+                    pid = int(marker.read_text())
+                    child.send_signal(signum)
+                    self.assertEqual(child.wait(timeout=5), 128 + signum)
+                    status = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True)
+                    self.assertFalse(status.stdout.strip())
+                finally:
+                    if child.poll() is None:
+                        child.kill(); child.wait()
+
     @unittest.skipIf(os.name == "nt", "POSIX signal control")
     def test_sigterm_releases_lease_and_removes_header(self):
         self.check_signal(signal.SIGTERM)

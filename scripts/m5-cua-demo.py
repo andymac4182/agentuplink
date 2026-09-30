@@ -187,6 +187,60 @@ def markers_match(found: dict, state: dict) -> bool:
     return all(found[key] == value for key, value in expected.items())
 
 
+def supervised(command, *, timeout, input=None, capture_output=False):
+    """Bound and join a fresh child process group, including on INT/TERM."""
+    proc = None
+    blocked = {signal.SIGINT, signal.SIGTERM}
+    mask = signal.pthread_sigmask(signal.SIG_BLOCK, blocked)
+    try:
+        proc = subprocess.Popen(command, start_new_session=True,
+                                stdin=subprocess.PIPE if input is not None else None,
+                                stdout=subprocess.PIPE if capture_output else None,
+                                stderr=subprocess.PIPE if capture_output else None,
+                                text=True)
+    finally:
+        # Assignment precedes signal delivery, including a signal during Popen.
+        try:
+            signal.pthread_sigmask(signal.SIG_SETMASK, mask)
+        except BaseException:
+            if proc is not None:
+                stop_process_group(proc)
+            raise
+    try:
+        stdout, stderr = proc.communicate(input, timeout=timeout)
+        return subprocess.CompletedProcess(command, proc.returncode, stdout, stderr)
+    finally:
+        stop_process_group(proc)
+
+
+def stop_process_group(proc):
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    try:
+        proc.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        pass
+    # The leader may have exited while a descendant still owns the group.
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    proc.wait(timeout=2)
+
+
+def cmd_bounded(args):
+    def terminate(signum, _frame):
+        raise SystemExit(128 + signum)
+    signal.signal(signal.SIGTERM, terminate)
+    signal.signal(signal.SIGINT, terminate)
+    try:
+        return supervised(args.argv, timeout=args.timeout).returncode
+    except subprocess.TimeoutExpired:
+        return 124
+
+
 class Consumer:
     def __init__(self, args):
         self.args = args
@@ -199,21 +253,29 @@ class Consumer:
         import tempfile
         handle, self.header_file = tempfile.mkstemp(prefix="m5-cua-demo-auth.",
                                                dir=os.path.dirname(os.path.abspath(args.token_file)))
-        with os.fdopen(handle, "w") as header:
-            header.write(f"authorization: Bearer {args.token}\n")
+        try:
+            with os.fdopen(handle, "w") as header:
+                header.write(f"authorization: Bearer {args.token}\n")
+        except BaseException:
+            try:
+                os.close(handle)
+            except OSError:
+                pass
+            os.unlink(self.header_file)
+            raise
 
     def call(self, operation: str, params: dict | None = None) -> dict:
         body = json.dumps({"version": "computer.v1", "operation": operation,
                            "params": params or {}})
         started = time.monotonic()
-        proc = subprocess.run(
+        proc = supervised(
             # curl's stock `accept: */*` is sent on purpose: the relay drops
             # it for computer-v1, which does not allowlist it (M5-C26).
             ["curl", "-sS", "--http2", "--max-time", "60", "--cacert", self.args.ca,
              "-H", f"@{self.header_file}",
              "-H", "content-type: application/json",
              "-w", "\n%{http_code} %{http_version}", "--data-binary", "@-", self.url],
-            input=body, capture_output=True, text=True,
+            input=body, capture_output=True, timeout=65,
         )
         elapsed = round((time.monotonic() - started) * 1000)
         text, _, trailer = proc.stdout.rpartition("\n")
@@ -377,6 +439,10 @@ def consumer_flow(args, consumer) -> int:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command", required=True)
+    p = sub.add_parser("run-bounded")
+    p.add_argument("--timeout", type=float, required=True)
+    p.add_argument("argv", nargs=argparse.REMAINDER)
+    p.set_defaults(fn=cmd_bounded)
     p = sub.add_parser("jwks"); p.add_argument("key"); p.add_argument("out"); p.set_defaults(fn=cmd_jwks)
     p = sub.add_parser("token")
     for name in ("key", "issuer", "audience", "subject"):

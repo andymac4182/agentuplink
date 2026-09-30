@@ -78,8 +78,8 @@ on_exit() {
   local code=$? i cleanup_failed=0
   trap - EXIT
   trap '' INT TERM
+  stop_host_jobs || cleanup_failed=1
   for ((i = ${#CLEANUP[@]} - 1; i >= 0; i--)); do
-    if [ "${i}" = 0 ]; then stop_host_jobs || cleanup_failed=1; fi
     ( eval "${CLEANUP[i]}" ) || { log "cleanup step ${i} failed; inspect task-owned resources"; cleanup_failed=1; }
   done
   [ "${cleanup_failed}" = 0 ] || code=1
@@ -107,10 +107,20 @@ fi
 [ -x "${RELAY_BIN}" ] || die "no tunnel-relay at ${RELAY_BIN}"
 
 # ---- reuse the existing approved guest; no VM lifecycle mutations ---------
-GUEST_IP="$("${TART}" ip "${VM}")"
+GUEST_IP="$(python3 "${TOOLS}" run-bounded --timeout 30 "${TART}" ip "${VM}")"
 [ "${GUEST_IP}" = "${EXPECTED_GUEST_IP}" ] || die "guest address changed: ${GUEST_IP}"
-gexec() { "${TART}" exec "${VM}" "$@"; }
-gexec_in() { "${TART}" exec -i "${VM}" "$@"; }
+gexec() {
+  local pid
+  python3 "${TOOLS}" run-bounded --timeout 30 "${TART}" exec "${VM}" "$@" <&0 &
+  pid=$!
+  wait "$pid"
+}
+gexec_in() {
+  local pid
+  python3 "${TOOLS}" run-bounded --timeout 30 "${TART}" exec -i "${VM}" "$@" <&0 &
+  pid=$!
+  wait "$pid"
+}
 stop_guest() {
   # Run explicit probes in one guest shell. Never interpret an SSH/Tart error
   # as an empty process list, and never remove a workspace after a failed probe.
@@ -197,10 +207,10 @@ python3 "${TOOLS}" jwks "${S}/issuer-key.pem" "${S}/jwks.json"
 
 # ---- Redis TLS terminator ----------------------------------------------------
 python3 "${TOOLS}" tls-forward "${S}/relay-chain.pem" "${S}/relay-key.pem" "${REDIS_HOSTPORT}" "${S}/redis-tls.port" --bind-port 18445 &
-CLEANUP+=("kill $! 2>/dev/null")
+CLEANUP+=("kill $! 2>/dev/null || true")
 for _ in $(seq 1 50); do [ -s "${S}/redis-tls.port" ] && break; sleep 0.1; done
 REDIS_TLS_PORT="$(cat "${S}/redis-tls.port")"
-CLEANUP+=("python3 $(printf %q "${TOOLS}") redis-clean $(printf %q "${REDIS_HOSTPORT}") ${REDIS_DB} $(printf %q "${NAMESPACE}") >&2")
+CLEANUP+=("if kill -0 ${REDIS_PID} 2>/dev/null; then python3 $(printf %q "${TOOLS}") redis-clean $(printf %q "${REDIS_HOSTPORT}") ${REDIS_DB} $(printf %q "${NAMESPACE}") >&2; fi")
 
 # ---- relay configuration -------------------------------------------------------
 free_port() { python3 -c 'import socket,sys; s=socket.socket(); s.bind((sys.argv[1], 0)); print(s.getsockname()[1]); s.close()' "$1"; }
@@ -234,13 +244,17 @@ EOF
 
 # ---- the device (guest): binaries, relay name, key, CSR ---------------------
 log "installing the device binaries and the backend wrapper in the guest"
-gexec sudo -u cua mkdir -m 700 "${GD}"
+# Refuse an existing workspace before registering cleanup. The guest operation
+# creates an ownership marker atomically with mkdir; cleanup never deletes an
+# unmarked directory, including when creation was interrupted or refused.
 # Only this new task directory is owned by this run. Cleanup leaves task10 intact.
 cleanup_guest_runtime() {
+  gexec sudo -u cua test -f "${GD}/.run-${NONCE}" || return 1
   stop_guest || return 1
   gexec sudo -u cua rm -rf -- "${GD}"
 }
 CLEANUP+=("cleanup_guest_runtime")
+gexec sudo -u cua bash -c "mkdir -m 700 '${GD}' && touch '${GD}/.run-${NONCE}'"
 COPYFILE_DISABLE=1 tar -C "${GUEST_BIN_DIR}" -cf - tunnel-client tunnel-deadman \
   | gexec_in sudo -u cua tar -C "${GD}" -xf -
 # Record the supervisor's process group before any native child can start.
@@ -303,7 +317,7 @@ cp "${RECORDS}" "${S}/catalog.toml"
 ( cd "${S}" && "${RELAY_BIN}" provision-catalog --config "${WORK}/relay.toml" --records catalog.toml ) >&2
 RUST_LOG=warn "${RELAY_BIN}" serve --config "${WORK}/relay.toml" 2>"${WORK}/relay.log" &
 RELAY_PID=$!
-CLEANUP+=("kill ${RELAY_PID} 2>/dev/null; sleep 1")
+CLEANUP+=("kill ${RELAY_PID} 2>/dev/null || true")
 for _ in $(seq 1 100); do grep -q "tunnel-relay listening" "${WORK}/relay.log" && break; kill -0 "${RELAY_PID}" || die "relay exited: $(tail -5 "${WORK}/relay.log")"; sleep 0.2; done
 grep -q "tunnel-relay listening" "${WORK}/relay.log" || die "relay never listened"
 
@@ -318,7 +332,7 @@ ssh -i "${SSH_STATE}/id_ed25519" -o StrictHostKeyChecking=yes -o UserKnownHostsF
     -o ExitOnForwardFailure=yes -o ServerAliveInterval=15 -N \
     -R "127.0.0.1:${GUEST_PORT}:127.0.0.1:${DEVICE_PORT}" "admin@${GUEST_IP}" &
 SSH_PID=$!
-CLEANUP+=("kill ${SSH_PID} 2>/dev/null")
+CLEANUP+=("kill ${SSH_PID} 2>/dev/null || true")
 # The guest-side ownership gate: the forwarded port's only listener is sshd.
 owner=""
 for _ in $(seq 1 40); do
@@ -348,7 +362,7 @@ log "device session ready"
 # Negative control at the exact relay route: the native backend has no
 # consumer JWT policy. Refuse to accept pixels through an unauthenticated route.
 ROUTE="https://127.0.0.1:${CONSUMER_PORT}/v1/devices/${DEVICE}/services/${SERVICE}/http/computer"
-unauthenticated_status=$(curl -sS --http2 --max-time 10 --cacert "${S}/server-ca.pem" \
+unauthenticated_status=$(python3 "${TOOLS}" run-bounded --timeout 15 curl -sS --http2 --max-time 10 --cacert "${S}/server-ca.pem" \
   -H 'content-type: application/json' --data '{"version":"computer.v1","operation":"describe","params":{}}' \
   -o /dev/null -w '%{http_code}' "${ROUTE}")
 [ "${unauthenticated_status}" = 401 ] || die "relay route accepted an unauthenticated request: ${unauthenticated_status}"
