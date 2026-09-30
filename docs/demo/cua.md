@@ -28,7 +28,8 @@ REDIS_BIN=/path/to/existing/redis-server GUEST_BIN_DIR=/path/to/arm64/binaries \
 RELAY_BIN=/path/to/tunnel-relay scripts/m5-cua-demo-reuse.sh /path/to/evidence
 ```
 
-The consumer calls only the relay's HTTP/2 computer route. It checks fixture
+The runner first requires HTTP 401 for an unauthenticated request at the exact
+relay route. The consumer calls only the relay's HTTP/2 computer route. It checks fixture
 markers before input, both unleased and post-release refusal, lease acquire and
 release, exact application text/click state, and superseded-capture refusal.
 `--reset-entry` replaces an already populated synthetic Tk entry for repeat runs.
