@@ -22,6 +22,7 @@ import hashlib
 import json
 import os
 import socket
+import signal
 import ssl
 import struct
 import subprocess
@@ -86,7 +87,7 @@ def cmd_tls_forward(args) -> int:
         await asyncio.gather(pump(client_reader, up_writer), pump(up_reader, client_writer))
 
     async def main():
-        server = await asyncio.start_server(serve_one, "127.0.0.1", 0, ssl=context)
+        server = await asyncio.start_server(serve_one, "127.0.0.1", args.bind_port, ssl=context)
         bound = server.sockets[0].getsockname()[1]
         with open(args.portfile + ".tmp", "w") as handle:
             handle.write(str(bound))
@@ -192,10 +193,12 @@ class Consumer:
         self.url = (f"https://127.0.0.1:{args.consumer_port}/v1/devices/{args.device}"
                     f"/services/{args.service}/http/computer")
         self.log = []
+        self.lease_held = False
         # The bearer token goes in a 0600 header file, never on a command
         # line where `ps` would show it.
         import tempfile
-        handle, self.header_file = tempfile.mkstemp(prefix="m5-cua-demo-auth.")
+        handle, self.header_file = tempfile.mkstemp(prefix="m5-cua-demo-auth.",
+                                               dir=os.path.dirname(os.path.abspath(args.token_file)))
         with os.fdopen(handle, "w") as header:
             header.write(f"authorization: Bearer {args.token}\n")
 
@@ -234,6 +237,10 @@ class Consumer:
             answer["_png"] = png
         elif result is not None:
             record["result"] = result
+        if operation == "acquire_input_lease" and answer.get("outcome") == "answered_locally":
+            self.lease_held = (answer.get("result") or {}).get("held") is True
+        elif operation == "release_input_lease" and answer.get("outcome") == "answered_locally":
+            self.lease_held = False
         self.log.append(record)
         print(f"consumer {operation}: http={status} {version} outcome={answer.get('outcome')} "
               f"code={(answer.get('error') or {}).get('code')} ms={elapsed}", file=sys.stderr)
@@ -241,10 +248,35 @@ class Consumer:
 
 
 def cmd_consumer(args) -> int:
-    state = json.load(open(args.state))
     with open(args.token_file) as handle:
         args.token = handle.read().strip()
     consumer = Consumer(args)
+    previous_term = signal.getsignal(signal.SIGTERM)
+
+    def terminate(signum, _frame):
+        raise SystemExit(128 + signum)
+
+    signal.signal(signal.SIGTERM, terminate)
+    try:
+        return consumer_flow(args, consumer)
+    finally:
+        try:
+            if consumer.lease_held:
+                consumer.call("release_input_lease")
+        finally:
+            signal.signal(signal.SIGTERM, previous_term)
+            if os.path.exists(consumer.header_file):
+                os.unlink(consumer.header_file)
+            if getattr(args, "out", None):
+                evidence = os.path.join(args.out, "consumer.json")
+                if not os.path.exists(evidence):
+                    os.makedirs(args.out, exist_ok=True)
+                    with open(evidence, "w") as handle:
+                        json.dump({"aborted": True, "calls": consumer.log}, handle, indent=2)
+
+def consumer_flow(args, consumer) -> int:
+    with open(args.state) as handle:
+        state = json.load(handle)
     out = args.out
     os.makedirs(out, exist_ok=True)
 
@@ -254,8 +286,8 @@ def cmd_consumer(args) -> int:
     capture = consumer.call("capture")
     if capture.get("outcome") != "ok":
         print("consumer: capture failed; no input will be sent", file=sys.stderr)
-        json.dump({"markers_match_fixture": False, "calls": consumer.log},
-                  open(os.path.join(out, "consumer.json"), "w"), indent=2)
+        with open(os.path.join(out, "consumer.json"), "w") as handle:
+            json.dump({"markers_match_fixture": False, "calls": consumer.log}, handle, indent=2)
         return 3
     png = capture.pop("_png")
     found = markers(png, state)
@@ -265,17 +297,37 @@ def cmd_consumer(args) -> int:
     if not markers_match(found, state):
         print(f"consumer: frame is not the fixture ({found}); no input will be sent",
               file=sys.stderr)
-        json.dump({"markers": found, "calls": consumer.log}, open(os.path.join(out, "consumer.json"), "w"), indent=2)
+        with open(os.path.join(out, "consumer.json"), "w") as handle:
+            json.dump({"markers": found, "calls": consumer.log}, handle, indent=2)
         return 3
     identity = capture["result"]["capture"]
 
     unleased = consumer.call("click", {"capture": identity, "x": 1, "y": 1})
+    if (unleased.get("error") or {}).get("code") != "lease_not_held":
+        return 4
     lease = consumer.call("acquire_input_lease")
+    if lease.get("outcome") != "answered_locally":
+        return 4
     entry, button = state["entry"], state["button"]
     focus = consumer.call("click", {"capture": identity,
                                     "x": entry["x"] + entry["width"] // 2,
                                     "y": entry["y"] + entry["height"] // 2})
+    if getattr(args, "reset_entry", False):
+        if lease.get("outcome") != "answered_locally" or focus.get("outcome") != "ok":
+            consumer.call("release_input_lease")
+            return 4
+        # Tk Entry on Linux binds Ctrl+A to beginning-of-line, not select-all.
+        home = consumer.call("press_key", {"key": "home"})
+        if home.get("outcome") != "ok":
+            return 4
+        selected = consumer.call("hotkey", {"keys": ["shift", "end"]})
+        cleared = consumer.call("press_key", {"key": "backspace"})
+        if selected.get("outcome") != "ok" or cleared.get("outcome") != "ok":
+            consumer.call("release_input_lease")
+            return 4
     typed = consumer.call("type_text", {"text": args.text})
+    if typed.get("outcome") != "ok":
+        return 4
     clicked = consumer.call("click", {"capture": identity,
                                       "x": button["x"] + button["width"] // 2,
                                       "y": button["y"] + button["height"] // 2})
@@ -285,6 +337,8 @@ def cmd_consumer(args) -> int:
     stale = consumer.call("click", {"capture": identity,
                                     "x": button["x"] + 5, "y": button["y"] + 5})
     released = consumer.call("release_input_lease")
+    post_release = consumer.call("click", {"capture": fresh.get("result", {}).get("capture"),
+                                           "x": button["x"] + 5, "y": button["y"] + 5})
     summary = {
         "markers": found,
         "markers_match_fixture": True,
@@ -299,14 +353,18 @@ def cmd_consumer(args) -> int:
         "button_click": clicked.get("outcome"),
         "stale_click": (stale.get("error") or {}).get("code"),
         "release": released.get("outcome"),
+        "post_release_click": (post_release.get("error") or {}).get("code"),
         "fresh_capture": fresh.get("outcome"),
         "calls": consumer.log,
     }
     with open(os.path.join(out, "consumer.json"), "w") as handle:
         json.dump(summary, handle, indent=2, sort_keys=True)
-    os.unlink(consumer.header_file)
     ok = (clicked.get("outcome") == "ok" and typed.get("outcome") == "ok"
-          and focus.get("outcome") == "ok")
+          and focus.get("outcome") == "ok" and lease.get("outcome") == "answered_locally"
+          and released.get("outcome") == "answered_locally" and fresh.get("outcome") == "ok"
+          and summary["unleased_click"] == "lease_not_held"
+          and summary["stale_click"] == "capture_superseded"
+          and summary["post_release_click"] == "lease_not_held")
     return 0 if ok else 4
 
 
@@ -321,6 +379,7 @@ def main() -> int:
     p = sub.add_parser("tls-forward")
     for name in ("chain", "key", "upstream", "portfile"):
         p.add_argument(name)
+    p.add_argument("--bind-port", type=int, default=0)
     p.set_defaults(fn=cmd_tls_forward)
     p = sub.add_parser("redis-clean")
     p.add_argument("address"); p.add_argument("db", type=int); p.add_argument("namespace")
@@ -328,6 +387,7 @@ def main() -> int:
     p = sub.add_parser("consumer")
     for name in ("--consumer-port", "--device", "--service", "--ca", "--token-file", "--state", "--out", "--text"):
         p.add_argument(name, required=True)
+    p.add_argument("--reset-entry", action="store_true")
     p.set_defaults(fn=cmd_consumer)
     args = parser.parse_args()
     return args.fn(args)
