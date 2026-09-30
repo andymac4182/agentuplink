@@ -251,18 +251,26 @@ class Consumer:
         # The bearer token goes in a 0600 header file, never on a command
         # line where `ps` would show it.
         import tempfile
-        handle, self.header_file = tempfile.mkstemp(prefix="m5-cua-demo-auth.",
-                                               dir=os.path.dirname(os.path.abspath(args.token_file)))
+        mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT, signal.SIGTERM})
+        handle = None
+        self.header_file = None
         try:
+            handle, self.header_file = tempfile.mkstemp(prefix="m5-cua-demo-auth.",
+                                                       dir=os.path.dirname(os.path.abspath(args.token_file)))
+            signal.pthread_sigmask(signal.SIG_SETMASK, mask)
             with os.fdopen(handle, "w") as header:
                 header.write(f"authorization: Bearer {args.token}\n")
         except BaseException:
-            try:
-                os.close(handle)
-            except OSError:
-                pass
-            os.unlink(self.header_file)
+            if handle is not None:
+                try:
+                    os.close(handle)
+                except OSError:
+                    pass
+            if self.header_file is not None:
+                os.unlink(self.header_file)
             raise
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK, mask)
 
     def call(self, operation: str, params: dict | None = None) -> dict:
         body = json.dumps({"version": "computer.v1", "operation": operation,
