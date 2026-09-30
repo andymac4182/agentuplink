@@ -62,7 +62,16 @@ stop_host_jobs() {
   done
   for pid in $(jobs -pr); do kill -KILL "${pid}" 2>/dev/null || true; done
   for pid in $(jobs -p); do wait "${pid}" 2>/dev/null || true; done
-  [ -z "$(jobs -pr)" ]
+  [ -z "$(jobs -pr)" ] || return 1
+  local listeners
+  for port in 18443 18444 16398 18445; do
+    listeners=$(lsof -nP -iTCP:"$port" -sTCP:LISTEN -t 2>/dev/null); status=$?
+    [ "$status" -le 1 ] && [ -z "$listeners" ] || return 1
+  done
+  if [ -n "${SSH_PID:-}" ]; then
+    listeners=$(gexec ss -Hltn "sport = :18444") || return 1
+    [ -z "$listeners" ] || return 1
+  fi
 }
 
 on_exit() {
@@ -77,8 +86,16 @@ on_exit() {
   exit "${code}"
 }
 trap on_exit EXIT
-trap 'exit 130' INT
-trap 'exit 143' TERM
+interrupt() {
+  local code=$1
+  if [ -n "${CONSUMER_PID:-}" ]; then
+    kill -TERM "${CONSUMER_PID}" 2>/dev/null || true
+    wait "${CONSUMER_PID}" 2>/dev/null || true
+  fi
+  exit "$code"
+}
+trap 'interrupt 130' INT
+trap 'interrupt 143' TERM
 CLEANUP+=("rm -rf $(printf %q "${WORK}/secrets") $(printf %q "${WORK}/redis"); rm -f $(printf %q "${WORK}/fixture-state-before.json")")
 
 # ---- host binaries ---------------------------------------------------------
@@ -95,20 +112,53 @@ GUEST_IP="$("${TART}" ip "${VM}")"
 gexec() { "${TART}" exec "${VM}" "$@"; }
 gexec_in() { "${TART}" exec -i "${VM}" "$@"; }
 stop_guest() {
-  local pid port
-  pid="$(gexec sudo -u cua cat "${GD}/client.pid")"
-  [[ "${pid}" =~ ^[0-9]+$ ]] || return 1
-  gexec sudo -u cua bash -c "if kill -0 ${pid} 2>/dev/null; then [ \"\$(ps -o pgid= -p ${pid} | tr -d ' ')\" = ${pid} ] && kill -TERM -- -${pid}; fi"
-  sleep 2
-  if gexec sudo -u cua pgrep -f "${GD}/(tunnel-client|tunnel-deadman|cua-backend-supervised)" >/dev/null; then
-    log "guest processes remain; preserve runtime directory for inspection"
-    return 1
+  # Run explicit probes in one guest shell. Never interpret an SSH/Tart error
+  # as an empty process list, and never remove a workspace after a failed probe.
+  gexec_in sudo -u cua bash -s -- "${GD}" <<'GUEST_CLEANUP'
+set -u
+root=$1
+pattern="${root}/([t]unnel-client|[t]unnel-deadman|[c]ua-backend-supervised)"
+if [ -f "${root}/client.pid" ]; then
+  pid=$(cat "${root}/client.pid") || exit 1
+  [[ "$pid" =~ ^[0-9]+$ ]] || exit 1
+  if kill -0 "$pid" 2>/dev/null; then
+    group=$(ps -o pgid= -p "$pid") || exit 1
+    [ "${group// /}" = "$pid" ] || exit 1
+    kill -TERM -- "-$pid" || exit 1
   fi
-  if port="$(gexec sudo -u cua cat "${GD}/workspace/backend.address" 2>/dev/null)"; then
-    port="${port##*:}"
-    [ -z "$(gexec ss -Hltn "sport = :${port}")" ] || { log "backend listener remains on ${port}"; return 1; }
-  fi
+fi
+# Covers an interruption before the launcher writes its atomic PID marker.
+remaining=$(pgrep -f "$pattern"); status=$?
+[ "$status" -le 1 ] || exit 1
+for pid in $remaining; do
+  group=$(ps -o pgid= -p "$pid") || exit 1
+  group=${group// /}
+  [[ "$group" =~ ^[0-9]+$ ]] && [ "$group" != "$(ps -o pgid= -p $$ | tr -d ' ')" ] || exit 1
+  kill -TERM -- "-$group" || exit 1
+done
+if [ -f "${root}/workspace/backend.address.group" ]; then
+  group=$(cat "${root}/workspace/backend.address.group") || exit 1
+  group=${group// /}
+  [[ "$group" =~ ^[0-9]+$ ]] || exit 1
+  if kill -0 -- "-$group" 2>/dev/null; then kill -TERM -- "-$group" || exit 1; fi
+fi
+sleep 2
+if [ -n "${group:-}" ]; then
+  processes=$(ps -eo pgid=,stat=) || exit 1
+  if printf '%s\n' "$processes" | awk -v group="$group" '$1 == group && $2 !~ /^Z/ {found=1} END {exit !found}'; then exit 1; fi
+fi
+remaining=$(pgrep -f "$pattern"); status=$?
+[ "$status" = 1 ] && [ -z "$remaining" ] || exit 1
+if [ -f "${root}/workspace/backend.address" ]; then
+  address=$(cat "${root}/workspace/backend.address") || exit 1
+  [[ "$address" =~ ^127\.0\.0\.1:([0-9]+)$ ]] || exit 1
+  port=${BASH_REMATCH[1]}
+  listeners=$(ss -Hltn "sport = :${port}") || exit 1
+  [ -z "$listeners" ] || exit 1
+fi
+GUEST_CLEANUP
 }
+
 gexec sudo bash /opt/cua-fixture/guest-manifest.sh >"${OUT}/manifest.json"
 gexec cat /tmp/cua-fixture/state.json >"${WORK}/fixture-state-before.json"
 # Reserve fixed approval endpoints by checking; actual binds must fail on collision.
@@ -187,13 +237,20 @@ log "installing the device binaries and the backend wrapper in the guest"
 gexec sudo -u cua mkdir -m 700 "${GD}"
 # Only this new task directory is owned by this run. Cleanup leaves task10 intact.
 cleanup_guest_runtime() {
-  if gexec sudo -u cua test -f "${GD}/client.pid"; then stop_guest || return 1; fi
+  stop_guest || return 1
   gexec sudo -u cua rm -rf -- "${GD}"
 }
 CLEANUP+=("cleanup_guest_runtime")
 COPYFILE_DISABLE=1 tar -C "${GUEST_BIN_DIR}" -cf - tunnel-client tunnel-deadman \
   | gexec_in sudo -u cua tar -C "${GD}" -xf -
-gexec_in sudo -u cua tee "${GD}/cua-backend-supervised.sh" >/dev/null <"${ROOT}/tests/cua-fixture/cua-backend-supervised.sh"
+# Record the supervisor's process group before any native child can start.
+python3 - "${ROOT}/tests/cua-fixture/cua-backend-supervised.sh" <<'WRAPPER' | gexec_in sudo -u cua tee "${GD}/cua-backend-supervised.sh" >/dev/null
+import sys
+source = open(sys.argv[1]).read()
+source = source.replace('/usr/local/bin/cua-server-start "${backend}" "${port}" &',
+                        'ps -o pgid= -p $$ >"${address_file}.group"\n/usr/local/bin/cua-server-start "${backend}" "${port}" &')
+sys.stdout.write(source)
+WRAPPER
 gexec sudo -u cua chmod 0755 "${GD}/cua-backend-supervised.sh"
 GUEST_PORT=18444
 gexec python3 -c 'import socket; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1); s.bind(("127.0.0.1",18444)); s.close()'
@@ -277,9 +334,9 @@ binding="$(printf '%s\n' "${forward_state}" | awk '{print $4}')"
 log "guest 127.0.0.1:${GUEST_PORT} forwards to the relay's device listener over SSH"
 
 # ---- connect the device (guest), opted in to Lane B ----------------------------
-gexec sudo -u cua bash -c "setsid env AGENT_TUNNEL_CUA_LANE_B=1 TUNNEL_DEADMAN_BIN=${GD}/tunnel-deadman ${GD}/tunnel-client connect --config ${GD}/client.toml --json >${GD}/connect.log 2>&1 </dev/null & echo \$! >${GD}/client.pid"
-# Signal only the process group started by this run, never broad pkill.
+# Install cleanup before launch; publish the group identity before exec.
 CLEANUP+=("stop_guest")
+gexec sudo -u cua bash -c "setsid bash -c 'echo \$\$ >${GD}/client.pid.tmp; mv ${GD}/client.pid.tmp ${GD}/client.pid; exec env AGENT_TUNNEL_CUA_LANE_B=1 TUNNEL_DEADMAN_BIN=${GD}/tunnel-deadman ${GD}/tunnel-client connect --config ${GD}/client.toml --json' >${GD}/connect.log 2>&1 </dev/null &"
 for _ in $(seq 1 100); do
   gexec sudo -u cua grep -q '"ready"' "${GD}/connect.log" 2>/dev/null && break
   sleep 0.3
@@ -293,21 +350,24 @@ chmod 600 "${S}/token"
 gexec cat /tmp/cua-fixture/state.json >"${S}/state.json"
 set +e
 python3 "${TOOLS}" consumer --consumer-port "${CONSUMER_PORT}" --device "${DEVICE}" --service "${SERVICE}" \
-  --ca "${S}/server-ca.pem" --token-file "${S}/token" --state "${S}/state.json" --out "${OUT}" --text "${DEMO_TEXT}" --reset-entry
+  --ca "${S}/server-ca.pem" --token-file "${S}/token" --state "${S}/state.json" --out "${OUT}" --text "${DEMO_TEXT}" --reset-entry &
+CONSUMER_PID=$!
+wait "${CONSUMER_PID}"
 consumer_exit=$?
+CONSUMER_PID=""
 set -e
 gexec sudo -u cua cat "${GD}/workspace/backend.address" >"${OUT}/backend.address"
 sleep 1
-gexec cat /tmp/cua-fixture/state.json >"${OUT}/fixture-state-after.json"
+gexec cat /tmp/cua-fixture/state.json >"${S}/state-after.json"
 gexec sudo -u cua cat "${GD}/connect.log" | grep -v '^\s*$' >"${OUT}/connect.log" || true
 grep -v 'token\|Bearer' "${WORK}/relay.log" >"${OUT}/relay.log" || true
 
 # ---- the verdict, from the application's own state file --------------------------
-python3 - "${OUT}" "${DEMO_TEXT}" "${consumer_exit}" "${WORK}/fixture-state-before.json" <<'EOF'
+python3 - "${OUT}" "${DEMO_TEXT}" "${consumer_exit}" "${WORK}/fixture-state-before.json" "${S}/state-after.json" <<'EOF'
 import json, sys
 out, text, consumer_exit = sys.argv[1], sys.argv[2], int(sys.argv[3])
 before = json.load(open(sys.argv[4]))
-after = json.load(open(f"{out}/fixture-state-after.json"))
+after = json.load(open(sys.argv[5]))
 consumer = json.load(open(f"{out}/consumer.json"))
 verdict = {
     "consumer_exit": consumer_exit,

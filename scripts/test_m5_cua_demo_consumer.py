@@ -47,7 +47,10 @@ class ConsumerControls(unittest.TestCase):
             state.write_text(json.dumps({"entry": {"x": 100, "y": 100, "width": 400, "height": 32}, "button": {"x": 100, "y": 160, "width": 160, "height": 40}}))
             args = SimpleNamespace(state=str(state), out=root, text="synthetic", reset_entry=True)
             with patch.object(demo, "markers", return_value={}), patch.object(demo, "markers_match", return_value=marker_ok):
-                return demo.consumer_flow(args, consumer)
+                result = demo.consumer_flow(args, consumer)
+                if not marker_ok:
+                    self.assertFalse((Path(root) / "screenshot-tunnel.png").exists())
+                return result
 
     def test_repeat_flow_clears_entry_after_lease_and_focus(self):
         consumer = FakeConsumer()
@@ -81,6 +84,8 @@ class ConsumerControls(unittest.TestCase):
         consumer = FakeConsumer({"hotkey": {"outcome": "unknown"}})
         self.assertEqual(self.run_flow(consumer), 4)
         self.assertNotIn("type_text", [call["operation"] for call in consumer.log])
+
+        self.assertNotIn({"key": "backspace"}, [call["params"] for call in consumer.log])
 
     def test_exception_releases_lease_and_deletes_header(self):
         with tempfile.TemporaryDirectory() as root:

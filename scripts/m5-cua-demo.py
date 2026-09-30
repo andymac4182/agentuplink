@@ -250,24 +250,25 @@ class Consumer:
 def cmd_consumer(args) -> int:
     with open(args.token_file) as handle:
         args.token = handle.read().strip()
-    consumer = Consumer(args)
     previous_term = signal.getsignal(signal.SIGTERM)
 
     def terminate(signum, _frame):
         raise SystemExit(128 + signum)
 
     signal.signal(signal.SIGTERM, terminate)
+    consumer = None
     try:
+        consumer = Consumer(args)
         return consumer_flow(args, consumer)
     finally:
         try:
-            if consumer.lease_held:
+            if consumer is not None and consumer.lease_held:
                 consumer.call("release_input_lease")
         finally:
             signal.signal(signal.SIGTERM, previous_term)
-            if os.path.exists(consumer.header_file):
+            if consumer is not None and os.path.exists(consumer.header_file):
                 os.unlink(consumer.header_file)
-            if getattr(args, "out", None):
+            if consumer is not None and getattr(args, "out", None):
                 evidence = os.path.join(args.out, "consumer.json")
                 if not os.path.exists(evidence):
                     os.makedirs(args.out, exist_ok=True)
@@ -291,8 +292,6 @@ def consumer_flow(args, consumer) -> int:
         return 3
     png = capture.pop("_png")
     found = markers(png, state)
-    with open(os.path.join(out, "screenshot-tunnel.png"), "wb") as handle:
-        handle.write(png)
     # The fixture-marker gate: no input unless the frame is the fixture's.
     if not markers_match(found, state):
         print(f"consumer: frame is not the fixture ({found}); no input will be sent",
@@ -300,6 +299,8 @@ def consumer_flow(args, consumer) -> int:
         with open(os.path.join(out, "consumer.json"), "w") as handle:
             json.dump({"markers": found, "calls": consumer.log}, handle, indent=2)
         return 3
+    with open(os.path.join(out, "screenshot-tunnel.png"), "wb") as handle:
+        handle.write(png)
     identity = capture["result"]["capture"]
 
     unleased = consumer.call("click", {"capture": identity, "x": 1, "y": 1})
@@ -321,8 +322,10 @@ def consumer_flow(args, consumer) -> int:
         if home.get("outcome") != "ok":
             return 4
         selected = consumer.call("hotkey", {"keys": ["shift", "end"]})
+        if selected.get("outcome") != "ok":
+            return 4
         cleared = consumer.call("press_key", {"key": "backspace"})
-        if selected.get("outcome") != "ok" or cleared.get("outcome") != "ok":
+        if cleared.get("outcome") != "ok":
             consumer.call("release_input_lease")
             return 4
     typed = consumer.call("type_text", {"text": args.text})
