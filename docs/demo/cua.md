@@ -33,8 +33,10 @@ relay route. The consumer calls only the relay's HTTP/2 computer route. It check
 markers before input, both unleased and post-release refusal, lease acquire and
 release, exact application text/click state, and superseded-capture refusal.
 `--reset-entry` replaces an already populated synthetic Tk entry for repeat runs.
-The runner cleans up its own processes, forwards and credentials on exit or
-INT/TERM, retaining the guest workspace when cleanup cannot be verified. SIGKILL
+The runner supervises curl process groups, bounds each guest command to 30
+seconds, and stops host jobs before guest cleanup. It cleans up its own
+processes, forwards and credentials on exit or INT/TERM, retaining the guest
+workspace when cleanup cannot be verified or ownership cannot be established. SIGKILL
 or loss of guest access requires inspecting the task-owned resources before
 reusing that workspace. Offline CI checks do not access a desktop; VM acceptance
 remains a separate local gate, with no rotation, cluster or full-M5 claim.
