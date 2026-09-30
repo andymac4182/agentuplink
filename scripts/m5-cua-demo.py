@@ -251,11 +251,13 @@ def cmd_consumer(args) -> int:
     with open(args.token_file) as handle:
         args.token = handle.read().strip()
     previous_term = signal.getsignal(signal.SIGTERM)
+    previous_int = signal.getsignal(signal.SIGINT)
 
     def terminate(signum, _frame):
         raise SystemExit(128 + signum)
 
     signal.signal(signal.SIGTERM, terminate)
+    signal.signal(signal.SIGINT, terminate)
     consumer = None
     try:
         consumer = Consumer(args)
@@ -266,6 +268,7 @@ def cmd_consumer(args) -> int:
                 consumer.call("release_input_lease")
         finally:
             signal.signal(signal.SIGTERM, previous_term)
+            signal.signal(signal.SIGINT, previous_int)
             if consumer is not None and os.path.exists(consumer.header_file):
                 os.unlink(consumer.header_file)
             if consumer is not None and getattr(args, "out", None):

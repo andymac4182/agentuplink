@@ -345,6 +345,15 @@ gexec sudo -u cua grep -q '"ready"' "${GD}/connect.log" || die "device not ready
 log "device session ready"
 
 # ---- the consumer (host) ---------------------------------------------------------
+# Negative control at the exact relay route: the native backend has no
+# consumer JWT policy. Refuse to accept pixels through an unauthenticated route.
+ROUTE="https://127.0.0.1:${CONSUMER_PORT}/v1/devices/${DEVICE}/services/${SERVICE}/http/computer"
+unauthenticated_status=$(curl -sS --http2 --max-time 10 --cacert "${S}/server-ca.pem" \
+  -H 'content-type: application/json' --data '{"version":"computer.v1","operation":"describe","params":{}}' \
+  -o /dev/null -w '%{http_code}' "${ROUTE}")
+[ "${unauthenticated_status}" = 401 ] || die "relay route accepted an unauthenticated request: ${unauthenticated_status}"
+printf '{"url":"%s","unauthenticated_status":%s,"relay_pid":%s}\n' "${ROUTE}" "${unauthenticated_status}" "${RELAY_PID}" >"${OUT}/route.json"
+
 python3 "${TOOLS}" token "${S}/issuer-key.pem" "${ISSUER}" "${AUDIENCE}" "${SUBJECT}" >"${S}/token"
 chmod 600 "${S}/token"
 gexec cat /tmp/cua-fixture/state.json >"${S}/state.json"

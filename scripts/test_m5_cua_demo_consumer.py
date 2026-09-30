@@ -116,6 +116,13 @@ class ConsumerControls(unittest.TestCase):
 
     @unittest.skipIf(os.name == "nt", "POSIX signal control")
     def test_sigterm_releases_lease_and_removes_header(self):
+        self.check_signal(signal.SIGTERM)
+
+    @unittest.skipIf(os.name == "nt", "POSIX signal control")
+    def test_sigint_releases_lease_and_removes_header(self):
+        self.check_signal(signal.SIGINT)
+
+    def check_signal(self, signum):
         with tempfile.TemporaryDirectory() as root:
             token = Path(root) / "token"
             token.write_text("synthetic")
@@ -142,8 +149,8 @@ demo.cmd_consumer(SimpleNamespace(consumer_port=18443,device="synthetic",service
                                       str(token), str(marker)], stdout=subprocess.PIPE, text=True)
             try:
                 header = Path(json.loads(child.stdout.readline())["header"])
-                child.send_signal(signal.SIGTERM)
-                self.assertEqual(child.wait(timeout=5), 143)
+                child.send_signal(signum)
+                self.assertEqual(child.wait(timeout=5), 128 + signum)
                 self.assertFalse(header.exists())
                 self.assertEqual(marker.read_text(), "released")
                 self.assertTrue(token.exists())
