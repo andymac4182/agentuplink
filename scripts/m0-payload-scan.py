@@ -726,6 +726,17 @@ def check_clean(run: GateRun) -> list[str]:
     return failures
 
 
+def witness_failure_diagnostics(run: GateRun) -> list[str]:
+    """Bounded redacted context for a failed child, never witness acceptance."""
+    if run.exit_code == 0:
+        return []
+    # An unreadable/incomplete manifest cannot redact the child's domains.
+    # Do not print even its error string or raw stderr in that case.
+    if run.error or any(not run.sentinels.get(kind) for kind in run.gate.requires):
+        return ["failed witness child: stderr withheld because capture domains are incomplete"]
+    return [f"failed witness child: redacted stderr tail:\n{redacted_tail(run)}"]
+
+
 def classify_witness(run: GateRun) -> str:
     """RED only when the scan went red with exactly the declared witness."""
     if run.error:
@@ -956,6 +967,8 @@ def main() -> int:
                 f"hits={len(run.hits)} secs={run.seconds:.0f}",
                 flush=True,
             )
+            for detail in witness_failure_diagnostics(run):
+                print(f"m0-payload-scan:   {gate.command}: {detail}", flush=True)
             failed |= outcome != "RED"
     finally:
         if cleanup is not None:
