@@ -476,8 +476,8 @@ jobs:
   # in hosted CI at all.
   #
   # **No artifacts, on purpose (M7-C112).**  The captures hold the fixture's
-  # synthetic keys and tokens; the script prints only counts, categories,
-  # stream roles and offsets, and deletes its captures on exit.
+  # synthetic keys and tokens; output is counts, categories, stream roles,
+  # offsets and bounded redacted failure context. Captures are deleted on exit.
   m0-payload-scan:
     name: M0 cross-milestone payload scan (Linux, Redis)
     runs-on: ubuntu-latest
@@ -511,6 +511,8 @@ jobs:
           node-version: "24"
       - name: Scanner unit probes
         run: python3 scripts/m0-payload-scan.py --unit
+      - name: Failed witness diagnostic regressions
+        run: python3 scripts/test_m0_witness_diagnostics.py
       - name: Build runnable workspace binaries
         run: cargo +1.95.0 build --workspace --bins --locked
       - name: Scan the M1, M2, M3, M4 and M8 gates, with 21 planted witnesses, one per gate
