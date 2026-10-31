@@ -48,6 +48,8 @@ use uuid::Uuid;
 mod authority_fault_proxy;
 #[path = "common/m7_deployment.rs"]
 mod common;
+#[path = "m6_online_authority/recovery.rs"]
+mod recovery;
 use authority_fault_proxy::FaultProxy;
 use common::{
     FixtureFiles, ProcessConfigFixture, RedisTlsProxy, free_tcp_addr, jwks_json,
@@ -152,6 +154,11 @@ struct Fixture {
     device_id: Uuid,
     service_id: Uuid,
     consumer_token: String,
+    // Retain the exact seeded identities for the separate recovery drill;
+    // regenerating catalog_fixture would allocate different credential IDs.
+    topology: FixtureTopology,
+    oidc: OidcFixture,
+    records: tunnel_catalog::CatalogFixture,
 }
 
 #[derive(PartialEq, Eq)]
@@ -313,12 +320,11 @@ impl Fixture {
         let oidc = OidcFixture::new("https://online-authority-oidc.invalid", "agent-tunnel")
             .map_err(|_| "OIDC fixture")?;
         let topology = FixtureTopology::new(&pki).map_err(|_| "device and consumer fixture")?;
+        let records = topology
+            .catalog_fixture(&oidc)
+            .map_err(|_| "authorized catalog fixture")?;
         catalog
-            .seed_fixture(
-                &topology
-                    .catalog_fixture(&oidc)
-                    .map_err(|_| "authorized catalog fixture")?,
-            )
+            .seed_fixture(&records)
             .await
             .map_err(|_| "seed actual device and consumer authorization")?;
         let device = topology.devices_a.first().ok_or("device fixture missing")?;
@@ -455,6 +461,9 @@ impl Fixture {
             device_id: device.id,
             service_id,
             consumer_token,
+            topology,
+            oidc,
+            records,
         };
         fixture.approve(true, 0).await?;
         command(
@@ -813,6 +822,11 @@ impl Fixture {
     }
 
     async fn canary(&self, phase: &str) -> GateResult {
+        self.canary_with_token(phase, &self.consumer_token, false)
+            .await
+    }
+
+    async fn canary_with_token(&self, phase: &str, token: &str, denied: bool) -> GateResult {
         let mut payload = vec![0, 0xff, 0x80, 0x7f];
         payload.extend_from_slice(phase.as_bytes());
         payload.extend_from_slice(Uuid::new_v4().as_bytes());
@@ -859,7 +873,7 @@ impl Fixture {
                     ))
                     .header("host", "localhost")
                     .header("connection", "close")
-                    .header("authorization", format!("Bearer {}", self.consumer_token))
+                    .header("authorization", format!("Bearer {token}"))
                     .header("content-type", "application/octet-stream")
                     .body(Full::new(Bytes::from(payload)))
                     .map_err(|_| "canary HTTP request")?;
@@ -867,19 +881,24 @@ impl Fixture {
                     .send_request(request)
                     .await
                     .map_err(|_| "canary HTTP response")?;
-                require(
-                    response.status().as_u16() == 200,
-                    "non-owner public canary was refused",
-                )?;
+                let status = response.status().as_u16();
                 let body = Limited::new(response.into_body(), 4096)
                     .collect()
                     .await
                     .map_err(|_| "bounded canary response body")?
                     .to_bytes();
-                require(
-                    body.as_ref() == expected,
-                    "non-owner public canary differed from exact binary request and device prefix",
-                )
+                if denied {
+                    require(
+                        matches!(status, 403 | 404) && body.as_ref() != expected,
+                        "revoked grant did not produce an authorization denial",
+                    )
+                } else {
+                    require(status == 200, "non-owner public canary was refused")?;
+                    require(
+                        body.as_ref() == expected,
+                        "non-owner public canary differed from exact binary request and device prefix",
+                    )
+                }
             }
             .await;
             let cleanup = task.shutdown().await;
