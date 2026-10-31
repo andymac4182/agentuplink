@@ -141,3 +141,33 @@ its final phase marker. The unchanged earlier authority lifecycle/fault gates
 remain registered alongside this drill in the M7 script. Full workspace,
 hosted/platform checks, optimized-archive proof and real off-host operator
 acceptance remain separately reported requirements.
+
+## First artifact attempt retained
+
+At source `3d092deb`, the targeted integration test compiled in 3.62 seconds;
+both diagnostic projection tests and all four snapshot controls passed. Scoped
+strict Clippy passed in 48.70 seconds. The frozen harness SHA-256 is
+`41f556e3f959aad4acadf35a353ecfc8c8a4881b7bbf018064381c993de67e2f`.
+
+The first artifact-mode attempt used copies of the C241 image-extracted
+optimized authority (`cc7420062204c7f0d6ce6ad551c7d203ef16c3430a955b21c5d78b47762336f2`)
+and relay (`2827f610c4c553fe9ece6bf0040ad27c8170a692a95e98cd76e058eb8842206c`).
+Their hashes were checked against the container-notice report and again after
+the attempt. The test failed in 5.83 seconds (6.806 seconds including wrapper
+cleanup), before restoring Redis. Both exact owned containers were removed.
+
+The first revocation command returned a real nonzero exit with
+`stage=connection_establishment lane=4/6 class=io`; the PEM output detector did
+not trigger. The existing serving TLS proxy has 32 slots. Three relays and the
+authority each retain seven catalog connections, using 28. A separate actual
+CLI needs seven more: its primary and first three lanes fill 32, then its
+fourth lane is refused. This is fixture capacity, not evidence of a production
+Redis or authorization defect. An independent bounded verified-TLS operator
+proxy/config to the same owned Redis is the approved fixture repair; the
+serving proxy limit and all acceptance predicates remain unchanged.
+
+Evidence is retained privately under
+`/workspace/agentuplink-review-artifacts/c243-c248-artifact-proof-3d092deb/`,
+including immutable executable copies, validation logs, source/image manifests,
+`run-first/result.json`, bounded command captures and post-run hash checks.
+The failed run has not been retried, and it does not verify the recovery drill.
