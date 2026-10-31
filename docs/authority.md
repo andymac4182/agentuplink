@@ -39,8 +39,8 @@ Keep these credentials separate:
 All authority input files, including configuration, inventory and public trust,
 must be regular files owned by the service UID with mode 0600, inside an owned
 0700 parent. State and the stable sibling lock have the same restrictions.
-Symlink components, parent traversal and hard links are refused. Use canonical
-absolute paths; `/var/run` and some macOS temporary paths are symlinks. The
+Symlink components, parent traversal and hard links are refused. Run the offline commands as that same service UID while the service is stopped.
+Use canonical absolute paths; `/var/run` and some macOS temporary paths are symlinks. The
 service does not chmod, create directories or repair unexpected files.
 
 The Redis credential file contains a single `rediss://USER:PASSWORD@HOST:PORT/0`
@@ -179,8 +179,11 @@ for a confirmed new round. A removed client pin is refused immediately after
 restart, even if publication is unavailable. Newly approved clients receive 503
 until the new inventory has a confirmed round. There is no live reload.
 
-For publisher-key rotation, distribute the new public trust to every relay
-before signing with that key. A stop/update/restart interrupts checkpoint
+For publisher-key rotation, add the new public key alongside the current key
+and roll each relay process so it loads that trust before signing with the new
+key. Copying the trust file alone does not reload it; SIGHUP stages a peer
+identity, not publisher trust. Verify all relays with both trusted publisher keys
+before changing the authority inventory and signing-key path. A stop/update/restart interrupts checkpoint
 availability, so keep it well within the existing trust lifetime. A prolonged
 outage fails closed. Approve both peer keys during a controlled rotation, follow
 the relay's convergence hold, then withdraw the old key with a later inventory
@@ -201,7 +204,11 @@ TLS handshake and HTTP exchange each have a two-second budget; request bodies
 are at most 4 KiB, headers at most 16 and the HTTP buffer 8 KiB. Connections close
 after one response. A disconnected caller cannot release the durable serializer
 early or cancel its timeout watchdog. The publisher joins the same fair
-serializer without requiring an HTTP admission slot.
+serializer without requiring an HTTP admission slot. HTTP waits at most one
+second for that serializer; the publisher waits at most three seconds, covering
+older HTTP waiters' one-second queue budget, the last healthy one-second write
+and a one-second scheduling margin. It therefore retains its fair position under
+admitted HTTP load. The actual blocking operation watchdog stays at one second.
 
 Authorized clients can use `GET /livez` for process liveness and `GET /readyz`
 for current confirmed publication freshness. Readiness consumes no signed
@@ -235,7 +242,11 @@ TEST_REDIS_URL=redis://127.0.0.1:16379/ cargo test -p tunnel-test-harness \
 ```
 
 The process gate uses generated PKI, an isolated publisher ACL and namespace,
-the real authority binary, Redis TLS and configured relay processes. Storage
+the real authority binary, Redis TLS and three configured relay processes. It
+checks exact binary canaries through a non-owner ingress while the same device
+owner/session/carrier survives two confirmed refreshes and an authority restart,
+then separately exercises outage expiry, pending client revocation and run
+mismatch. Storage
 tests separately exercise actual crash/rename boundaries, stable locks, permanent
 failure and cancellation. Local tests do not attest deployment DNS, real volume
 crash durability, hosted archives or independent recovery execution. Keep those

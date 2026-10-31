@@ -213,6 +213,82 @@ fn approval_preserves_both_allocators_and_removes_old_inventory_confirmation() {
 }
 
 #[test]
+fn historical_node_slots_survive_replacements_and_incarnation_changes() {
+    let fixture = Fixture::new();
+    let mut engine = fixture.engine();
+    confirm_next(&mut engine);
+    checkpoint(&mut engine);
+    checkpoint(&mut engine);
+    drop(engine.reserve_round().unwrap());
+    drop(engine);
+
+    let mut inventory = fixture.inventory.clone();
+    inventory.revision = 2;
+    for index in 1..32 {
+        let mut node = inventory.nodes[0].clone();
+        node.node_id = format!("retained-node-{index}");
+        node.keys[0].key_id = format!("retained-key-{index}");
+        inventory.nodes.push(node);
+    }
+    approve(
+        &fixture.config,
+        &fixture.inventory_file(&inventory),
+        1,
+        RUN_A,
+    )
+    .unwrap();
+    let after_expansion = fixture.engine();
+    assert_eq!(after_expansion.state.known_node_ids.len(), 32);
+    assert_eq!(after_expansion.state.membership_high_water, 2);
+    assert_eq!(after_expansion.state.checkpoint_high_water, 2);
+    drop(after_expansion);
+
+    // Replacing a certificate for one stable logical ID consumes no Redis
+    // directory slot, including across independently approved recovery.
+    inventory.revision = 3;
+    inventory.deployment_incarnation = "incarnation-recovered".into();
+    inventory.nodes[0].checkpoint_client_spkis = vec!["44".repeat(32)];
+    inventory.nodes[0].keys[0].spki_sha256 = "55".repeat(32);
+    approve(
+        &fixture.config,
+        &fixture.inventory_file(&inventory),
+        2,
+        RUN_B,
+    )
+    .unwrap();
+    let replaced = fixture.engine();
+    assert_eq!(replaced.state.known_node_ids.len(), 32);
+    assert_eq!(replaced.state.membership_high_water, 2);
+    assert_eq!(replaced.state.checkpoint_high_water, 2);
+    assert_eq!(replaced.expected_run(), RUN_B);
+    assert!(replaced.state.confirmed.is_none());
+    drop(replaced);
+
+    // Current inventory still has only32 nodes, but removing one does not
+    // free its historical directory slot. A new incarnation cannot reset it.
+    let before = fs::read(&fixture.config.state_path).unwrap();
+    inventory.revision = 4;
+    inventory.deployment_incarnation = "incarnation-third".into();
+    inventory.nodes[31].node_id = "thirty-third-distinct-node".into();
+    assert_eq!(inventory.nodes.len(), 32);
+    assert!(
+        approve(
+            &fixture.config,
+            &fixture.inventory_file(&inventory),
+            3,
+            RUN_A
+        )
+        .is_err()
+    );
+    assert_eq!(fs::read(&fixture.config.state_path).unwrap(), before);
+    let refused = fixture.engine();
+    assert_eq!(refused.state.known_node_ids.len(), 32);
+    assert_eq!(refused.state.membership_high_water, 2);
+    assert_eq!(refused.state.checkpoint_high_water, 2);
+    assert_eq!(refused.expected_run(), RUN_B);
+}
+
+#[test]
 fn same_inventory_abandoned_refresh_cannot_extend_confirmed_authorization() {
     let fixture = Fixture::new();
     let mut engine = fixture.engine();
@@ -558,4 +634,173 @@ async fn http_admission_is_bounded_while_publisher_can_join_the_serializer() {
     assert_eq!(completed.load(Ordering::SeqCst), 32);
     assert_eq!(coordinator.admission.available_permits(), 32);
     assert!(!coordinator.fatal.load(Ordering::SeqCst));
+}
+
+// A current-thread async runtime makes admission observations queue evidence:
+// after a spawned call consumes its HTTP slot, this test cannot run again
+// until that call has suspended on the occupied serializer.
+#[tokio::test]
+async fn publisher_survives_three_admitted_durable_checkpoint_operations() {
+    struct ActiveOperation(Arc<AtomicUsize>);
+    impl Drop for ActiveOperation {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    let fixture = Fixture::new();
+    let coordinator = fixture.coordinator();
+    coordinator
+        .call(true, |engine| {
+            let round = engine.reserve_round()?;
+            engine.confirm(round)
+        })
+        .await
+        .unwrap();
+    let active = Arc::new(AtomicUsize::new(0));
+    let completed = Arc::new(AtomicUsize::new(0));
+    let overlap = Arc::new(AtomicBool::new(false));
+    let (first_entered, first_started) = tokio::sync::oneshot::channel();
+    let mut first_entered = Some(first_entered);
+    let mut first_started = Some(first_started);
+    let (release, blocked) = mpsc::channel();
+    let release = ReleaseOnDrop(Some(release));
+    let mut blocked = Some(blocked);
+    let mut http_tasks = Vec::new();
+
+    for index in 0..3 {
+        let caller = coordinator.clone();
+        let active = active.clone();
+        let completed = completed.clone();
+        let overlap = overlap.clone();
+        let entered = first_entered.take();
+        let blocked = blocked.take();
+        http_tasks.push(tokio::spawn(async move {
+            caller
+                .call(false, move |engine| {
+                    if active.fetch_add(1, Ordering::SeqCst) != 0 {
+                        overlap.store(true, Ordering::SeqCst);
+                    }
+                    let _active = ActiveOperation(active);
+                    if let Some(entered) = entered {
+                        let _ = entered.send(());
+                    }
+                    if let Some(blocked) = blocked {
+                        blocked
+                            .recv_timeout(STATE_IO_BUDGET * 5)
+                            .map_err(|_| "test queue was not released")?;
+                    }
+                    // The actual production blocking task keeps the serializer,
+                    // then performs the real signing+durable checkpoint write.
+                    // Each operation is safely inside its one-second watchdog;
+                    // the third HTTP call also starts within its one-second wait.
+                    std::thread::sleep(Duration::from_millis(400));
+                    let response =
+                        engine.checkpoint(format!("queued-checkpoint-nonce-{index:04}"))?;
+                    completed.fetch_add(1, Ordering::SeqCst);
+                    Ok(response)
+                })
+                .await
+        }));
+        if let Some(started) = first_started.take() {
+            tokio::time::timeout(STATE_IO_BUDGET, started)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        eventually(|| coordinator.admission.available_permits() == 31 - index).await;
+    }
+    assert_eq!(completed.load(Ordering::SeqCst), 0);
+    assert_eq!(active.load(Ordering::SeqCst), 1);
+    let publisher_coordinator = coordinator.clone();
+    let publisher_active = active.clone();
+    let publisher_completed = completed.clone();
+    let publisher_overlap = overlap.clone();
+    let (publisher_entered, publisher_queued) = tokio::sync::oneshot::channel();
+    let mut publisher = tokio::spawn(async move {
+        let _ = publisher_entered.send(());
+        publisher_coordinator
+            .call(true, move |engine| {
+                if publisher_active.fetch_add(1, Ordering::SeqCst) != 0 {
+                    publisher_overlap.store(true, Ordering::SeqCst);
+                }
+                let _active = ActiveOperation(publisher_active);
+                if publisher_completed.load(Ordering::SeqCst) != 3 {
+                    return Err("publisher overtook previously admitted HTTP writes");
+                }
+                engine.reserve_round().map(|round| round.version)
+            })
+            .await
+    });
+    // On this single async thread the publisher has reached its serializer
+    // await before this signal can resume us. The first operation is still
+    // gated, so it cannot complete and reorder the admission setup.
+    tokio::time::timeout(STATE_IO_BUDGET, publisher_queued)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(coordinator.admission.available_permits(), 29);
+    assert_eq!(coordinator.permit.available_permits(), 0);
+    let released_at = Instant::now();
+    release.release();
+
+    // Join all admitted work before asserting the expected publisher result,
+    // including on the deliberate red run. Timeouts abort and join callers;
+    // the real blocking operation retains its own permit/watchdog as tested
+    // separately by cancelled_slow_caller_keeps_its_watchdog above.
+    let mut responses = Vec::new();
+    let mut join_failed = false;
+    for mut task in http_tasks {
+        match tokio::time::timeout(STATE_IO_BUDGET * 4, &mut task).await {
+            Ok(Ok(response)) => responses.push(response),
+            _ => {
+                task.abort();
+                let _ = tokio::time::timeout(STATE_IO_BUDGET, task).await;
+                join_failed = true;
+            }
+        }
+    }
+    let publisher_result = match tokio::time::timeout(STATE_IO_BUDGET * 4, &mut publisher).await {
+        Ok(Ok(result)) => result,
+        _ => {
+            publisher.abort();
+            let _ = tokio::time::timeout(STATE_IO_BUDGET, publisher).await;
+            Err("publisher test task did not complete")
+        }
+    };
+    assert!(!join_failed);
+    assert!(
+        released_at.elapsed() >= Duration::from_millis(1100),
+        "fixture did not exercise a queue longer than the HTTP wait budget"
+    );
+    let versions: Vec<u64> = responses
+        .into_iter()
+        .map(|response| {
+            serde_json::from_slice::<SignedMembershipCheckpoint>(
+                &response.expect("HTTP operation stayed within its own wait and I/O budgets"),
+            )
+            .unwrap()
+            .checkpoint_version
+        })
+        .collect();
+    assert_eq!(versions, [1, 2, 3]);
+    assert_eq!(completed.load(Ordering::SeqCst), 3);
+    assert_eq!(active.load(Ordering::SeqCst), 0);
+    assert!(!overlap.load(Ordering::SeqCst));
+    assert!(!coordinator.fatal.load(Ordering::SeqCst));
+    assert_eq!(
+        coordinator
+            .engine
+            .lock()
+            .unwrap()
+            .state
+            .checkpoint_high_water,
+        3
+    );
+    assert_eq!(
+        publisher_result.expect(
+            "publisher must retain its fair queue position behind admitted bounded HTTP writes"
+        ),
+        2
+    );
 }

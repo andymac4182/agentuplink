@@ -4,25 +4,42 @@
 #![cfg(any(target_os = "linux", target_os = "macos"))]
 
 use std::{
+    collections::BTreeMap,
     env, fs,
+    io::Read,
     net::SocketAddr,
     path::{Path, PathBuf},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
 use chrono::Utc;
+use http_body_util::{BodyExt, Full, Limited};
+use hyper::{Request, body::Bytes};
+use hyper_util::rt::TokioIo;
+use rustls::{
+    ClientConfig, RootCertStore,
+    pki_types::{CertificateDer, ServerName},
+};
+use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::time::{sleep, timeout};
-use tunnel_catalog::{Catalog, RedisCatalog};
+use tokio_rustls::TlsConnector;
+use tunnel_catalog::{Catalog, OwnerToken, RedisCatalog};
+use tunnel_client::{
+    ConnectConfig, ConnectOptions, ConnectionHandle, CredentialConfig, LimitsConfig, LocalExport,
+    LocalExportKind, SessionInfo, connect,
+};
 use tunnel_cluster::membership::{
-    MembershipPolicy, MembershipVerifier, PrivateEndpointPolicy, SignedMembershipCheckpoint,
-    TrustedPublisherKey,
+    MembershipPolicy, MembershipVerifier, MembershipVersionState, PrivateEndpointPolicy,
+    SignedMembershipCheckpoint, TrustedPublisherKey,
 };
 use tunnel_relay::membership_runtime::{
     CheckpointAuthority, CheckpointAuthorityError, CheckpointRequest, HttpsCheckpointAuthority,
 };
 use tunnel_test_harness::{
-    CertificateMaterial, ClusterFixture, FixturePki, ManagedProcess, OidcFixture, ProcessSpec,
+    CertificateMaterial, ClusterFixture, FixturePki, FixtureTopology, ManagedProcess, OidcFixture,
+    ProcessSpec,
 };
 use tunnel_transport::load_server_config_from_pem;
 use uuid::Uuid;
@@ -39,7 +56,9 @@ type GateResult<T = ()> = Result<T, &'static str>;
 const IO_BOUND: Duration = Duration::from_secs(2);
 const PROCESS_BOUND: Duration = Duration::from_secs(8);
 const PUBLISH_BOUND: Duration = Duration::from_secs(25);
-const SCENARIO_BOUND: Duration = Duration::from_secs(180);
+const SCENARIO_BOUND: Duration = Duration::from_secs(240);
+const CANARY: &str = "m6-online-authority-device-canary";
+const EXCHANGE_BOUND: Duration = Duration::from_secs(8);
 
 fn require(condition: bool, message: &'static str) -> GateResult {
     if condition { Ok(()) } else { Err(message) }
@@ -98,8 +117,11 @@ async fn command(binary: &Path, args: &[String]) -> GateResult {
 }
 
 struct Relay {
+    node_id: String,
     config: PathBuf,
+    version_state: PathBuf,
     consumer: SocketAddr,
+    device: SocketAddr,
     identity: CertificateMaterial,
 }
 
@@ -121,6 +143,30 @@ struct Fixture {
     authority: Option<ManagedProcess>,
     relay_processes: Vec<ManagedProcess>,
     proxy: Option<RedisTlsProxy>,
+    client_config: ConnectConfig,
+    connector: Option<ConnectionHandle>,
+    tenant_id: Uuid,
+    device_id: Uuid,
+    service_id: Uuid,
+    consumer_token: String,
+}
+
+#[derive(PartialEq, Eq)]
+struct SessionEvidence {
+    owner: OwnerToken,
+    session: SessionInfo,
+    connection_id: String,
+    relay_pids: Vec<u32>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RelayVersionEnvelope {
+    schema_version: u16,
+    deployment_id: String,
+    deployment_incarnation: String,
+    node_id: String,
+    state: MembershipVersionState,
 }
 
 impl Fixture {
@@ -130,6 +176,7 @@ impl Fixture {
         username: &str,
         password: &str,
         redis_run: String,
+        catalog: &RedisCatalog,
     ) -> GateResult<Self> {
         let authority_binary = authority_binary()?;
         let relay_binary =
@@ -262,6 +309,27 @@ impl Fixture {
 
         let oidc = OidcFixture::new("https://online-authority-oidc.invalid", "agent-tunnel")
             .map_err(|_| "OIDC fixture")?;
+        let topology = FixtureTopology::new(&pki).map_err(|_| "device and consumer fixture")?;
+        catalog
+            .seed_fixture(
+                &topology
+                    .catalog_fixture(&oidc)
+                    .map_err(|_| "authorized catalog fixture")?,
+            )
+            .await
+            .map_err(|_| "seed actual device and consumer authorization")?;
+        let device = topology.devices_a.first().ok_or("device fixture missing")?;
+        let service_id = *topology
+            .service_ids
+            .get(&device.id)
+            .ok_or("device service missing")?;
+        let consumer = topology
+            .consumers_a
+            .first()
+            .ok_or("consumer fixture missing")?;
+        let consumer_token = oidc
+            .issue_for_tenant(&consumer.name, consumer.tenant_id)
+            .map_err(|_| "consumer token")?;
         let jwks = files
             .write(
                 "jwks.json",
@@ -293,8 +361,9 @@ impl Fixture {
                 .map_err(|_| "peer key file")?;
             let relay_state = state.with_file_name(format!("{}-versions.json", node.node_id));
             let consumer = node.addresses.tcp;
+            let device = free_tcp_addr();
             let config = ProcessConfigFixture {
-                consumer_bind: consumer, device_bind: free_tcp_addr(), peer_bind: node.addresses.udp,
+                consumer_bind: consumer, device_bind: device, peer_bind: node.addresses.udp,
                 redis_url: &relay_redis, namespace, deployment_id: &deployment, deployment_incarnation: &incarnation,
                 oidc: &oidc, oidc_jwks_path: &jwks, server_chain_path: &server_cert, server_key_path: &server_key,
                 server_ca_path: &ca, device_ca_path: &device_ca, peer_chain_path: &peer_cert, peer_key_path: &peer_key,
@@ -306,12 +375,59 @@ impl Fixture {
                 .write(&format!("{}.toml", node.node_id), config.as_bytes())
                 .map_err(|_| "relay config file")?;
             relays.push(Relay {
+                node_id: node.node_id.clone(),
                 config,
+                version_state: relay_state,
                 consumer,
+                device,
                 identity: node.peer_certificate.clone(),
             });
             node.release_ports();
         }
+        let client_certificate = files
+            .write(
+                "device.pem",
+                format!(
+                    "{}{}",
+                    device.certificate.certificate_pem, pki.device_ca.certificate_pem
+                )
+                .as_bytes(),
+            )
+            .map_err(|_| "device certificate file")?;
+        let client_key = files
+            .write("device.key", device.certificate.private_key_pem.as_bytes())
+            .map_err(|_| "device key file")?;
+        let client_config = ConnectConfig {
+            device_id: device.id.to_string(),
+            relay_url: format!(
+                "wss://localhost:{}/v1/tunnel/control",
+                relays[1].device.port()
+            ),
+            credentials: CredentialConfig {
+                client_certificate,
+                client_key,
+                server_ca: ca,
+                pinned: None,
+            },
+            exports: BTreeMap::from([(
+                service_id.to_string(),
+                LocalExport {
+                    kind: LocalExportKind::Echo,
+                    device_canary: Some(CANARY.into()),
+                    mcp: None,
+                    acp: None,
+                    fs: None,
+                    cua: None,
+                },
+            )]),
+            limits: LimitsConfig::default(),
+            rotation: Default::default(),
+            reconnect: Default::default(),
+            supervisor: Default::default(),
+        };
+        client_config
+            .validate()
+            .map_err(|_| "device connector config")?;
         let fixture = Self {
             files,
             pki,
@@ -330,6 +446,12 @@ impl Fixture {
             authority: None,
             relay_processes: Vec::new(),
             proxy: Some(proxy),
+            client_config,
+            connector: None,
+            tenant_id: device.tenant_id,
+            device_id: device.id,
+            service_id,
+            consumer_token,
         };
         fixture.approve(true, 0).await?;
         command(
@@ -464,7 +586,7 @@ impl Fixture {
                     return Err("authority exited before listener start");
                 }
                 if String::from_utf8_lossy(&process.stderr()).contains("authority_started") {
-                    return Ok(());
+                    return Ok::<(), &'static str>(());
                 }
                 sleep(Duration::from_millis(10)).await;
             }
@@ -475,7 +597,7 @@ impl Fixture {
 
     async fn stop_authority(&mut self) -> GateResult {
         let Some(mut process) = self.authority.take() else {
-            return Ok(());
+            return Ok::<(), &'static str>(());
         };
         let signal = process
             .request_stop()
@@ -509,15 +631,13 @@ impl Fixture {
             .await
             .map_err(|_| "start real relay")?;
             self.relay_processes.push(process);
-            wait_for_ready(
-                self.relay_processes
-                    .last_mut()
-                    .ok_or("relay process missing")?,
-                relay.consumer,
-                &self.pki.server_ca.certificate_der,
-            )
-            .await
-            .map_err(|_| "real relay failed mTLS authority readiness")?;
+        }
+        // Required peer-route readiness depends on every approved node. All
+        // three listeners must be running before any readiness wait starts.
+        for (relay, process) in self.relays.iter().zip(&mut self.relay_processes) {
+            wait_for_ready(process, relay.consumer, &self.pki.server_ca.certificate_der)
+                .await
+                .map_err(|_| "real relay failed mTLS authority readiness")?;
         }
         require(
             self.relay_processes.len() == 3,
@@ -537,7 +657,248 @@ impl Fixture {
         require(!failed, "relay process cleanup failed")
     }
 
+    async fn connect_device(&mut self) -> GateResult {
+        self.connector = Some(
+            timeout(
+                PROCESS_BOUND,
+                connect(ConnectOptions::new(self.client_config.clone())),
+            )
+            .await
+            .map_err(|_| "device connection deadline")?
+            .map_err(|_| "device connection")?,
+        );
+        let session = timeout(
+            PROCESS_BOUND,
+            self.connector
+                .as_mut()
+                .ok_or("device handle missing")?
+                .wait_ready(),
+        )
+        .await
+        .map_err(|_| "device readiness deadline")?
+        .map_err(|_| "device readiness")?;
+        require(
+            session.generation > 0,
+            "device started without active data generation",
+        )
+    }
+
+    async fn session_evidence(&self, catalog: &RedisCatalog) -> GateResult<SessionEvidence> {
+        let owner = catalog
+            .current_owner(self.tenant_id, self.device_id, Utc::now())
+            .await
+            .map_err(|_| "read real device owner")?
+            .ok_or("device owner lease disappeared")?
+            .token;
+        require(
+            owner.node_id == "relay-b" && owner.deployment_incarnation == self.incarnation,
+            "device ownership did not stay on the non-ingress relay",
+        )?;
+        let status = self
+            .connector
+            .as_ref()
+            .ok_or("device connector missing")?
+            .status_snapshot();
+        let session = SessionInfo {
+            session_id: status.session_id.ok_or("device session closed")?,
+            epoch: status.epoch.ok_or("device epoch missing")?,
+            generation: status
+                .active_generation
+                .ok_or("device data generation closed")?,
+        };
+        require(
+            owner.session_id == session.session_id
+                && owner.epoch == session.epoch
+                && session.generation > 0,
+            "catalog ownership and actual device session differ",
+        )?;
+        Ok(SessionEvidence {
+            owner,
+            session,
+            connection_id: status
+                .active_connection_id
+                .ok_or("active device socket identity missing")?,
+            relay_pids: self
+                .relay_processes
+                .iter()
+                .map(|process| {
+                    process
+                        .id()
+                        .ok_or("relay process exited during continuity check")
+                })
+                .collect::<GateResult<_>>()?,
+        })
+    }
+
+    fn relays_adopted(&self, target: &SignedMembershipCheckpoint) -> GateResult<bool> {
+        const MAX_BYTES: usize =
+            tunnel_relay::membership_version_state::MAX_MEMBERSHIP_VERSION_STATE_BYTES;
+        let mut adopted = true;
+        for relay in &self.relays {
+            // The running relay owns the exclusive writer lock. Read only
+            // its atomically replaced, bounded public version envelope.
+            let mut bytes = Vec::new();
+            fs::File::open(&relay.version_state)
+                .map_err(|_| "open relay version evidence")?
+                .take((MAX_BYTES + 1) as u64)
+                .read_to_end(&mut bytes)
+                .map_err(|_| "read relay version evidence")?;
+            require(
+                bytes.len() <= MAX_BYTES,
+                "relay version evidence exceeded its byte bound",
+            )?;
+            let envelope: RelayVersionEnvelope =
+                serde_json::from_slice(&bytes).map_err(|_| "relay version evidence schema")?;
+            require(
+                envelope.schema_version == 1
+                    && envelope.deployment_id == self.deployment
+                    && envelope.deployment_incarnation == self.incarnation
+                    && envelope.node_id == relay.node_id,
+                "relay version evidence identity mismatch",
+            )?;
+            // A checkpoint fence is saved before the Redis records are read.
+            // Requiring every node fence too proves verified record adoption,
+            // rather than merely a successful new checkpoint fetch.
+            adopted &= envelope
+                .state
+                .checkpoint_version
+                .is_some_and(|version| version >= target.checkpoint_version)
+                && target.minimum_versions.iter().all(|(node, minimum)| {
+                    envelope
+                        .state
+                        .node_versions
+                        .get(node)
+                        .is_some_and(|version| version >= minimum)
+                });
+        }
+        Ok(adopted)
+    }
+
+    async fn wait_relay_adoption(
+        &mut self,
+        target: &SignedMembershipCheckpoint,
+        catalog: &RedisCatalog,
+        original: &SessionEvidence,
+    ) -> GateResult {
+        timeout(PUBLISH_BOUND, async {
+            loop {
+                self.canary("relay-adoption-after-authority-restart")
+                    .await?;
+                require(
+                    &self.session_evidence(catalog).await? == original,
+                    "device continuity changed while relays adopted recovered authority trust",
+                )?;
+                if self.relays_adopted(target)? {
+                    break;
+                }
+                sleep(Duration::from_millis(250)).await;
+            }
+            for (relay, process) in self.relays.iter().zip(&mut self.relay_processes) {
+                wait_for_ready(process, relay.consumer, &self.pki.server_ca.certificate_der)
+                    .await
+                    .map_err(|_| "relay was not ready after persisting recovered trust")?;
+            }
+            self.canary("all-three-relays-adopted-recovered-trust")
+                .await?;
+            require(
+                &self.session_evidence(catalog).await? == original,
+                "device continuity changed after every relay adopted recovered trust",
+            )
+        })
+        .await
+        .map_err(|_| "three-relay adoption exceeded the refresh bound")?
+    }
+
+    async fn canary(&self, phase: &str) -> GateResult {
+        let mut payload = vec![0, 0xff, 0x80, 0x7f];
+        payload.extend_from_slice(phase.as_bytes());
+        payload.extend_from_slice(Uuid::new_v4().as_bytes());
+        let mut expected = CANARY.as_bytes().to_vec();
+        expected.extend_from_slice(&payload);
+        let exchange = async {
+            let mut roots = RootCertStore::empty();
+            roots
+                .add(CertificateDer::from(
+                    self.pki.server_ca.certificate_der.clone(),
+                ))
+                .map_err(|_| "canary server root")?;
+            let mut tls = ClientConfig::builder_with_provider(
+                rustls::crypto::ring::default_provider().into(),
+            )
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .map_err(|_| "canary TLS policy")?
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+            tls.alpn_protocols = vec![b"http/1.1".to_vec()];
+            let socket = tokio::net::TcpStream::connect(self.relays[0].consumer)
+                .await
+                .map_err(|_| "non-owner consumer TCP")?;
+            let socket = TlsConnector::from(Arc::new(tls))
+                .connect(
+                    ServerName::try_from("localhost").map_err(|_| "canary server name")?,
+                    socket,
+                )
+                .await
+                .map_err(|_| "non-owner consumer TLS")?;
+            let (mut sender, connection) =
+                hyper::client::conn::http1::handshake(TokioIo::new(socket))
+                    .await
+                    .map_err(|_| "canary HTTP handshake")?;
+            let task = EchoTask(Some(tokio::spawn(async move {
+                let _ = connection.await;
+            })));
+            let result = async {
+                let request = Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "https://localhost/v1/devices/{}/services/{}/echo",
+                        self.device_id, self.service_id
+                    ))
+                    .header("host", "localhost")
+                    .header("connection", "close")
+                    .header("authorization", format!("Bearer {}", self.consumer_token))
+                    .header("content-type", "application/octet-stream")
+                    .body(Full::new(Bytes::from(payload)))
+                    .map_err(|_| "canary HTTP request")?;
+                let response = sender
+                    .send_request(request)
+                    .await
+                    .map_err(|_| "canary HTTP response")?;
+                require(
+                    response.status().as_u16() == 200,
+                    "non-owner public canary was refused",
+                )?;
+                let body = Limited::new(response.into_body(), 4096)
+                    .collect()
+                    .await
+                    .map_err(|_| "bounded canary response body")?
+                    .to_bytes();
+                require(
+                    body.as_ref() == expected,
+                    "non-owner public canary differed from exact binary request and device prefix",
+                )
+            }
+            .await;
+            let cleanup = task.shutdown().await;
+            result.and(cleanup)
+        };
+        timeout(EXCHANGE_BOUND, exchange)
+            .await
+            .map_err(|_| "non-owner public canary exceeded exchange deadline")?
+    }
+
+    async fn stop_device(&mut self) -> GateResult {
+        if let Some(connector) = self.connector.take() {
+            timeout(PROCESS_BOUND, connector.stop())
+                .await
+                .map_err(|_| "device shutdown deadline")?
+                .map_err(|_| "device did not stop cleanly")?;
+        }
+        Ok(())
+    }
+
     async fn cleanup(mut self) -> GateResult {
+        let device = self.stop_device().await;
         let relays = self.stop_relays().await;
         let authority = self.stop_authority().await;
         let proxy = if let Some(proxy) = self.proxy.take() {
@@ -548,7 +909,31 @@ impl Fixture {
         } else {
             Ok(())
         };
-        relays.and(authority).and(proxy)
+        device.and(relays).and(authority).and(proxy)
+    }
+}
+
+struct EchoTask(Option<tokio::task::JoinHandle<()>>);
+
+impl EchoTask {
+    async fn shutdown(mut self) -> GateResult {
+        let Some(task) = self.0.take() else {
+            return Ok::<(), &'static str>(());
+        };
+        task.abort();
+        match timeout(IO_BOUND, task).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) if error.is_cancelled() => Ok(()),
+            _ => Err("canary connection task did not join"),
+        }
+    }
+}
+
+impl Drop for EchoTask {
+    fn drop(&mut self) {
+        if let Some(task) = self.0.take() {
+            task.abort();
+        }
     }
 }
 
@@ -573,7 +958,7 @@ async fn wait_spent_round(fixture: &Fixture, previous: u64) -> GateResult {
                 .as_u64()
                 .is_some_and(|current| current > previous)
             {
-                return Ok(());
+                return Ok::<(), &'static str>(());
             }
             sleep(Duration::from_millis(100)).await;
         }
@@ -663,34 +1048,95 @@ async fn run_scenario(
         )?;
     }
     fixture.start_relays().await?;
+    fixture.connect_device().await?;
+    let original_session = fixture.session_evidence(catalog).await?;
+    fixture.canary("initial-public-through-relay-a").await?;
     eprintln!(
-        "online authority: three real relay processes reached readiness with CLI-generated membership trust and mTLS"
+        "online authority: three real relays ready; exact public canary entered relay-a and reached device owned by relay-b"
     );
 
-    // Observe a second actual publication while all three relays run. Their
-    // startup did not rely on the test-local issuer used by older fixtures.
-    wait_spent_round(fixture, first.minimum_versions["relay-a"]).await?;
-    let refreshed = timeout(PUBLISH_BOUND, async {
+    // Keep one actual control/data session across two complete publication
+    // refreshes. A fresh request body is required at every observation; a
+    // recreated connector, owner epoch, socket or relay process cannot pass.
+    let before_refreshes = fixture.wait_checkpoint(&client).await?;
+    let mut last_confirmed_minimum = before_refreshes.minimum_versions["relay-a"];
+    let mut observed_refreshes = 0;
+    let refreshed = timeout(Duration::from_secs(55), async {
         loop {
-            if let Some(response) = fixture.checkpoint(&client).await?
-                && response.minimum_versions["relay-a"] > first.minimum_versions["relay-a"]
-            {
-                return Ok(response);
+            fixture
+                .canary("continuous-two-publication-refreshes")
+                .await?;
+            require(
+                fixture.session_evidence(catalog).await? == original_session,
+                "device owner/session/socket or relay process changed across refreshes",
+            )?;
+            if let Some(response) = fixture.checkpoint(&client).await? {
+                let minimum = response.minimum_versions["relay-a"];
+                require(
+                    minimum >= last_confirmed_minimum,
+                    "confirmed membership minimum rolled back",
+                )?;
+                if minimum > last_confirmed_minimum {
+                    last_confirmed_minimum = minimum;
+                    observed_refreshes += 1;
+                    if observed_refreshes == 2 {
+                        return Ok::<_, &'static str>(response);
+                    }
+                }
             }
-            sleep(Duration::from_millis(100)).await;
+            sleep(Duration::from_secs(1)).await;
         }
     })
     .await
-    .map_err(|_| "continuous publisher failed to confirm a newer round")??;
+    .map_err(
+        |_| "continuous publisher did not confirm two refreshes with a live device session",
+    )??;
+
+    // Healthy authority restart: the relays and connector remain untouched.
+    // Cached bounded trust carries a fresh cross-relay exchange while the
+    // authority is stopped; new publication then restores the authority.
+    fixture.stop_authority().await?;
+    fixture
+        .canary("authority-stopped-same-device-session")
+        .await?;
+    require(
+        fixture.session_evidence(catalog).await? == original_session,
+        "healthy authority stop changed device ownership or carrier",
+    )?;
+    fixture.start_authority().await?;
+    let after_healthy_restart = fixture.wait_checkpoint(&client).await?;
+    require(
+        after_healthy_restart.minimum_versions["relay-a"] > refreshed.minimum_versions["relay-a"]
+            && after_healthy_restart.checkpoint_version > refreshed.checkpoint_version,
+        "healthy authority restart did not produce fresh publication and checkpoint",
+    )?;
+    fixture
+        .canary("authority-recovered-same-device-session")
+        .await?;
+    require(
+        fixture.session_evidence(catalog).await? == original_session,
+        "healthy authority recovery recreated device owner/session/socket or relay process",
+    )?;
+    fixture
+        .wait_relay_adoption(&after_healthy_restart, catalog, &original_session)
+        .await?;
+    eprintln!(
+        "online authority: exact public canaries survived two refreshes, authority stop, and persisted new-checkpoint/all-node adoption by all3 ready relays with unchanged owner/session/epoch/generation/socket and three relay PIDs"
+    );
+    fixture.stop_device().await?;
+    fixture.stop_relays().await?;
+
+    // Adoption may span the next continuous publication. Fence the outage
+    // against the latest confirmed snapshot after the live traffic phase.
+    let before_failed_refresh = fixture.wait_checkpoint(&client).await?;
     publication_permission(admin, username, false).await?;
-    wait_spent_round(fixture, refreshed.minimum_versions["relay-a"]).await?;
+    wait_spent_round(fixture, before_failed_refresh.minimum_versions["relay-a"]).await?;
     let bounded = fixture.wait_checkpoint(&client).await?;
     require(
-        bounded.expires_at == refreshed.expires_at
-            && bounded.minimum_versions == refreshed.minimum_versions,
+        bounded.expires_at == before_failed_refresh.expires_at
+            && bounded.minimum_versions == before_failed_refresh.minimum_versions,
         "failed publish extended or advanced confirmed authorization",
     )?;
-    fixture.stop_relays().await?;
 
     // Restart while the old signed trust is still temporally usable. Its
     // persisted confirmation alone must never restore process freshness.
@@ -745,7 +1191,7 @@ async fn run_scenario(
                             && recovered.expires_at - Utc::now() <= chrono::Duration::seconds(8),
                         "outage refused before the bounded confirmed window",
                     )?;
-                    return Ok(());
+                    return Ok::<(), &'static str>(());
                 }
             }
             sleep(Duration::from_millis(250)).await;
@@ -888,63 +1334,95 @@ async fn online_authority_publishes_for_three_relays_and_fails_closed_across_lif
         .get_multiplexed_async_connection()
         .await
         .expect("admin Redis connection");
-    let _: () = redis::cmd("ACL")
-        .arg("SETUSER")
-        .arg(&username)
-        .arg("reset")
-        .arg("on")
-        .arg(format!(">{password}"))
-        .arg(format!("~tunnel-catalog:{namespace}:membership:operator:*"))
-        .arg([
-            "+ping", "+info", "+eval", "+hget", "+hlen", "+hset", "+expire",
-        ])
-        .query_async(&mut admin)
-        .await
-        .expect("isolated publisher ACL");
-    let catalog =
-        RedisCatalog::connect_for_recovery(&upstream_url, &namespace, "authority-incarnation-a")
+    let mut catalog = None;
+    // Retain every allocated resource before the next fallible setup step.
+    // Even an ambiguous ACL write or failed catalog activation reaches the
+    // isolated-user cleanup below; no early assertion bypasses it.
+    let setup: GateResult = async {
+        redis::cmd("ACL")
+            .arg("SETUSER")
+            .arg(&username)
+            .arg("reset")
+            .arg("on")
+            .arg(format!(">{password}"))
+            .arg(format!("~tunnel-catalog:{namespace}:membership:operator:*"))
+            .arg(&[
+                "+ping", "+info", "+eval", "+hget", "+hlen", "+hset", "+expire",
+            ])
+            .query_async::<()>(&mut admin)
             .await
-            .expect("isolated catalog");
-    catalog
-        .activate_deployment_incarnation()
-        .await
-        .expect("explicit fixture incarnation activation");
-    common::mark_catalog_provisioned(&catalog)
-        .await
-        .expect("explicit fixture provisioning");
-    let run_catalog = catalog.clone();
-    let run_namespace = namespace.clone();
-    let run_username = username.clone();
-    let mut run_admin = admin.clone();
-    let run = tokio::spawn(async move {
-        let mut fixture = Fixture::create(
-            upstream,
-            &run_namespace,
-            &run_username,
-            &password,
-            run_catalog.bound_redis_run_id(),
-        )
-        .await?;
-        let outcome = timeout(
-            SCENARIO_BOUND,
-            run_scenario(&mut fixture, &mut run_admin, &run_username, &run_catalog),
-        )
-        .await
-        .map_err(|_| "online authority scenario exceeded shared deadline")
-        .and_then(|result| result);
-        let cleanup = fixture.cleanup().await;
-        outcome.and(cleanup)
-    });
-    let outcome: Result<GateResult, _> = run.await;
-    let keys = catalog.cleanup_fixture_namespace().await;
+            .map_err(|_| "create isolated publisher ACL")?;
+        catalog = Some(
+            RedisCatalog::connect_for_recovery(
+                &upstream_url,
+                &namespace,
+                "authority-incarnation-a",
+            )
+            .await
+            .map_err(|_| "connect isolated fixture catalog")?,
+        );
+        catalog
+            .as_ref()
+            .ok_or("fixture catalog missing")?
+            .activate_deployment_incarnation()
+            .await
+            .map_err(|_| "activate explicit fixture incarnation")?;
+        Ok(())
+    }
+    .await;
+    let setup_succeeded = setup.is_ok();
+    let outcome: GateResult = match (setup, catalog.as_ref()) {
+        (Ok(()), Some(catalog)) => {
+            let run_catalog = catalog.clone();
+            let run_namespace = namespace.clone();
+            let run_username = username.clone();
+            let mut run_admin = admin.clone();
+            tokio::spawn(async move {
+                let mut fixture = Fixture::create(
+                    upstream,
+                    &run_namespace,
+                    &run_username,
+                    &password,
+                    run_catalog.bound_redis_run_id(),
+                    &run_catalog,
+                )
+                .await?;
+                let outcome = timeout(
+                    SCENARIO_BOUND,
+                    run_scenario(&mut fixture, &mut run_admin, &run_username, &run_catalog),
+                )
+                .await
+                .map_err(|_| "online authority scenario exceeded shared deadline")
+                .and_then(|result| result);
+                let cleanup = fixture.cleanup().await;
+                outcome.and(cleanup)
+            })
+            .await
+            .map_err(|_| "authority lifecycle task panicked")
+            .and_then(|result| result)
+        }
+        (Err(error), _) => Err(error),
+        _ => Err("fixture setup completed without a catalog"),
+    };
+    let keys = if let Some(catalog) = catalog {
+        catalog
+            .cleanup_fixture_namespace()
+            .await
+            .map_err(|_| "remove fixture namespace")
+    } else {
+        Ok(())
+    };
     let users: redis::RedisResult<i64> = redis::cmd("ACL")
         .arg("DELUSER")
         .arg(&username)
         .query_async(&mut admin)
         .await;
     keys.expect("remove only fixture namespace");
-    assert_eq!(users.expect("remove fixture publisher ACL"), 1);
-    outcome
-        .expect("authority lifecycle task")
-        .expect("online authority real-process acceptance");
+    let removed = users.expect("remove fixture publisher ACL");
+    if setup_succeeded {
+        assert_eq!(removed, 1);
+    } else {
+        assert!((0..=1).contains(&removed));
+    }
+    outcome.expect("online authority real-process acceptance");
 }

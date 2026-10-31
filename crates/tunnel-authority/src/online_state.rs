@@ -20,6 +20,10 @@ use tunnel_catalog::SignedMembershipRecord;
 use tunnel_cluster::membership::{MembershipIssuer, MembershipVerifier, TrustedPublisherKey};
 
 const STATE_IO_BUDGET: Duration = Duration::from_secs(1);
+// Every older HTTP waiter expires within one second; the last admitted
+// operation then holds the serializer for at most one more healthy second.
+// Keep the publisher in that fair queue, with one second of scheduling margin.
+const PUBLISHER_QUEUE_BUDGET: Duration = Duration::from_secs(3);
 pub const RESPONSE_MARGIN: Duration = Duration::from_secs(7);
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -368,11 +372,17 @@ impl Coordinator {
                     .map_err(|_| "state admission limit")?,
             )
         };
-        let permit =
-            tokio::time::timeout(STATE_IO_BUDGET, Arc::clone(&self.permit).acquire_owned())
-                .await
-                .map_err(|_| "state allocator is busy")?
-                .map_err(|_| "state allocator closed")?;
+        let permit = tokio::time::timeout(
+            if wait {
+                PUBLISHER_QUEUE_BUDGET
+            } else {
+                STATE_IO_BUDGET
+            },
+            Arc::clone(&self.permit).acquire_owned(),
+        )
+        .await
+        .map_err(|_| "state allocator is busy")?
+        .map_err(|_| "state allocator closed")?;
         let engine = Arc::clone(&self.engine);
         let fatal = Arc::clone(&self.fatal);
         let task = tokio::task::spawn_blocking(move || {
