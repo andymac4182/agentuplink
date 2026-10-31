@@ -7,7 +7,7 @@
 #   M3SC_PLAIN_REDIS=127.0.0.1:63790 ...            # TLS-front an existing plaintext Redis
 #
 # Pinned in tests/mcp-sdk-conformance (never a runtime dependency):
-#   * the official MCP TypeScript SDK   @modelcontextprotocol/sdk 1.30.1 (npm lockfile)
+#   * the official MCP TypeScript SDK   @modelcontextprotocol/sdk 1.32.0 (npm lockfile)
 #   * the official MCP Python SDK       mcp 2.2.0 (uv/pip hash-locked requirements.txt)
 #   * the official MCP conformance suite @modelcontextprotocol/conformance 0.2.0-alpha.11
 #   * the suite's reference "everything" server, fetched from
@@ -152,7 +152,7 @@ fi
 python_sdk=$("$venv/bin/python" -c 'import importlib.metadata as m; print(m.version("mcp"))')
 [ "$python_sdk" = 2.2.0 ] || fail "python mcp is $python_sdk, not the pinned 2.2.0"
 ts_sdk=$(node -p 'require(process.argv[1]).version' "$suite/node_modules/@modelcontextprotocol/sdk/package.json")
-[ "$ts_sdk" = 1.30.1 ] || fail "@modelcontextprotocol/sdk is $ts_sdk, not the pinned 1.30.1"
+[ "$ts_sdk" = 1.32.0 ] || fail "@modelcontextprotocol/sdk is $ts_sdk, not the pinned 1.32.0"
 say "fetch the reference server at $REFERENCE_COMMIT"
 mkdir -p "$suite/.reference"
 curl -sSfL "$REFERENCE_URL" -o "$suite/.reference/everything-server.ts.part" \
@@ -227,7 +227,16 @@ fi
 
 # 5. A synthetic identity issuer and one consumer token (scope http:invoke).
 openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "$work/issuer-key.pem" 2>/dev/null
-modulus=$(openssl rsa -noout -modulus -in "$work/issuer-key.pem" | sed 's/^Modulus=//' | xxd -r -p | b64url)
+modulus=$(openssl rsa -noout -modulus -in "$work/issuer-key.pem" | python3 -c '
+import base64, sys
+line = sys.stdin.read().strip()
+if not line.startswith("Modulus="):
+    raise SystemExit("missing RSA modulus")
+raw = bytes.fromhex(line.removeprefix("Modulus="))
+if not raw:
+    raise SystemExit("empty RSA modulus")
+print(base64.urlsafe_b64encode(raw).decode().rstrip("="))
+')
 printf '{"keys":[{"kid":"m3sc-issuer","kty":"RSA","alg":"RS256","n":"%s","e":"AQAB"}]}\n' \
   "$modulus" > "$work/issuer-jwks.json"
 records="$repo/examples/m6-catalog-mcp.toml"

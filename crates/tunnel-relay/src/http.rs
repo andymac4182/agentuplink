@@ -2931,40 +2931,101 @@ async fn handle_remote_device_control(
     );
     let exchange = peer.open(&route, envelope).await?;
     let (mut send, mut recv) = exchange.split();
-    loop {
-        tokio::select! {
-            inbound = socket.next() => {
-                let Some(inbound) = inbound else { break; };
-                let message = inbound.map_err(|_| PeerRuntimeError::Closed)?;
-                match message {
-                    Message::Text(text) if text.len() <= MAX_CONTROL_BYTES => {
-                        send.send_message(PeerRecordKind::CompleteControlText, text.as_bytes()).await?;
+    let mut liveness = ControlLiveness::new(tokio::time::Instant::now());
+    let mut pings = control_ping_ticker();
+    // Keep every fallible pump operation inside this result. Otherwise a `?`
+    // bypasses the explicit cancellation below, leaving the owner dependent
+    // on eventual transport cleanup to notice the vanished device.
+    let result = async {
+        loop {
+            match next_forwarded_control_event(socket, &mut liveness, &mut pings, recv.recv_message()).await {
+                ForwardedControlEvent::Device(inbound) => {
+                    let Some(inbound) = inbound else { break; };
+                    let message = inbound.map_err(|_| PeerRuntimeError::Closed)?;
+                    match message {
+                        Message::Text(text) if text.len() <= MAX_CONTROL_BYTES => {
+                            send.send_message(PeerRecordKind::CompleteControlText, text.as_bytes()).await?;
+                        }
+                        Message::Ping(payload) => {
+                            if !send_socket(&mut *socket, Message::Pong(payload)).await { break; }
+                        }
+                        Message::Close(_) => break,
+                        Message::Pong(_) => {}
+                        _ => break,
                     }
-                    Message::Ping(payload) => {
-                        if !send_socket(&mut *socket, Message::Pong(payload)).await { break; }
-                    }
-                    Message::Close(_) => break,
-                    Message::Pong(_) => {}
-                    _ => break,
                 }
-            }
-            remote = recv.recv_message() => {
-                let Some(record) = remote? else { break; };
-                match record.kind() {
-                    PeerRecordKind::CompleteControlText => {
-                        let text = record.as_text().map_err(PeerRuntimeError::Frame)?;
-                        if !send_socket(&mut *socket, Message::Text(text.to_owned().into())).await { break; }
+                ForwardedControlEvent::Peer(remote) => {
+                    let Some(record) = remote? else { break; };
+                    match record.kind() {
+                        PeerRecordKind::CompleteControlText => {
+                            let text = record.as_text().map_err(PeerRuntimeError::Frame)?;
+                            if !send_socket(&mut *socket, Message::Text(text.to_owned().into())).await { break; }
+                        }
+                        PeerRecordKind::Close => break,
+                        _ => break,
                     }
-                    PeerRecordKind::Close => break,
-                    _ => break,
+                }
+                ForwardedControlEvent::Ping => {
+                    if !send_socket(&mut *socket, Message::Ping(Default::default())).await { break; }
+                }
+                ForwardedControlEvent::IdleTimeout => {
+                    tracing::info!(
+                        device_id = %route.owner_token().device_id,
+                        idle_timeout_ms = u64::try_from(DEVICE_CONTROL_IDLE_TIMEOUT.as_millis()).unwrap_or(u64::MAX),
+                        phase = "control_liveness_timeout",
+                        route = "forwarded",
+                    );
+                    break;
                 }
             }
         }
-    }
+        Ok(())
+    }.await;
+    // The ingress owns device-path liveness: owner traffic and successful
+    // local writes cannot prove that the device still receives anything.
+    // Reset both peer halves before attempting the bounded WebSocket close,
+    // so the owner can release the session even if that write stalls.
     send.cancel();
     recv.cancel();
-    let _ = send_socket(&mut *socket, Message::Close(None)).await;
-    Ok(())
+    // Preserve the caller's typed admission-refusal close on errors.
+    if result.is_ok() {
+        let _ = send_socket(&mut *socket, Message::Close(None)).await;
+    }
+    result
+}
+
+/// One scheduling decision in the forwarded control pump. The generic stream
+/// and peer future allow the real scheduling rules to be exercised with a
+/// paused clock, without adding a fixture-only timeout to the wire protocol.
+enum ForwardedControlEvent<E, P> {
+    Device(Option<Result<Message, E>>),
+    Peer(P),
+    Ping,
+    IdleTimeout,
+}
+
+async fn next_forwarded_control_event<S, E, F, P>(
+    socket: &mut S,
+    liveness: &mut ControlLiveness,
+    pings: &mut tokio::time::Interval,
+    peer_receive: F,
+) -> ForwardedControlEvent<E, P>
+where
+    S: futures_util::Stream<Item = Result<Message, E>> + Unpin,
+    F: std::future::Future<Output = P>,
+{
+    tokio::select! {
+        biased;
+        // A buffered device frame wins a simultaneous deadline. Only these
+        // frames renew the deadline; even continuous owner output must not.
+        inbound = socket.next() => {
+            liveness.observe_inbound(tokio::time::Instant::now());
+            ForwardedControlEvent::Device(inbound)
+        }
+        () = tokio::time::sleep_until(liveness.deadline()) => ForwardedControlEvent::IdleTimeout,
+        _ = pings.tick() => ForwardedControlEvent::Ping,
+        remote = peer_receive => ForwardedControlEvent::Peer(remote),
+    }
 }
 
 async fn handle_remote_device_data(
@@ -5276,6 +5337,111 @@ mod tests {
             "an older observation must not pull the deadline back"
         );
         assert!(liveness.deadline() >= pong + DEVICE_CONTROL_PING_INTERVAL * 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn forwarded_control_pings_then_expires_a_silent_device() {
+        use super::{
+            ControlLiveness, ForwardedControlEvent, control_ping_ticker,
+            next_forwarded_control_event,
+        };
+        let admitted = tokio::time::Instant::now();
+        let mut liveness = ControlLiveness::new(admitted);
+        let mut pings = control_ping_ticker();
+        let mut socket = futures_util::stream::pending::<Result<Message, ()>>();
+        for interval in 1..=2 {
+            assert!(matches!(
+                next_forwarded_control_event(
+                    &mut socket,
+                    &mut liveness,
+                    &mut pings,
+                    std::future::pending::<()>(),
+                )
+                .await,
+                ForwardedControlEvent::Ping,
+            ));
+            assert_eq!(
+                tokio::time::Instant::now(),
+                admitted + super::DEVICE_CONTROL_PING_INTERVAL * interval,
+            );
+        }
+        assert!(matches!(
+            next_forwarded_control_event(
+                &mut socket,
+                &mut liveness,
+                &mut pings,
+                std::future::pending::<()>(),
+            )
+            .await,
+            ForwardedControlEvent::IdleTimeout,
+        ));
+        assert_eq!(
+            tokio::time::Instant::now(),
+            admitted + super::DEVICE_CONTROL_IDLE_TIMEOUT,
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn forwarded_control_owner_output_cannot_hide_a_dead_device() {
+        use super::{
+            ControlLiveness, ForwardedControlEvent, control_ping_ticker,
+            next_forwarded_control_event,
+        };
+        let admitted = tokio::time::Instant::now();
+        let mut liveness = ControlLiveness::new(admitted);
+        let mut pings = control_ping_ticker();
+        let mut socket = futures_util::stream::pending::<Result<Message, ()>>();
+        assert!(matches!(
+            next_forwarded_control_event(
+                &mut socket,
+                &mut liveness,
+                &mut pings,
+                std::future::ready(()),
+            )
+            .await,
+            ForwardedControlEvent::Peer(()),
+        ));
+        tokio::time::advance(super::DEVICE_CONTROL_IDLE_TIMEOUT).await;
+        // Both a pending Ping and another owner record are ready. Neither
+        // may starve expiry or reset it without an inbound device frame.
+        assert!(matches!(
+            next_forwarded_control_event(
+                &mut socket,
+                &mut liveness,
+                &mut pings,
+                std::future::ready(()),
+            )
+            .await,
+            ForwardedControlEvent::IdleTimeout,
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn forwarded_control_buffered_pong_wins_a_simultaneous_deadline() {
+        use super::{
+            ControlLiveness, ForwardedControlEvent, control_ping_ticker,
+            next_forwarded_control_event,
+        };
+        let admitted = tokio::time::Instant::now();
+        let mut liveness = ControlLiveness::new(admitted);
+        let mut pings = control_ping_ticker();
+        let mut socket =
+            futures_util::stream::iter([Ok::<_, ()>(Message::Pong(Default::default()))]);
+        tokio::time::advance(super::DEVICE_CONTROL_IDLE_TIMEOUT).await;
+        assert!(matches!(
+            next_forwarded_control_event(
+                &mut socket,
+                &mut liveness,
+                &mut pings,
+                std::future::ready(()),
+            )
+            .await,
+            ForwardedControlEvent::Device(Some(Ok(Message::Pong(_)))),
+        ));
+        assert_eq!(
+            liveness.deadline(),
+            tokio::time::Instant::now() + super::DEVICE_CONTROL_IDLE_TIMEOUT,
+        );
     }
 
     use super::{

@@ -425,13 +425,15 @@ It warns that a single volume has no redundancy. That is expected: there is
 exactly one Redis, and its durability is the AOF on this volume plus Fly's
 daily snapshots.
 
-**Known gap: no memory limit.** The Redis entrypoint sets
-`maxmemory-policy noeviction` but no `maxmemory`, so the policy never applies
-and Redis can grow until the 256 MB VM runs out of memory (an out-of-memory
-kill is a Redis restart, section 6.4). The fix, `maxmemory 160mb` or similar,
-belongs in the next planned Redis rebuild. It was not made in place because
-redeploying Redis restarted it, which ended the live namespace; with a relay
-image that has M6-C65 a Redis redeploy is an ordinary restart (section 6.4).
+The Redis image sets `maxmemory 160mb` and `maxmemory-policy noeviction` for
+the 256 MB VM. At that dataset limit, Redis refuses writes rather than evicting
+catalog or revocation records. The remaining 96 MB is headroom for Redis and
+AOF work, not a guarantee against an out-of-memory kill: measure peak RSS,
+AOF rewrite copy-on-write memory and disk usage under your workload, and alert
+before the limit. Increase the machine size and the dataset budget together
+when capacity requires it. Older images have no dataset limit; rebuilding an
+image does not change a running deployment. Plan its rollout as the Redis
+restart described in section 6.4.
 
 **Costs money: $2.47 a month** (one `shared-cpu-1x` 256 MB machine in `syd`).
 Run from the Redis directory, whose `fly.toml` and `Dockerfile` are the
@@ -1167,20 +1169,32 @@ verified.` and exited `0`, and the relay deployed afterwards served.
 #### 6.4.1 A new namespace
 
 For a Redis that came back empty or older, or a relay image without M6-C65,
-the way back is a new namespace. Redis's data and the device's key,
-certificate and profile are all kept:
+a new namespace can be provisioned only from a reconciled authority catalog.
+A fresh namespace or incarnation does not prove that permissions are current.
+Do not reuse the original provisioning file blindly: a grant, device or
+credential revoked since that file was written would become active again.
+Reconcile all later revocations and membership changes against an independent
+durable record, exclude revoked identities and grants, and check certificate
+validity before provisioning. If that record is unavailable, keep the relay
+stopped and re-enrol/re-authorize explicitly from current approvals. The
+external recovery signer remains missing (M6-C22); this procedure is not an
+automated restore guarantee.
+
+After reconciliation, retained device keys, certificates and UUIDs may be
+reused only for identities still approved:
 
 1. Stop the relay if it is still running, so nothing is served while you
    work: `fly machine stop <id> -a agentuplink-relay`.
 2. Edit `redis_namespace` and `deployment_incarnation` in
    `deploy/fly/relay/relay.toml` to values never used before.
 3. Section 6.1 with a new `--image-label` (for example `fly-2`).
-4. Section 6.2 with that label: all four steps, with the same `catalog.toml`
-   and `device-cert.pem`. The UUIDs can be reused because the records go into
-   the new namespace.
+4. Section 6.2 with that label: all four steps, using the **reconciled**
+   `catalog.toml` and approved, unexpired device certificates. Check the dry
+   run against the reconciled grants before writing the new namespace.
 5. Section 6.3 with that label. If `fly machine list` then shows the relay
    `stopped`, start it with `fly machine start <id> -a agentuplink-relay`.
-6. Reconnect the device and repeat the echo.
+6. Reconnect an approved device and repeat the echo. Also verify that a
+   previously revoked grant and device remain refused before reopening access.
 
 The old namespace's keys stay in Redis; nothing shipped removes them.
 

@@ -50,11 +50,12 @@ ignore = [
     # signing).  The shipped relay only *verifies* RS256 consumer tokens with
     # public keys (`DecodingKey::from_rsa_components` in
     # crates/tunnel-relay/src/main.rs); no shipped binary holds an RSA private
-    # key.  RSA signing and private keys appear only in test code: the
+    # key. The JWT provider is now AWS-LC; the remaining rsa dependency is
+    # test-only. RSA signing and private keys appear only in test code: the
     # `tunnel-test-harness` OIDC fixture (`rsa` is a direct dependency of that
     # crate) and the tunnel-relay process tests
     # (tests/m6_provisioning_process.rs, tests/m6_reconnect_process.rs).
-    { id = "RUSTSEC-2023-0071", reason = "rsa via jsonwebtoken: shipped code only verifies RS256 with public keys; RSA signing and private keys appear only in test code (tunnel-test-harness, tunnel-relay/tests) (docs/tasks.md M6-C03)" },
+    { id = "RUSTSEC-2023-0071", reason = "rsa is test-only (tunnel-test-harness, tunnel-relay/tests); shipped JWT verification uses AWS-LC and public keys (docs/tasks.md M6-C03)" },
     # Unmaintained, not a vulnerability.  The replacement is
     # `rustls_pki_types::pem::PemObject`; migrating touches the TLS
     # credential loaders in tunnel-transport, tunnel-client and tunnel-relay,

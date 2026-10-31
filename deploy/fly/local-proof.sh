@@ -61,6 +61,10 @@ ok() { echo "ok $*"; }
 fail() { echo "FAILED $*" >&2; exit 1; }
 b64() { base64 < "$1" | tr -d '\n'; }
 b64url() { base64 | tr -d '\n=' | tr '+/' '-_'; }
+uuid() { python3 -c 'import uuid; print(uuid.uuid4())'; }
+tcp_check() {
+  python3 -c 'import socket, sys; socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=5).close()' "$1"
+}
 
 echo "== images"
 # PROOF_SKIP_BUILD=1 runs images built elsewhere (RELAY_IMAGE, REDIS_IMAGE),
@@ -94,7 +98,7 @@ server_cert consumer-server relay-ca "IP:127.0.0.1,DNS:localhost,DNS:agentuplink
 server_cert redis-server redis-ca "DNS:agentuplink-redis.internal"
 openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "$pki/oidc-key.pem" 2>/dev/null
 modulus=$(openssl rsa -noout -modulus -in "$pki/oidc-key.pem" | sed 's/^Modulus=//')
-n=$(printf '%s' "$modulus" | xxd -r -p | b64url)
+n=$(printf '%s' "$modulus" | python3 -c 'import sys; sys.stdout.buffer.write(bytes.fromhex(sys.stdin.read()))' | b64url)
 printf '{"keys":[{"kid":"m6c60-issuer","kty":"RSA","alg":"RS256","n":"%s","e":"AQAB"}]}' "$n" > "$pki/oidc-jwks.json"
 redis_password=$(openssl rand -hex 24)
 ok "generated 3 CAs, 3 server certificates, an issuer key and a ${#redis_password}-character Redis password"
@@ -131,7 +135,7 @@ ok "no key line and no password in the saved images (the check greps the same by
 echo "== Redis: private network, TLS only, password, AOF on a volume"
 docker network create "$net" >/dev/null
 docker volume create "$volume" >/dev/null
-docker run -d --name "$redis" --network "$net" --network-alias agentuplink-redis.internal \
+docker run -d --name "$redis" --memory 256m --network "$net" --network-alias agentuplink-redis.internal \
   --env-file "$work/redis.env" -v "$volume:/data" "$redis_image" >/dev/null
 for _ in $(seq 1 50); do
   docker logs "$redis" 2>&1 | grep -q "Ready to accept connections tls" && break
@@ -151,19 +155,29 @@ ok "redis refuses a client without the password"
 plain=$(docker exec "$redis" redis-cli -h 127.0.0.1 -p 6379 PING 2>&1 || true)
 case "$plain" in PONG) fail "redis answered in plaintext" ;; esac
 ok "redis has no plaintext port ($plain)"
-for pair in appendonly:yes appendfsync:always aof-load-truncated:no maxmemory-policy:noeviction port:0 tls-port:6379; do
+for pair in appendonly:yes appendfsync:always aof-load-truncated:no maxmemory:167772160 maxmemory-policy:noeviction port:0 tls-port:6379; do
   got=$(redis_authed CONFIG GET "${pair%%:*}" | sed -n 2p | tr -d '\r')
   [ "$got" = "${pair#*:}" ] || fail "redis ${pair%%:*} is '$got', not '${pair#*:}'"
 done
-ok "redis durability and listener settings: appendonly yes, appendfsync always, aof-load-truncated no, maxmemory-policy noeviction, port 0, tls-port 6379"
+ok "redis durability and listener settings: appendonly yes, appendfsync always, aof-load-truncated no, maxmemory 160mb, maxmemory-policy noeviction, port 0, tls-port 6379"
+# Prove capacity pressure refuses writes without deleting existing authority.
+# Only this disposable proof instance is changed, before catalog provisioning.
+[ "$(redis_authed SET proof-memory-canary retained)" = OK ] || fail "could not seed memory canary"
+[ "$(redis_authed CONFIG SET maxmemory 1)" = OK ] || fail "could not set proof memory pressure"
+refusal=$(redis_authed SET proof-memory-refused rejected)
+case "$refusal" in OOM*) ;; *) fail "memory pressure did not refuse the write" ;; esac
+[ "$(redis_authed GET proof-memory-canary)" = retained ] || fail "memory pressure evicted existing data"
+[ "$(redis_authed CONFIG SET maxmemory 167772160)" = OK ] || fail "could not restore memory budget"
+[ "$(redis_authed DEL proof-memory-canary)" = 1 ] || fail "could not remove memory canary"
+ok "redis refuses writes under memory pressure and preserves existing data"
 run_id_1=$(redis_authed INFO server | sed -n 's/^run_id://p' | tr -d '\r')
 echo "redis run_id=$run_id_1"
 
 echo "== provisioning in one-off relay containers (as fly machine run, then destroy)"
-dev=$(uuidgen | tr 'A-Z' 'a-z')
-tenant=$(uuidgen | tr 'A-Z' 'a-z')
-user=$(uuidgen | tr 'A-Z' 'a-z')
-svc=$(uuidgen | tr 'A-Z' 'a-z')
+dev=$(uuid)
+tenant=$(uuid)
+user=$(uuid)
+svc=$(uuid)
 canary="m6c60-canary-$nonce"
 device_dir=$work/device
 mkdir -p "$device_dir"
@@ -251,7 +265,7 @@ ok "activated and provisioned through the image's entrypoint"
 
 echo "== relay: both listeners published as plain TCP (passthrough)"
 start_relay() {
-  docker run -d --name "$relay" --network "$net" --env-file "$work/relay.env" \
+  docker run -d --name "$relay" --memory 256m --network "$net" --env-file "$work/relay.env" \
     -p "127.0.0.1:$consumer_port:8443" -p "127.0.0.1:$device_port:9443" "$relay_image" >/dev/null
 }
 readyz() { curl -sS --max-time 3 --cacert "$pki/relay-ca.pem" "https://127.0.0.1:$consumer_port/readyz" 2>/dev/null || true; }
@@ -280,8 +294,8 @@ noauth=$(printf 'x' | openssl s_client -connect "127.0.0.1:$device_port" -server
 echo "device listener without a client certificate: ${noauth:-no alert text}"
 case "$noauth" in *"certificate required"*) ok "the device listener refuses a TLS client with no certificate" ;; *) fail "device listener accepted a client with no certificate" ;; esac
 lines_before=$(docker logs "$relay" 2>&1 | wc -l | tr -d ' ')
-nc -z 127.0.0.1 "$device_port"
-nc -z 127.0.0.1 "$consumer_port"
+tcp_check "$device_port"
+tcp_check "$consumer_port"
 sleep 1
 lines_after=$(docker logs "$relay" 2>&1 | wc -l | tr -d ' ')
 echo "log lines added by two bare TCP connects (what a tcp_check does): $((lines_after - lines_before))"
@@ -346,10 +360,10 @@ echo "unknown command: exit=$code: $out"
 case "$out" in *"unknown command 'no-such-command'"*) ;; *) fail "unknown command output" ;; esac
 ok "the entrypoint refuses an unknown command, exit 1"
 
-user2=$(uuidgen | tr 'A-Z' 'a-z')
-dev2=$(uuidgen | tr 'A-Z' 'a-z')
-svc2=$(uuidgen | tr 'A-Z' 'a-z')
-dev3=$(uuidgen | tr 'A-Z' 'a-z')
+user2=$(uuid)
+dev2=$(uuid)
+svc2=$(uuid)
+dev3=$(uuid)
 canary2="m6c91-canary-$nonce"
 device2_dir=$work/device2
 mkdir -p "$device2_dir"
@@ -423,7 +437,7 @@ done
 day2_run 0 "revoke-grant --dry-run" revoke-grant --tenant "$tenant" --user "$user2" --device "$dev2" --service "$svc2" --dry-run
 day2_run 0 "revoke-device --dry-run" revoke-device --tenant "$tenant" --device "$dev2" --dry-run
 day2_run 0 "revoke-credential --dry-run" revoke-credential --tenant "$tenant" --device "$dev2" \
-  --credential "$(uuidgen | tr 'A-Z' 'a-z')" --dry-run
+  --credential "$(uuid)" --dry-run
 [ "$(grep -c 'This dry run contacted no Redis authority and wrote nothing.' "$day2_out")" = 7 ] || fail "not seven dry runs"
 ok "all seven catalog commands pass --dry-run through the entrypoint, exit 0"
 
@@ -545,8 +559,20 @@ echo "== Redis stop, then a Redis restart, as a Fly host migration or redeploy w
 docker stop -t 30 "$redis" >/dev/null
 echo "redis after docker stop: $(docker inspect -f 'exit={{.State.ExitCode}}' "$redis")"
 docker logs "$redis" 2>&1 | grep -E "Received SIGTERM|ready to exit" || true
-sleep 2
-echo "running relay while Redis is down: readyz=$(readyz) echo=HTTP $(echo_once)"
+token=$(mint_token m6c60-user)
+# Readiness is cached for at most 7 s (probe interval + deadline + margin).
+# Poll beyond that window rather than assuming the next probe ran in 2 s.
+down_deadline=$(( $(date +%s) + 10 ))
+down_ready=""
+while [ "$(date +%s)" -lt "$down_deadline" ]; do
+  down_ready=$(readyz)
+  [ "$down_ready" = '{"status":"unready"}' ] && break
+  sleep 0.2
+done
+down_code=$(echo_once)
+[ "$down_ready" = '{"status":"unready"}' ] || fail "relay did not withdraw readiness while Redis was down"
+[ "$down_code" != 200 ] || fail "relay served an echo without its Redis authority"
+ok "relay fails closed while Redis is down"
 docker start "$redis" >/dev/null
 for _ in $(seq 1 50); do
   docker logs "$redis" 2>&1 | grep -c "Ready to accept connections tls" | grep -q 2 && break
@@ -555,8 +581,24 @@ done
 run_id_2=$(redis_authed INFO server | sed -n 's/^run_id://p' | tr -d '\r')
 keys=$(redis_authed DBSIZE)
 echo "redis restarted: run_id=$run_id_2 (was $run_id_1), keys kept by AOF=$keys"
-sleep 3
-echo "running relay after the Redis restart: readyz=$(readyz) echo=HTTP $(echo_once) body=$(head -c 200 "$work/echo.body")"
+[ -n "$run_id_2" ] && [ "$run_id_2" != "$run_id_1" ] || fail "Redis did not start a new run"
+[ "$keys" -gt 0 ] || fail "Redis lost its catalog on restart"
+# Readiness alone is insufficient: the catalog may be rebound while the old
+# device owner lease still prevents reconnect (M6-C125). Require traffic too.
+token=$(mint_token m6c60-user)
+recovery_started=$(date +%s)
+recovery_deadline=$(( recovery_started + 60 ))
+code=""
+while [ "$(date +%s)" -lt "$recovery_deadline" ]; do
+  code=$(echo_once)
+  [ "$code" = 200 ] && break
+  sleep 0.5
+done
+[ "$code" = 200 ] || fail "device traffic did not recover within 60 s after Redis restart"
+[ "$(( $(date +%s) - recovery_started ))" -le 60 ] || fail "recovered traffic exceeded the 60 s budget"
+[ "$(cat "$work/echo.body")" = "$canary$payload" ] || fail "recovered echo payload changed"
+[ "$(readyz)" = '{"status":"ready"}' ] || fail "relay is not ready after recovered traffic"
+ok "Redis AOF restart recovered device traffic with the exact echo payload"
 if kill -0 "$client_pid" 2>/dev/null; then
   kill -TERM "$client_pid"
   echo "device was still running after the Redis restart; sent it SIGTERM"
@@ -570,7 +612,7 @@ echo "device: exit=$client_exit last=$(tail -1 "$work/connect2.log")"
 docker stop -t 60 "$relay" >/dev/null
 docker rm "$relay" >/dev/null
 start_relay
-sleep 5
+wait_ready || fail "fresh relay did not become ready on the rebound Redis namespace"
 echo "a fresh relay on the restarted Redis: $(docker inspect -f 'running={{.State.Running}} exit={{.State.ExitCode}}' "$relay")"
 docker logs "$relay" 2>&1 | grep -v '^{' | tail -3
 echo "proof complete nonce=$nonce"

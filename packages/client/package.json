@@ -42,6 +42,11 @@
     "files-sdk": { "optional": true },
     "just-bash": { "optional": true }
   },
+  "overrides": {
+    "@mastra/core": {
+      "@modelcontextprotocol/server": "2.3.0"
+    }
+  },
   "devDependencies": {
     "@ai-sdk/provider": "4.0.11",
     "@mastra/core": "1.65.0",
@@ -50,6 +55,6 @@
     "files-sdk": "2.4.0",
     "just-bash": "3.4.2",
     "typescript": "5.9.3",
-    "zod": "4.1.13"
+    "zod": "4.6.6"
   }
 }

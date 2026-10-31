@@ -64,6 +64,10 @@ appendfsync always
 # continuity (M6-C65) checks all three settings with CONFIG GET.
 no-appendfsync-on-rewrite no
 aof-load-truncated no
+# The Fly profile allocates 256 MiB. Leave 96 MiB for Redis overhead and AOF
+# work; refuse writes at this dataset limit instead of evicting authority.
+# AOF rewrite/copy-on-write still needs monitoring and capacity testing.
+maxmemory 160mb
 maxmemory-policy noeviction
 dir $data
 CONF

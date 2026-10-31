@@ -18,6 +18,52 @@ env:
   CARGO_INCREMENTAL: "0"
 
 jobs:
+  typescript:
+    name: TypeScript client and framework adapters
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: packages/client
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: packages/client/package-lock.json
+      - run: npm ci --ignore-scripts
+      - run: npm run check
+      - run: npm audit --audit-level=high
+      - name: Audit the pinned MCP conformance dependencies
+        working-directory: tests/mcp-sdk-conformance
+        run: |
+          npm ci --ignore-scripts
+          npm audit --audit-level=high
+
+  fly-deployment:
+    name: Fly deployment images and real-socket smoke test
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.95.0 --profile minimal
+      - name: Build the device binaries
+        run: cargo +1.95.0 build --locked -p tunnel-client -p tunnel-deadman --bins
+      # This uses disposable synthetic PKI, an isolated Docker network and
+      # an AOF volume. It builds the actual deployment Dockerfiles, provisions
+      # the catalog through the shipped image, sends an authenticated echo,
+      # checks revocation, and proves orderly shutdown. No Fly access needed.
+      - name: Prove the shipped container deployment
+        env:
+          TUNNEL_CLIENT: ${{ github.workspace }}/target/debug/tunnel-client
+        run: bash deploy/fly/local-proof.sh
+
   rust:
     name: Rust (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -135,6 +181,10 @@ jobs:
         # licence by file rather than by manifest field, so this covers both
         # needs. Alternatively pass `--no-offline` to the script.
         run: cargo +1.95.0 fetch --locked
+      - name: Check current Rust security advisories
+        # The offline release gate below deliberately does not run advisories.
+        # cargo-deny fetches the current RustSec database for this check.
+        run: cargo +1.95.0 deny --locked check advisories
       - name: Prove the checks can still fail
         # **Runs before the checks themselves, deliberately.** Each control
         # plants a synthetic case and requires the corresponding check to go
@@ -155,10 +205,9 @@ jobs:
           # gate go green on a repository that fails the gate -- an automation
           # that cannot report the one problem it exists to catch.
           #
-          # This job is therefore expected to FAIL while the repository is
-          # public (docs/tasks.md M6-C01). That is the correct behaviour and
-          # must not be "fixed" by dropping the check again; it goes green when
-          # the owner restores privacy.
+          # The owner subsequently approved public visibility. The check now
+          # compares GitHub against repository-visibility in Cargo.toml;
+          # either kind of unexpected visibility change must fail the gate.
           GH_TOKEN: ${{ github.token }}
         run: python3 scripts/m6-release-checks.py
 
