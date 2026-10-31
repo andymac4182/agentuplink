@@ -46,6 +46,8 @@ use uuid::Uuid;
 
 #[path = "common/authority_fault_proxy.rs"]
 mod authority_fault_proxy;
+#[path = "common/authority_canary_diagnostics.rs"]
+mod canary_diagnostics;
 #[path = "common/m7_deployment.rs"]
 mod common;
 #[path = "m6_online_authority/recovery.rs"]
@@ -821,12 +823,20 @@ impl Fixture {
         .map_err(|_| "three-relay adoption exceeded the refresh bound")?
     }
 
-    async fn canary(&self, phase: &str) -> GateResult {
+    async fn canary(&self, phase: &'static str) -> GateResult {
         self.canary_with_token(phase, &self.consumer_token, false)
             .await
     }
 
-    async fn canary_with_token(&self, phase: &str, token: &str, denied: bool) -> GateResult {
+    async fn canary_with_token(
+        &self,
+        phase: &'static str,
+        token: &str,
+        denied: bool,
+    ) -> GateResult {
+        let started = Instant::now();
+        let mut observed = canary_diagnostics::Observation::default();
+        observed.stage = "tls_setup";
         let mut payload = vec![0, 0xff, 0x80, 0x7f];
         payload.extend_from_slice(phase.as_bytes());
         payload.extend_from_slice(Uuid::new_v4().as_bytes());
@@ -847,9 +857,11 @@ impl Fixture {
             .with_root_certificates(roots)
             .with_no_client_auth();
             tls.alpn_protocols = vec![b"http/1.1".to_vec()];
+            observed.stage = "tcp_connect";
             let socket = tokio::net::TcpStream::connect(self.relays[0].consumer)
                 .await
                 .map_err(|_| "non-owner consumer TCP")?;
+            observed.stage = "tls_connect";
             let socket = TlsConnector::from(Arc::new(tls))
                 .connect(
                     ServerName::try_from("localhost").map_err(|_| "canary server name")?,
@@ -857,6 +869,7 @@ impl Fixture {
                 )
                 .await
                 .map_err(|_| "non-owner consumer TLS")?;
+            observed.stage = "http_handshake";
             let (mut sender, connection) =
                 hyper::client::conn::http1::handshake(TokioIo::new(socket))
                     .await
@@ -865,6 +878,7 @@ impl Fixture {
                 let _ = connection.await;
             })));
             let result = async {
+                observed.stage = "request_build";
                 let request = Request::builder()
                     .method("POST")
                     .uri(format!(
@@ -877,16 +891,25 @@ impl Fixture {
                     .header("content-type", "application/octet-stream")
                     .body(Full::new(Bytes::from(payload)))
                     .map_err(|_| "canary HTTP request")?;
+                observed.stage = "request_send";
                 let response = sender
                     .send_request(request)
                     .await
                     .map_err(|_| "canary HTTP response")?;
                 let status = response.status().as_u16();
+                observed.status = Some(status);
+                observed.stage = "response_body";
                 let body = Limited::new(response.into_body(), 4096)
                     .collect()
                     .await
                     .map_err(|_| "bounded canary response body")?
                     .to_bytes();
+                observed.stage = "response_assert";
+                if (denied && (!matches!(status, 403 | 404) || body.as_ref() == expected))
+                    || (!denied && (status != 200 || body.as_ref() != expected))
+                {
+                    observed.response(&body);
+                }
                 if denied {
                     require(
                         matches!(status, 403 | 404) && body.as_ref() != expected,
@@ -901,12 +924,76 @@ impl Fixture {
                 }
             }
             .await;
+            if result.is_ok() {
+                observed.stage = "connection_cleanup";
+            }
             let cleanup = task.shutdown().await;
             result.and(cleanup)
         };
-        timeout(EXCHANGE_BOUND, exchange)
+        let result = timeout(EXCHANGE_BOUND, exchange)
             .await
-            .map_err(|_| "non-owner public canary exceeded exchange deadline")?
+            .map_err(|_| "non-owner public canary exceeded exchange deadline")
+            .and_then(|result| result);
+        if let Err(reason) = result {
+            // Failure-only local reads. No new canary, retry, healthy-path
+            // checkpoint fetch or changed survival predicate is introduced.
+            let mut event = observed.event(phase, started.elapsed().as_millis(), reason);
+            event["authority"] = canary_diagnostics::authority_counters(
+                canary_diagnostics::bounded_json(&self.state, 256 * 1024),
+            );
+            let connector = self
+                .connector
+                .as_ref()
+                .map(ConnectionHandle::status_snapshot);
+            event["connector"] = connector.map_or(json!({"present": false}), |status| json!({
+                "present": true, "has_session": status.session_id.is_some(), "epoch": status.epoch,
+                "generation": status.active_generation, "has_socket": status.active_connection_id.is_some(),
+                "streams": status.streams, "queue_frames": status.queue_frames, "replay_frames": status.replay_frames
+            }));
+            let relays: Vec<_> = self.relays.iter().enumerate().map(|(index, relay)| {
+                let mut counters = canary_diagnostics::relay_counters(canary_diagnostics::bounded_json(
+                    &relay.version_state, tunnel_relay::membership_version_state::MAX_MEMBERSHIP_VERSION_STATE_BYTES,
+                ));
+                counters["index"] = index.into();
+                counters["pid"] = self.relay_processes.get(index).and_then(ManagedProcess::id).into();
+                counters
+            }).collect();
+            event["relays"] = relays.into();
+            eprintln!("authority_canary_failure {event}");
+        }
+        result
+    }
+
+    async fn failed_scenario_owner_evidence(&self, catalog: &RedisCatalog) {
+        // This observation is explicitly after failure, before teardown. Its
+        // result cannot turn the failed exchange into success or add a retry.
+        let observed = timeout(
+            IO_BOUND,
+            catalog.current_owner(self.tenant_id, self.device_id, Utc::now()),
+        )
+        .await;
+        let evidence = match observed {
+            Ok(Ok(Some(owner))) => {
+                let node = match owner.token.node_id.as_str() {
+                    "relay-a" => "relay-a",
+                    "relay-b" => "relay-b",
+                    "relay-c" => "relay-c",
+                    _ => "unrecognized",
+                };
+                let connector = self
+                    .connector
+                    .as_ref()
+                    .map(ConnectionHandle::status_snapshot);
+                json!({"available": true, "present": true, "node": node, "epoch": owner.token.epoch,
+                    "same_incarnation": owner.token.deployment_incarnation == self.incarnation,
+                    "same_connector_session": connector.as_ref().and_then(|status| status.session_id.as_ref()) == Some(&owner.token.session_id),
+                    "lease_remaining_ms": (owner.lease_expires_at - Utc::now()).num_milliseconds()})
+            }
+            Ok(Ok(None)) => json!({"available": true, "present": false}),
+            Ok(Err(_)) => json!({"available": false, "cause": "catalog_refused"}),
+            Err(_) => json!({"available": false, "cause": "read_deadline"}),
+        };
+        eprintln!("authority_owner_after_failed_scenario {evidence}");
     }
 
     async fn stop_device(&mut self) -> GateResult {
@@ -1416,6 +1503,9 @@ async fn online_authority_publishes_for_three_relays_and_fails_closed_across_lif
                 .await
                 .map_err(|_| "online authority scenario exceeded shared deadline")
                 .and_then(|result| result);
+                if outcome.is_err() {
+                    fixture.failed_scenario_owner_evidence(&run_catalog).await;
+                }
                 let cleanup = fixture.cleanup().await;
                 outcome.and(cleanup)
             })
