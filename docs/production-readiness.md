@@ -26,7 +26,19 @@ and [Mastra depth / authority lock #275](https://github.com/andymac4182/agentupl
 then [terminal retirement observer #276](https://github.com/andymac4182/agentuplink/pull/276)
 and [client matcher correction #277](https://github.com/andymac4182/agentuplink/pull/277).
 
-Current hosted candidate [#277](https://github.com/andymac4182/agentuplink/pull/277)
+The next C240 implementation is locally verified at
+`bf21e353ede811088cf31b64f8b9076d28378f11` (tree
+`2b3aa8f155d65c4ac07b327e835fbf440216de78`): all six new real actor-loop tests
+and four existing handler controls pass on the first compiled run,10/0/0 in
+2.78s. A separate full workspace format check passes. The first overall
+attempt remains **failed before Clippy** because tmp capacity was138,395,648B
+below its required startup reserve; no lint process or automatic retry ran.
+[Exact actor evidence and retained failure](m6-c240-queue-boundary.md#first-real-actor-loop-run-and-retained-validation-failure)
+keep public C240 scope B and full candidate validation open. A new stacked
+draft will carry this tested implementation plus documentation; the prior
+hosted and image results below retain their exact original identities.
+
+Latest fully successful hosted baseline [#277](https://github.com/andymac4182/agentuplink/pull/277)
 head `bd93cfbd828a2d23415e5e406120f9a70e9e92c0` and actual runner checkout
 `3615d7a2ff4ffb5837a8e0f894f353ea68115ac4` share tree
 `00fcf8d247642d9ace69b6223c7500858385e6d3`.

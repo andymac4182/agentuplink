@@ -93,13 +93,13 @@ above. The misleading later fallback is unchanged and has not been reached by
 valid accounted input.
 
 
-## Actor-loop continuation prepared; execution pending
+## Actor-loop preparation observation before execution
 
 A separate source-only continuation from exact `bd93cfbd828a2d23415e5e406120f9a70e9e92c0`
 adds six `c240_actor_` tests in
 `crates/tunnel-client/src/m2_runtime/tests/c240_actor_loop.rs`. The earlier
-handler proof and its recorded run are unchanged. These new tests are **not
-compiled or executed yet**. Pinned-toolchain formatting of the two changed
+handler proof and its recorded run are unchanged. At this preparation
+observation the new tests were **not compiled or executed yet**. Pinned-toolchain formatting of the two changed
 Rust files and diff whitespace checks are source checks only.
 
 The new fixture starts `run_m2_session` empty with a validated256KiB queue,
@@ -161,3 +161,70 @@ as in the original runtime. Draft v1's private patch and receipt are retained.
 The six tests and their assertions are unchanged and remain uncompiled and
 unexecuted. Formatting/whitespace checks do not close actor scope A, public
 scope B or C240; no cache or frozen artifact is moved by this correction.
+
+
+## First real actor-loop run and retained validation failure
+
+At clean implementation `bf21e353ede811088cf31b64f8b9076d28378f11`, tree
+`2b3aa8f155d65c4ac07b327e835fbf440216de78`, the first actual compile and
+focused run passed all six new actor cases and all four unchanged handler
+controls: **10 passed, 0 failed, 0 ignored, 248 filtered out**, in 2.78 seconds
+(3.010 seconds including the command wrapper). The compiler ran once in
+55.618 seconds; listing the selected executable established 258 tests and
+zero benchmarks before execution. This is the expected-green valid-state
+proof described above, not a reproduced or repaired quota-to-revocation bug.
+
+Rust1.95 Cargo JSON selected the default-feature client library test executable,
+which was copied independently as a regular0555/single-link file outside the
+mutable target. Its45,942,416 bytes have SHA-256
+`da37b1f8b9ac24e3c6d0b371734904ed788973c39c1b4f1e4449676ecaa81e14`.
+The actual compiler output and frozen copy remained byte-identical after the
+attempt. Exact commands were:
+
+```sh
+cargo test --locked --offline -p tunnel-client --lib --no-run --message-format=json
+# The independent copy of the one Cargo-selected executable:
+tunnel-client-c240-tests --list
+tunnel-client-c240-tests c240_ --test-threads=1 --nocapture
+```
+
+The first overall validation attempt is **failed**, not passed: immediately
+before Clippy, free tmp capacity was2,009,088,000 bytes, above the unchanged
+1.5GiB active floor but138,395,648 bytes below the2,147,483,648-byte startup
+requirement. Neither Clippy nor formatting launched in that attempt; no retry
+or source edit followed. Required full workspace Clippy/tests and hosted
+acceptance remain pending for the publication candidate. Passing ten tests
+cannot replace those checks.
+
+The controlled cache-preservation step before compilation retained all25 exact
+inactive integration outputs, round-tripped17 new archive members and reverified
+8 existing independent copies before removing the mutable outputs. It reclaimed
+672,796,672 bytes. This is local derived-cache maintenance, not a production
+backup drill. All frozen/protected inputs, fingerprints and both dependency
+trees remained unchanged; no Docker or Redis action occurred.
+
+The failed test-controller result is
+`084d6bd4c0b243f742ecc27fdb019a533b9c5c1aec1b23d99b9b126071cb1b6f`;
+its final handoff is
+`4a1cd84e67f28d6c93003df17fb08471874e39f42abd3a92b35b6b1af8eb85f1`.
+All88 source/protected/tool checks passed, including the entire1093-file tracked
+source. All three started command groups and the controller were independently
+absent; the OOM counters did not increase. Earlier controller review findings
+and the failed archive-control source-order assertion are retained separately;
+none is relabelled product acceptance.
+
+A separately authorized, read-only `cargo fmt --all -- --check` then passed in
+5.015 seconds (7.262 seconds total controller), without recompilation or fixture
+execution. All92 source/protected/tool checks passed, including both selected
+executable copies and the first failed result; the command group and controller
+were independently absent. Format result SHA-256:
+`9d72aff487170e6e133261b334d915e2943cf9f155e9008c7a70851357efd3b9`.
+This separate pass does not change the original failed attempt.
+
+These observations establish actor scope A at the named implementation only.
+Public endpoint scope B, actual filesystem consumer `unknown`/`not_started`,
+unary `not_dispatched`, the full C240 row and production readiness remain open.
+No claim about current-image recovery, live deployment, license approval or
+M4-47 follows from this run. Publication documentation changes are separate
+from the frozen tested implementation; hosted verification must name its own
+final candidate and actual checkout.
