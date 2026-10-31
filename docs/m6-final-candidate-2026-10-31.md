@@ -147,9 +147,10 @@ this immutable image ID and the original packaged relay. All 14 owned
 inspection/lifecycle containers are absent and input hashes remain unchanged.
 
 The lifecycle fixture explicitly uses UID 1000; default UID 10002 startup is
-checked separately. This does not verify mounted-secret provisioning for the
-default UID, older-backup recovery with this image, legal policy or a live
-deployment. The container uses a read-only root filesystem, no capabilities,
+checked separately. A later [default-user mounted-secret/state proof](m6-authority-default-user-2026-10-31.md)
+passes in 24.044 s with this same image. Its first failed provisioning attempt
+is retained. Neither result verifies older-backup recovery with this image,
+legal policy or a live deployment. The container uses a read-only root filesystem, no capabilities,
 no new privileges, 256 MiB memory, one CPU and a 32-PID limit.
 
 Failures are retained. The first launcher invocation hit EACCES before the
@@ -205,9 +206,46 @@ checks, so this is not described as a quiet timing experiment.
 The full accessible-history scan at this source passes2,081commits/6,923blobs
 with zero findings in declared formats and zero oversized blobs. The later
 documentation-only status update receives a separate changed-blob scan; it is
-not described as another full-history run. New-head hosted acceptance is
-pending. The complete local90-stage and hosted results above remain bound to
+not described as another full-history run. Subsequent hosted results are
+recorded below. The complete local90-stage and hosted results above remain bound to
 8c and its identical hosted tree, not relabelled as a full run on this follow-up.
+
+## Hosted follow-up at 107d94a2
+
+Draft [#274](https://github.com/andymac4182/agentuplink/pull/274) has head
+`107d94a2e331f850bcc70a2b9406bc79ccfa1cbf`. Actual checkout logs identify merge
+`20c57e323dbac23a7fb00893ea5a34b1390f2ba3`; both have tree
+`7c56f7251a12f996f151e7e4aa9d7ff1a0129f7c`. The head adds only documentation
+after the local required-check source `86fb4d70` above.
+
+CI [41187171852](https://github.com/andymac4182/agentuplink/actions/runs/41187171852)
+is **not green**: Ubuntu Rust job
+[124496648961](https://github.com/andymac4182/agentuplink/actions/runs/41187171852/job/124496648961)
+fails `online_state::tests::unsafe_state_permissions_make_persistence_failure_permanent`.
+`Fixture::coordinator` calls `Engine::open` at `online_state_tests.rs:105:62`
+and receives `authority state is already open`. The failure occurs before
+the test changes permissions or reaches its persistence/fatal-latch assertions.
+The cause is under review as M6-C251; this is not evidence of a permission-policy
+failure or proof that the production store is correct. The full log is retained,
+SHA-256 `35d96206c4f92384a9a0d91dac8188e157a52a24ac80ebc5f4666d4395e3a506`.
+
+Full M4 job
+[124496648862](https://github.com/andymac4182/agentuplink/actions/runs/41187171852/job/124496648862)
+passes, including the four installed frameworks across an actual 300-second
+rotation, the new C244 real-endpoint fid-confirmation gate and filesystem demo.
+C244 observes provider-bound fid 1 while parallel fid 2 stays usable, exact
+confirmed reuse of 1, both walk/clunk cases and preserved delivery order.
+This is new hosted integration evidence; the earlier local negative controls
+remain separately bound to their actual patched inputs. The M4 full log SHA-256
+is `515f56e78fe199a411c7c75da68c56e23a2a5527b14a802f5d2fa62ed87873ff`.
+
+At this review, M7 remains in progress. The other twelve completed CI jobs
+pass, including macOS/Windows Rust, both M1 lanes, M2, M3, payload scan,
+TypeScript, dependency checks and container tests. Packaging run 41187171856
+passes. Fresh hosted TypeScript has 601 offline and 33 installed-peer tests
+on Node 24.22.1; this predates the Mastra M4-75 correction. No optimized release
+workflow is observed for this test/documentation-only follow-up. Seeded MCP
+policy checks do not close the outstanding universal license decisions.
 
 Private follow-up receipts are under
 `production-evidence-followup/required-checks-86fb4d70/`. The receipt SHA-256 is
