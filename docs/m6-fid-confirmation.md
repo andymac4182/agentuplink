@@ -1,9 +1,11 @@
 # Real-endpoint fid confirmation acceptance (M6-C244)
 
-Status: PR #275 failed the final terminal witness after earlier focused and
-PR #274 hosted passes. A fixture observer correction is prepared but unverified;
-the first failure and earlier evidence remain retained below. M6-C244 stays
-open. M4-21's broader deadline and descriptor acceptance remains open.
+Status: C244's declared fid confirmation scope is verified locally and in
+PR276 full M4, with all Rust platforms passing by2026-10-31T22:14:20+10:00.
+The PR275 final-witness failure, unknown discarded scalar and all earlier
+controls remain retained below. M4-21's broader deadline and descriptor
+acceptance, the unclaimed flushed-before-dispatch clunk schedule and production
+readiness remain open.
 
 The command is `tunnel-test-harness verify-m6-ts-fid-ordering`, registered in
 `scripts/m4-harness-verify.sh`. It uses the existing three-relay, disposable-Redis
@@ -209,3 +211,21 @@ controller-review corrections, the prelaunch lease-path error and resource/cache
 provenance. Final receipt SHA256
 `82559eefdf13ef34b3def2abacb7bad39a61f9554451b7734ce7e12b64893a44`.
 Hosted integration of this correction remains pending; PR275 CI stays failed.
+
+## Hosted correction verified at PR276
+
+Exact head2f3686b7 and actual runner2f30edff share tree736c7bbc. Full M4
+passes, recording3 completed exchanges with1 retained stream and0 replay frames,
+then the unchanged terminal3/0/0. All provider/order/parallel/reuse/refusal/host/
+session/cleanup assertions pass. All three Rust platforms pass by
+2026-10-31T22:14:20+10:00, closing the declared C244 row scope with the retained
+local required checks and meaningful controls. The old PR275 scalar remains
+unknown. BroaderM4-21, flushed-before-dispatch clunk and production readiness
+remain separate. [Exact candidate and hosted evidence](m6-client-followup-2026-10-31.md).
+
+The isolated worker's shared-client ninep sources and TypeScript fid driver are
+byte-identical to decc. Within the examined fid gate, the later Rust changes
+are the terminal observer/diagnostics. The current decc local and PR276 hosted
+positives re-execute all original held-response/provider/parallel/reuse
+predicates; an isolated sibling result alone does not establish current
+integration. The full prior tracker row is retained in commit95eb2d83.
