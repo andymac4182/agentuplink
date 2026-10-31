@@ -33,6 +33,11 @@ import {
 } from './paths.ts';
 import { ConsumerSession, ROOT_FID, type Lifecycle } from './session.ts';
 import {
+  runOperation, streamOperation, throwIfOperationCancelled, waitForCleanup, waitForSource,
+  type OperationOptions,
+} from './operation-deadline.ts';
+export type { OperationOptions } from './operation-deadline.ts';
+import {
   isTlsVerificationFailure,
   requireSecureEndpoint,
   upgrade,
@@ -80,14 +85,12 @@ export interface DirectoryEntry {
   kind: 'file' | 'directory' | 'symlink';
 }
 
-export interface ReadOptions {
-  signal?: AbortSignal | undefined;
+export interface ReadOptions extends OperationOptions {
   offset?: bigint | undefined;
   length?: number | undefined;
 }
 
-export interface WriteOptions {
-  signal?: AbortSignal | undefined;
+export interface WriteOptions extends OperationOptions {
   /** `false` uses exclusive creation, never an exists-then-create race. */
   overwrite?: boolean | undefined;
 }
@@ -235,6 +238,7 @@ export class RemoteFilesystem {
    * fid is released and the path reported absent.
    */
   private async walk(path: string, signal?: AbortSignal): Promise<number> {
+    throwIfOperationCancelled(signal, 'walk');
     const components = validatePath(path, this.bounds);
     const fid = this.session.allocateFid();
     let from = ROOT_FID;
@@ -276,7 +280,7 @@ export class RemoteFilesystem {
       return fid;
     } catch (error) {
       if (bound) {
-        await this.clunkQuietly(fid);
+        await this.clunkQuietly(fid, signal);
       } else {
         this.session.releaseFid(fid);
       }
@@ -284,18 +288,17 @@ export class RemoteFilesystem {
     }
   }
 
-  private async clunkQuietly(fid: number): Promise<void> {
+  private async clunkQuietly(fid: number, signal?: AbortSignal): Promise<void> {
     if (fid === ROOT_FID || this.state === 'closed') {
       this.session.releaseFid(fid);
       return;
     }
-    try {
-      await this.session.request({ kind: 'Tclunk', tag: 0, fid });
-    } catch {
-      // A failed clunk still releases the fid on the device — 9P's own rule —
-      // so holding the number here would leak it against this side's quota.
-    }
-    this.session.releaseFid(fid);
+    // Do not pass the expired application signal: cleanup still has to reach
+    // the device. The number stays owned until this bounded request settles.
+    const cleanup = this.session.request({ kind: 'Tclunk', tag: 0, fid })
+      .catch(() => {})
+      .finally(() => { this.session.releaseFid(fid); });
+    await waitForCleanup(cleanup, signal);
   }
 
   private unexpected(operation: string, path?: string): FilesystemError {
@@ -340,13 +343,18 @@ export class RemoteFilesystem {
    * The shared API
    * ---------------------------------------------------------------- */
 
-  async stat(path: string, options: { signal?: AbortSignal | undefined } = {}): Promise<Stat> {
+  async stat(path: string, options: OperationOptions = {}): Promise<Stat> {
+    return runOperation(options, this.descriptor.limits, 'stat', (scoped) =>
+      this.statWithin(path, scoped));
+  }
+
+  private async statWithin(path: string, options: OperationOptions = {}): Promise<Stat> {
     this.require('stat', path);
     const fid = await this.walk(path, options.signal);
     try {
       return await this.getattr(fid, options.signal);
     } finally {
-      await this.clunkQuietly(fid);
+      await this.clunkQuietly(fid, options.signal);
     }
   }
 
@@ -359,6 +367,11 @@ export class RemoteFilesystem {
    * that looks whole.
    */
   async readFile(path: string, options: ReadOptions = {}): Promise<Uint8Array> {
+    return runOperation(options, this.descriptor.limits, 'readFile', (scoped) =>
+      this.readFileWithin(path, scoped));
+  }
+
+  private async readFileWithin(path: string, options: ReadOptions = {}): Promise<Uint8Array> {
     this.require('readFile', path);
     const chunks: Uint8Array[] = [];
     let total = 0;
@@ -389,7 +402,12 @@ export class RemoteFilesystem {
   }
 
   /** Bounded byte chunks. Streaming bypasses the per-file ceiling, not the queue. */
-  async *readStream(path: string, options: ReadOptions = {}): AsyncGenerator<Uint8Array> {
+  readStream(path: string, options: ReadOptions = {}): AsyncGenerator<Uint8Array> {
+    return streamOperation(options, this.descriptor.limits, 'readStream', (scoped) =>
+      this.readStreamWithin(path, scoped));
+  }
+
+  private async *readStreamWithin(path: string, options: ReadOptions = {}): AsyncGenerator<Uint8Array> {
     this.require('readStream', path);
     const fid = await this.walk(path, options.signal);
     let opened = false;
@@ -431,15 +449,23 @@ export class RemoteFilesystem {
       }
     } finally {
       if (opened || this.state !== 'closed') {
-        await this.clunkQuietly(fid);
+        await this.clunkQuietly(fid, options.signal);
       }
     }
   }
 
   /** Immediate children, paged by the opaque directory cookie. */
-  async *readDirectory(
+  readDirectory(
     path: string,
-    options: { signal?: AbortSignal | undefined } = {},
+    options: OperationOptions = {},
+  ): AsyncGenerator<DirectoryEntry> {
+    return streamOperation(options, this.descriptor.limits, 'readDirectory', (scoped) =>
+      this.readDirectoryWithin(path, scoped));
+  }
+
+  private async *readDirectoryWithin(
+    path: string,
+    options: OperationOptions = {},
   ): AsyncGenerator<DirectoryEntry> {
     this.require('readDirectory', path);
     const fid = await this.walk(path, options.signal);
@@ -491,7 +517,7 @@ export class RemoteFilesystem {
         }
       }
     } finally {
-      await this.clunkQuietly(fid);
+      await this.clunkQuietly(fid, options.signal);
     }
   }
 
@@ -505,12 +531,26 @@ export class RemoteFilesystem {
    * preliminary `stat` either.
    */
   async writeFile(path: string, bytes: Uint8Array, options: WriteOptions = {}): Promise<void> {
+    return runOperation(options, this.descriptor.limits, 'writeFile', (scoped) =>
+      this.writeFileWithin(path, bytes, scoped));
+  }
+
+  private async writeFileWithin(path: string, bytes: Uint8Array, options: WriteOptions = {}): Promise<void> {
     this.require('writeFile', path);
     await this.writeInto('writeFile', path, [bytes], options);
   }
 
   /** The same, over an iterable of chunks, reporting acknowledged bytes. */
   async writeStream(
+    path: string,
+    chunks: Iterable<Uint8Array> | AsyncIterable<Uint8Array>,
+    options: WriteOptions = {},
+  ): Promise<void> {
+    return runOperation(options, this.descriptor.limits, 'writeStream', (scoped) =>
+      this.writeStreamWithin(path, chunks, scoped));
+  }
+
+  private async writeStreamWithin(
     path: string,
     chunks: Iterable<Uint8Array> | AsyncIterable<Uint8Array>,
     options: WriteOptions = {},
@@ -575,7 +615,7 @@ export class RemoteFilesystem {
         }
         // An `Rlerror(EEXIST)` means the create was refused and made nothing,
         // so the floor above was never reached on this path.
-        await this.clunkQuietly(parentFid);
+        await this.clunkQuietly(parentFid, options.signal);
         fid = undefined;
         fid = await this.walk(path, options.signal);
         const opened = await this.session.request(
@@ -596,7 +636,7 @@ export class RemoteFilesystem {
       }
       const limit = this.session.msize - C.WRITE_REQUEST_OVERHEAD;
       let offset = 0n;
-      for await (const chunk of asAsync(chunks)) {
+      for await (const chunk of asAsync(chunks, options.signal, operation)) {
         let at = 0;
         while (at < chunk.byteLength) {
           const slice = chunk.subarray(at, at + limit);
@@ -670,7 +710,7 @@ export class RemoteFilesystem {
       });
     } finally {
       if (fid !== undefined) {
-        await this.clunkQuietly(fid);
+        await this.clunkQuietly(fid, options.signal);
       }
     }
   }
@@ -718,7 +758,12 @@ export class RemoteFilesystem {
    * exists-then-act race this contract forbids. The adapters use it for
    * exactly that.
    */
-  async mkdir(path: string, options: { recursive?: boolean | undefined; signal?: AbortSignal | undefined } = {}): Promise<number> {
+  async mkdir(path: string, options: OperationOptions & { recursive?: boolean | undefined } = {}): Promise<number> {
+    return runOperation(options, this.descriptor.limits, 'mkdir', (scoped) =>
+      this.mkdirWithin(path, scoped));
+  }
+
+  private async mkdirWithin(path: string, options: OperationOptions & { recursive?: boolean | undefined } = {}): Promise<number> {
     this.require('mkdir', path);
     const components = validatePath(path, this.bounds);
     const recursive = options.recursive === true;
@@ -751,7 +796,7 @@ export class RemoteFilesystem {
           throw this.withCompositeFloor(failed, 'mkdir', path, made > 0);
         }
       } finally {
-        await this.clunkQuietly(parentFid);
+        await this.clunkQuietly(parentFid, options.signal);
       }
     }
     return made;
@@ -821,7 +866,17 @@ export class RemoteFilesystem {
    */
   async remove(
     path: string,
-    options: { recursive?: boolean | undefined; force?: boolean | undefined; signal?: AbortSignal | undefined } = {},
+    options: OperationOptions & { recursive?: boolean | undefined; force?: boolean | undefined } = {},
+    depth = 0,
+    progress: { entries: number; removed: number } = { entries: 0, removed: 0 },
+  ): Promise<void> {
+    return runOperation(options, this.descriptor.limits, 'remove', (scoped) =>
+      this.removeWithin(path, scoped, depth, progress));
+  }
+
+  private async removeWithin(
+    path: string,
+    options: OperationOptions & { recursive?: boolean | undefined; force?: boolean | undefined } = {},
     depth = 0,
     progress: { entries: number; removed: number } = { entries: 0, removed: 0 },
   ): Promise<void> {
@@ -839,7 +894,7 @@ export class RemoteFilesystem {
 
   private async removeInner(
     path: string,
-    options: { recursive?: boolean | undefined; force?: boolean | undefined; signal?: AbortSignal | undefined },
+    options: OperationOptions & { recursive?: boolean | undefined; force?: boolean | undefined },
     depth: number,
     progress: { entries: number; removed: number },
   ): Promise<void> {
@@ -939,7 +994,7 @@ export class RemoteFilesystem {
       }
       throw failed;
     } finally {
-      await this.clunkQuietly(parentFid);
+      await this.clunkQuietly(parentFid, options.signal);
     }
   }
 
@@ -950,7 +1005,12 @@ export class RemoteFilesystem {
    * renamed through `Trename`, which names the source by **fid** — the same
    * confinement, one fewer name to resolve.
    */
-  async rename(source: string, destination: string, options: { signal?: AbortSignal | undefined } = {}): Promise<void> {
+  async rename(source: string, destination: string, options: OperationOptions = {}): Promise<void> {
+    return runOperation(options, this.descriptor.limits, 'rename', (scoped) =>
+      this.renameWithin(source, destination, scoped));
+  }
+
+  private async renameWithin(source: string, destination: string, options: OperationOptions = {}): Promise<void> {
     this.require('rename', source);
     const target = splitParent(destination, this.bounds);
     if (this.descriptor.features.atomicRename) {
@@ -965,7 +1025,7 @@ export class RemoteFilesystem {
       try {
         newParent = await this.walk(target.parent, options.signal);
       } catch (error) {
-        await this.clunkQuietly(oldParent);
+        await this.clunkQuietly(oldParent, options.signal);
         throw error;
       }
       try {
@@ -981,8 +1041,8 @@ export class RemoteFilesystem {
           { signal: options.signal },
         );
       } finally {
-        await this.clunkQuietly(oldParent);
-        await this.clunkQuietly(newParent);
+        await this.clunkQuietly(oldParent, options.signal);
+        await this.clunkQuietly(newParent, options.signal);
       }
       return;
     }
@@ -991,7 +1051,7 @@ export class RemoteFilesystem {
     try {
       newParent = await this.walk(target.parent, options.signal);
     } catch (error) {
-      await this.clunkQuietly(fid);
+      await this.clunkQuietly(fid, options.signal);
       throw error;
     }
     try {
@@ -1000,8 +1060,8 @@ export class RemoteFilesystem {
         { signal: options.signal },
       );
     } finally {
-      await this.clunkQuietly(fid);
-      await this.clunkQuietly(newParent);
+      await this.clunkQuietly(fid, options.signal);
+      await this.clunkQuietly(newParent, options.signal);
     }
   }
 
@@ -1012,6 +1072,11 @@ export class RemoteFilesystem {
    * write, it can partially apply, and its failure says so.
    */
   async copy(source: string, destination: string, options: WriteOptions = {}): Promise<void> {
+    return runOperation(options, this.descriptor.limits, 'copy', (scoped) =>
+      this.copyWithin(source, destination, scoped));
+  }
+
+  private async copyWithin(source: string, destination: string, options: WriteOptions = {}): Promise<void> {
     this.require('copy', source);
     // **Both** paths are validated here, before anything is created. The read
     // is lazy, so a source the namespace refuses would otherwise be refused
@@ -1022,7 +1087,12 @@ export class RemoteFilesystem {
     await this.writeInto('copy', destination, this.readStream(source, { signal: options.signal }), options);
   }
 
-  async readlink(path: string, options: { signal?: AbortSignal | undefined } = {}): Promise<string> {
+  async readlink(path: string, options: OperationOptions = {}): Promise<string> {
+    return runOperation(options, this.descriptor.limits, 'readlink', (scoped) =>
+      this.readlinkWithin(path, scoped));
+  }
+
+  private async readlinkWithin(path: string, options: OperationOptions = {}): Promise<string> {
     this.require('readlink', path);
     const fid = await this.walk(path, options.signal);
     try {
@@ -1032,11 +1102,16 @@ export class RemoteFilesystem {
       }
       return reply.target;
     } finally {
-      await this.clunkQuietly(fid);
+      await this.clunkQuietly(fid, options.signal);
     }
   }
 
-  async symlink(target: string, path: string, options: { signal?: AbortSignal | undefined } = {}): Promise<void> {
+  async symlink(target: string, path: string, options: OperationOptions = {}): Promise<void> {
+    return runOperation(options, this.descriptor.limits, 'symlink', (scoped) =>
+      this.symlinkWithin(target, path, scoped));
+  }
+
+  private async symlinkWithin(target: string, path: string, options: OperationOptions = {}): Promise<void> {
     this.require('symlink', path);
     const { parent, name } = splitParent(path, this.bounds);
     const parentFid = await this.walk(parent, options.signal);
@@ -1046,11 +1121,16 @@ export class RemoteFilesystem {
         options,
       );
     } finally {
-      await this.clunkQuietly(parentFid);
+      await this.clunkQuietly(parentFid, options.signal);
     }
   }
 
-  async chmod(path: string, mode: number, options: { signal?: AbortSignal | undefined } = {}): Promise<void> {
+  async chmod(path: string, mode: number, options: OperationOptions = {}): Promise<void> {
+    return runOperation(options, this.descriptor.limits, 'chmod', (scoped) =>
+      this.chmodWithin(path, mode, scoped));
+  }
+
+  private async chmodWithin(path: string, mode: number, options: OperationOptions = {}): Promise<void> {
     this.require('chmod', path);
     if ((mode & ~0o777) !== 0) {
       // Refused, never masked: set-user-ID, set-group-ID and the sticky bit
@@ -1084,7 +1164,7 @@ export class RemoteFilesystem {
         options,
       );
     } finally {
-      await this.clunkQuietly(fid);
+      await this.clunkQuietly(fid, options.signal);
     }
   }
 
@@ -1092,7 +1172,17 @@ export class RemoteFilesystem {
     path: string,
     accessedAtMs: number,
     modifiedAtMs: number,
-    options: { signal?: AbortSignal | undefined } = {},
+    options: OperationOptions = {},
+  ): Promise<void> {
+    return runOperation(options, this.descriptor.limits, 'utimes', (scoped) =>
+      this.utimesWithin(path, accessedAtMs, modifiedAtMs, scoped));
+  }
+
+  private async utimesWithin(
+    path: string,
+    accessedAtMs: number,
+    modifiedAtMs: number,
+    options: OperationOptions = {},
   ): Promise<void> {
     this.require('utimes', path);
     const fid = await this.walk(path, options.signal);
@@ -1116,7 +1206,7 @@ export class RemoteFilesystem {
         options,
       );
     } finally {
-      await this.clunkQuietly(fid);
+      await this.clunkQuietly(fid, options.signal);
     }
   }
 
@@ -1175,12 +1265,26 @@ function msFrom(seconds: bigint, nanoseconds: bigint): number {
 
 async function* asAsync(
   chunks: Iterable<Uint8Array> | AsyncIterable<Uint8Array>,
+  signal: AbortSignal | undefined,
+  operation: string,
 ): AsyncGenerator<Uint8Array> {
-  if (Symbol.asyncIterator in chunks) {
-    yield* chunks as AsyncIterable<Uint8Array>;
-    return;
+  const iterator = Symbol.asyncIterator in chunks
+    ? chunks[Symbol.asyncIterator]() : chunks[Symbol.iterator]();
+  let done = false;
+  try {
+    for (;;) {
+      throwIfOperationCancelled(signal, operation);
+      const next = await waitForSource(Promise.resolve(iterator.next()), signal, operation);
+      if (next.done) { done = true; return; }
+      yield next.value;
+    }
+  } finally {
+    // A producer can ignore cancellation, even in return(). Observe its late
+    // settlement but never resume writes or keep this operation open for it.
+    if (!done && iterator.return !== undefined) {
+      await waitForCleanup(Promise.resolve(iterator.return()), signal);
+    }
   }
-  yield* chunks as Iterable<Uint8Array>;
 }
 
 /* ------------------------------------------------------------------ *

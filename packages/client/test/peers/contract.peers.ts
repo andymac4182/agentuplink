@@ -293,7 +293,7 @@ describe('just-bash: a real Bash over the real IFileSystem', () => {
     const bash = new Bash({ fs, cwd: '/', defenseInDepth: { excludeViolationTypes } });
 
     const cat = await bash.exec('cat /notes.txt');
-    assert.equal(cat.exitCode, 0);
+    assert.equal(cat.exitCode, 0, cat.stderr);
     assert.equal(cat.stdout, 'hello\nworld\n');
 
     const wc = await bash.exec('cat /notes.txt | wc -l');

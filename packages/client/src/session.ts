@@ -37,6 +37,7 @@ import {
   type SessionErrorCode,
 } from './errors.ts';
 import type { BinaryTransport, CloseInfo } from './websocket.ts';
+import { operationCancellation } from './operation-deadline.ts';
 
 export type Lifecycle = 'connecting' | 'ready' | 'closed';
 
@@ -504,10 +505,11 @@ export class ConsumerSession {
     if (this.lifecycle === 'closed') {
       return Promise.reject(this.endError(message.kind));
     }
-    if (options.signal?.aborted === true) {
+    const cancellation = operationCancellation(options.signal);
+    if (cancellation !== undefined) {
       return Promise.reject(
         new FilesystemError({
-          code: 'ABORTED',
+          code: cancellation,
           operation: message.kind,
           outcome: 'not_started',
           retryable: false,
@@ -524,7 +526,12 @@ export class ConsumerSession {
     const signal = options.signal;
     if (signal !== undefined) {
       const onAbort = (): void => {
-        void this.abort(tag);
+        if (operationCancellation(signal) === 'DEADLINE_EXCEEDED') {
+          const record = this.outstanding.get(tag);
+          if (record !== undefined) this.expire(record);
+        } else {
+          void this.abort(tag);
+        }
       };
       signal.addEventListener('abort', onAbort, { once: true });
       return sent.finally(() => {
