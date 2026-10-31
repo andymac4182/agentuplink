@@ -1,10 +1,11 @@
 # Installed framework rotation gate (M4-68)
 
-`verify-m4-fs-adapters-rotation` is being implemented against the production
-three-relay fixture. The first actual 300-second attempt failed its final
-fresh-admission expectation; the full gate remains failed. Seven focused controls, scoped strict checks and the corrected build pass;
-the next exact-source full acceptance is pending. The TypeScript driver preflight
-is not rotation or relay acceptance evidence.
+`verify-m4-fs-adapters-rotation` passed locally against the production
+three-relay fixture at `3ebe8b48`: all four real frameworks crossed the actual
+300-second scheduled rotation with writes in flight, then preserved unknown
+outcomes under grant revocation. The first failed attempt and its gate-only
+contract correction remain recorded below. This local result does not replace
+final aggregate or hosted acceptance.
 
 The gate uses the installed Files SDK 2.4.0, Mastra 1.65.0, AI SDK 7.0.94
 with `@ai-sdk/provider` 4.0.11, and just-bash 3.4.2. Four isolated Node children
@@ -152,9 +153,9 @@ discoverable-but-disallowed case's `403 ACCESS_DENIED`. Only the gate expectatio
 is corrected; no authorization or production response changed. A new regression
 first reproduced the old helper accepting malformed text that merely contained
 the expected label. The replacement uses bounded structured matching and
-failure-only closed-label diagnostics. Seven focused controls, scoped all-target strict Clippy, the harness build,
-formatting and documentation guards pass after correction. The next authorized
-full attempt remains pending.
+failure-only closed-label diagnostics. Seven focused controls, scoped all-target
+strict Clippy, the harness build, formatting and documentation guards passed
+after correction, before the separately recorded second attempt.
 
 After the first attempt, all 1,063 tracked source hashes, frozen harness/Node
 hashes and 16,798 dependency entries were unchanged; the six owned processes
@@ -164,3 +165,54 @@ SHA-256 is
 The failed attempt, runtime freeze and integrity receipts remain retained.
 This leaf does not include every final aggregate correction and cannot replace
 final combined or hosted acceptance.
+
+## Corrected actual attempt: passed locally
+
+Source `3ebe8b483d94b2062dcdd1952defcfc1d0250e50` ran once after the reviewed
+gate correction, from `2026-10-31T16:42:52.684339+10:00` to
+`2026-10-31T16:48:05.139533+10:00`, exiting 0 after **312.455 seconds**.
+This was another full scheduled 300-second run, not a replay of the first
+attempt's observations or mutations. The original failed log remains unchanged.
+
+- All four writes reached the exact host image at **295.032 seconds**, before
+  the scheduled freeze observed at **300.387 seconds**. Eight separate read/write
+  streams crossed immutable per-direction fences. Every native call completed,
+  the AI reference survived, and the same session/epoch advanced generation
+  1 to 2 with **1.382-second** bounded resumption, zero replay, no recovery and
+  no forced retirement. Socket peak was three and final steady state was two.
+- The independent host oracle passed its complete file/directory comparison;
+  its one-byte tamper control failed as required. Eight completed exchanges
+  accounted for exactly **20,480 written bytes**, including AI preparation.
+- All four subsequent revoked writes were dispatched and observed on the host
+  before revocation. Within **468 ms**, each framework preserved a native
+  unknown/non-retryable result with close 1008, exactly one Twrite and no Rwrite.
+  The quiet observation window and exact host images found no replay.
+- Fresh revoked admission matched exactly **404 EXPORT_NOT_FOUND** in the
+  nested error code. No new actor stream appeared, and the next independent
+  control received ID **14** after the last revoked stream's **13**, excluding
+  a transient forbidden allocation. The independent grant continued working;
+  non-owner filesystem admission remained the explicit 503 refusal.
+- Joined cleanup completed. At `2026-10-31T16:48:28.072649+10:00`, all six owned
+  processes were gone, a bounded namespace scan found zero keys, and all 1,063
+  tracked source hashes plus the frozen Node and 16,798 dependency entries were
+  unchanged. Both attempt binaries and the original receipt were preserved.
+
+The corrected harness SHA-256 is
+`06ebd4ad901fd5a8e5a76cad763d7d198da72698266ce8b3921127d8bcddfd4d`;
+its log SHA-256 is
+`0a3675931e6bc719ebfc5913a7a9363fde42e5648cbcfa9570b33e66e8501c88`;
+the parsed evidence SHA-256 is
+`56bfcb04ef91e681870bb0ea34c9dc7aed2de65bdc2bf5cacfb83074b26185f9`.
+Pinned Node 24.21.0 has SHA-256
+`7fde7b8afa198da66257f42ee2001d874c7355631e6d1579a5fb5ef1f246df4c`;
+the retained dependency-tree digest is
+`d6ce3dcf3876f8f86e52f24b8531dae0f8c6457ab87e7bc3243b81a26f4bce61`.
+
+The full package check (601 offline and 33 installed-peer tests) was run at
+`41746cf5`; all 58 recorded Node source/config inputs were byte-identical at
+this live run. Seven focused Rust controls and scoped all-target strict Clippy,
+build and formatting were run on the corrected gate source. This evidence
+update changes documentation only. The Linux CI registration has not yet been
+verified on a hosted runner, and the final aggregate must run its own acceptance.
+M4-21's remaining boundaries, three-rotation framework compatibility, multi-user
+isolation and filesystem peer forwarding are not covered by this result.
