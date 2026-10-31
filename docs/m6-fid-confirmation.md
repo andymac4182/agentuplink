@@ -183,3 +183,29 @@ inputs, not synthetic replacements for the actual relay/device gate. An
 independent review and coordinator resource lease precede compilation and
 any focused real endpoint run. C244 remains open pending the correction's
 proof and integrated hosted acceptance; M4-21 remains open.
+
+### Verified observer correction at decc5b58
+
+At 2026-10-31T21:54:50+10:00, clean source
+`decc5b58dd4c91a417a61e09e47e3e35e4d30b38` passes the old-count negative,
+exact-restored eleven controls, formatting, strict workspace/all-target Clippy,
+and locked workspace tests:2938 passed,0 failed,108 ignored,174 summaries.
+The final compiler-selected harness SHA256 is
+`f510526b88cf1b5f18128a626537aee3736dab71d5de3f1a31f521db28013fc2`.
+
+The first actual gate passes13.0765s. One pending snapshot directly reports
+3 exchanges/1 stream/1 replay; the same session subsequently reaches3/0/0
+with every original terminal predicate intact. Walk/clunk provider probes,
+parallel fid2, confirmed fid1 reuse, refusal/pre-abort controls, unchanged host
+and joined cleanup pass. The owned group is absent and namespace scans are0.
+All source, Node24.21,16798 dependency entries and protected binary inputs
+remain unchanged; no retry or deadline extension. The historical PR275 scalar
+remains unknown, and flushed-before-dispatch clunk/broader M4-21 remain outside
+this fixture's claim.
+
+[Exact current evidence](m6-production-followup-2026-10-31.md#verified-observer-correction-at-decc5b58)
+retains commands, timings including compilation, independent output identities,
+controller-review corrections, the prelaunch lease-path error and resource/cache
+provenance. Final receipt SHA256
+`82559eefdf13ef34b3def2abacb7bad39a61f9554451b7734ce7e12b64893a44`.
+Hosted integration of this correction remains pending; PR275 CI stays failed.
