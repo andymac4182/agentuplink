@@ -263,3 +263,23 @@ Storage tests separately exercise actual crash/rename boundaries, stable locks, 
 failure and cancellation. Local tests do not attest deployment DNS, real volume
 crash durability, hosted archives or independent recovery execution. Keep those
 remaining M6-C22 obligations visible in the production deployment goal.
+
+Local acceptance recorded on 2026-10-31 for the M6-C234 service slice:
+
+| Check | Observed result |
+|---|---|
+| Formatting, strict workspace/all-target Clippy, locked workspace tests | Pass; 2,868 passed, zero failed, 106 ignored across 174 suite results. |
+| Durable state, crash boundaries, cancellation and publisher fairness | Twenty state/store tests pass. The independent one-second publisher queue control fails; the bounded three-second publisher queue passes without changing the one-second I/O watchdog. |
+| Actual daemon with committed publication reply loss and real isolated Redis restart | Both tests pass in 67.14 s; spent versions are not reused and a changed Redis run is not adopted. |
+| Three-relay process traffic and lifecycle | Pass in 119.01 s; unchanged device session/carrier and exact non-owner canaries across two refreshes, authority restart and persisted checkpoint/all-node-floor adoption by all three relays. |
+| Actual authority image | Build passes in 188.02 s. Default UID10002, help and unconfigured startup refusal pass. The same unchanged lifecycle gate using the actual image passes in 127.44 s, with original-expiry outage refusal after 53,052 ms and zero residual owned containers. |
+
+The image lifecycle uses a synthetic private fixture directory, host networking
+and fixture UID/GID1000 to preserve its file ownership. Its root filesystem is
+read-only, with all capabilities dropped, no-new-privileges, 256 MiB memory,
+one CPU and 32 PIDs. The fixed production image UID10002 is checked separately.
+The runtime source is `cd509527`; the equivalent optimized Dockerfile is
+`9513540d`. The image ID is
+`sha256:b4ebccb54ba01ce71158cdcb28aee7fb8bef4b73407a606ec9ba45eef606a3df`.
+These component results leave hosted authority/platform verification, final
+combined acceptance and the deployment/operator/recovery obligations above open.
