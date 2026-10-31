@@ -1177,8 +1177,11 @@ Reconcile all later revocations and membership changes against an independent
 durable record, exclude revoked identities and grants, and check certificate
 validity before provisioning. If that record is unavailable, keep the relay
 stopped and re-enrol/re-authorize explicitly from current approvals. The
-external recovery signer remains missing (M6-C22); this procedure is not an
-automated restore guarantee.
+offline `tunnel-authority` recovery signer is available (M6-C22; see
+[the operator contract](operator.md#331-external-authorities-and-offline-recovery-signing)),
+but its recovery flow still requires cluster configuration and is not integrated
+with this single-relay Fly profile. Signing an approval does not establish that
+the catalog was reconciled; this procedure is not an automated restore guarantee.
 
 After reconciliation, retained device keys, certificates and UUIDs may be
 reused only for identities still approved:

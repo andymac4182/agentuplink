@@ -137,7 +137,7 @@ while it runs (section 2.5). Anything larger is not supported yet:
 | Service installation | Example systemd units (relay and client) and a launchd agent (client) in `examples/service/`, checked but not packaged in the bundle (section 4); **Windows service: not supported in this alpha** | M6-C23 |
 | Upgrade | Stop, replace the binaries from one bundle, start (section 4); **rolling or mixed-version upgrade: not supported in this alpha** in general. One piece is nonetheless mixed-version safe by design: the statuses a cluster owner uses to refuse a forwarded device session, so a new relay never turns an older one's transient refusal into a terminal device exit ([runtime.md](runtime.md), M6-C38) | M6-C23 |
 | Supervisor IPC, `status` | Supported on Linux and macOS: `tunnel-client status` reads a redacted snapshot over an owner-only Unix socket ([runtime.md](runtime.md#supervisor-status-ipc)); **not on Windows** | M6-06, M6-C206 |
-| Backup and restore of the Redis catalog | Operator's Redis tooling only; restore goes through the recovery commands, which need an external signing authority that is not shipped | M6-C22 |
+| Backup and restore of the Redis catalog | Operator's Redis tooling; recovery approvals can be signed with `tunnel-authority`, with independent fencing and revocation reconciliation still required | M6-C22 |
 | A Redis restart in place that keeps its data (one relay) | Supported: a serving relay with `redis_restart_continuity_seconds` re-binds by itself on a durable Redis (`appendfsync always`); a relay started after the restart needs `tunnel-relay rebind-redis-run` once (section 4). A Redis that came back empty or older than the relay's last token is refused. **Failover to a replica, or a restore: not supported this way** | M6-C65 |
 | Metrics and audit log | Metrics: a minimal, opt-in, unauthenticated listener on a loopback or private address (`metrics_bind`, section 5). Audit log: **not supported in this alpha** | M6-C24 |
 | One relay and its Redis on Fly.io | Dockerfiles, `fly.toml` files, a runbook and a cost list in [deploy-fly.md](deploy-fly.md), proved with Docker on one machine and run on Fly: one relay serves from an image built from `main`, measured end to end from a Mac (reconnect through a relay restart included) | M6-C70 |
@@ -217,7 +217,7 @@ $ grep -E '^(commit|target|rustc_version|receipt_attested_binaries):' PROVENANCE
 commit: ...
 target: ...
 rustc_version: rustc 1.95.0 ...
-receipt_attested_binaries: tunnel-client,tunnel-deadman,tunnel-relay
+receipt_attested_binaries: tunnel-authority,tunnel-client,tunnel-deadman,tunnel-relay
 ```
 
 `NOTICE` carries the full text of every third-party licence, not just their
@@ -229,10 +229,12 @@ registry_crates: ...
 embedded_licence_texts: ...
 ```
 
-Keep the three binaries in `bin/` together. `tunnel-deadman` is not a command
+Keep `tunnel-client` and `tunnel-deadman` together. `tunnel-deadman` is not a command
 you run: the client looks for it beside its own executable to contain
-supervised child processes, and `doctor` reports whether it found it. Put
-`bin/` on your `PATH`:
+supervised child processes, and `doctor` reports whether it found it. Install
+`tunnel-relay` on relay hosts and `tunnel-authority` on a separate operator host;
+private authority keys never belong on relay hosts. For this local rehearsal,
+put the bundle's `bin/` on your `PATH`:
 
 ```console
 $ export PATH="$PWD/bin:$PATH"
@@ -1274,6 +1276,135 @@ relay has accepted, so a restarted relay cannot be fed an older signed snapshot.
 `recovery.fence_path` records the highest recovery approval consumed. Starting
 each relay is the `serve` command from section 3.1.
 
+#### 3.3.1 External authorities and offline recovery signing
+
+Run authority operations under a separate operator identity and on a separate
+host from ordinary relays. Membership publisher, recovery approval and CA
+private keys stay outside Redis and normal relay configuration. Install only
+public verification material on relay hosts. A signature does not grant device
+enrolment or consumer permissions.
+
+The three authority wire formats use schema version 1, Ed25519 signatures and
+the library's canonical compact JSON, with no trailing newline. The signed body
+includes `publisher_key_id` and every claim except `signature`; the signature
+is base64url without padding. Use the existing encoders, because arbitrary JSON
+sorting or reformatting changes the canonical bytes. Records are at most 16 KiB
+with at most a 60-second lifetime and five-second verifier clock skew. Recovery
+activation additionally enforces the window strictly against Redis `TIME`.
+
+The membership publisher signs `MembershipRecord` with
+`tunnel_cluster::membership::sign_membership_bytes`. Its fields are
+`schema_version`, `deployment_id`, `deployment_incarnation`, `node_id`,
+`record_version`, `roles`, `peer_endpoint`, `server_name`, `keys`, `issued_at`,
+`not_before`, `expires_at`, followed by `publisher_key_id` and `signature`.
+The initial role is `relay_peer`; endpoints must be approved private HTTP/3
+addresses. A deployment permits at most 32 nodes, with at most two keys per
+node. Each key has `key_id`, lower-case `spki_sha256`, `not_before`, `expires_at`
+and `revoked`. The publisher uses authenticated Redis TLS and a separate ACL
+restricted to `tunnel-catalog:<namespace>:membership:operator:*`. Its atomic
+directory update uses `EVAL` with `HGET`, `HLEN`, `HSET` and `EXPIRE` on those
+keys. Use `RedisMembershipPublisher::publish_signed_membership_for_node`;
+ordinary relays must not have this write permission. An attempted publication
+spends the version even when its reply is lost: sign a higher version for the
+next attempt.
+
+The checkpoint client POSTs JSON with `deployment_id`,
+`deployment_incarnation` and its fresh `nonce` to the configured HTTPS URL.
+HTTP 200 must carry exact `SignedMembershipCheckpoint` bytes. Its fields are
+`schema_version`, `deployment_id`, `deployment_incarnation`,
+`checkpoint_version`, `nonce`, `minimum_versions`, `issued_at`, `not_before`,
+`expires_at`, followed by `publisher_key_id` and `signature`.
+`minimum_versions` is an ordered map of authorized node IDs to minimum record
+versions. The authority signs only the current operator-approved state for the
+requested deployment/incarnation and binds it to the request nonce; the caller
+cannot choose its own authorized version map. Use
+`tunnel_cluster::membership::sign_checkpoint` and its encoder. HTTPS CA trust
+is separate from Ed25519 signing trust. The current client uses TLS 1.3 and
+HTTP/1.1, with TLS resumption and early data disabled.
+
+Membership publishing and checkpoint serving remain unavailable as shipped
+commands. The planned checkpoint responder requires mTLS; the current relay
+checkpoint client has no client-authentication configuration, so that compatible
+client change and its acceptance tests are part of the remaining M6-C22 work.
+
+Unix server bundles include `tunnel-authority` for the offline recovery part: `generate-key` and
+`sign-recovery-approval`. It cannot observe Redis, reconcile a restored catalog,
+prove quiescence or activate an incarnation. Generate a recovery-only key on the
+authority host. The private file is strict PKCS#8 v2 Ed25519 DER; ordinary
+OpenSSL PKCS#8 v1 output is not accepted by the existing parser. The generated
+public file has schema `{"schema_version":1,"keys":[{"key_id":"ID","public_key":"HEX"}]}`,
+where `HEX` is a 64-character lower-case public key. Install only this public
+file at the relay's recovery trusted-keys path.
+
+An unsigned recovery approval has exactly these fields:
+
+| Field | Requirement |
+| --- | --- |
+| `schema_version` | `1` |
+| `deployment_id`, `redis_namespace`, `redis_run_id`, `deployment_incarnation` | Exact values from the independently reviewed `recovery-observe` output |
+| `catalog_digest` | The observation's 64-character lower-case digest |
+| `approval_version` | Nonzero and higher than every consumed or uncertain attempt |
+| `nonce` | Independently chosen fresh random nonce, 16–128 permitted characters |
+| `issued_at`, `not_before`, `expires_at` | RFC3339 UTC instants defining a current window of at most 60 seconds |
+
+The signer accepts the unsigned JSON, the separate observation file and an
+independently supplied expected nonce. It checks every scope field, the digest,
+nonce and time window with the same verifier used by `recover`, then emits the
+exact canonical signed bytes. An observation's `quiescence` must remain
+`unproven`; accepting its format never certifies reconciliation or fencing.
+
+All inputs are bounded regular files owned by the invoking user, with mode
+0600 and no hard links. Their immediate parent directories must be owned by
+that user with mode 0700. Symlinks in any path component and `..` traversal are
+refused. New files use mode 0600 and never replace an existing path. These
+protections use Unix descriptor-relative file operations. On macOS, use the
+physical directory path (`pwd -P`) rather than an ancestor symlink.
+
+The following is an offline rehearsal with synthetic scope and a fixed test
+nonce. It does not authorize a real catalog. The Python command creates fresh
+timestamps for this rehearsal; production approvals need the independently
+reviewed observation, an actual monotonic approval version and a random nonce.
+
+```console
+$ mkdir -m 700 authority-trial
+$ tunnel-authority generate-key --key-id recovery-trial --private-key authority-trial/key.der --public-keys authority-trial/public.json
+Created private signing key and public recovery trust document.
+$ python3 -c 'import datetime,json,os; os.umask(0o077); now=datetime.datetime.now(datetime.timezone.utc); observed=dict(schema_version=1,deployment_id="rehearsal",redis_namespace="rehearsal",redis_run_id="rehearsal-run",deployment_incarnation="rehearsal-incarnation",catalog_digest="a"*64,catalog_generation="1",key_count=0,byte_count=0,quiescence="unproven"); approval={k:observed[k] for k in ("schema_version","deployment_id","redis_namespace","redis_run_id","deployment_incarnation","catalog_digest")}; approval.update(approval_version=1,nonce="rehearsal-nonce-123456",issued_at=now.isoformat(),not_before=now.isoformat(),expires_at=(now+datetime.timedelta(seconds=60)).isoformat()); [json.dump(value,open("authority-trial/"+name,"x")) for name,value in (("observation.json",observed),("unsigned.json",approval))]'
+$ tunnel-authority sign-recovery-approval --key authority-trial/key.der --key-id recovery-trial --observation authority-trial/observation.json --approval authority-trial/unsigned.json --expected-nonce rehearsal-nonce-123456 --output authority-trial/signed.json
+Created canonical signed recovery approval.
+$ tunnel-authority sign-recovery-approval --key authority-trial/key.der --key-id recovery-trial --observation authority-trial/observation.json --approval authority-trial/unsigned.json --expected-nonce rehearsal-nonce-123456 --output authority-trial/signed.json; echo "exit=$?"
+tunnel-authority: output already exists or cannot be created
+exit=1
+$ python3 -c 'from pathlib import Path; data=Path("authority-trial/signed.json").read_bytes(); assert not data.endswith(b"\n"); print("Signed approval has no trailing newline.")'
+Signed approval has no trailing newline.
+```
+
+For actual recovery, first fence old primaries and relays and independently
+reconcile durable authorization and revocation state. Observe the candidate
+catalog and keep it quiescent, transfer that observation to the authority host,
+prepare and review the unsigned approval, and invoke the signing command with
+your real paths and independent nonce. Transfer the exact signed file to the
+recovery host and use the commands in section 4. Do not reformat the JSON or
+append a newline. Never read the expected nonce out of the signed document.
+
+The relay observes Redis again and enforces the actual run ID, catalog digest
+and durable approval-version fence. An unknown outcome or failure after fence
+consumption needs a fresh approval at a higher version. Never reset that fence
+or restore an older copy. The signer neither knows nor changes the relay's
+fence; keep an independent record of issued versions.
+
+Generation writes two files and cannot make them one filesystem transaction.
+Ordinary errors clean up this invocation's uncommitted files; a crash can leave
+incomplete files. Inspect outputs after failure and use fresh paths. Never
+automatically overwrite or reuse a key or approval. Exit 2 means invalid command
+syntax; exit 1 means a refused operation; exit 0 means success. Diagnostics
+contain no private keys or signed approval bytes.
+
+This offline slice does not complete M6-C22 or establish a deployable cluster.
+Recovery currently requires `[cluster].deployment_id` in relay configuration;
+the signer alone does not make the single-relay Fly restore procedure turnkey.
+
+
 ### 3.4 Rotating a relay's peer key without a restart
 
 A cluster relay can replace its private HTTP/3 peer certificate and key while
@@ -1418,9 +1549,10 @@ of `connect`'s waits only by unit tests.
    reconnect by themselves when it returns (measured: under a second after
    an orderly restart, about 30 s after a crash; M6-C40). In-flight operations on those sessions end with them,
    and a mutation's outcome can be unknown ([protocol.md](protocol.md)).
-2. Replace **all three binaries from one bundle** together
-   (`tunnel-client`, `tunnel-relay`, and `tunnel-deadman`, which the client
-   finds beside itself).
+2. Replace the installed binaries from one bundle: keep `tunnel-client` and
+   `tunnel-deadman` together on device hosts, replace `tunnel-relay` on relay
+   hosts, and update `tunnel-authority` separately on its operator host.
+   Preserve signing keys, public trust and durable version fences.
 3. Start it again with the same configuration.
 
 **What carries over:** the Redis catalog (tenants, devices, credential
@@ -1536,8 +1668,8 @@ namespace instead.
 
 **Recovery** is three commands, specified in [recovery-cli.md](recovery-cli.md).
 `recovery-initialize` is shown in section 3.3. The other two need a live Redis,
-and `recover` needs a signed approval from an external recovery authority,
-which is not shipped (M6-C22). **Shape-only:**
+and `recover` needs an approval signed on the separate authority host using
+`tunnel-authority` (section 3.3.1). **Shape-only:**
 
 ```sh shape-only
 tunnel-relay recovery-observe --config /etc/agent-tunnel/relay.toml

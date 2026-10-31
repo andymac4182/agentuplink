@@ -18,6 +18,8 @@ on:
       - 'examples/**'
       - '.cargo/config.toml'
       - 'Cargo.lock'
+      - 'Cargo.toml'
+      - 'crates/tunnel-authority/**'
       - 'crates/tunnel-client/src/main.rs'
       - 'crates/tunnel-relay/src/main.rs'
       - 'crates/tunnel-deadman/src/**'
