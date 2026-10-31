@@ -1,6 +1,6 @@
 [package]
 name = "tunnel-authority"
-description = "Offline operator authority for signed recovery approvals"
+description = "Operator authority for membership, checkpoints and offline recovery approvals"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.95"
@@ -13,6 +13,16 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.145"
 tunnel-catalog = { path = "../tunnel-catalog" }
 zeroize = "1.8"
+bytes = "1"
+http-body-util = "0.1"
+hyper = { version = "1.7", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+tokio = { version = "1.52.1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+toml.workspace = true
+tunnel-cluster = { path = "../tunnel-cluster" }
+tunnel-transport = { path = "../tunnel-transport" }
 
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1.1", default-features = false, features = ["fs", "process", "std"] }

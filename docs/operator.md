@@ -153,7 +153,7 @@ while it runs (section 2.5). Anything larger is not supported yet:
 | Service types `provision-catalog` can create | The synthetic echo (`echo`), an MCP server or an ACP agent (`http-forward`, by `http_forward_profile`), and a filesystem export (`fs`), one per namespace (section 2.3); any other type is refused by the dry run | M6-C57 |
 | First activation of a deployment incarnation in a new Redis namespace | Supported with `tunnel-relay activate-first-incarnation` (section 2.3) | M6-C21 |
 | Adding users, devices, services and grants after the first provisioning, replacing a grant, and revoking a grant, device or credential | Supported while `serve` runs, with `add-user`, `add-device`, `add-service`, `set-grant`, `revoke-grant`, `revoke-device` and `revoke-credential` (section 2.5); a second tenant, and changing or deactivating a user or service, are **not supported in this alpha** | M6-C31 |
-| Cluster membership publishing and the HTTPS checkpoint authority | **Not supported in this alpha**: a cluster relay needs both and neither is shipped | M6-C22 |
+| Cluster membership publishing and the HTTPS checkpoint authority | Separate `tunnel-authority serve` with independent durable approval and mandatory mTLS; deployment and recovery acceptance remain open | M6-C22, M6-C234 |
 | Device certificate renewal | **Not supported in this alpha**: re-enrol before the certificate expires (see the known limitation above) | M6-C56 |
 | Windows | **Client-only**: `tunnel-client` and `tunnel-deadman` build and pass the locked checks; the relay, `credentials create` and `credentials import` refuse there, and the M1 real-socket acceptance runs on Linux and macOS only (section 1) | M1-04 |
 | Automatic reconnect of `connect` after a relay restart or a network loss | Supported, with bounded jittered backoff (section 3.1) | M6-C23 |
@@ -1260,7 +1260,8 @@ accept failed; on Linux it stays queued.
 
 ### 3.3 A cluster
 
-**A cluster cannot be brought up with what this alpha ships** (M6-C22). Each
+**A cluster requires a separately operated authority and deployment-specific trust**
+(M6-C22). The combined service is described in [Online authority](authority.md). Each
 relay also needs:
 
 - a peer certificate and key, and the CA for other relays' peer certificates;
@@ -1269,8 +1270,9 @@ relay also needs:
 - an **HTTPS checkpoint authority** that returns a signed, nonce-bound
   checkpoint when the relay starts.
 
-The project ships neither the publisher nor the checkpoint authority. The
-contract they must meet is in
+`tunnel-authority serve` supplies both functions from one independent durable
+approval state. The deployment/operator/recovery acceptance remains open; a
+local process gate does not establish a production rollout. The contract is in
 [cluster.md](cluster.md#relay-trust-bootstrap-and-redis-key-distribution).
 
 The checkpoint client supports mTLS through the paired
@@ -1281,8 +1283,7 @@ relay hosts. Set the client key to mode 0600 on Unix; it must be a regular file
 without group/other permissions or symlink path components. A missing or invalid
 configured identity refuses startup; the client never falls back to an anonymous request. Both
 paths may be omitted for compatibility with an existing external authority,
-but the planned shipped checkpoint authority requires mTLS. Its publication
-loop, responder and durable version storage remain M6-C22 work.
+but `tunnel-authority serve` requires mTLS and current node/SPKI approval.
 
 The configuration and the relay's local state can still be prepared and checked.
 `examples/m7-cluster-relay.toml` is a complete placeholder configuration. Note
@@ -1361,15 +1362,13 @@ cannot choose its own authorized version map. Use
 is separate from Ed25519 signing trust. The current client uses TLS 1.3 and
 HTTP/1.1, with TLS resumption and early data disabled.
 
-Membership publishing and checkpoint serving remain unavailable as shipped
-commands. The planned checkpoint responder requires mTLS. The relay now supports
-its HTTPS client identity through the paired
-`cluster.checkpoint_authority_client_cert_chain` and
-`cluster.checkpoint_authority_client_private_key` paths described above; invalid
-configured identities fail without anonymous fallback (M6-C231). The publisher
-API also accepts explicit Redis TLS trust and client identity through
-`RedisMembershipPublisher::connect_with_tls`. The publication loop, checkpoint
-responder and durable authority version storage remain M6-C22 work.
+`tunnel-authority serve` combines continuous publishing and the checkpoint
+responder with a private durable allocator (M6-C234). Follow [Online authority](authority.md)
+for explicit initialization, stop/approve/restart updates, separate credentials,
+the stable lock and fixed trust lifetimes. It requires both HTTPS client paths
+above; invalid identities never fall back to anonymous requests. Recovery signing
+below remains offline and uses a different private key. M6-C22 remains open for
+the complete three-relay deployment, operator and recovery acceptance.
 
 Unix server bundles include `tunnel-authority` for the offline recovery part: `generate-key` and
 `sign-recovery-approval`. It cannot observe Redis, reconcile a restored catalog,
@@ -1454,8 +1453,10 @@ the signer alone does not make the single-relay Fly restore procedure turnkey.
 A cluster relay can replace its private HTTP/3 peer certificate and key while
 it serves (task rows M8-C45, M8-C46; the design is in
 [cluster.md](cluster.md#certificate-and-key-lifecycle)). Like the rest of
-section 3.3 it needs the membership publisher this alpha does not ship: the
-relay stages and serves a successor, but only your publisher can approve it.
+section 3.3 it needs the separately operated membership publisher: the relay
+stages and serves a successor, but only an approved inventory revision can
+authorize it. See [Online authority](authority.md) for the stop/approve/restart
+workflow and its publication gap.
 
 1. Issue the successor certificate for the **same node** under the same relay
    peer CA, covering the same server names. Put its chain and key where the

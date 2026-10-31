@@ -1,0 +1,19 @@
+# Replace every deployment-specific value. All paths are absolute, owned by
+# the authority UID, regular mode-0600 files in mode-0700 owned directories.
+schema_version = 1
+bind = "0.0.0.0:8444"
+state_path = "/var/lib/agentuplink-authority/state/authority.json"
+signing_key_path = "/var/lib/agentuplink-authority/secrets/membership.der"
+redis_url_path = "/var/lib/agentuplink-authority/secrets/redis-url"
+redis_ca_path = "/var/lib/agentuplink-authority/secrets/redis-ca.pem"
+# If Redis requires client authentication, set both paths:
+# redis_client_cert_path = "/var/lib/agentuplink-authority/secrets/redis-client.pem"
+# redis_client_key_path = "/var/lib/agentuplink-authority/secrets/redis-client-key.pem"
+tls_cert_chain = "/var/lib/agentuplink-authority/secrets/https-chain.pem"
+tls_private_key = "/var/lib/agentuplink-authority/secrets/https-key.pem"
+tls_client_ca = "/var/lib/agentuplink-authority/secrets/checkpoint-client-ca.pem"
+
+[endpoint_policy]
+allowed_hosts = ["10.42.0.11", "10.42.0.12", "10.42.0.13"]
+allowed_server_names = ["relay-a.example.internal", "relay-b.example.internal", "relay-c.example.internal"]
+allowed_ports = [7443]

@@ -1,0 +1,242 @@
+# Online membership authority
+
+`tunnel-authority serve` runs the membership publisher and HTTPS checkpoint
+responder together, under one independent operator identity (M6-C234). It uses
+the existing signed membership and checkpoint formats. It does not provision
+catalog users/devices, issue certificates, reconcile a restored catalog or
+activate recovery. M6-C22 remains open until the complete three-relay operator,
+deployment and recovery acceptance is recorded.
+
+Use one authority process and a durable local filesystem on Linux or macOS.
+The Windows workspace builds, but this service refuses its unsupported private
+filesystem boundary. There is no active/active mode, network administration
+API, automatic initialization or automatic state repair. Recovery and CA
+private keys must remain offline; do not mount them into this service.
+
+## Provision the independent host
+
+Start with [the example configuration](../examples/authority/authority.toml)
+and [three-node inventory](../examples/authority/inventory.json). All example
+identifiers, addresses, digests and dates are placeholders. Provision actual
+values independently from the intended deployment, never by trusting Redis's
+membership directory. Inventory approval covers the deployment ID, durable
+Redis namespace, incarnation, publisher public key, each stable node ID,
+private peer endpoint/name, peer key windows and checkpoint client SPKIs.
+
+Keep these credentials separate:
+
+| Material | Location and use |
+| --- | --- |
+| Membership Ed25519 private key | Authority only; signs records/checkpoints |
+| Membership public trust JSON | All relays; verify the publisher |
+| Authority HTTPS server key/chain | Authority only; a name in the authority endpoint URL |
+| Checkpoint client CA | Authority public trust; required client authentication |
+| Checkpoint client key/chain | Its relay only; peer SAN for that node, client-auth usage, SPKI separately approved in inventory |
+| Redis named publisher ACL password and optional client key | Authority only; membership namespace writes |
+| Redis server CA | Authority public trust; hostname verification stays enabled |
+| Recovery signing and CA private keys | Separate offline operator boundary; never supplied to `serve` |
+
+All authority input files, including configuration, inventory and public trust,
+must be regular files owned by the service UID with mode 0600, inside an owned
+0700 parent. State and the stable sibling lock have the same restrictions.
+Symlink components, parent traversal and hard links are refused. Use canonical
+absolute paths; `/var/run` and some macOS temporary paths are symlinks. The
+service does not chmod, create directories or repair unexpected files.
+
+The Redis credential file contains a single `rediss://USER:PASSWORD@HOST:PORT/0`
+URL. Use a named ACL user with a nonempty password, percent-encoded as required
+by URL syntax. The client verifies the explicit Redis CA and server name. If
+Redis requires mTLS, configure both Redis client identity paths. Grant only
+`PING`, `INFO`, `EVAL`, `HGET`, `HLEN`, `HSET`, `EXPIRE` and access to
+`tunnel-catalog:<namespace>:membership:operator:*`; do not grant catalog,
+ownership, recovery or ACL administration. The publisher needs `INFO server`
+to verify the Redis process run ID. Configure the account outside this process.
+
+The authority's HTTPS listener must be reachable privately by all three relays.
+It requires TLS 1.3 mTLS, with HTTP/1.1 and no TLS resumption or early data. The
+client certificate must also identify an approved peer node and match one of
+that node's checkpoint client pins. A same-CA but unapproved identity gets 403;
+having a trusted CA chain alone never authorizes a checkpoint. Peer-key approval
+and checkpoint-client approval are separate inventory fields, even when an
+operator deliberately uses the same certificate for both.
+
+## Initialize explicitly, then start
+
+Generate a dedicated membership key on the authority host. This is separate
+from the default recovery-key output format:
+
+```sh
+tunnel-authority generate-key --purpose membership --key-id membership-1 \
+  --private-key /var/lib/agentuplink-authority/secrets/membership.der \
+  --public-keys /var/lib/agentuplink-authority/secrets/membership-public.json
+```
+
+Install the emitted public trust JSON on the relays. Copy its public key and
+key ID into the reviewed inventory. Independently verify the intended Redis
+primary's 40-character run ID through the trusted operator control plane.
+Initialization performs no network reads and cannot discover or approve it:
+
+```sh
+tunnel-authority initialize-membership \
+  --config /var/lib/agentuplink-authority/secrets/authority.toml \
+  --inventory /var/lib/agentuplink-authority/secrets/inventory.json \
+  --expected-redis-run-id "$REVIEWED_REDIS_RUN_ID"
+tunnel-authority check-config --config /var/lib/agentuplink-authority/secrets/authority.toml
+tunnel-authority serve --config /var/lib/agentuplink-authority/secrets/authority.toml
+```
+
+The first inventory revision is exactly 1. Initialization creates state only
+when absent. `check-config` validates local state, signing identity, required
+HTTPS identity/trust and credential-file configuration without contacting Redis;
+it does not prove Redis credentials, DNS, reachability or deployment readiness.
+It takes the same exclusive lock, so run it while `serve` is stopped.
+
+Every process start requires a newly reserved and acknowledged publication
+round. Persisted confirmation cannot make a restarted process ready. Each
+new Redis publisher connection, including reconnections, must match the
+independently approved run ID. A changed run or version conflict sets the fatal
+latch and exits for operator review. It never adopts the observed run or derives
+approved inventory or counters from Redis.
+
+For each relay, set the cluster endpoint to
+`https://authority.example.internal:8444/v1/checkpoint`, the authority server
+CA path and both `checkpoint_authority_client_cert_chain` and
+`checkpoint_authority_client_private_key`. The relay's deployment/incarnation,
+node ID, peer endpoint/name and membership signer trust must match approval.
+Initialize each relay's own membership state and recovery fence explicitly as
+described in [operator.md section 3.3](operator.md#33-a-cluster). Those relay
+volumes are separate from the authority volume and from Redis persistence.
+
+## Durable allocation and failure behavior
+
+The private schema-1 state contains the exact inventory, expected Redis run,
+global membership high-water counter, separate checkpoint high-water counter,
+all previously approved node IDs and the last confirmed round. It is bounded
+at 256 KiB. An exclusive stable sibling lock remains locked across atomic state
+replacement. Replacement writes a private temporary file, fsyncs it, renames
+it atomically, then fsyncs the directory before reporting success. Missing,
+corrupt, unsafe or externally changed state is refused. A persistence error or
+one-second operation timeout latches fatal; no subsequent successful checkpoint
+or publication reservation is released in that process.
+
+A publication round validates every inventory entry, allocates one globally
+higher record version, and durably reserves it before attempting any Redis
+write. All nodes in that round use that version. Up to four writes run at once;
+the round is bounded at ten seconds. A lost reply, partial write or process
+crash spends the entire reserved version. The next attempt uses a higher one.
+Only acknowledgements for every node followed by a durable confirmation make
+the round available for checkpoints. A checkpoint independently reserves and
+persists its higher checkpoint version before returning the exact signed bytes.
+Both counters survive all approval changes, including new incarnations.
+
+Records expire 60 seconds after the round begins. Publication starts on a
+20-second schedule with skipped missed ticks; work never queues catch-up bursts.
+Publication failure cannot refresh an earlier confirmation. A same-inventory
+checkpoint may carry a fresh request nonce and higher checkpoint version, but
+its expiry remains exactly the previously confirmed record expiry. Responses
+stop when fewer than seven seconds remain (two seconds for the request and five
+for clock skew), checked against both UTC and the original monotonic deadline.
+New inventory never uses an old inventory's confirmation. Discipline the
+authority, Redis and relay clocks; the existing cluster clock-skew bound is five
+seconds. Arbitrary clock steps and rate error are outside the deployment proof.
+
+**One unusable node stops the whole next publication round.** Before allocating,
+every node needs a non-revoked active peer key under the relay's shared activation
+rule; key expiry remains strict. All-future keys beyond the allowed activation
+skew, expired keys or invalid entries refuse the round. No entry is silently
+deleted and no window is extended. Previously confirmed trust can only run to
+its original expiry, while each relay still enforces each key's own expiry.
+Approve rotations/removals before any required key window lapses. This publisher
+policy does not change M7-C187's relay behavior: a lapsed named record is absent
+only for that node.
+
+**Do not roll back the authority volume or reset either counter.** A valid
+whole-volume rollback cannot be detected using that same volume alone. Backups
+are evidence for independent recovery, not safe copies to restore over current
+state. Missing/corrupt state requires operator reconciliation; this slice does
+not introduce an automatic repair or external rollback anchor.
+
+## Change approval while stopped
+
+Stop the service, review a complete replacement inventory with revision exactly
+one higher, and run:
+
+```sh
+tunnel-authority approve-membership \
+  --config /var/lib/agentuplink-authority/secrets/authority.toml \
+  --inventory /var/lib/agentuplink-authority/secrets/inventory-next.json \
+  --expected-revision "$PREVIOUS_REVISION" \
+  --expected-redis-run-id "$REVIEWED_REDIS_RUN_ID"
+```
+
+The command refuses a running writer, stale revision, deployment/namespace
+change, mismatched signing key or invalid inventory. To change the expected
+Redis run, an independently recovered different incarnation is required. This
+command does not establish catalog reconciliation, quiescence or activation;
+perform the existing recovery contract independently. It preserves both version
+counters, clears confirmation and does not perform Redis I/O. Restart and wait
+for a confirmed new round. A removed client pin is refused immediately after
+restart, even if publication is unavailable. Newly approved clients receive 503
+until the new inventory has a confirmed round. There is no live reload.
+
+For publisher-key rotation, distribute the new public trust to every relay
+before signing with that key. A stop/update/restart interrupts checkpoint
+availability, so keep it well within the existing trust lifetime. A prolonged
+outage fails closed. Approve both peer keys during a controlled rotation, follow
+the relay's convergence hold, then withdraw the old key with a later inventory
+revision. Separately rotate checkpoint client pins; permit at most two per node.
+
+The Redis directory retains removed node IDs and has a 32-entry bound. The
+authority therefore permits at most **32 distinct node IDs over the namespace's
+lifetime**, across incarnations. Reuse stable logical node IDs for process and
+SPKI replacement. There is no safe online deletion command; directory cleanup
+and deployments exceeding that historical bound remain M6-C236. Creating a new
+incarnation does not free slots or justify resetting version counters.
+
+## Service and network limits
+
+The responder admits at most 64 TLS/HTTP connections, one authenticated request
+per node, a 32-slot state-admission queue and one actual blocking state operation.
+TLS handshake and HTTP exchange each have a two-second budget; request bodies
+are at most 4 KiB, headers at most 16 and the HTTP buffer 8 KiB. Connections close
+after one response. A disconnected caller cannot release the durable serializer
+early or cancel its timeout watchdog. The publisher joins the same fair
+serializer without requiring an HTTP admission slot.
+
+Authorized clients can use `GET /livez` for process liveness and `GET /readyz`
+for current confirmed publication freshness. Readiness consumes no signed
+checkpoint version. `POST /v1/checkpoint` requires JSON content type, exact scope
+and a 16–128-character alphanumeric/underscore/hyphen nonce. Refused client
+identities get 403, concurrent work for a node gets 429, and unavailable authority
+state gets 503. Do not make readiness public or add a certificate bypass for a
+load balancer. Logs contain fixed stage/status messages, no private material,
+Redis URL, signed documents or request bodies.
+
+The [systemd example](../examples/service/tunnel-authority.service) runs an
+independent account with an owned persistent directory. The [container](../deploy/authority/Dockerfile)
+contains only the authority executable; mount private configuration/credentials
+read-only and state read-write with the fixed UID. Neither starts an initializer.
+Restrict ingress to relay networks and egress to the independently approved Redis
+primary. The actual hostnames, firewall rules, issued PKI, UID ownership,
+durable-volume guarantees and Redis persistence/ACL configuration remain
+deployment inputs. This is not an unattended production rollout manifest.
+
+## Acceptance
+
+Run the locked workspace checks and the registered actual-process gate:
+
+```sh
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --locked
+cargo build --workspace --bins --locked
+TEST_REDIS_URL=redis://127.0.0.1:16379/ cargo test -p tunnel-test-harness \
+  --test m6_online_authority --locked -- --ignored --test-threads=1
+```
+
+The process gate uses generated PKI, an isolated publisher ACL and namespace,
+the real authority binary, Redis TLS and configured relay processes. Storage
+tests separately exercise actual crash/rename boundaries, stable locks, permanent
+failure and cancellation. Local tests do not attest deployment DNS, real volume
+crash durability, hosted archives or independent recovery execution. Keep those
+remaining M6-C22 obligations visible in the production deployment goal.

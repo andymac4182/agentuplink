@@ -1,0 +1,62 @@
+{
+  "schema_version": 1,
+  "deployment_id": "example-deployment",
+  "redis_namespace": "agent-tunnel-cluster",
+  "deployment_incarnation": "example-incarnation-1",
+  "revision": 1,
+  "publisher_key_id": "membership-1",
+  "publisher_public_key": "0000000000000000000000000000000000000000000000000000000000000000",
+  "nodes": [
+    {
+      "node_id": "relay-a",
+      "peer_endpoint": "10.42.0.11:7443",
+      "server_name": "relay-a.example.internal",
+      "keys": [
+        {
+          "key_id": "relay-a-1",
+          "spki_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+          "not_before": "2030-01-01T00:00:00Z",
+          "expires_at": "2030-02-01T00:00:00Z",
+          "revoked": false
+        }
+      ],
+      "checkpoint_client_spkis": [
+        "2121212121212121212121212121212121212121212121212121212121212121"
+      ]
+    },
+    {
+      "node_id": "relay-b",
+      "peer_endpoint": "10.42.0.12:7443",
+      "server_name": "relay-b.example.internal",
+      "keys": [
+        {
+          "key_id": "relay-b-1",
+          "spki_sha256": "1212121212121212121212121212121212121212121212121212121212121212",
+          "not_before": "2030-01-01T00:00:00Z",
+          "expires_at": "2030-02-01T00:00:00Z",
+          "revoked": false
+        }
+      ],
+      "checkpoint_client_spkis": [
+        "2222222222222222222222222222222222222222222222222222222222222222"
+      ]
+    },
+    {
+      "node_id": "relay-c",
+      "peer_endpoint": "10.42.0.13:7443",
+      "server_name": "relay-c.example.internal",
+      "keys": [
+        {
+          "key_id": "relay-c-1",
+          "spki_sha256": "1313131313131313131313131313131313131313131313131313131313131313",
+          "not_before": "2030-01-01T00:00:00Z",
+          "expires_at": "2030-02-01T00:00:00Z",
+          "revoked": false
+        }
+      ],
+      "checkpoint_client_spkis": [
+        "2323232323232323232323232323232323232323232323232323232323232323"
+      ]
+    }
+  ]
+}

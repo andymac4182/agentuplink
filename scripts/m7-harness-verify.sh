@@ -46,6 +46,8 @@ gate "Redis cluster integration tests" \
   cargo test -p tunnel-catalog --test redis_cluster --locked -- --ignored --test-threads=1
 gate "membership publisher explicit Redis TLS and restricted ACL" \
   cargo test -p tunnel-test-harness --test m7_membership_publisher_tls --locked -- --ignored --test-threads=1
+gate "independent online authority publication, mTLS and durable restart refusal" \
+  cargo test -p tunnel-test-harness --test m6_online_authority --locked -- --ignored --test-threads=1
 gate "Redis recovery integration tests" \
   cargo test -p tunnel-catalog --test redis_recovery --locked -- --ignored --test-threads=1
 gate "Redis recovery-race integration tests" \
