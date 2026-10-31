@@ -77,7 +77,7 @@ these completion criteria are evidenced; scheduling is not verification.
 | P0 | Verify deployed credential replacement before expiry | M6-C56 remains owner-deferred for same-device renewal. M6-C233 locally verifies the approved new-device workaround, including migrated grants, revocation, restart and actual expiry | Execute the procedure against the real deployment inventory before expiry; deliver same-device renewal separately when taken up |
 | P0 | Prove durable recovery | M6-C82; the single-relay continuity witness is process-local | Simultaneous restart recovers with an independent witness; rollback remains refused; restore drill completed |
 | P0 | Complete vanished-device CLI recovery evidence | M6-C68; remote owner release and fresh library reconnect pass complete cluster acceptance. M6-C229 quiet-session fix is verified. Actual CLI through the cut-client/held-relay proxy and all three negative controls pass; same PID regains readiness in 30.643 s after owner release at 30.021 s. Combined acceptance remains owed | Same CLI PID reaches a fresh ready session after remote owner cleanup within the stated bounds, with real echo and negative controls; full combined acceptance |
-| P1 | Stabilize cluster membership and key changes | M7-C06/C80/C81/C83/C86/C131/C150; M8-C46/C47/C48/C61; M6-C232 passes prior combined acceptance. C235 identifies an additional clean-EOF path; C238 has deterministic regressions and awaits its own combined/comparison evidence | Repeatable re-sign, trust-expiry, rotation and restart acceptance; retain intermittent failures |
+| P1 | Stabilize cluster membership and key changes | M7-C06/C80/C81/C83/C86/C131/C150; M8-C46/C47/C48/C61; M6-C232 passes prior combined acceptance. C235 identifies an additional clean-EOF path; C238 has deterministic regressions and a completed fixed20/20 versus control19/20 comparison; final combined evidence remains owed | Repeatable re-sign, trust-expiry, rotation and restart acceptance; retain intermittent failures |
 | P1 | Finish limits and real adapter acceptance | M4-21/68/70/72/73/74; M3-12/13/37/41/42/44 | Enforced advertised limits, long-lived streams and framework clients across peer hops/rotation/revocation |
 | P1 | Establish load and recovery budgets | M6-03/C125/C126/C183/C192/C201/C239 | Off-host multi-tenant load and soak at declared capacity, explicit latency/error/recovery targets, Redis peak-memory/AOF rewrite evidence |
 | P1 | Close release and operator verification gaps | M6-01/C217/C220/C241; M3-50 | Exact final-candidate checks, clean-machine archives and executed deployment guide |
@@ -152,7 +152,12 @@ these completion criteria are evidenced; scheduling is not verification.
   that observed EOF ordering, not all historical failures or C232 efficacy.
   M6-C238 changes only clean-EOF classification after decoder validation,
   preserving actual earlier non-expiry reasons and malformed-record errors.
-  Its own 20-pair comparison and combined acceptance remain required.
+  Its own unchanged, uninstrumented 20-pair comparison is now complete:
+  fixed20/20, control19/20, with the sole failing control preserving the exact
+  ingress Closed/owner membership-expiry mismatch. All forty outcomes, unique
+  namespaces and final source/tool/binary hashes are retained in the
+  [C238 comparison report](m6-c238-clean-eof-comparison-2026-10-31.md).
+  There were no retries or timeouts. Final combined acceptance remains required.
 - Hosted CI at `89acdcad` passed every job, including M7:
   [41156405921](https://github.com/andymac4182/agentuplink/actions/runs/41156405921).
   Offline-authority candidate `8997e7f6` also passed every job:

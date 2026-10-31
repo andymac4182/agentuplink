@@ -1,6 +1,6 @@
 # Combined production-candidate acceptance
 
-Status at 2026-10-31T15:12:00+10:00: **not accepted for deployment**.
+Status at 2026-10-31T15:48:00+10:00: **not accepted for deployment**.
 
 This report records runtime `20b92455706baaacc1f2329c26afba41c48f906a`,
 tree `79d6e525a79f5b26cf2437e7c1a8a1d2dc14b61e`. The source remained clean
@@ -57,8 +57,12 @@ Its outer bound is 1,550 seconds,
 covering the existing 1,500-second OG-02 bundle timeout and cleanup. The
 continuation's arbitrary 300-second outer bound did not fire but was shorter
 than the harness contract. Neither continuation nor repeat replaces the failed
-timing-boundaries gate. The predeclared 20-pair clean-EOF comparison is prepared
-but has not run; its isolated source, target and frozen binaries were untouched.
+timing-boundaries gate. The predeclared 20-pair clean-EOF comparison subsequently completed with
+fixed20/20 and control19/20. Pair15 control reproduces the exact expiry
+classification mismatch; all forty outcomes and final integrity checks are
+retained in the [separate report](m6-c238-clean-eof-comparison-2026-10-31.md).
+No retry, timeout or diagnostic feature was used. This focused comparison
+does not turn the failed combined M7 attempt into a pass.
 
 Local artifacts are retained privately under
 `/workspace/agentuplink-review-artifacts/combined-runtime-20b92455`, including
@@ -173,9 +177,9 @@ capacity refusal each drop a request without response headers, producing
 controls pass. No production fix has yet been applied, and the evidence does
 not identify which exact request caused the historical hosted failure.
 
-The final combined candidate still needs all required gates passing, the
-unchanged predeclared expiry comparison, corrected image traffic/recovery and
-headroom checks, and hosted release checks. The real deployment inventory,
+The final combined candidate still needs all required gates passing, corrected image traffic/recovery and
+headroom checks, and hosted release checks. The unchanged predeclared expiry
+comparison is complete and remains a separate fixed-source measurement. The real deployment inventory,
 certificate and OIDC configuration, monitoring/alerts, backup ownership,
 off-host capacity/soak, license disposition and operator recovery remain
 explicit in the production-readiness goal and task tracker.
