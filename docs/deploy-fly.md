@@ -425,15 +425,22 @@ It warns that a single volume has no redundancy. That is expected: there is
 exactly one Redis, and its durability is the AOF on this volume plus Fly's
 daily snapshots.
 
-The Redis image sets `maxmemory 160mb` and `maxmemory-policy noeviction` for
+The Redis image sets `maxmemory 96mb` and `maxmemory-policy noeviction` for
 the 256 MB VM. At that dataset limit, Redis refuses writes rather than evicting
-catalog or revocation records. The remaining 96 MB is headroom for Redis and
-AOF work, not a guarantee against an out-of-memory kill: measure peak RSS,
-AOF rewrite copy-on-write memory and disk usage under your workload, and alert
-before the limit. Increase the machine size and the dataset budget together
-when capacity requires it. Older images have no dataset limit; rebuilding an
-image does not change a running deployment. Plan its rollout as the Redis
-restart described in section 6.4.
+catalog or revocation records. The earlier 160 MiB limit was OOM-killed during
+an AOF rewrite with heavy existing-key churn in a 256 MiB container without
+swap. The 96 MiB candidate completed that bounded workload with no OOM,
+successful persistence and an intact canary; this is local evidence, not a
+worst-case capacity guarantee. The [rewrite experiment](m6-redis-aof-headroom-2026-10-31.md)
+records every outcome, sampling limits and the reproducible gate.
+
+Measure RSS, copy-on-write memory and disk growth under your workload, and alert
+before the limit. Cgroup peak includes reclaimable file cache; repeated memory
+limit hits still deserve attention even when OOM counters remain zero. Increase
+the machine size and validate its dataset budget together when capacity requires
+it. Older images have no limit or the former 160 MiB limit. Rebuilding an image
+does not change a running deployment; plan its rollout as the Redis restart in
+section 6.4. This change has not been deployed to a user's environment.
 
 **Costs money: $2.47 a month** (one `shared-cpu-1x` 256 MB machine in `syd`).
 Run from the Redis directory, whose `fly.toml` and `Dockerfile` are the
