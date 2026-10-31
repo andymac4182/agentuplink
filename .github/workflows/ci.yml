@@ -18,6 +18,20 @@ env:
   CARGO_INCREMENTAL: "0"
 
 jobs:
+  python-audit:
+    name: Python MCP conformance dependency advisories
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Audit the fully pinned Python test environment
+        run: |
+          python3 -m venv "$RUNNER_TEMP/mcp-audit"
+          "$RUNNER_TEMP/mcp-audit/bin/pip" install pip-audit==2.10.1
+          "$RUNNER_TEMP/mcp-audit/bin/pip-audit" --require-hashes --disable-pip --progress-spinner off --requirement tests/mcp-sdk-conformance/python/requirements.txt
+
   typescript:
     name: TypeScript client and framework adapters
     runs-on: ubuntu-latest

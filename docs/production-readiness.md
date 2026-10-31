@@ -5,6 +5,7 @@ Status: active; production readiness is not yet established.
 Goal: make Agent Uplink deployable with a repeatable release, verified recovery,
 and evidence for every production blocker. Requested by the owner on 2026-10-31.
 Review baseline: `c749a78432c2d863572a601a7935abf73fa193a2`.
+Reviewable hardening changes: [draft PR #260](https://github.com/andymac4182/agentuplink/pull/260).
 
 This document tracks the deployment review and its next actions. Existing task
 IDs in `tasks.md` retain their acceptance criteria. A historical green gate is
@@ -38,6 +39,7 @@ Fly profile is an intermediate step, not a reduction of that requirement.
 | P0 | Deliver the external cluster and recovery authority | M6-C22; no `tunnel-authority` workspace member | Shipped signing/publishing/checkpoint commands and executed recovery/cluster procedures |
 | P0 | Verify the credential-rotation procedure before expiry | M6-C56; same-device renewal remains owner-deferred because the relay cannot register its new SPKI. Re-enrolment as a new device is the approved workaround | Execute re-enrolment, grant migration, old-device revocation and restart; deliver same-device renewal separately when taken up |
 | P0 | Prove durable recovery | M6-C82; the single-relay continuity witness is process-local | Simultaneous restart recovers with an independent witness; rollback remains refused; restore drill completed |
+| P0 | Preserve quiet forwarded sessions across peer idle expiry | M6-C229; quiet control closes at fixture peer idle despite WebSocket Pongs; production timeout is 60 s | Real quiet-session proof beyond the production idle window, compatible heartbeat and vanished-device controls |
 | P0 | End vanished forwarded device sessions | M6-C68; non-owner ingress control path lacks liveness enforcement | Real cluster network-cut test releases ownership and reconnects within the declared bound |
 | P1 | Stabilize cluster membership and key changes | M7-C80/C81/C83/C86/C131/C150; M8-C46/C47/C48/C61 | Repeatable re-sign, trust-expiry, rotation and restart acceptance |
 | P1 | Finish limits and real adapter acceptance | M4-21/68/70/72/73/74; M3-12/13/37/41/42/44 | Enforced advertised limits, long-lived stream behavior and framework clients across peer hops/rotation/revocation |
@@ -74,6 +76,9 @@ Fly profile is an intermediate step, not a reduction of that requirement.
   old dependency graph had eight new advisory findings; none was ignored to
   make the update pass. Existing test-only RSA and unmaintained PEM-parser
   exceptions remain in `deny.toml`.
+- Python MCP test dependencies audit clean on Linux after the minimal
+  OpenTelemetry API 1.45.1 patch. The full SDK conformance run also passes on
+  Python 3.10 after fixing its missing exception-group backport import (M6-C228).
 - Both npm trees audit with zero vulnerabilities. Mastra's existing 1.65.0
   Agent behavior is retained; a scoped MCP-server 2.3.0 override is verified
   by four real SDK tests, including two tests shown failing on version 2.0.0.
@@ -86,7 +91,8 @@ Fly profile is an intermediate step, not a reduction of that requirement.
   and a fresh relay startup. Serving containers were capped at 256 MiB.
   This proves a local container deployment, not the live Fly machines.
 - M1 real-socket acceptance and M2 accelerated rotation/fault gates passed.
-  Three actual 300-second rotations and the full M7 suite are still pending.
+  Three actual 300-second rotations also passed with 18,913 records. The full
+  M7 suite is running separately.
 - Actual Fly credentials, deployed image, certificates, Redis backup state and
   monitoring are not available through the environment's configured identities.
   Repository deployment notes are historical evidence, not a live inspection.
@@ -145,7 +151,7 @@ grants, lease cleanup and dedicated guest acceptance are complete.
 
 ## Next action
 
-Complete M2 scheduled-rotation and M7 real-cluster acceptance, then package the
+Complete M7 real-cluster acceptance and the quiet-forwarded-session fix, then package the
 reviewed candidate. A focused vanished-device regression and the accepted
 M6-C22 offline recovery-signer slice are in progress; neither closes the broader
 cluster-authority and recovery goal on its own. Do not mark this goal complete while required
