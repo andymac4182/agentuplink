@@ -111,7 +111,8 @@ impl FaultProxy {
         if let Some(mut task) = self.task.take() {
             match timeout(IO_BOUND, &mut task).await {
                 Ok(Ok(())) => {}
-                _ => {
+                Ok(Err(_)) => return Err("fault proxy cleanup failed"),
+                Err(_) => {
                     task.abort();
                     let _ = task.await;
                     return Err("fault proxy cleanup failed");
@@ -184,9 +185,13 @@ async fn connection(mut client: TcpStream, upstream: SocketAddr, control: Contro
         // the partial-round witness depend on executor/connection scheduling.
         let _publication = if let Some((_, version)) = &publish {
             let permit = control.publication_gate.lock().await;
-            if control.cut_version.load(Ordering::SeqCst) == *version { return; }
+            if control.cut_version.load(Ordering::SeqCst) == *version {
+                return;
+            }
             Some(permit)
-        } else { None };
+        } else {
+            None
+        };
         if !matches!(
             timeout(IO_BOUND, server.write_all(&request)).await,
             Ok(Ok(()))
@@ -205,7 +210,10 @@ async fn connection(mut client: TcpStream, upstream: SocketAddr, control: Contro
                 .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
                 .is_ok()
         {
-            control.cut_version.store(publish.as_ref().expect("selected publication").1, Ordering::SeqCst);
+            control.cut_version.store(
+                publish.as_ref().expect("selected publication").1,
+                Ordering::SeqCst,
+            );
             control.cuts.fetch_add(1, Ordering::SeqCst);
             control.cut.notify_one();
             return;
