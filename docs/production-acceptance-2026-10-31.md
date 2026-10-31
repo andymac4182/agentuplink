@@ -1,6 +1,6 @@
 # Combined production-candidate acceptance
 
-Status at 2026-10-31T16:17:30+10:00: **not accepted for deployment**.
+Status at 2026-10-31T16:38:38+10:00: **not accepted for deployment**.
 
 This report records runtime `20b92455706baaacc1f2329c26afba41c48f906a`,
 tree `79d6e525a79f5b26cf2437e7c1a8a1d2dc14b61e`. The source remained clean
@@ -219,8 +219,32 @@ The TypeScript deadline and fid work passes pinned Node24.21.0, 598 offline
 tests,25 installed-framework tests and the existing real-path filesystem demo.
 The separate four-framework scheduled-rotation gate at `41746cf5` passes the
 full Node check with 601 offline and 33 installed-framework tests. Its first
-Rust compilation and real 300-second attempt remain pending; preflight does
-not establish real-relay rotation acceptance.
+Rust library controls pass five cases. Review found an unbounded cleanup path;
+`1edfe559` uses the existing deadline-aware cleanup methods and retains errors
+while attempting later cleanup. The first strict Clippy invocation retains a
+style error; the second exposes three E0277 errors in the new CLI dispatch.
+The Result boundary correction at `29d9171366a3aa81280901894c6f91f5601601ff`
+passes scoped all-target strict Clippy, binary build and formatting.
+
+The first real framework attempt then **fails** in 308.540 seconds at that
+exact source, frozen harness
+`2e899a5631588661279226eb7ce5011aab34a2dbce64f3f1f4d270a9e311f678`.
+It records host effects at 295.030 s, scheduled rotation at 300.401 s,
+generation 1 to 2, 1.506 s resumption, zero replay, eight completed exchanges
+and 20,480 written bytes. All four held revoked writes report native unknown,
+non-retryable outcomes with close1008 and no Rwrite; the independent grant
+survives. These observations do not qualify the gate: final evidence has
+`revoked_admission_refused=false`. The fixture expected403 ACCESS_DENIED;
+the documented missing/undiscoverable export contract is404 EXPORT_NOT_FOUND.
+The helper discarded the actual response, so source reasoning is not a
+recovered wire observation. Exact structured matching, bounded diagnostics
+and a separately authorized corrected attempt remain pending.
+
+All1,063 tracked source hashes, harness/Node hashes and16,798 dependency
+entries remain unchanged after this failed run. All six owned PIDs are gone
+and its unique Redis namespace has zero remaining keys. Private evidence is
+under `/workspace/agentuplink-review-artifacts/m4c68/`; failed log SHA-256
+`7665f061c74fab0720bd3cd9e156138676ee3c961d29ec82344399128d9463b6`.
 
 C246's unresolved-request cancellation and capacity refusal reproduce real
 HTTP/3 connection errors that interrupt siblings. The narrow fix now resets
