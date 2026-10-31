@@ -1,6 +1,6 @@
 # Combined production-candidate acceptance
 
-Status at 2026-10-31T15:48:00+10:00: **not accepted for deployment**.
+Status at 2026-10-31T16:03:54+10:00: **not accepted for deployment**.
 
 This report records runtime `20b92455706baaacc1f2329c26afba41c48f906a`,
 tree `79d6e525a79f5b26cf2437e7c1a8a1d2dc14b61e`. The source remained clean
@@ -121,7 +121,14 @@ At Redis-profile descendant `9866a671`, M7 job 124447619983 in run
 At notice descendant `a81e3b9f`, Ubuntu job 124452672186 and macOS job
 124452672144 in run 41172225687 fail C247's old publisher-queue fixture with
 `fixture did not exercise a queue longer than the HTTP wait budget`. Its
-replacement has only local evidence so far.
+replacement has only local evidence so far. M7 job 124452672134 also fails
+the retained C245 timing assertion; all other jobs in this CI run pass.
+Earlier CLI descendant `c8f51416` has the same old publisher-fixture failure
+on macOS (job 124442370671), alongside the historical placeholder scan;
+its M7 and five-target release pass. Stale-authorization descendant `58e15d4`
+has the C245 M7 failure (job 124443232189) and historical placeholder scan;
+its other CI jobs and packaging pass. None of those histories is erased by
+downstream local corrections.
 
 Release run 41172225676 builds all five targets, then **all five native archive
 verifiers fail**: the checksum sidecar is named for the final notice supplement,
@@ -163,19 +170,53 @@ provider, rotate a real secret or claim coverage of all GitHub-only refs.
 The next integration candidate contains the C245 exact stale-refresh matcher
 (seven focused tests and one live timing pass, 53.614 seconds) and C247's
 deterministic queue-budget fixture (twenty tests and scoped strict Clippy pass;
-production timing unchanged). C243's recovery executable compiles and four
-snapshot controls pass; the actual old-backup recovery sequence has not yet
-run. C248's bounded failure diagnostics are source-ready and still need
-compilation. The TypeScript deadline and fid work passes pinned Node 24.21.0,
-598 offline tests, 25 installed-framework tests and the existing real-path
-filesystem demo. None of these claims is a full integrated-candidate pass.
+production timing unchanged).
 
-The C246 investigation has reproduced two real HTTP/3 connection-isolation
-defects with actual mTLS/H3 sockets: unresolved planned cancellation and
-capacity refusal each drop a request without response headers, producing
-`H3_FRAME_UNEXPECTED` and interrupting an admitted sibling. Two corresponding
-controls pass. No production fix has yet been applied, and the evidence does
-not identify which exact request caused the historical hosted failure.
+C243 has two retained **failed** local optimized-artifact attempts. Source
+`3d092deb` fails before restore because three relays plus the authority occupy
+28 of the fixture proxy's 32 TLS slots, while the operator CLI requires seven
+more. The fixture repair at `7c9c24fc` gives operator commands a separate bounded
+verified TLS proxy to the same owned Redis; it passes all seven focused controls
+and strict scoped Clippy. Its frozen test executable is
+`1be64fb1c693baa9297dbf2b3b3f478daa8df400336e981aeb7819ce966dff10`,
+with the unchanged C241 optimized authority and relay copies.
+
+That second attempt fails in 82.60 seconds (wrapper 83.452 seconds), after
+actual older-RDB restoration, both live revocations, 65.023 seconds of quiescence,
+wrong-nonce/missing-fence/stale-digest refusal, signed approval, consumed fence
+version1 and replay refusal. After three replacement relays start, a canary
+returns `503 CLUSTER_UNREADY/not_dispatched` in 1ms. Both exact owned Redis
+containers are removed. This does not verify the recovery drill. Independent
+review also requires old-config changed-run refusals before reconciliation and
+approval; post-activation incarnation refusals cannot prove that earlier boundary.
+
+C248's bounded diagnostics and retained ingress log establish the second
+attempt's readiness transition: relay-a reports `Authority(HttpStatus(429))`
+at `2026-10-31T05:50:50.863787Z`, before teardown. The fixture observer polls
+checkpoints with that serving relay's identity; the authority permits one
+simultaneous connection per node. The competing observer can consume its slot,
+causing the legitimate relay to fail closed. Later persisted floors and
+confirmation timestamps are not event-time readiness snapshots. This is a
+source-backed fixture-contention explanation for this occurrence, not proof
+of the exact cause in the older hosted31-second failure. A passive observer
+with independently verified adoption by all three actual relays is in progress;
+no authority limit or canary predicate is relaxed.
+
+The TypeScript deadline and fid work passes pinned Node24.21.0, 598 offline
+tests,25 installed-framework tests and the existing real-path filesystem demo.
+The separate four-framework scheduled-rotation gate is being implemented;
+its preflight does not establish real-relay rotation acceptance.
+
+C246's unresolved-request cancellation and capacity refusal reproduce real
+HTTP/3 connection errors that interrupt siblings. The narrow fix now resets
+only the unresolved request and transfers request-end accounting correctly.
+Source `29897889` passes seven focused real-H3 cases, all83 transport tests,
+strict scoped Clippy, formatting and vendor provenance replay. An initial
+malformed-frame fixture wrongly expected delivery of the server's error code
+to the client; that failed control is retained, and its corrected assertion
+checks the exact server protocol error. Full aggregate acceptance and exact
+historical hosted-stream attribution remain separate. No production change
+has been merged or deployed.
 
 The final combined candidate still needs all required gates passing, corrected image traffic/recovery and
 headroom checks, and hosted release checks. The unchanged predeclared expiry
