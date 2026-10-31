@@ -239,8 +239,11 @@ This is new hosted integration evidence; the earlier local negative controls
 remain separately bound to their actual patched inputs. The M4 full log SHA-256
 is `515f56e78fe199a411c7c75da68c56e23a2a5527b14a802f5d2fa62ed87873ff`.
 
-At this review, M7 remains in progress. The other twelve completed CI jobs
-pass, including macOS/Windows Rust, both M1 lanes, M2, M3, payload scan,
+The final CI result is failure: thirteen jobs pass and Ubuntu Rust fails.
+Full M7 job124496648626 passes, including all ten OG-02 rows with complete
+correlation. The saved M7 log SHA-256 is
+`dedfd86daaf5e093497a786c81f61cf98988d9e56129bb166c031ff79b1edb6c`.
+The other successful jobs include macOS/Windows Rust, both M1 lanes, M2, M3, payload scan,
 TypeScript, dependency checks and container tests. Packaging run 41187171856
 passes. Fresh hosted TypeScript has 601 offline and 33 installed-peer tests
 on Node 24.22.1; this predates the Mastra M4-75 correction. No optimized release

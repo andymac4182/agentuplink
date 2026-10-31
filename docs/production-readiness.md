@@ -49,14 +49,18 @@ integrated86fb workspace checks pass2,931tests. PR #274 at head
 `107d94a2e331f850bcc70a2b9406bc79ccfa1cbf` has a successful full hosted M4
 run, including C244, but its Ubuntu Rust job failed before the authority
 permission-refusal test could begin: reopening state returned `authority state
-is already open` (M6-C251). The hosted M7 job is still running at this review.
+is already open` (M6-C251). The hosted M7 job has now passed, including all ten
+OG-02 correlation rows; the final CI result is failure with thirteen successful
+jobs and that one failed Ubuntu job.
 The [follow-up evidence](m6-final-candidate-2026-10-31.md#hosted-follow-up-at-107d94a2)
 preserves the actual checkout and failed log. No overall CI pass is claimed.
 
 Mastra depth enforcement (M4-75) now rejects descriptor-ceiling overrides and
 incomplete default listings, preserving explicit bounded views. Its 610 offline
-and 34 installed-peer checks pass; actual relay/device rotation integration
-is pending. The separate M4-47 valid-state reproduction demonstrates that
+and 34 installed-peer checks pass. Separate actual relay/device integration
+passes the unchanged 300-second framework rotation gate in311.020s, with
+zero replay, live revocation and joined cleanup; [exact evidence](m4-mastra-depth-2026-10-31.md)
+retains the prelaunch diagnostic failure. New-candidate hosted evidence remains pending. The separate M4-47 valid-state reproduction demonstrates that
 ordinary in-credit DATA can exhaust the response budget and fence all 33
 streams. That production correction and its complete acceptance remain open.
 
