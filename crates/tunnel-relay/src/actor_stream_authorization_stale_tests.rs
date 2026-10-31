@@ -210,6 +210,18 @@ async fn check(case: Case, expected_reason: Option<u16>, expected_close: Option<
                 other => panic!("{case:?}: expected failure, got {other:?}"),
             }
         }
+        let terminal = actor
+            .stream_terminal_events
+            .back()
+            .expect("retained terminal");
+        assert_eq!(
+            terminal.reason, expected_outcome,
+            "{case:?}: terminal reason"
+        );
+        assert_eq!(
+            terminal.authorization_failure_code,
+            stream.authorization_failure_code
+        );
         assert_eq!(
             stream.authorization_failure_code,
             Some(match case {
