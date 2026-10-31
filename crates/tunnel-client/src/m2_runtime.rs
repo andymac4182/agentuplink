@@ -5318,7 +5318,8 @@ impl M2Actor {
             .get(&invalidated.stream_id)
             .is_some_and(|stream| stream.auth.challenge_id == invalidated.challenge_id)
         {
-            self.expire_stream(invalidated.stream_id).await?;
+            self.invalidate_stream(invalidated.stream_id, M2_RESET_AUTH_EXPIRED)
+                .await?;
         }
         Ok(())
     }
@@ -6446,7 +6447,10 @@ impl M2Actor {
                         if stream.pending_bytes.saturating_add(payload.len())
                             > self.config.limits.max_queue_bytes
                         {
-                            return self.expire_stream(stream_id).await;
+                            // Retain the existing queue-limit terminal classification.
+                            return self
+                                .invalidate_stream(stream_id, M2_RESET_AUTH_EXPIRED)
+                                .await;
                         }
                         stream.pending_bytes += payload.len();
                         stream.pending.push_back(BufferedInput::Data(payload));
@@ -9037,6 +9041,18 @@ impl M2Actor {
     }
 
     async fn expire_stream(&mut self, stream_id: u64) -> Result<(), ClientError> {
+        self.invalidate_stream(
+            stream_id,
+            tunnel_protocol::reset_reason::AUTHORIZATION_STALE,
+        )
+        .await
+    }
+
+    async fn invalidate_stream(
+        &mut self,
+        stream_id: u64,
+        reset_reason: u16,
+    ) -> Result<(), ClientError> {
         #[cfg(test)]
         {
             self.expire_stream_calls = self.expire_stream_calls.saturating_add(1);
@@ -9046,7 +9062,7 @@ impl M2Actor {
             // remains, and a RESET now would be one it never acknowledges.
             return Ok(());
         }
-        self.http_abort(stream_id, M2_RESET_AUTH_EXPIRED);
+        self.http_abort(stream_id, reset_reason);
         if let Some(stream) = self.streams.get_mut(&stream_id) {
             // Counted once per stream. The expired-stream selection skips
             // streams already invalidated (task row M6-C88), and the guard
@@ -9069,7 +9085,7 @@ impl M2Actor {
             stream_id,
             kind: FrameKind::Reset,
             payload: Vec::new(),
-            reset_reason: Some(M2_RESET_AUTH_EXPIRED),
+            reset_reason: Some(reset_reason),
         })
         .await
     }
@@ -10334,6 +10350,102 @@ mod tests {
                 .get(&7)
                 .is_none_or(|stream| stream.auth.invalidated)
         );
+    }
+
+    /// M4-70 observes the RESET emitted by the real deadline/invalidation
+    /// entry points, including a terminal held behind a rotation freeze.
+    async fn m4c70_reset_for_cause(local_deadline: Option<bool>, frozen: bool, reason: u16) {
+        let (mut actor, _key, mut receiver, _control_receiver) =
+            test_actor_with_carrier(M2_CARRIER_QUEUE_FRAMES);
+        let mut stream = test_stream();
+        stream.sequence = StreamState::new(7, 1_024).expect("stream sequence");
+        stream.auth.confirmed = true;
+        stream.auth.refresh_in_flight = false;
+        let live = DualDeadline::new(Instant::now(), SystemTime::now(), Duration::from_secs(60))
+            .expect("live deadline");
+        let expired = DualDeadline::new(
+            Instant::now() - Duration::from_secs(1),
+            SystemTime::now(),
+            Duration::from_millis(1),
+        )
+        .expect("expired deadline");
+        stream.auth.deadline = if local_deadline == Some(true) {
+            expired
+        } else {
+            live
+        };
+        stream.auth.operation_deadline = if local_deadline == Some(false) {
+            expired
+        } else {
+            live
+        };
+        stream.pending.push_back(BufferedInput::Data(vec![0x2a]));
+        stream.pending_bytes = 1;
+        actor.pending_output_bytes = 1;
+        actor.streams.insert(7, stream);
+        actor.writes_frozen = frozen;
+        if local_deadline.is_some() {
+            actor.refresh_authorizations().await.expect("deadline pass");
+        } else {
+            actor
+                .handle_authorization_invalidated(AuthorizationInvalidated::new(
+                    "m4c70-invalidation",
+                    "session",
+                    1,
+                    7,
+                    "challenge",
+                    1,
+                    "grant unavailable",
+                ))
+                .await
+                .expect("explicit invalidation");
+        }
+        assert!(actor.streams[&7].auth.invalidated);
+        assert!(actor.streams[&7].pending.is_empty());
+        assert_eq!(actor.streams[&7].pending_bytes, 0);
+        assert_eq!(actor.pending_output_bytes, 0);
+        if frozen {
+            assert!(receiver.try_recv().is_err(), "no data writes during freeze");
+            assert_eq!(actor.pending_outputs.len(), 1);
+            assert_eq!(actor.pending_outputs[0].reset_reason, Some(reason));
+            actor.writes_frozen = false;
+            actor.flush_pending_outputs().await.expect("terminal flush");
+        }
+        let mut reasons = Vec::new();
+        while let Ok(command) = receiver.try_recv() {
+            if let CarrierCommand::Frame(frame) = command {
+                let frame = Frame::decode(&frame.bytes).expect("emitted frame");
+                if let Some(reason) = frame.reset_reason().expect("reset framing") {
+                    reasons.push(reason);
+                }
+            }
+        }
+        assert_eq!(
+            reasons,
+            [reason],
+            "exactly one RESET for the observed cause"
+        );
+        assert!(actor.pending_outputs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn m4c70_local_authorization_lapse_emits_retryable_reset() {
+        m4c70_reset_for_cause(Some(true), false, 4_006).await;
+    }
+
+    #[tokio::test]
+    async fn m4c70_local_operation_deadline_emits_retryable_reset() {
+        m4c70_reset_for_cause(Some(false), false, 4_006).await;
+    }
+
+    #[tokio::test]
+    async fn m4c70_explicit_authorization_invalidation_remains_terminal() {
+        m4c70_reset_for_cause(None, false, 4_001).await;
+    }
+
+    #[tokio::test]
+    async fn m4c70_a_frozen_lapse_keeps_its_retryable_reason() {
+        m4c70_reset_for_cause(Some(true), true, 4_006).await;
     }
 
     #[tokio::test]
