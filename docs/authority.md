@@ -223,6 +223,9 @@ The [systemd example](../examples/service/tunnel-authority.service) runs an
 independent account with an owned persistent directory. The [container](../deploy/authority/Dockerfile)
 contains only the authority executable; mount private configuration/credentials
 read-only and state read-write with the fixed UID. Neither starts an initializer.
+The CI deployment job builds this Dockerfile after the Fly proof, checks the
+effective non-root UID and requires an unconfigured default startup to fail.
+That image smoke does not replace the three-relay process acceptance below.
 Restrict ingress to relay networks and egress to the independently approved Redis
 primary. The actual hostnames, firewall rules, issued PKI, UID ownership,
 durable-volume guarantees and Redis persistence/ACL configuration remain

@@ -77,6 +77,22 @@ jobs:
         env:
           TUNNEL_CLIENT: ${{ github.workspace }}/target/debug/tunnel-client
         run: bash deploy/fly/local-proof.sh
+      - name: Build the independent authority image and verify startup boundaries
+        run: |
+          set -euo pipefail
+          docker build --file deploy/authority/Dockerfile --tag agentuplink-authority:ci .
+          # Check the effective image user, then exercise its actual default
+          # entrypoint without mounts. Missing independent configuration must
+          # fail; the service must never initialize authority state on startup.
+          test "$(docker run --rm --network none --entrypoint id agentuplink-authority:ci -u)" = 10002
+          docker run --rm --network none agentuplink-authority:ci --help | grep -F 'tunnel-authority serve --config PATH'
+          set +e
+          timeout 10s docker run --rm --network none --read-only agentuplink-authority:ci >"$RUNNER_TEMP/authority-missing-config.log" 2>&1
+          status=$?
+          set -e
+          cat "$RUNNER_TEMP/authority-missing-config.log"
+          test "$status" -eq 1
+          grep -F 'input is missing, inaccessible or a symlink' "$RUNNER_TEMP/authority-missing-config.log"
 
   rust:
     name: Rust (${{ matrix.os }})

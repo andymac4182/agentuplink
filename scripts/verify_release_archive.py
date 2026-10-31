@@ -33,7 +33,7 @@ prints, not left to a reader to infer:
   cli          help, version, every subcommand's `--help` (D6), `config check`
                on the shipped client example, and (Unix) the relay's help and
                `check-serve-config` on every shipped serving example, plus the
-               separate offline authority's signing/key-generation help
+               separate authority's offline approval and online service help
   portability  every binary's dynamic dependencies are system libraries a
                clean machine of that OS has (ELF DT_NEEDED, Mach-O `otool -L`,
                PE import table)

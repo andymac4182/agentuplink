@@ -203,17 +203,14 @@ async fn connection(mut client: TcpStream, upstream: SocketAddr, control: Contro
         };
         // This exact Lua success reply is received only after Redis committed.
         // The one-shot exchange ensures other concurrent replies pass through.
-        if publish.is_some()
+        if let Some((_, version)) = &publish
             && response == b"*1\r\n$2\r\nok\r\n"
             && control
                 .armed
                 .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
                 .is_ok()
         {
-            control.cut_version.store(
-                publish.as_ref().expect("selected publication").1,
-                Ordering::SeqCst,
-            );
+            control.cut_version.store(*version, Ordering::SeqCst);
             control.cuts.fetch_add(1, Ordering::SeqCst);
             control.cut.notify_one();
             return;
