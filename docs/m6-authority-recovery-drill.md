@@ -229,7 +229,11 @@ revision/deployment/incarnation, the expected Redis run and exact three node
 identities to match. Only a valid confirmed publication with its original
 future expiry can advance the observation; a spent reservation is insufficient.
 Both allocators and confirmed membership versions must not roll back, and the
-same confirmation cannot change its expiry.
+same confirmation cannot change its expiry. During an explicitly declared
+authority restart only, a cleared confirmation is a bounded pending state. No
+old confirmation can satisfy it: the next confirmed version must exceed the
+pre-restart membership high-water. The observer returns to strict steady mode
+as soon as that fresh confirmation is observed; unexpected clearing then fails.
 
 This is an unsigned **test observation**, never a runtime trust source or a
 manufactured signed checkpoint. A fixed target captures confirmed membership

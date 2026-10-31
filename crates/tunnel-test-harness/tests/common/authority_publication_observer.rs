@@ -31,6 +31,17 @@ pub struct Observation {
     pub confirmed: Option<Confirmation>,
 }
 
+#[derive(Clone, Copy)]
+pub enum Mode<'a> {
+    Steady,
+    /// Engine::open clears confirmation before the listener starts. Only this
+    /// declared restart transition may wait for None; its eventual publication
+    /// must exceed the retained pre-restart allocation floor.
+    RestartPending {
+        before: &'a Observation,
+    },
+}
+
 impl Observation {
     pub fn read(
         reader: impl Read,
@@ -38,6 +49,7 @@ impl Observation {
         run: &str,
         now: DateTime<Utc>,
         previous: Option<&Self>,
+        mode: Mode<'_>,
     ) -> GateResult<Self> {
         let mut bytes = Vec::new();
         reader
@@ -79,6 +91,12 @@ impl Observation {
                     && confirmed.expires_at <= now + chrono::Duration::seconds(60),
                 "authority observation confirmation is invalid or expired",
             )?;
+            if let Mode::RestartPending { before } = mode {
+                require(
+                    confirmed.membership_version > before.membership_high_water,
+                    "restart observer saw a pre-restart confirmation",
+                )?;
+            }
         }
         if let Some(previous) = previous {
             require(
@@ -90,7 +108,7 @@ impl Observation {
                                 && (new.membership_version != old.membership_version
                                     || new.expires_at == old.expires_at)
                         }
-                        (Some(_), None) => false,
+                        (Some(_), None) => matches!(mode, Mode::RestartPending { .. }),
                         _ => true,
                     },
                 "authority observation rolled back or extended a fixed confirmation",
@@ -194,6 +212,7 @@ mod tests {
             "run",
             now,
             previous,
+            Mode::Steady,
         )
     }
 
@@ -221,12 +240,21 @@ mod tests {
                 &original["inventory"],
                 "run",
                 now,
-                None
+                None,
+                Mode::Steady,
             )
             .is_err()
         );
         assert!(
-            Observation::read(b"{}".as_slice(), &original["inventory"], "run", now, None).is_err()
+            Observation::read(
+                b"{}".as_slice(),
+                &original["inventory"],
+                "run",
+                now,
+                None,
+                Mode::Steady
+            )
+            .is_err()
         );
     }
 
@@ -272,6 +300,46 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn only_declared_restart_waits_for_cleared_confirmation_and_requires_a_new_round() {
+        let now = Utc::now();
+        let original = fixture(now);
+        let before = decode(&original, &original, now, None).unwrap();
+        let mode = Mode::RestartPending { before: &before };
+        let read = |value: &Value, previous: &Observation| {
+            Observation::read(
+                serde_json::to_vec(value).unwrap().as_slice(),
+                &original["inventory"],
+                "run",
+                now,
+                Some(previous),
+                mode,
+            )
+        };
+        let mut pending = original.clone();
+        pending["confirmed"] = Value::Null;
+        let pending_observation = read(&pending, &before).unwrap();
+        assert!(pending_observation.next_target(&before).unwrap().is_none());
+        assert!(decode(&pending, &original, now, Some(&before)).is_err());
+        assert!(
+            read(&original, &pending_observation).is_err(),
+            "old confirmation reused"
+        );
+        for field in ["membership_high_water", "checkpoint_high_water"] {
+            let mut rollback = pending.clone();
+            rollback[field] = json!(0);
+            assert!(read(&rollback, &pending_observation).is_err());
+        }
+        let mut fresh = original.clone();
+        fresh["membership_high_water"] = json!(3);
+        fresh["confirmed"]["membership_version"] = json!(3);
+        let confirmed = read(&fresh, &pending_observation).unwrap();
+        assert!(confirmed.next_target(&before).unwrap().is_some());
+        assert!(decode(&pending, &original, now, Some(&confirmed)).is_err());
+        fresh["confirmed"]["expires_at"] = json!(now);
+        assert!(read(&fresh, &pending_observation).is_err());
     }
 
     #[test]
