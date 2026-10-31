@@ -26,6 +26,13 @@ sequence, receive credit and replay limits before encoding it.
 | Accepted input | A small real record remains buffered with no output until matching `AuthorizationConfirmed`; then exactly one DATA response carries the expected record and sequence. |
 | Explicit invalidation, normal and frozen writes | Real accepted input is cleared by `AuthorizationInvalidated`, which emits exactly one4001RESET. While writes are frozen that terminal stays queued and consumes no outbound sequence until unfreeze. No buffered DATA is replayed. After writer drain only the two-byte RESET reason remains as bounded transport replay; later DATA is acknowledged without retaining or dispatching it. |
 
+Every no-output assertion requires `TryRecvError::Empty`; a disconnected
+carrier or control channel cannot satisfy it. The rejection snapshot captures
+pending payload bytes, ready frames and the sequence fields it names. Its
+`DirectionSnapshot` contains reorder frame/byte counts, not private reorder
+payload bytes; the gap case independently checks those payloads in exact order
+after legitimate closure.
+
 These are handler/event-level regressions with real protocol encoding and
 sequence accounting, using bounded channels rather than sockets. The freeze
 control exercises the writer latch; it is not another complete rotation proof.

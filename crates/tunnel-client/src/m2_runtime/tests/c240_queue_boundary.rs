@@ -95,12 +95,18 @@ impl Fixture {
 
     fn no_application_output(&mut self) {
         assert!(
-            self.carrier.try_recv().is_err(),
-            "no DATA or RESET before authorization"
+            matches!(
+                self.carrier.try_recv(),
+                Err(mpsc::error::TryRecvError::Empty)
+            ),
+            "the carrier remains open with no DATA or RESET queued"
         );
         assert!(
-            self.control.try_recv().is_err(),
-            "no invented control response"
+            matches!(
+                self.control.try_recv(),
+                Err(mpsc::error::TryRecvError::Empty)
+            ),
+            "the control channel remains open with no invented response"
         );
         assert!(self.actor.pending_outputs.is_empty());
         assert_eq!(self.actor.pending_output_bytes, 0);
@@ -142,6 +148,8 @@ fn pending_payloads(actor: &M2Actor) -> Vec<Option<Vec<u8>>> {
         .collect()
 }
 
+// DirectionSnapshot exposes reorder frame/byte counts, not private payloads.
+// The gap test separately checks every payload after legitimate gap closure.
 #[derive(Debug, PartialEq, Eq)]
 struct Snapshot {
     sequence: [tunnel_protocol::DirectionSnapshot; 2],
@@ -400,8 +408,11 @@ async fn c240_explicit_revocation_clears_real_input_and_preserves_frozen_termina
         assert_eq!(fixture.actor.auth_expired_streams, 1);
         if frozen {
             assert!(
-                fixture.carrier.try_recv().is_err(),
-                "terminal cannot cross the freeze"
+                matches!(
+                    fixture.carrier.try_recv(),
+                    Err(mpsc::error::TryRecvError::Empty)
+                ),
+                "the carrier remains open and the terminal cannot cross the freeze"
             );
             assert_eq!(fixture.actor.pending_outputs.len(), 1);
             let terminal = &fixture.actor.pending_outputs[0];
