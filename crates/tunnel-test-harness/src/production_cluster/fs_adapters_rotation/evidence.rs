@@ -58,6 +58,9 @@ pub struct FsAdaptersRotationEvidence {
     pub(super) revocation_in_ms: u64,
     pub(super) non_owner_refused: bool,
     pub(super) revoked_admission_refused: bool,
+    pub(super) revoked_admission_no_stream_opened: bool,
+    pub(super) last_revoked_stream_id: u64,
+    pub(super) next_control_stream_id: u64,
     pub(super) independent_grant_survived: bool,
     pub(super) versions: BTreeMap<String, String>,
     pub(super) node: String,
@@ -323,6 +326,9 @@ pub fn validate_fs_adapters_rotation_evidence(e: &FsAdaptersRotationEvidence) ->
             && e.revocation_in_ms < 20_000
             && e.non_owner_refused
             && e.revoked_admission_refused
+            && e.revoked_admission_no_stream_opened
+            && e.last_revoked_stream_id > 0
+            && e.last_revoked_stream_id.checked_add(1) == Some(e.next_control_stream_id)
             && e.independent_grant_survived,
         "bounded revocation, host effect, refusal and unaffected grant",
     )?;
@@ -377,6 +383,9 @@ mod tests {
             revocation_in_ms: 700,
             non_owner_refused: true,
             revoked_admission_refused: true,
+            revoked_admission_no_stream_opened: true,
+            last_revoked_stream_id: 13,
+            next_control_stream_id: 14,
             independent_grant_survived: true,
             versions: expected_versions(),
             node: "v24.21.0".into(),
@@ -592,6 +601,22 @@ mod tests {
             }),
             ("non-owner secretly forwarded", |e| {
                 e.non_owner_refused = false
+            }),
+            ("fresh revoked admission allowed", |e| {
+                e.revoked_admission_refused = false
+            }),
+            ("revoked admission opened a stream", |e| {
+                e.revoked_admission_no_stream_opened = false
+            }),
+            ("transient forbidden stream allocation", |e| {
+                e.next_control_stream_id += 1
+            }),
+            ("missing allocation witness", |e| {
+                e.last_revoked_stream_id = 0
+            }),
+            ("allocation witness overflow", |e| {
+                e.last_revoked_stream_id = u64::MAX;
+                e.next_control_stream_id = 0
             }),
             ("cleanup detached", |e| e.cleanup_joined = false),
         ];

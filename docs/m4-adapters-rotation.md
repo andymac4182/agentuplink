@@ -1,8 +1,10 @@
 # Installed framework rotation gate (M4-68)
 
 `verify-m4-fs-adapters-rotation` is being implemented against the production
-three-relay fixture. Its focused Rust controls pass; strict checks and the real-resource run are pending.
-The TypeScript driver preflight is not rotation or relay acceptance evidence.
+three-relay fixture. The first actual 300-second attempt failed its final
+fresh-admission expectation; the full gate remains failed. Seven focused controls, scoped strict checks and the corrected build pass;
+the next exact-source full acceptance is pending. The TypeScript driver preflight
+is not rotation or relay acceptance evidence.
 
 The gate uses the installed Files SDK 2.4.0, Mastra 1.65.0, AI SDK 7.0.94
 with `@ai-sdk/provider` 4.0.11, and just-bash 3.4.2. Four isolated Node children
@@ -76,8 +78,15 @@ a reason to retry mutations, force rotation, or accelerate the policy.
    enabled; Mastra's public tool error content must retain `[unknown]`; the
    AI upload must retain its incomplete path without returning a reference;
    just-bash must expose its structured failure. An independently granted
-   control continues reading, and fresh revoked admission is denied. The
-   ambiguous outputs are neither retried nor rolled back.
+   control continues reading, and fresh revoked admission must return exactly
+   `404 EXPORT_NOT_FOUND`: revocation makes that service undiscoverable under
+   the [endpoint contract](filesystem-api.md). The nested `error.code` is parsed
+   exactly; message substrings cannot satisfy it. Before/after owner snapshots
+   must show no new stream, and a subsequent independently granted control
+   socket must receive the immediately next actor stream ID. The actor allocates
+   with `checked_add(1)` without reuse, so even a transient forbidden allocation
+   fails. That control sends no 9P attach or data and is closed before teardown.
+   The ambiguous outputs are neither retried nor rolled back.
 
 The non-owner consumer path remains a **refusal**: 503
 `BACKEND_UNAVAILABLE` with `DEVICE_NOT_OWNED_HERE`. This gate implements no
@@ -108,6 +117,50 @@ All branches now use the existing deadline cleanup APIs, retain errors while
 continuing later teardown, and retain the connector join through transport
 cleanup. The five controls pass again after correction. The first scoped
 strict Clippy run found one collapsible-if style error; its log is retained
-and the corrected strict rerun is pending. The real 300-second scenario has
-not run yet. Separate local evidence will not substitute for final combined
-production acceptance.
+and the corrected strict rerun passed. A subsequent bin check caught three E0277
+errors from the new dispatch arm using `?` inside `main` returning `ExitCode`.
+The arm now uses the existing explicit async Result boundary. Scoped all-target
+strict Clippy, the harness build and final format check passed at `29d91713`.
+Both failed compile logs remain retained. Separate local evidence will not
+substitute for final combined production acceptance.
+
+## First actual attempt: failed, retained
+
+Source `29d9171366a3aa81280901894c6f91f5601601ff` ran once on Linux through
+the subreaper against a unique shared-Redis namespace at
+`2026-10-31T06:29:31.294880+00:00`, exiting 1 after **308.540 seconds**.
+The frozen harness SHA-256 was
+`2e899a5631588661279226eb7ce5011aab34a2dbce64f3f1f4d270a9e311f678`.
+
+The host writes were checked at 295.030 seconds, before the scheduled freeze
+observed at 300.401 seconds. All four native read/write results succeeded,
+immutable fences drained and committed with generation 1 to 2, and resumption
+took 1.506 seconds. Recorded completed exchanges were 8 with exactly 20,480
+written bytes; the one-byte host tamper was red; replay remained zero and
+sockets settled from three to two. The subsequent four revoked writes each
+reported native unknown/non-retryable outcomes, 1008, one sent write and no
+Rwrite; the independent grant survived. These are completed subphases of a
+**failed gate**, not full acceptance.
+
+The final `revoked_admission_refused` predicate was false. The original helper
+discarded the actual response status/body, so **the first wire status is
+unavailable**. Source review found its expectation wrong: the catalog filters
+revoked grants from discovery, the shared resolver cannot find that service,
+and the filesystem endpoint translates the refusal to `404 EXPORT_NOT_FOUND`,
+as required for an undiscoverable export. The gate had expected the
+discoverable-but-disallowed case's `403 ACCESS_DENIED`. Only the gate expectation
+is corrected; no authorization or production response changed. A new regression
+first reproduced the old helper accepting malformed text that merely contained
+the expected label. The replacement uses bounded structured matching and
+failure-only closed-label diagnostics. Seven focused controls, scoped all-target strict Clippy, the harness build,
+formatting and documentation guards pass after correction. The next authorized
+full attempt remains pending.
+
+After the first attempt, all 1,063 tracked source hashes, frozen harness/Node
+hashes and 16,798 dependency entries were unchanged; the six owned processes
+were gone and a bounded namespace scan found zero remaining keys. Its log
+SHA-256 is
+`7665f061c74fab0720bd3cd9e156138676ee3c961d29ec82344399128d9463b6`.
+The failed attempt, runtime freeze and integrity receipts remain retained.
+This leaf does not include every final aggregate correction and cannot replace
+final combined or hosted acceptance.

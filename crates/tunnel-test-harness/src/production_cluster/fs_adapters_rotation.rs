@@ -615,8 +615,9 @@ async fn exercise(
     e.completed_exchanges = ledger.exchanges;
     e.completed_bytes_written = ledger.bytes_written;
 
+    let mut last_revoked_stream_id = 0;
     for driver in drivers.iter_mut() {
-        open_one(cluster, bracket, driver, "revoked").await?;
+        last_revoked_stream_id = open_one(cluster, bracket, driver, "revoked").await?;
     }
     all(
         drivers,
@@ -697,7 +698,24 @@ async fn exercise(
     e.independent_grant_survived = true;
     host_exact(root, "revoked")?;
     e.host_after_revocation = true;
-    e.revoked_admission_refused = refused(&target, ca, &token, 403, "ACCESS_DENIED").await?;
+    let before_refusal = owner(cluster, bracket).await?;
+    // Revocation removes this service from discovery. The filesystem contract
+    // requires the same exact 404 as a nonexistent export, not a discoverable
+    // export's 403. Do not accept another status or a code inside message text.
+    e.revoked_admission_refused = refused(&target, ca, &token, 404, "EXPORT_NOT_FOUND").await?;
+    let after_refusal = owner(cluster, bracket).await?;
+    let before_ids: BTreeSet<_> = before_refusal.streams.iter().map(|s| s.stream_id).collect();
+    e.revoked_admission_no_stream_opened = after_refusal
+        .streams
+        .iter()
+        .all(|stream| before_ids.contains(&stream.stream_id));
+    // actor::allocate_stream_id uses checked_add(1), with no reuse. All four
+    // framework children are now idle and this is the only new permitted
+    // socket. Its next ID detects even a forbidden OPEN that was removed
+    // between snapshots. It sends no 9P version/attach/data request.
+    e.last_revoked_stream_id = last_revoked_stream_id;
+    e.next_control_stream_id =
+        next_control_stream(cluster, bracket, &control_target, ca, &token).await?;
     // No calls are replayed or ambiguous files removed. The exact observed host
     // state survives until the fixture directory is removed after cleanup.
     e.replayed_frames = owner(cluster, bracket).await?.total_replayed_frames;
@@ -881,15 +899,153 @@ async fn refused(
     label: &str,
 ) -> Result<bool> {
     match NinepClient::connect(target, ca, token, Some(SUBPROTOCOL)).await {
-        Err(UpgradeFailure::Status { status, body }) => Ok(status == expected
-            && body
-                .as_ref()
-                .is_some_and(|body| String::from_utf8_lossy(body).contains(label))),
+        Err(UpgradeFailure::Status { status, body }) => {
+            let matches = refusal_matches(status, body.as_deref(), expected, label);
+            if !matches {
+                eprintln!(
+                    "fs adapters refusal mismatch expected_status={expected} expected_label={label} observed={:?}",
+                    refusal_diagnostic(status, body.as_deref())
+                );
+            }
+            Ok(matches)
+        }
         Err(UpgradeFailure::Harness(error)) => Err(error),
         Ok(client) => {
+            eprintln!(
+                "fs adapters refusal mismatch expected_status={expected} expected_label={label} observed_status=101 observed=upgrade"
+            );
             client.close().await;
             Ok(false)
         }
+    }
+}
+
+fn refusal_matches(status: u16, body: Option<&[u8]>, expected: u16, label: &str) -> bool {
+    let observed = refusal_diagnostic(status, body);
+    let (code, reason) = if label == "DEVICE_NOT_OWNED_HERE" {
+        ("BACKEND_UNAVAILABLE", Some(label))
+    } else {
+        (label, None)
+    };
+    observed.status == expected
+        && observed.shape == "filesystem_error"
+        && observed.code == code
+        && observed.execution == "absent"
+        && reason.is_none_or(|reason| observed.reason == reason)
+}
+
+/// Never retain arbitrary error text, IDs, paths, or credentials in a failure
+/// diagnostic. The byte bound also limits JSON work on a wrong peer response.
+#[derive(Debug, PartialEq, Eq)]
+struct RefusalDiagnostic {
+    status: u16,
+    shape: &'static str,
+    code: &'static str,
+    reason: &'static str,
+    execution: &'static str,
+}
+
+fn refusal_diagnostic(status: u16, body: Option<&[u8]>) -> RefusalDiagnostic {
+    let mut result = RefusalDiagnostic {
+        status,
+        shape: "missing",
+        code: "absent",
+        reason: "absent",
+        execution: "absent",
+    };
+    let Some(body) = body else { return result };
+    if body.len() > 16_384 {
+        result.shape = "oversized";
+        return result;
+    }
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
+        result.shape = "invalid_json";
+        return result;
+    };
+    let Some(error) = value.get("error").and_then(serde_json::Value::as_object) else {
+        result.shape = "invalid_shape";
+        return result;
+    };
+    result.shape = "filesystem_error";
+    result.code = match error.get("code").and_then(serde_json::Value::as_str) {
+        Some("UNAUTHENTICATED") => "UNAUTHENTICATED",
+        Some("EXPORT_NOT_FOUND") => "EXPORT_NOT_FOUND",
+        Some("ACCESS_DENIED") => "ACCESS_DENIED",
+        Some("CAPABILITIES_CHANGED") => "CAPABILITIES_CHANGED",
+        Some("RESOURCE_EXHAUSTED") => "RESOURCE_EXHAUSTED",
+        Some("DEVICE_OFFLINE") => "DEVICE_OFFLINE",
+        Some("BACKEND_UNAVAILABLE") => "BACKEND_UNAVAILABLE",
+        None => "absent",
+        Some(_) => "other",
+    };
+    result.reason = match error.get("message").and_then(serde_json::Value::as_str) {
+        Some(message) if message.starts_with("DEVICE_NOT_OWNED_HERE:") => "DEVICE_NOT_OWNED_HERE",
+        None => "absent",
+        Some(_) => "other",
+    };
+    result.execution = match value.get("execution").or_else(|| error.get("execution")) {
+        None => "absent",
+        Some(value) => match value.as_str() {
+            Some("not_dispatched") => "not_dispatched",
+            Some("unknown") => "unknown",
+            Some("completed") => "completed",
+            _ => "other",
+        },
+    };
+    result
+}
+
+async fn next_control_stream(
+    cluster: &ProductionCluster,
+    bracket: &CreationBracket,
+    target: &Target,
+    ca: &[u8],
+    token: &str,
+) -> Result<u64> {
+    let before: BTreeSet<_> = owner(cluster, bracket)
+        .await?
+        .streams
+        .iter()
+        .map(|s| s.stream_id)
+        .collect();
+    let client = NinepClient::connect(target, ca, token, Some(SUBPROTOCOL))
+        .await
+        .map_err(|_| fail("post-refusal independent control admission failed"))?;
+    let sampled = owner(cluster, bracket).await.map(|after| {
+        after
+            .streams
+            .into_iter()
+            .filter(|s| !before.contains(&s.stream_id))
+            .map(|s| s.stream_id)
+            .collect::<Vec<_>>()
+    });
+    // Close on success and snapshot failure alike; cluster cleanup later joins
+    // every server task. First prove this new registration is gone/terminal.
+    client.close().await;
+    let cleanup = async {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let after = owner(cluster, bracket).await?;
+            if after
+                .streams
+                .iter()
+                .all(|s| before.contains(&s.stream_id) || s.terminal)
+            {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(fail("post-refusal control registration cleanup deadline"));
+            }
+            sleep(POLL).await;
+        }
+    }
+    .await;
+    let mut errors = Vec::new();
+    push_cleanup_error(&mut errors, "post-refusal control cleanup", cleanup);
+    let sampled = finish_scenario_with_cleanup(sampled, errors)?;
+    match sampled.as_slice() {
+        [id] => Ok(*id),
+        _ => Err(fail("post-refusal control stream was not unique")),
     }
 }
 
@@ -1056,6 +1212,87 @@ fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fs_adapters_rotation_refusal_requires_exact_status_and_nested_code() {
+        let exact = br#"{"error":{"code":"EXPORT_NOT_FOUND","message":"no such filesystem export","requestId":"synthetic"}}"#;
+        assert!(refusal_matches(404, Some(exact), 404, "EXPORT_NOT_FOUND"));
+        for (name, status, body) in [
+            ("wrong status", 403, Some(exact.as_slice())),
+            ("actual upgrade", 101, None),
+            ("missing body", 404, None),
+            ("malformed JSON", 404, Some(b"EXPORT_NOT_FOUND".as_slice())),
+            (
+                "flat code",
+                404,
+                Some(br#"{"code":"EXPORT_NOT_FOUND"}"#.as_slice()),
+            ),
+            (
+                "error string",
+                404,
+                Some(br#"{"error":"EXPORT_NOT_FOUND"}"#.as_slice()),
+            ),
+            (
+                "misleading message",
+                404,
+                Some(
+                    br#"{"error":{"code":"ACCESS_DENIED","message":"EXPORT_NOT_FOUND"}}"#
+                        .as_slice(),
+                ),
+            ),
+            (
+                "code suffix",
+                404,
+                Some(br#"{"error":{"code":"EXPORT_NOT_FOUND_extra"}}"#.as_slice()),
+            ),
+            (
+                "wrong code",
+                404,
+                Some(br#"{"error":{"code":"ACCESS_DENIED"}}"#.as_slice()),
+            ),
+            (
+                "wrong execution shape",
+                404,
+                Some(
+                    br#"{"error":{"code":"EXPORT_NOT_FOUND"},"execution":"not_dispatched"}"#
+                        .as_slice(),
+                ),
+            ),
+        ] {
+            assert!(
+                !refusal_matches(status, body, 404, "EXPORT_NOT_FOUND"),
+                "accepted {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn fs_adapters_rotation_refusal_diagnostics_are_bounded_closed_labels() {
+        let body = br#"{"error":{"code":"private-token-sentinel","message":"private-path-sentinel","requestId":"private-id-sentinel"},"execution":"private-effect-sentinel"}"#;
+        let diagnostic = refusal_diagnostic(502, Some(body));
+        assert_eq!(diagnostic.code, "other");
+        assert_eq!(diagnostic.reason, "other");
+        assert_eq!(diagnostic.execution, "other");
+        assert!(!format!("{diagnostic:?}").contains("private-"));
+        assert_eq!(
+            refusal_diagnostic(404, Some(&vec![b'x'; 16_385])).shape,
+            "oversized"
+        );
+        let non_owner = br#"{"error":{"code":"BACKEND_UNAVAILABLE","message":"DEVICE_NOT_OWNED_HERE: synthetic"}}"#;
+        assert!(refusal_matches(
+            503,
+            Some(non_owner),
+            503,
+            "DEVICE_NOT_OWNED_HERE"
+        ));
+        let misleading = br#"{"error":{"code":"BACKEND_UNAVAILABLE","message":"unrelated DEVICE_NOT_OWNED_HERE"}}"#;
+        assert!(!refusal_matches(
+            503,
+            Some(misleading),
+            503,
+            "DEVICE_NOT_OWNED_HERE"
+        ));
+    }
 
     fn written_fixture() -> tempfile::TempDir {
         let directory = tempfile::tempdir().unwrap();

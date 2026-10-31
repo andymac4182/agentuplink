@@ -899,8 +899,10 @@ it must not be relabelled as success against a logical count.
 
 The [M4-68 installed-framework rotation gate](m4-adapters-rotation.md) specifies
 the real 300-second run, independent host oracle, per-stream fence proof and
-revocation cases. Its source and TypeScript driver preflight are implemented;
-The five focused Rust controls pass; strict and real-resource acceptance remain pending.
+revocation cases. Its TypeScript checks, five initial Rust controls and scoped
+strict checks pass. The first actual 300-second run failed its final revoked
+admission expectation; the documented 404 contract correction, exact-response
+controls and next full run are recorded separately. The full gate remains failed.
 
 Test the common path from each framework's native adapter through the shared TypeScript filesystem client, authenticated binary WebSocket, relay logical stream, and confined Rust 9P2000.L server. Use the endpoint discovery and session contract in [filesystem-api.md](filesystem-api.md); constructing a compatible-looking object or passing an in-process mock proves neither endpoint interoperability nor authorization. Consumer filesystem sockets are separate from the device's two steady-state sockets; monitor both classes so multiple mounted clients do not produce a false rotation-bound failure.
 
