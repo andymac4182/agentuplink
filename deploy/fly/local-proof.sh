@@ -155,11 +155,11 @@ ok "redis refuses a client without the password"
 plain=$(docker exec "$redis" redis-cli -h 127.0.0.1 -p 6379 PING 2>&1 || true)
 case "$plain" in PONG) fail "redis answered in plaintext" ;; esac
 ok "redis has no plaintext port ($plain)"
-for pair in appendonly:yes appendfsync:always aof-load-truncated:no maxmemory:167772160 maxmemory-policy:noeviction port:0 tls-port:6379; do
+for pair in appendonly:yes appendfsync:always aof-load-truncated:no maxmemory:100663296 maxmemory-policy:noeviction port:0 tls-port:6379; do
   got=$(redis_authed CONFIG GET "${pair%%:*}" | sed -n 2p | tr -d '\r')
   [ "$got" = "${pair#*:}" ] || fail "redis ${pair%%:*} is '$got', not '${pair#*:}'"
 done
-ok "redis durability and listener settings: appendonly yes, appendfsync always, aof-load-truncated no, maxmemory 160mb, maxmemory-policy noeviction, port 0, tls-port 6379"
+ok "redis durability and listener settings: appendonly yes, appendfsync always, aof-load-truncated no, maxmemory 96mb, maxmemory-policy noeviction, port 0, tls-port 6379"
 # Prove capacity pressure refuses writes without deleting existing authority.
 # Only this disposable proof instance is changed, before catalog provisioning.
 [ "$(redis_authed SET proof-memory-canary retained)" = OK ] || fail "could not seed memory canary"
@@ -167,7 +167,7 @@ ok "redis durability and listener settings: appendonly yes, appendfsync always, 
 refusal=$(redis_authed SET proof-memory-refused rejected)
 case "$refusal" in OOM*) ;; *) fail "memory pressure did not refuse the write" ;; esac
 [ "$(redis_authed GET proof-memory-canary)" = retained ] || fail "memory pressure evicted existing data"
-[ "$(redis_authed CONFIG SET maxmemory 167772160)" = OK ] || fail "could not restore memory budget"
+[ "$(redis_authed CONFIG SET maxmemory 100663296)" = OK ] || fail "could not restore memory budget"
 [ "$(redis_authed DEL proof-memory-canary)" = 1 ] || fail "could not remove memory canary"
 ok "redis refuses writes under memory pressure and preserves existing data"
 run_id_1=$(redis_authed INFO server | sed -n 's/^run_id://p' | tr -d '\r')

@@ -77,6 +77,25 @@ jobs:
         env:
           TUNNEL_CLIENT: ${{ github.workspace }}/target/debug/tunnel-client
         run: bash deploy/fly/local-proof.sh
+      - name: Prove bounded Redis AOF rewrite overlap without swap
+        run: |
+          set -euo pipefail
+          python3 scripts/test_m6_redis_aof_headroom.py
+          # BuildKit need not retain an inspectable base image. Pull the exact
+          # source pin so the gate can verify its layer prefix before load.
+          redis_base=$(awk '$1 == "FROM" { print $2; exit }' deploy/fly/redis/Dockerfile)
+          docker pull "$redis_base"
+          python3 scripts/m6-redis-aof-headroom.py \
+            --image agentuplink-redis:m6c60 \
+            --output "$RUNNER_TEMP/c239-headroom"
+      - name: Retain Redis rewrite measurements on success and failure
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: redis-aof-headroom
+          path: ${{ runner.temp }}/c239-headroom/
+          if-no-files-found: ignore
+          retention-days: 14
       - name: Build the independent authority image and verify startup boundaries
         run: |
           set -euo pipefail
