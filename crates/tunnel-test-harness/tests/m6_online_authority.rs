@@ -787,21 +787,12 @@ impl Fixture {
         &self,
         previous: Option<&PublicationObservation>,
     ) -> GateResult<PublicationObservation> {
-        self.publication_in_mode(previous, publication_observer::Mode::Steady)
-    }
-
-    fn publication_in_mode(
-        &self,
-        previous: Option<&PublicationObservation>,
-        mode: publication_observer::Mode<'_>,
-    ) -> GateResult<PublicationObservation> {
         PublicationObservation::read(
             fs::File::open(&self.state).map_err(|_| "open passive authority observation")?,
             &self.inventory,
             &self.redis_run,
             Utc::now(),
             previous,
-            mode,
         )
     }
 
@@ -811,26 +802,17 @@ impl Fixture {
         original: &SessionEvidence,
         previous: &PublicationObservation,
         phase: &'static str,
-        restarted: bool,
     ) -> GateResult<PublicationObservation> {
         timeout(PUBLISH_BOUND, async {
             let mut latest = previous.clone();
             let mut fixed = None;
-            let mut mode = if restarted {
-                publication_observer::Mode::RestartPending { before: previous }
-            } else {
-                publication_observer::Mode::Steady
-            };
             loop {
                 self.canary(phase).await?;
                 require(
                     &self.session_evidence(catalog).await? == original,
                     "device continuity changed while publication advanced",
                 )?;
-                let current = self.publication_in_mode(Some(&latest), mode)?;
-                if current.confirmed.is_some() {
-                    mode = publication_observer::Mode::Steady;
-                }
+                let current = self.publication(Some(&latest))?;
                 if fixed.is_none()
                     && let Some(target) = current.next_target(previous)?
                 {
@@ -1239,7 +1221,6 @@ async fn run_scenario(
                 &original_session,
                 &before_refreshes,
                 "continuous-two-publication-refreshes",
-                false,
             )
             .await?;
         fixture
@@ -1248,7 +1229,6 @@ async fn run_scenario(
                 &original_session,
                 &first_refresh,
                 "continuous-two-publication-refreshes",
-                false,
             )
             .await
     })
@@ -1276,7 +1256,6 @@ async fn run_scenario(
             &original_session,
             &before_healthy_restart,
             "authority-recovered-same-device-session",
-            true,
         )
         .await?;
     eprintln!(

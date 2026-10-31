@@ -1328,7 +1328,6 @@ async fn drill(
             &new_session,
             &before_refreshes,
             "waiting-next-publication",
-            false,
         )
         .await?;
     fixture
@@ -1337,7 +1336,6 @@ async fn drill(
             &new_session,
             &second,
             "waiting-next-publication",
-            false,
         )
         .await?;
     revocations.denied(fixture).await?;

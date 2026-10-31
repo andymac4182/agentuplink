@@ -229,11 +229,11 @@ revision/deployment/incarnation, the expected Redis run and exact three node
 identities to match. Only a valid confirmed publication with its original
 future expiry can advance the observation; a spent reservation is insufficient.
 Both allocators and confirmed membership versions must not roll back, and the
-same confirmation cannot change its expiry. During an explicitly declared
-authority restart only, a cleared confirmation is a bounded pending state. No
-old confirmation can satisfy it: the next confirmed version must exceed the
-pre-restart membership high-water. The observer returns to strict steady mode
-as soon as that fresh confirmation is observed; unexpected clearing then fails.
+same confirmation cannot change its expiry. An ordinary restart retains the persisted confirmation but resets only the
+process-local freshness deadline. The observer must wait until a newly
+confirmed version exceeds the pre-restart membership high-water, then require
+all three real relays to adopt the fixed target. Unexpected confirmation
+clearing fails in every live continuity phase.
 
 This is an unsigned **test observation**, never a runtime trust source or a
 manufactured signed checkpoint. A fixed target captures confirmed membership
@@ -265,3 +265,16 @@ recovery or inventory approval. Generic connection, TLS, timeout and later
 incarnation-mismatch failures cannot count as changed-run refusal. This is
 additional missing acceptance coverage, not a reproduced runtime defect.
 Its source and pure cause-selection control await compilation and live proof.
+
+
+A reviewer initially inferred that startup clears persisted confirmation and
+proposed a special pending-clear observer mode. Source review disproved that:
+`Engine::open` retains `state.confirmed` and resets only `fresh_deadline`; offline
+inventory approval is the operation that clears confirmation. The mode was
+removed before any process run. Superseded source `3cd898a1` compiled in 58.83 s,
+passed 13 nonignored controls and scoped Clippy in 42.71 s, but those results do
+not validate the corrected source. Their logs and executable are retained at
+`/workspace/agentuplink-review-artifacts/c243-passive-superseded-3cd898a1/`.
+A replacement pure control requires unchanged old confirmation and a spent
+unconfirmed reservation to wait, a genuinely new confirmation to yield a fixed
+target, and any unexpected clearing to fail. No runtime defect is inferred.
