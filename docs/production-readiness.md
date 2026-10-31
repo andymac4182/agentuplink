@@ -21,17 +21,35 @@ followed by [clean-EOF expiry #269](https://github.com/andymac4182/agentuplink/p
 and [Redis AOF headroom #271](https://github.com/andymac4182/agentuplink/pull/271),
 then [container notices #272](https://github.com/andymac4182/agentuplink/pull/272)
 and [integrated acceptance #273](https://github.com/andymac4182/agentuplink/pull/273),
-then [filesystem confirmation #274](https://github.com/andymac4182/agentuplink/pull/274).
+then [filesystem confirmation #274](https://github.com/andymac4182/agentuplink/pull/274)
+and [Mastra depth / authority lock #275](https://github.com/andymac4182/agentuplink/pull/275).
 
-Latest integrated source `88083555ffec868012938e0d253e9090177deec2` passes
-required Rust checks with 2,932 tests, native three-relay authority lifecycle,
-lost-reply/Redis-restart faults and older-backup/operator recovery. The
-[C251 report](m6-c251-authority-lock-2026-10-31.md#integrated-checks-at-88083555)
-retains the failed post-test artifact selector, separate successful selection
-recovery, first disk-guard setup failure and successful recovery-only run.
-New-candidate hosted checks, optimized artifacts and actual-image verification
-remain pending; earlier binaries and images are not relabelled as this source.
-The next stacked draft is prepared on `codex/production-limits` after #274.
+Current hosted candidate [#275](https://github.com/andymac4182/agentuplink/pull/275)
+head `b13f43cd38c356863dfdd9a99a4573c191d58965` and actual checkout
+`5909dc38ec843275e81dd2c73116b91ded575934` share tree
+`2bf1832d3554b1c9aba2f9478d2f980fc10b2ed8`. CI is **failed**:13 jobs pass,
+including all three Rust platforms and complete M7; M4 passes its actual
+300-second framework gate, then fails the C244 grouped terminal witness.
+The failed scalar was not retained and is not retrospectively attributed.
+[Current follow-up evidence](m6-production-followup-2026-10-31.md) records
+exact runs, logs, artifacts and the subsequent fixture correction.
+
+All five release builds/native archive verifiers pass. All original uploaded
+ZIPs were downloaded and independently verified. The new original Linux
+archive authority/relay pass local lifecycle120.539s and older-backup recovery
+117.204s, with all C243 witnesses and joined cleanup. These use the native880
+test driver with1082 identical non-document inputs; they do not execute the
+packaged device CLI or establish current actual-image/default-user operation.
+
+Locally tested `88083555ffec868012938e0d253e9090177deec2` still supplies the
+required2,932-test Rust result and native authority lifecycle/fault/recovery
+proofs. The [C251 report](m6-c251-authority-lock-2026-10-31.md#integrated-checks-at-88083555)
+retains failed artifact selection, separate selection recovery, first disk-guard
+setup failure and successful recovery-only run. PR275 now passes Ubuntu's
+original permission test and all21 authority tests; the historical PR274
+failure's exact cause remains unattributed. M4-75 closes only its Mastra
+traversal-depth/framework scope. C244, full current CI, current actual image,
+M4-47 and the new M6-C252 moderate advisory remain explicit follow-up work.
 
 Earlier integrated candidate `8c8c14fc9f6bb164daad224ad7300c04389a296f` passes
 complete local Rust checks (2,922 tests), all 90 frozen M1/M2/M7 stages, all
@@ -130,14 +148,19 @@ these completion criteria are evidenced; scheduling is not verification.
 | P0 | Prove durable recovery | M6-C82; the single-relay continuity witness is process-local | Simultaneous restart recovers with an independent witness; rollback remains refused; restore drill completed |
 | Verified at 8c | Vanished-device CLI recovery | M6-C68; remote owner release and fresh library reconnect pass complete cluster acceptance. M6-C229 quiet-session fix is verified. Actual CLI through the cut-client/held-relay proxy and all three negative controls pass; same PID regains readiness in 30.643 s after owner release at 30.021 s. Final 8c combined and original packaged CLI acceptance pass | Same CLI PID reaches a fresh ready session after remote owner cleanup within the stated bounds, with real echo and negative controls; full combined acceptance |
 | P1 | Stabilize cluster membership and key changes | M7-C06/C80/C81/C83/C86/C131/C150; M8-C46/C47/C48/C61; M6-C232 passes prior combined acceptance. C235 identifies an additional clean-EOF path; C238 has deterministic regressions and a completed fixed20/20 versus control19/20 comparison; final 8c full local and hosted M7 pass | Repeatable re-sign, trust-expiry, rotation and restart acceptance; retain intermittent failures |
-| P1 | Finish limits and real adapter acceptance | M4-21/47/68/70/72/73/74/75; M3-12/13/37/41/42/44 | Enforced advertised limits, long-lived streams and framework clients across peer hops/rotation/revocation |
-| P1 | Resolve authority state test bootstrap lock collision | M6-C251; PR #274 Ubuntu Rust failure occurs before permission-refusal assertions; separate duplicated-descriptor regression and scoped correction pass | Causal regression, correction without weakened lock checks, required and hosted candidate checks |
+| P1 | Finish limits and real adapter acceptance | M4-21/47/68/70/72/73/74; M4-75 is verified at its narrow depth/integration scope; M3-12/13/37/41/42/44 | Enforced advertised limits, long-lived streams and framework clients across peer hops/rotation/revocation |
+| P1 | Resolve authority state test bootstrap lock collision | M6-C251; PR #274 failure remains retained/unattributed. Duplicated-descriptor regression, correction, required Rust, native/original-packaged authority drills and PR275 hosted authority tests pass; current actual-image follow-up remains separate | Causal regression, correction without weakened lock checks, required and hosted candidate checks |
+| P1 | Correct current dependency advisory | M6-C252; minimatch10.2.6 through just-bash3.4.2 reports two moderate affected graph nodes for GHSA-g3hv-75wg-m249; high-severity CI gate remains unchanged | Compatible graph correction, fresh audit, real framework checks and explicit consumer override contract if applicable |
 | P1 | Establish load and recovery budgets | M6-03/C125/C126/C183/C192/C201/C239 | Off-host multi-tenant load and soak at declared capacity, explicit latency/error/recovery targets, Redis peak-memory/AOF rewrite evidence |
 | P1 | Close release and operator verification gaps | M6-01/C217/C220/C241; M3-50 | Exact final-candidate checks, clean-machine archives and executed deployment guide |
 | P1 | Configure operations | M6-C218; private metrics exist, privileged-change audit is deferred | Scraper, alerts, retention, certificate/JWKS rotation and incident/restore ownership verified |
 | Restricted | CUA is not eligible for ordinary production enablement | M5-C28/C29 and remaining OS/backend gates | Per-operation caller grants, revocation, lease expiry and dedicated-VM acceptance |
 
 ## Verification ledger
+
+- **New C244 local correction:** clean `decc5b58` passes its controlled negative, eleven fixed controls, required Rust checks (2938/0/108/174), and one actual gate13.0765s. The real run observes handler completion before stream/replay retirement and then reaches the unchanged terminal assertions. Hosted follow-up remains pending; [exact evidence](m6-production-followup-2026-10-31.md#verified-observer-correction-at-decc5b58).
+
+- **Current PR275 follow-up:** [exact evidence](m6-production-followup-2026-10-31.md) records the failed13-pass/1-fail CI, successful five-platform original archives, and new Linux packaged lifecycle/recovery. Older complete acceptance below remains bound to8c.
 
 - **Prior complete acceptance baseline:** [8c8c14fc final-candidate report](m6-final-candidate-2026-10-31.md)
   supersedes the pending-verification statements for that source in the dated entries below.
@@ -369,10 +392,14 @@ lease cleanup and dedicated-guest acceptance.
 
 ## Next action
 
-Run complete Rust, M1, both M2 plans and M7 on the combined runtime candidate,
-then the predeclared clean-EOF-only 20-pair comparison. Complete the Redis
-rewrite profile/image proof, test-dependency license/advisory gate and container
-notices without silently widening license policy. Execute packaged three-relay
-recovery and rotation procedures, then establish actual hosting identity,
-certificates, monitoring, capacity and operational ownership. Keep this goal
-active while any completion criterion or deployment input remains unresolved.
+Verify the locally passed C244 fixture correction on the next hosted candidate without
+retrying or relabelling the failed PR275 M4 run. Verify the current actual
+authority image/default-user layout; preserve the existing8c image proof as its
+own scope. Complete the M4-47 correction when the recorded account-security
+access requirement is satisfied, and validate a compatible M6-C252 dependency
+correction in an isolated tree. Do not repeat completed8c core/comparison/archive
+drills as new-candidate evidence. Resolve the explicit universal-license owner
+decisions, actual deployment inventory/PKI/OIDC, simultaneous-restart recovery,
+off-host capacity/soak and operational ownership before any deployment claim.
+Keep this goal and its automation active while a completion criterion or actual
+deployment input remains unresolved.

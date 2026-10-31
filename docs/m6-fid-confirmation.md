@@ -1,9 +1,9 @@
 # Real-endpoint fid confirmation acceptance (M6-C244)
 
-Status: focused checks and real-endpoint positive/negative confirmation
-evidence passed on source `8804cd57`. Integration checks remain pending, so
-M6-C244 stays open until they are recorded. M4-21's broader deadline and
-descriptor acceptance remains open.
+Status: PR #275 failed the final terminal witness after earlier focused and
+PR #274 hosted passes. A fixture observer correction is prepared but unverified;
+the first failure and earlier evidence remain retained below. M6-C244 stays
+open. M4-21's broader deadline and descriptor acceptance remains open.
 
 The command is `tunnel-test-harness verify-m6-ts-fid-ordering`, registered in
 `scripts/m4-harness-verify.sh`. It uses the existing three-relay, disposable-Redis
@@ -135,3 +135,77 @@ production filesystem behavior changed. The real-endpoint results above remain
 bound to their original8804 source and immutable executable; the integrated
 checks do not pretend to rerun that gate. See the [combined receipt and scope](m6-final-candidate-2026-10-31.md#integrated-test-follow-up).
 New-head hosted full M4 acceptance remains pending, so C244 stays open.
+
+### Hosted follow-up failure and terminal observation correction
+
+PR #275 head `b13f43cd` / actual merge `5909dc38` (identical tree `2bf1832d`)
+failed M4 job `124515625939` at C244's final grouped predicate, after the
+300-second framework gate passed. The complete first log is retained with
+SHA-256 `9187f86018b42c111b24bbec73453e15a042c942f76a9cbcb7876a2b71ab97c5`.
+The earlier PR #274 full M4 pass remains historical evidence. No unchanged
+retry is treated as a fix. The failure's exact scalar cannot be recovered:
+its generic error discarded the completed count, session, host and retirement
+values. Case/refusal validation and cleanup had already completed before that
+final rejection, but that does not establish which grouped scalar failed.
+
+Source inspection identifies a reachable fixture race. The connector folds
+filesystem completion and publishes its ledger in `HttpActorRequest::Done`
+(`m2_http.rs`); stream removal requires a separate validated `STREAM_FORGET`
+and carrier barriers (`m2_runtime.rs`). A completed handler is therefore not
+proof that its transport state has already retired. C244 previously awaited
+only the completed-exchange count and immediately demanded zero retained
+streams/replay from a separate snapshot. The relevant production lifecycle
+and this fixture path are unchanged from the prior passing source. This is
+a source-derived timing defect in the observer, not proof that the lost
+hosted scalar was a retained stream or that the product regressed.
+
+An isolated fixture-only correction is prepared, **not yet compiled or run**.
+One watch observation now requires the exact count and every original final
+session/retirement predicate together, under the same existing 30-second
+ledger deadline and outer 90-second scenario bound. Only incomplete exchange
+count or pending streams/replay can wait. Extra exchanges, mutation/write,
+wrong phase/session/epoch, rotation and recovery reject as soon as observed;
+no retry, grace period, application request or deadline reset is added.
+Every rejection preserves the scalar snapshot; final host/cleanup errors
+preserve all original grouped values. At most one pending-retirement line
+records whether the new run actually observed handler completion before
+transport retirement. A watch channel coalesces snapshots: this does not
+claim exhaustive observation of every transient state.
+
+The declared next narrow regression uses a deterministic status sequence:
+three completed handlers with a retained stream and replay, final ACK, then
+stream retirement. Restoring only the old count-only return condition must
+fail its first pending assertion. The corrected observer must pass that
+sequence, while wrong mutation/session/epoch/phase/rotation/recovery, extra
+exchange, persistent replay/stream, missing completion, closed observation
+and the unchanged absolute deadline remain failures. These are observer-unit
+inputs, not synthetic replacements for the actual relay/device gate. An
+independent review and coordinator resource lease precede compilation and
+any focused real endpoint run. C244 remains open pending the correction's
+proof and integrated hosted acceptance; M4-21 remains open.
+
+### Verified observer correction at decc5b58
+
+At 2026-10-31T21:54:50+10:00, clean source
+`decc5b58dd4c91a417a61e09e47e3e35e4d30b38` passes the old-count negative,
+exact-restored eleven controls, formatting, strict workspace/all-target Clippy,
+and locked workspace tests:2938 passed,0 failed,108 ignored,174 summaries.
+The final compiler-selected harness SHA256 is
+`f510526b88cf1b5f18128a626537aee3736dab71d5de3f1a31f521db28013fc2`.
+
+The first actual gate passes13.0765s. One pending snapshot directly reports
+3 exchanges/1 stream/1 replay; the same session subsequently reaches3/0/0
+with every original terminal predicate intact. Walk/clunk provider probes,
+parallel fid2, confirmed fid1 reuse, refusal/pre-abort controls, unchanged host
+and joined cleanup pass. The owned group is absent and namespace scans are0.
+All source, Node24.21,16798 dependency entries and protected binary inputs
+remain unchanged; no retry or deadline extension. The historical PR275 scalar
+remains unknown, and flushed-before-dispatch clunk/broader M4-21 remain outside
+this fixture's claim.
+
+[Exact current evidence](m6-production-followup-2026-10-31.md#verified-observer-correction-at-decc5b58)
+retains commands, timings including compilation, independent output identities,
+controller-review corrections, the prelaunch lease-path error and resource/cache
+provenance. Final receipt SHA256
+`82559eefdf13ef34b3def2abacb7bad39a61f9554451b7734ce7e12b64893a44`.
+Hosted integration of this correction remains pending; PR275 CI stays failed.

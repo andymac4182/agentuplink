@@ -12,7 +12,8 @@ filtering, grants and deadline policy are unchanged.
 Source correction is `b117a6e835cdfc15c334bba3e18b0065d31bbef0`; the later clean
 documentation head used for actual integration is
 `4df856ec900d375cf0897727ec42fbc489fc4b98`, based on PR #274 head `107d94a2`.
-Broader M4-21 and new-candidate hosted verification remain open.
+Broader M4-21 remains open. Hosted verification of the narrow Mastra scope is
+recorded below; the full candidate and M4 job remain separate gates.
 
 ## Boundary proof and package checks
 
@@ -94,3 +95,32 @@ at `4df856ec` are identical to the earlier `86fb4d70` required-check inputs;
 that 2,931-test Rust result is carried forward by input equality, not reported
 as a fresh workspace run. This gate is not the complete M4 suite, a hosted run,
 a production deployment, or closure of the broader filesystem requirements.
+
+## Hosted Mastra scope on PR275
+
+The narrow M4-75 scope is verified local and hosted at
+2026-10-31T20:49:49+10:00. PR275 head `b13f43cd` and actual hosted merge
+`5909dc38ec843275e81dd2c73116b91ded575934` have the identical tree
+`2bf1832d3554b1c9aba2f9478d2f980fc10b2ed8`.
+
+TypeScript job124515625904 passes all nine depth controls and the installed
+Workspace case within 610 offline and 34 peer tests on Node24.22.1. This is
+separate from the earlier pinned Node24.21.0 full package proof.
+
+M4 job124515625939 passes the standalone installed-framework rotation gate
+on Node24.21.0 (311.346 s between the command-start and success log records).
+Host writes are checked at295030ms before the scheduled lower bound300398ms;
+resumption takes1354ms. Eight exchanges/20480B, zero replay/recovery/forced
+retirement, sockets3→2, native revocation422ms, exact refusal/no stream
+allocation13→14, independent grant/non-owner controls and joined cleanup pass.
+
+The shell then proceeds to C200 and the separate C244 fid-confirmation command,
+which fails its final independent witness. The **whole M4 job and candidate
+remain failed**. The successful earlier command supplies only M4-75's stated
+integration acceptance; depth boundaries are proven by its focused tests.
+Broader M4-21 remains open. The two moderate npm audit entries are separately
+tracked as M6-C252, with no exception or dependency compatibility claim.
+
+Retained hosted log SHA-256 values: TypeScript
+`c5bf2c593fa585b6ffda94432a34fede4de267c859d6e9eb65d017f4da8b28fa`;
+M4 `9187f86018b42c111b24bbec73453e15a042c942f76a9cbcb7876a2b71ab97c5`.

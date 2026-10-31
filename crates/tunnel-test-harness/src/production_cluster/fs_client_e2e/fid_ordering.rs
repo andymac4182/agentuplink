@@ -1,6 +1,9 @@
 //! C244: actual relay/device replies withheld at an ordered consumer boundary.
 //! This proves confirmation ordering, not a clunk cancelled before dispatch.
 
+mod retirement;
+
+use retirement::{DeviceTerminal, await_device_terminal};
 use std::{path::Path, process::Stdio, time::Duration};
 
 use serde::{Deserialize, Serialize};
@@ -12,8 +15,8 @@ use tunnel_client::{
 };
 
 use super::{
-    CLEANUP_TIMEOUT, Harness, HarnessError, HarnessOptions, OidcTokenOptions, ProductionCluster,
-    Result, RunningHarness, STARTUP_TIMEOUT, await_exchanges, await_owner,
+    CLEANUP_TIMEOUT, Harness, HarnessError, HarnessOptions, LEDGER_WAIT, OidcTokenOptions,
+    ProductionCluster, Result, RunningHarness, STARTUP_TIMEOUT, await_owner,
     finish_scenario_with_cleanup, push_cleanup_error, repository_root, synthetic_bytes,
     write_device_profile, write_private,
 };
@@ -110,6 +113,7 @@ pub struct FsFidOrderingEvidence {
     session_unchanged: bool,
     host_unchanged: bool,
     cleanup_joined: bool,
+    device_terminal: DeviceTerminal,
 }
 
 fn validate_case(case: &CaseProof) -> Result<()> {
@@ -241,10 +245,21 @@ pub fn validate_fs_fid_ordering_evidence(evidence: &FsFidOrderingEvidence) -> Re
         || !evidence.session_unchanged
         || !evidence.host_unchanged
         || !evidence.cleanup_joined
+        || !evidence.device_terminal.quiescent()
+        || evidence.completed_exchanges != evidence.device_terminal.exchanges
+        || evidence.mutations_dispatched != evidence.device_terminal.mutations_dispatched
+        || evidence.bytes_written != evidence.device_terminal.bytes_written
     {
-        return Err(fail(
-            "independent device/host/session/cleanup witness differs",
-        ));
+        return Err(fail(&format!(
+            "independent device/host/session/cleanup witness differs completed_exchanges={} mutations_dispatched={} bytes_written={} session_unchanged={} host_unchanged={} cleanup_joined={} device_terminal={:?}",
+            evidence.completed_exchanges,
+            evidence.mutations_dispatched,
+            evidence.bytes_written,
+            evidence.session_unchanged,
+            evidence.host_unchanged,
+            evidence.cleanup_joined,
+            evidence.device_terminal,
+        )));
     }
     Ok(())
 }
@@ -606,21 +621,22 @@ async fn run(
             }
             let Event::Refusal { result: refusal } = driver.event().await? else { return Err(fail("definite refusal control absent")); };
             if !matches!(driver.event().await?, Event::Done { cases: 3 }) { return Err(fail("all three real sessions did not finish")); }
-            let ledger = await_exchanges(client, 3).await?;
-            let status = client.status_snapshot();
+            // Handler Done publishes its ledger before asynchronous STREAM_FORGET
+            // and carrier barriers necessarily retire the stream. Observe every
+            // final predicate together under the existing ledger deadline.
+            let terminal = await_device_terminal(client.status(), &session.session_id, session.epoch,
+                tokio::time::Instant::now() + LEDGER_WAIT).await?;
             Ok(FsFidOrderingEvidence {
                 relay_count: cluster.relays.len(), owner_matches: actual_owner == expected_owner,
                 client_module_matches: module_matches, node_matches: node == "v24.21.0", held_owner_checks: cases.len(), cases, refusal,
-                completed_exchanges: ledger.exchanges, mutations_dispatched: ledger.mutations_dispatched, bytes_written: ledger.bytes_written,
-                session_unchanged: status.session_id.as_deref() == Some(session.session_id.as_str()) && status.epoch == Some(session.epoch)
-                    && status.phase == "active" && status.streams == 0 && status.rotations_completed == 0
-                    && status.recovery_attempt.is_none() && status.recovery_successor_generation.is_none() && status.replay_frames == 0,
+                completed_exchanges: terminal.exchanges, mutations_dispatched: terminal.mutations_dispatched, bytes_written: terminal.bytes_written,
+                session_unchanged: terminal.quiescent(),
                 host_unchanged: std::fs::read(host.join("held.bin")).map_err(HarnessError::Io)? == synthetic_bytes(HELD_SIZE as usize)
                     && std::fs::read(host.join("probe.bin")).map_err(HarnessError::Io)? == synthetic_bytes(PROBE_SIZE as usize)
                     && std::fs::read(host.join("parallel/entry.bin")).map_err(HarnessError::Io)? == synthetic_bytes(31)
                     && std::fs::read_dir(&host).map_err(HarnessError::Io)?.count() == 3
                     && std::fs::read_dir(host.join("parallel")).map_err(HarnessError::Io)?.count() == 1,
-                cleanup_joined: false,
+                cleanup_joined: false, device_terminal: terminal,
             })
     }).await.map_err(|_| fail("scenario deadline")).and_then(std::convert::identity);
     let mut errors = Vec::new();
@@ -690,6 +706,20 @@ mod tests {
             session_unchanged: true,
             host_unchanged: true,
             cleanup_joined: true,
+            device_terminal: DeviceTerminal::from_status(
+                &tunnel_client::ConnectionStatus {
+                    phase: "active".into(),
+                    session_id: Some("expected-session".into()),
+                    epoch: Some(7),
+                    fs: tunnel_client::FsCounters {
+                        exchanges: 3,
+                        ..tunnel_client::FsCounters::default()
+                    },
+                    ..tunnel_client::ConnectionStatus::default()
+                },
+                "expected-session",
+                7,
+            ),
         }
     }
 
@@ -733,6 +763,37 @@ mod tests {
         proof.provider_probe_size = HELD_SIZE;
         proof.provider_probe_errno = 0;
         assert!(validate_case(&proof).is_err());
+    }
+
+    #[test]
+    fn fs_fid_ordering_retains_each_failed_final_scalar_in_the_diagnostic() {
+        let mut proof = passing();
+        proof.completed_exchanges = 4;
+        proof.mutations_dispatched = 2;
+        proof.bytes_written = 17;
+        proof.session_unchanged = false;
+        proof.host_unchanged = false;
+        proof.cleanup_joined = false;
+        proof.device_terminal.streams = 1;
+        proof.device_terminal.replay_frames = 2;
+        let error = validate_fs_fid_ordering_evidence(&proof)
+            .expect_err("independent witnesses must refuse")
+            .to_string();
+        for scalar in [
+            "completed_exchanges=4",
+            "mutations_dispatched=2",
+            "bytes_written=17",
+            "session_unchanged=false",
+            "host_unchanged=false",
+            "cleanup_joined=false",
+            "streams: 1",
+            "replay_frames: 2",
+        ] {
+            assert!(
+                error.contains(scalar),
+                "lost failed scalar {scalar}: {error}"
+            );
+        }
     }
 
     #[test]
