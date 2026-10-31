@@ -29,7 +29,11 @@ and the additional hosted failures. The three actual images now pass their
 The next candidate integrates composite filesystem deadlines and confirmed
 fid cleanup, deterministic publisher-queue evidence, the exact stale-refresh
 timing assertion, an operator recovery drill and bounded canary diagnostics.
-Its combined acceptance remains pending. Two reproducible unresolved-request
+Its combined acceptance remains pending. Hosted image-notice release builds
+succeed for all five targets, but native archive verification exposes a
+checksum filename regression (M6-C249). Its narrow local fix and corrected
+Linux archive pass; final hosted qualification remains required.
+Two reproducible unresolved-request
 HTTP/3 defects can interrupt an admitted sibling; M6-C246 remains a blocker.
 The C131 diagnostic feature remains outside the deployment candidate. Its
 [causal evidence](m7-c131-diagnostic-evidence-2026-10-31.md) and source-reconstruction

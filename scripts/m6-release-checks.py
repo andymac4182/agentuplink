@@ -1397,10 +1397,9 @@ def check_secrets(repo: Path | None = None) -> Result:
 # with it, `package_release.py` now reads that table, and this check makes the
 # agreement structural rather than a coincidence waiting to drift.
 #
-# **It runs locally and deliberately so.** GitHub Actions billing has blocked
-# this repository since 2026-09-11, so `release.yml` has not executed at all
-# and cannot be the thing that notices a divergence. This check reads the
-# workflow as text on the machine running it.
+# This is a static agreement check, whether invoked locally or in CI. It reads
+# the workflow as text; actual build and archive verification results must be
+# obtained separately from the matching hosted release run.
 #
 # A triple-shaped literal, so a tuple reintroduced into the packager is seen
 # whatever it is named. `x86_64-pc-windows-msvc`, `aarch64-apple-darwin`, etc.
@@ -1605,9 +1604,8 @@ def check_packaging() -> Result:
     for line in notes:
         result.note(line)
     result.note(
-        "  NOTE: this check reads the workflow as text. It has never run on a hosted "
-        "runner -- Actions billing has blocked this repository since 2026-09-11 -- so "
-        "agreement here is agreement between files, not evidence that the matrix "
+        "  NOTE: this check reads the workflow as text. Agreement here is agreement "
+        "between files, not evidence that the matching hosted release matrix "
         f"builds. {SITE_RELEASES} -- the machine-readable public advertisement -- IS "
         "compared here since M6-C18. `site/docs/downloads.html` states the platforms in "
         "prose and is still NOT machine-compared; that residue is recorded on M6-C11."

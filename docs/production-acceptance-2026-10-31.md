@@ -112,6 +112,37 @@ tracks payload-free diagnostic attribution; no retry or weaker continuity
 predicate is permitted. Local native and actual-image successes do not erase
 this hosted failure.
 
+At Redis-profile descendant `9866a671`, M7 job 124447619983 in run
+41170584446 fails the retained C245 timing assertion; every other CI job passes.
+At notice descendant `a81e3b9f`, Ubuntu job 124452672186 and macOS job
+124452672144 in run 41172225687 fail C247's old publisher-queue fixture with
+`fixture did not exercise a queue longer than the HTTP wait budget`. Its
+replacement has only local evidence so far.
+
+Release run 41172225676 builds all five targets, then **all five native archive
+verifiers fail**: the checksum sidecar is named for the final notice supplement,
+rather than the archive. Its Linux artifact 13031099996 is downloaded and its
+ZIP SHA-256 `144f6c9db9f8438dc00a309051a3f4b2611ae88b820e182104c133cbe94a402a`
+matches GitHub. It contains the archive and `yasna-LICENSE-APACHE.sha256`; the
+sidecar also states the wrong filename. The source's supplemental-notice loop
+shadows the archive filename. M6-C249's renamed loop binding passes a new
+five-target regression that first failed six assertions, plus all 43 focused
+packaging/archive/notice checks. A corrective local repack of the actual CI Linux binaries now passes all seven
+native checks, eighteen CLI probes and twelve planted defects. Every original
+archive member byte, including notices and documents, is unchanged; the old
+checksum remains preserved. The original merge tree equals `a81e3b9f` exactly.
+The 372 original package identities were selected from the cached source
+inventory without running Cargo. This is a local packaging experiment, not a
+new runtime build, final coherent candidate or hosted success. Corrected
+archive SHA-256 is
+`48cdd2d8cdeca36729c0613d3b384193ed775965f1fd622e3599c1c0fff1f9ad`;
+verification log SHA-256 is
+`0043ab7a14cf68192e46d65124fa16667e176ffb0631ff89b21ca111cba7bae7`.
+Private inputs and detailed provenance remain under
+`/workspace/agentuplink-review-artifacts/c249-release-checksum`.
+Final hosted proof remains pending. Nothing was published or attested by this
+failed PR run.
+
 ## Historical placeholder verification
 
 The exact authority-guide placeholder exception in #270 has one document path,

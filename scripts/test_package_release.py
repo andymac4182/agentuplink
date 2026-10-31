@@ -138,6 +138,30 @@ class PackagingTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             assets(self.output, tag)
 
+    def test_supplemented_notices_preserve_every_archive_checksum(self):
+        import hashlib
+        directory, metadata = self.notice_dependency()
+        supplements = self.root / "deploy/notices/rust"
+        supplements.mkdir(parents=True)
+        data = b"Exact upstream license text\n"
+        (supplements / "dep-LICENSE").write_bytes(data)
+        (directory / ".cargo_vcs_info.json").write_text(json.dumps({"git": {"sha1": "1" * 40}}))
+        (supplements / "supplements.json").write_text(json.dumps({"schema": 1, "packages": [{
+            "name": "dep", "version": "1.0.0", "source": "registry+fixture", "license": "MIT",
+            "crate_checksum": "abc", "vcs_commit": "1" * 40,
+            "notices": [{"file": "dep-LICENSE", "sha256": hashlib.sha256(data).hexdigest(),
+                         "url": "https://example.invalid/commit/LICENSE"}],
+        }]}))
+        for target in TARGETS + CI_ONLY_TARGETS:
+            with self.subTest(target=target):
+                archive = package(self.root, target, self.sha, "123", self.output, metadata)
+                checksum = archive.with_name(archive.name + ".sha256")
+                self.assertTrue(checksum.is_file(), checksum.name)
+                self.assertEqual(checksum.read_bytes(),
+                                 f"{hashlib.sha256(archive.read_bytes()).hexdigest()}  {archive.name}\n".encode())
+        self.assertFalse((self.output / "dep-LICENSE.sha256").exists())
+        self.assertEqual(len(assets(self.output, version(self.root, self.sha, "123"))), 8)
+
     def test_complete_archives_and_checksums(self):
         self.build_all()
         # M6-C217: every checksum file is one LF-terminated line, on every host.
