@@ -50,6 +50,8 @@ mod authority_fault_proxy;
 mod canary_diagnostics;
 #[path = "common/m7_deployment.rs"]
 mod common;
+#[path = "common/authority_publication_observer.rs"]
+mod publication_observer;
 #[path = "m6_online_authority/recovery.rs"]
 mod recovery;
 use authority_fault_proxy::FaultProxy;
@@ -58,6 +60,7 @@ use common::{
     parse_plaintext_upstream, relay_binary_path, toml_path, toml_string, wait_for_exit,
     wait_for_ready,
 };
+use publication_observer::{AdoptionTarget, Observation as PublicationObservation};
 
 type GateResult<T = ()> = Result<T, &'static str>;
 const IO_BOUND: Duration = Duration::from_secs(2);
@@ -519,19 +522,20 @@ impl Fixture {
         .map_err(|_| "checkpoint client identity")
     }
 
-    fn request(&self) -> CheckpointRequest {
-        CheckpointRequest {
+    fn request(&self) -> GateResult<CheckpointRequest> {
+        publication_observer::require_no_serving_relays(self.relay_processes.len())?;
+        Ok(CheckpointRequest {
             deployment_id: self.deployment.clone(),
             deployment_incarnation: self.incarnation.clone(),
             nonce: Uuid::new_v4().simple().to_string(),
-        }
+        })
     }
 
     async fn checkpoint(
         &self,
         client: &HttpsCheckpointAuthority,
     ) -> GateResult<Option<SignedMembershipCheckpoint>> {
-        let request = self.request();
+        let request = self.request()?;
         let nonce = request.nonce.clone();
         let bytes = match client.fetch_checkpoint(request).await {
             Ok(bytes) => bytes,
@@ -744,10 +748,11 @@ impl Fixture {
         })
     }
 
-    fn relays_adopted(&self, target: &SignedMembershipCheckpoint) -> GateResult<bool> {
+    fn relays_adopted(&self, target: &AdoptionTarget) -> GateResult<bool> {
         const MAX_BYTES: usize =
             tunnel_relay::membership_version_state::MAX_MEMBERSHIP_VERSION_STATE_BYTES;
-        let mut adopted = true;
+        require(target.expires_at > Utc::now(), "adoption target expired")?;
+        let mut states = Vec::with_capacity(3);
         for relay in &self.relays {
             // The running relay owns the exclusive writer lock. Read only
             // its atomically replaced, bounded public version envelope.
@@ -773,24 +778,65 @@ impl Fixture {
             // A checkpoint fence is saved before the Redis records are read.
             // Requiring every node fence too proves verified record adoption,
             // rather than merely a successful new checkpoint fetch.
-            adopted &= envelope
-                .state
-                .checkpoint_version
-                .is_some_and(|version| version >= target.checkpoint_version)
-                && target.minimum_versions.iter().all(|(node, minimum)| {
-                    envelope
-                        .state
-                        .node_versions
-                        .get(node)
-                        .is_some_and(|version| version >= minimum)
-                });
+            states.push(envelope.state);
         }
-        Ok(adopted)
+        Ok(target.adopted(&states))
+    }
+
+    fn publication(
+        &self,
+        previous: Option<&PublicationObservation>,
+    ) -> GateResult<PublicationObservation> {
+        PublicationObservation::read(
+            fs::File::open(&self.state).map_err(|_| "open passive authority observation")?,
+            &self.inventory,
+            &self.redis_run,
+            Utc::now(),
+            previous,
+        )
+    }
+
+    async fn next_publication(
+        &mut self,
+        catalog: &RedisCatalog,
+        original: &SessionEvidence,
+        previous: &PublicationObservation,
+        phase: &'static str,
+    ) -> GateResult<PublicationObservation> {
+        timeout(PUBLISH_BOUND, async {
+            let mut latest = previous.clone();
+            let mut fixed = None;
+            loop {
+                self.canary(phase).await?;
+                require(
+                    &self.session_evidence(catalog).await? == original,
+                    "device continuity changed while publication advanced",
+                )?;
+                let current = self.publication(Some(&latest))?;
+                if fixed.is_none() {
+                    if let Some(target) = current.next_target(previous)? {
+                        // Freeze H+1 at this atomic observation. Following a
+                        // moving allocator would make adoption impossible.
+                        fixed = Some((target, current.clone()));
+                    }
+                }
+                latest = current;
+                if let Some((target, observed)) = &fixed {
+                    if self.relays_adopted(target)? {
+                        self.wait_relay_adoption(target, catalog, original).await?;
+                        return Ok(observed.clone());
+                    }
+                }
+                sleep(Duration::from_millis(200)).await;
+            }
+        })
+        .await
+        .map_err(|_| "passive confirmed publication/adoption deadline")?
     }
 
     async fn wait_relay_adoption(
         &mut self,
-        target: &SignedMembershipCheckpoint,
+        target: &AdoptionTarget,
         catalog: &RedisCatalog,
         original: &SessionEvidence,
     ) -> GateResult {
@@ -1112,7 +1158,7 @@ async fn run_scenario(
     .map_err(|_| "anonymous client fixture")?;
     require(
         matches!(
-            anonymous.fetch_checkpoint(fixture.request()).await,
+            anonymous.fetch_checkpoint(fixture.request()?).await,
             Err(CheckpointAuthorityError::Transport)
         ),
         "anonymous client bypassed mandatory mTLS",
@@ -1125,7 +1171,7 @@ async fn run_scenario(
         matches!(
             fixture
                 .client(&foreign)?
-                .fetch_checkpoint(fixture.request())
+                .fetch_checkpoint(fixture.request()?)
                 .await,
             Err(CheckpointAuthorityError::Transport)
         ),
@@ -1149,7 +1195,7 @@ async fn run_scenario(
             matches!(
                 fixture
                     .client(&identity)?
-                    .fetch_checkpoint(fixture.request())
+                    .fetch_checkpoint(fixture.request()?)
                     .await,
                 Err(CheckpointAuthorityError::HttpStatus(403))
             ),
@@ -1167,34 +1213,24 @@ async fn run_scenario(
     // Keep one actual control/data session across two complete publication
     // refreshes. A fresh request body is required at every observation; a
     // recreated connector, owner epoch, socket or relay process cannot pass.
-    let before_refreshes = fixture.wait_checkpoint(&client).await?;
-    let mut last_confirmed_minimum = before_refreshes.minimum_versions["relay-a"];
-    let mut observed_refreshes = 0;
+    let before_refreshes = fixture.publication(None)?;
     let refreshed = timeout(Duration::from_secs(55), async {
-        loop {
-            fixture
-                .canary("continuous-two-publication-refreshes")
-                .await?;
-            require(
-                fixture.session_evidence(catalog).await? == original_session,
-                "device owner/session/socket or relay process changed across refreshes",
-            )?;
-            if let Some(response) = fixture.checkpoint(&client).await? {
-                let minimum = response.minimum_versions["relay-a"];
-                require(
-                    minimum >= last_confirmed_minimum,
-                    "confirmed membership minimum rolled back",
-                )?;
-                if minimum > last_confirmed_minimum {
-                    last_confirmed_minimum = minimum;
-                    observed_refreshes += 1;
-                    if observed_refreshes == 2 {
-                        return Ok::<_, &'static str>(response);
-                    }
-                }
-            }
-            sleep(Duration::from_secs(1)).await;
-        }
+        let first_refresh = fixture
+            .next_publication(
+                catalog,
+                &original_session,
+                &before_refreshes,
+                "continuous-two-publication-refreshes",
+            )
+            .await?;
+        fixture
+            .next_publication(
+                catalog,
+                &original_session,
+                &first_refresh,
+                "continuous-two-publication-refreshes",
+            )
+            .await
     })
     .await
     .map_err(
@@ -1204,6 +1240,7 @@ async fn run_scenario(
     // Healthy authority restart: the relays and connector remain untouched.
     // Cached bounded trust carries a fresh cross-relay exchange while the
     // authority is stopped; new publication then restores the authority.
+    let before_healthy_restart = fixture.publication(Some(&refreshed))?;
     fixture.stop_authority().await?;
     fixture
         .canary("authority-stopped-same-device-session")
@@ -1213,21 +1250,13 @@ async fn run_scenario(
         "healthy authority stop changed device ownership or carrier",
     )?;
     fixture.start_authority().await?;
-    let after_healthy_restart = fixture.wait_checkpoint(&client).await?;
-    require(
-        after_healthy_restart.minimum_versions["relay-a"] > refreshed.minimum_versions["relay-a"]
-            && after_healthy_restart.checkpoint_version > refreshed.checkpoint_version,
-        "healthy authority restart did not produce fresh publication and checkpoint",
-    )?;
     fixture
-        .canary("authority-recovered-same-device-session")
-        .await?;
-    require(
-        fixture.session_evidence(catalog).await? == original_session,
-        "healthy authority recovery recreated device owner/session/socket or relay process",
-    )?;
-    fixture
-        .wait_relay_adoption(&after_healthy_restart, catalog, &original_session)
+        .next_publication(
+            catalog,
+            &original_session,
+            &before_healthy_restart,
+            "authority-recovered-same-device-session",
+        )
         .await?;
     eprintln!(
         "online authority: exact public canaries survived two refreshes, authority stop, and persisted new-checkpoint/all-node adoption by all3 ready relays with unchanged owner/session/epoch/generation/socket and three relay PIDs"
@@ -1258,7 +1287,7 @@ async fn run_scenario(
     fixture.start_authority().await?;
     require(
         matches!(
-            client.fetch_checkpoint(fixture.request()).await,
+            client.fetch_checkpoint(fixture.request()?).await,
             Err(CheckpointAuthorityError::HttpStatus(503))
         ),
         "restart reused persisted checkpoint freshness",
@@ -1339,7 +1368,7 @@ async fn run_scenario(
     fixture.start_authority().await?;
     require(
         matches!(
-            client.fetch_checkpoint(fixture.request()).await,
+            client.fetch_checkpoint(fixture.request()?).await,
             Err(CheckpointAuthorityError::HttpStatus(403))
         ),
         "revoked client was not forbidden while inventory pending",
@@ -1347,7 +1376,9 @@ async fn run_scenario(
     let replacement_client = fixture.client(&replacement)?;
     require(
         matches!(
-            replacement_client.fetch_checkpoint(fixture.request()).await,
+            replacement_client
+                .fetch_checkpoint(fixture.request()?)
+                .await,
             Err(CheckpointAuthorityError::HttpStatus(503))
         ),
         "pending inventory returned an old successful checkpoint",
@@ -1367,7 +1398,7 @@ async fn run_scenario(
     )?;
     require(
         matches!(
-            client.fetch_checkpoint(fixture.request()).await,
+            client.fetch_checkpoint(fixture.request()?).await,
             Err(CheckpointAuthorityError::HttpStatus(403))
         ),
         "publication restored a revoked client",
@@ -1753,7 +1784,7 @@ async fn committed_reply_fault(
     let client = fixture.client(&fixture.relays[0].identity)?;
     require(
         matches!(
-            client.fetch_checkpoint(fixture.request()).await,
+            client.fetch_checkpoint(fixture.request()?).await,
             Err(CheckpointAuthorityError::HttpStatus(503))
         ),
         "partial or lost-reply publication produced a successful checkpoint",
@@ -1858,7 +1889,7 @@ async fn actual_redis_restart_fault(
         "actual Redis restart did not hit the independent run fence",
     )?;
     require(
-        client.fetch_checkpoint(fixture.request()).await.is_err(),
+        client.fetch_checkpoint(fixture.request()?).await.is_err(),
         "authority served a checkpoint after fatal Redis-run detection",
     )?;
     let after = fixture.state()?;

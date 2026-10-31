@@ -751,39 +751,6 @@ async fn fence_processes(fixture: &mut Fixture) -> GateResult {
     )
 }
 
-async fn confirm_next(
-    fixture: &mut Fixture,
-    catalog: &RedisCatalog,
-    evidence: &SessionEvidence,
-    previous: u64,
-) -> GateResult<u64> {
-    let client = fixture.client(&fixture.relays[0].identity)?;
-    let next = timeout(PUBLISH_BOUND, async {
-        loop {
-            let checkpoint = fixture.wait_checkpoint(&client).await?;
-            if checkpoint
-                .minimum_versions
-                .values()
-                .all(|value| *value > previous)
-            {
-                return Ok::<_, &'static str>(checkpoint);
-            }
-            fixture.canary("waiting-next-publication").await?;
-            sleep(Duration::from_millis(200)).await;
-        }
-    })
-    .await
-    .map_err(|_| "new confirmed publication deadline")??;
-    fixture
-        .wait_relay_adoption(&next, catalog, evidence)
-        .await?;
-    next.minimum_versions
-        .values()
-        .copied()
-        .min()
-        .ok_or("empty checkpoint")
-}
-
 async fn drill(
     fixture: &mut Fixture,
     url: &str,
@@ -1233,17 +1200,26 @@ async fn drill(
         "recovery reused the old device session or incarnation",
     )?;
     fixture
-        .wait_relay_adoption(&first, &fresh_catalog, &new_session)
+        .wait_relay_adoption(&AdoptionTarget::from(&first), &fresh_catalog, &new_session)
         .await?;
     revocations.denied(fixture).await?;
-    let minimum = first
-        .minimum_versions
-        .values()
-        .copied()
-        .min()
-        .ok_or("first candidate membership floor missing")?;
-    let second = confirm_next(fixture, &fresh_catalog, &new_session, minimum).await?;
-    confirm_next(fixture, &fresh_catalog, &new_session, second).await?;
+    let before_refreshes = fixture.publication(None)?;
+    let second = fixture
+        .next_publication(
+            &fresh_catalog,
+            &new_session,
+            &before_refreshes,
+            "waiting-next-publication",
+        )
+        .await?;
+    fixture
+        .next_publication(
+            &fresh_catalog,
+            &new_session,
+            &second,
+            "waiting-next-publication",
+        )
+        .await?;
     revocations.denied(fixture).await?;
     for (path, hash) in old_relay_states {
         require(

@@ -168,11 +168,80 @@ implemented separately from the retained attempt: the serving proxy limit and
 all acceptance predicates remain unchanged. A pure exact-config/endpoint
 control and actual read-only observation plus wrong-CA refusal check endpoint
 identity and retained TLS verification. Independent proxy cleanup joins its
-connections and verifies listener release. The corrected artifact run remains
-pending.
+connections and verifies listener release. The corrected artifact run is retained below as a separate failure.
 
 Evidence is retained privately under
 `/workspace/agentuplink-review-artifacts/c243-c248-artifact-proof-3d092deb/`,
 including immutable executable copies, validation logs, source/image manifests,
 `run-first/result.json`, bounded command captures and post-run hash checks.
 The failed run has not been retried, and it does not verify the recovery drill.
+
+
+## Corrected operator-channel attempt retained
+
+At exact `7c9c24fc`, the targeted compile passed in 3.82 seconds, all seven
+nonignored controls passed, and scoped strict Clippy passed in 2.24 seconds.
+Frozen harness SHA-256
+`1be64fb1c693baa9297dbf2b3b3f478daa8df400336e981aeb7819ce966dff10`
+used the same optimized authority and relay copies as the first attempt.
+The test **failed** in 82.60 seconds (83.452 seconds including wrapper cleanup).
+Both exact owned containers were removed. Evidence is retained privately at
+`/workspace/agentuplink-review-artifacts/c243-operator-proof-7c9c24fc/`.
+
+The independent operator TLS channel and wrong-CA refusal passed. The run then
+proved live three-relay traffic and both revocations, fenced the old processes,
+loaded the visibly stale backup into a new Redis run after 65,023 ms of
+quiescence, rejected missing fencing/wrong nonce/stale digest, and completed
+actual signed recovery with replay refusal. It failed during the subsequent
+`waiting-next-publication` canary with HTTP 503, `CLUSTER_UNREADY`,
+`execution=not_dispatched`. Those earlier phases do not make the drill pass.
+
+Ingress relay-a PID 498654 logged `Authority(HttpStatus(429))` at
+`2026-10-31T05:50:50.863787Z`, immediately before its shutdown capture at
+05:50:50.870. The membership reconcile error withdraws membership readiness
+and invalidates peer admissions before logging. The authority permits one
+concurrent connection per approved node. The fixture was polling every 200 ms
+using the serving relay-a identity, competing with relay-a's own serialized
+reconciliation. This supplies a concrete current-run observer collision; it
+does not establish the cause of the earlier hosted C248 failure.
+
+The failure-only local reads showed authority confirmation version 2 with
+51,846 ms remaining, checkpoint high-water 50, and relay checkpoint floors
+38/39/40 with every node floor at 2. These are subsequent snapshots, not
+request-time readiness or peer-probe evidence. No request-time pin generation
+or route-probe snapshot was retained. The observed membership error alone
+makes the public readiness conjunction false, regardless of those other gates.
+The retained ingress log SHA-256 is
+`7688905ca94c87cd22ab4e935d6210ec50657ee6bc20e3ef4e31628d37ee509a`.
+
+## Passive live publication observations
+
+The fixture now observes the bounded atomic authority state while relays are
+active. It requires the entire independently supplied inventory, its exact
+revision/deployment/incarnation, the expected Redis run and exact three node
+identities to match. Only a valid confirmed publication with its original
+future expiry can advance the observation; a spent reservation is insufficient.
+Both allocators and confirmed membership versions must not roll back, and the
+same confirmation cannot change its expiry.
+
+This is an unsigned **test observation**, never a runtime trust source or a
+manufactured signed checkpoint. A fixed target captures confirmed membership
+version V and checkpoint high-water H and requires every actual relay to
+persist a checkpoint at least H+1 and every approved node record at least V.
+Each real relay performs the existing signature, nonce and identity checks
+before those fences are persisted. All three identities are checked in their
+bounded version envelopes. Exact non-owner canaries and identical owner,
+session, epoch, generation, socket and relay PIDs remain mandatory at every
+observation. A canary failure still immediately fails the scenario. The fixed
+target is not moved while waiting, and the existing 25-second publication and
+55-second two-refresh bounds remain.
+
+Every fixture checkpoint HTTP request now refuses before dispatch if any
+serving relay process is owned. The active-call audit covers healthy refreshes
+and authority restart in the lifecycle test, plus both post-recovery refreshes.
+Direct nonce-bound signed-response, mTLS negative, failed-publication expiry,
+restart freshness, recovered publication and inventory/client-revocation checks
+remain in phases before relay startup or after all relays stop. The isolated
+lost-write and Redis-run fault scenarios never start relays. No direct HTTP
+coverage was dropped; only the concurrent continuity observation changed.
+Focused observation controls and the next corrected process run are pending.
