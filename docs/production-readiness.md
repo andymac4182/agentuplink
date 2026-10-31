@@ -22,9 +22,33 @@ and [Redis AOF headroom #271](https://github.com/andymac4182/agentuplink/pull/27
 then [container notices #272](https://github.com/andymac4182/agentuplink/pull/272)
 and [integrated acceptance #273](https://github.com/andymac4182/agentuplink/pull/273),
 then [filesystem confirmation #274](https://github.com/andymac4182/agentuplink/pull/274)
-and [Mastra depth / authority lock #275](https://github.com/andymac4182/agentuplink/pull/275).
+and [Mastra depth / authority lock #275](https://github.com/andymac4182/agentuplink/pull/275),
+then [terminal retirement observer #276](https://github.com/andymac4182/agentuplink/pull/276).
 
-Current hosted candidate [#275](https://github.com/andymac4182/agentuplink/pull/275)
+Current hosted candidate [#276](https://github.com/andymac4182/agentuplink/pull/276)
+head `2f3686b7615e74000a65be8a805e64b8060ffe28` and actual runner checkout
+`2f30edffc45cb430f822ee76e3d7d9a011fef15f` share tree
+`736c7bbc8247e89ec41b19313d05f2d997903a65`. At the latest recorded observation,
+13 CI jobs pass and full M7 is still running. Full M4 passes, including the
+unchanged300-second framework rotation and corrected C244 terminal observer.
+The hosted fixture records3 completed exchanges with1 retained stream, then
+reaches3/0/0 and all original final predicates. All three Rust platforms pass;
+Ubuntu's all-target scope totals2931/0/108 across150 suites, distinct from
+local decc's workspace2938/0/108/174 including doctests. Packaging passes;
+no new optimized release workflow is observed. C244's narrow scope is verified;
+M4-21, candidate-wide CI and production readiness remain separate.
+
+Clean dependency proposal `95eb2d83db9bd5cd2c30e84e950398600b7df76e`
+implements C252's scoped just-bash/minimatch correction. Local pinned Node
+checks pass610 offline/40 peers, the actual consumer-root resolver controls pass,
+and a fresh audit has zero findings. Its first actual300-second framework gate now passes309.108s with unchanged
+assertions and joined cleanup; hosted verification remains pending.
+[Exact C252 input binding and proof](m6-client-followup-2026-10-31.md#c252-actual-framework-integration)
+distinguishes the older frozen Rust driver from the actual new TypeScript graph. The distinct [C253 client license coverage gap](m6-client-license-coverage-2026-10-31.md)
+requires an owner policy decision and artifact-aware enforcement; no license
+exception is approved. New dependency proof is isolated from prior frozen trees.
+
+Previous hosted candidate [#275](https://github.com/andymac4182/agentuplink/pull/275)
 head `b13f43cd38c356863dfdd9a99a4573c191d58965` and actual checkout
 `5909dc38ec843275e81dd2c73116b91ded575934` share tree
 `2bf1832d3554b1c9aba2f9478d2f980fc10b2ed8`. CI is **failed**:13 jobs pass,
@@ -48,8 +72,8 @@ retains failed artifact selection, separate selection recovery, first disk-guard
 setup failure and successful recovery-only run. PR275 now passes Ubuntu's
 original permission test and all21 authority tests; the historical PR274
 failure's exact cause remains unattributed. M4-75 closes only its Mastra
-traversal-depth/framework scope. C244, full current CI, current actual image,
-M4-47 and the new M6-C252 moderate advisory remain explicit follow-up work.
+traversal-depth/framework scope. Full current CI, current actual image,
+M4-47, C252 integration and C253 license policy/enforcement remain explicit follow-up work.
 
 Earlier integrated candidate `8c8c14fc9f6bb164daad224ad7300c04389a296f` passes
 complete local Rust checks (2,922 tests), all 90 frozen M1/M2/M7 stages, all
@@ -94,7 +118,7 @@ incomplete default listings, preserving explicit bounded views. Its 610 offline
 and 34 installed-peer checks pass. Separate actual relay/device integration
 passes the unchanged 300-second framework rotation gate in311.020s, with
 zero replay, live revocation and joined cleanup; [exact evidence](m4-mastra-depth-2026-10-31.md)
-retains the prelaunch diagnostic failure. New-candidate hosted evidence remains pending. The separate M4-47 valid-state reproduction demonstrates that
+retains the prelaunch diagnostic failure. PR275 and PR276 hosted framework checks also pass for their respective dependency graphs. The separate M4-47 valid-state reproduction demonstrates that
 ordinary in-credit DATA can exhaust the response budget and fence all 33
 streams. That production correction and its complete acceptance remain open.
 
@@ -150,7 +174,8 @@ these completion criteria are evidenced; scheduling is not verification.
 | P1 | Stabilize cluster membership and key changes | M7-C06/C80/C81/C83/C86/C131/C150; M8-C46/C47/C48/C61; M6-C232 passes prior combined acceptance. C235 identifies an additional clean-EOF path; C238 has deterministic regressions and a completed fixed20/20 versus control19/20 comparison; final 8c full local and hosted M7 pass | Repeatable re-sign, trust-expiry, rotation and restart acceptance; retain intermittent failures |
 | P1 | Finish limits and real adapter acceptance | M4-21/47/68/70/72/73/74; M4-75 is verified at its narrow depth/integration scope; M3-12/13/37/41/42/44 | Enforced advertised limits, long-lived streams and framework clients across peer hops/rotation/revocation |
 | P1 | Resolve authority state test bootstrap lock collision | M6-C251; PR #274 failure remains retained/unattributed. Duplicated-descriptor regression, correction, required Rust, native/original-packaged authority drills and PR275 hosted authority tests pass; current actual-image follow-up remains separate | Causal regression, correction without weakened lock checks, required and hosted candidate checks |
-| P1 | Correct current dependency advisory | M6-C252; minimatch10.2.6 through just-bash3.4.2 reports two moderate affected graph nodes for GHSA-g3hv-75wg-m249; high-severity CI gate remains unchanged | Compatible graph correction, fresh audit, real framework checks and explicit consumer override contract if applicable |
+| P1 | Correct current dependency advisory | M6-C252; the baseline reports two moderate graph nodes for GHSA-g3hv-75wg-m249. Clean95eb scoped11.0.1 correction passes local610/40 and fresh audit0; actual framework gate passes309.108s; hosted acceptance remains pending, threshold unchanged | Compatible graph correction, fresh audit, real framework checks and explicit consumer override contract if applicable |
+| P1 | Define and enforce client dependency license coverage | M6-C253; separate client graph is outside Cargo/MCP gates; existing BlueOak/LGPL declarations plus one new BlueOak dependency remain unapproved | Owner-reviewed client policy, artifact-aware alias-capable gate, unchanged universal scope and complete graph result |
 | P1 | Establish load and recovery budgets | M6-03/C125/C126/C183/C192/C201/C239 | Off-host multi-tenant load and soak at declared capacity, explicit latency/error/recovery targets, Redis peak-memory/AOF rewrite evidence |
 | P1 | Close release and operator verification gaps | M6-01/C217/C220/C241; M3-50 | Exact final-candidate checks, clean-machine archives and executed deployment guide |
 | P1 | Configure operations | M6-C218; private metrics exist, privileged-change audit is deferred | Scraper, alerts, retention, certificate/JWKS rotation and incident/restore ownership verified |
@@ -158,9 +183,9 @@ these completion criteria are evidenced; scheduling is not verification.
 
 ## Verification ledger
 
-- **New C244 local correction:** clean `decc5b58` passes its controlled negative, eleven fixed controls, required Rust checks (2938/0/108/174), and one actual gate13.0765s. The real run observes handler completion before stream/replay retirement and then reaches the unchanged terminal assertions. Hosted follow-up remains pending; [exact evidence](m6-production-followup-2026-10-31.md#verified-observer-correction-at-decc5b58).
+- **New C244 local correction:** clean `decc5b58` passes its controlled negative, eleven fixed controls, required Rust checks (2938/0/108/174), and one actual gate13.0765s. The real run observes handler completion before stream/replay retirement and then reaches the unchanged terminal assertions. PR276 full M4 and all Rust platforms now pass, closing the declared C244 scope; [local evidence](m6-production-followup-2026-10-31.md#verified-observer-correction-at-decc5b58) and [hosted evidence](m6-client-followup-2026-10-31.md) preserve their separate identities.
 
-- **Current PR275 follow-up:** [exact evidence](m6-production-followup-2026-10-31.md) records the failed13-pass/1-fail CI, successful five-platform original archives, and new Linux packaged lifecycle/recovery. Older complete acceptance below remains bound to8c.
+- **Prior PR275 follow-up:** [exact evidence](m6-production-followup-2026-10-31.md) records the failed13-pass/1-fail CI, successful five-platform original archives, and new Linux packaged lifecycle/recovery. Older complete acceptance below remains bound to8c.
 
 - **Prior complete acceptance baseline:** [8c8c14fc final-candidate report](m6-final-candidate-2026-10-31.md)
   supersedes the pending-verification statements for that source in the dated entries below.
@@ -392,12 +417,13 @@ lease cleanup and dedicated-guest acceptance.
 
 ## Next action
 
-Verify the locally passed C244 fixture correction on the next hosted candidate without
-retrying or relabelling the failed PR275 M4 run. Verify the current actual
+Finish observing PR276 full CI without retrying or relabelling the failed PR275
+M4 run. C244 local and hosted verification is complete within its declared scope. Verify the current actual
 authority image/default-user layout; preserve the existing8c image proof as its
 own scope. Complete the M4-47 correction when the recorded account-security
-access requirement is satisfied, and validate a compatible M6-C252 dependency
-correction in an isolated tree. Do not repeat completed8c core/comparison/archive
+access requirement is satisfied, and complete M6-C252 hosted verification against the locally verified new
+isolated dependency tree. Settle the distinct C253 client license
+policy and artifact-aware enforcement without silently granting exceptions. Do not repeat completed8c core/comparison/archive
 drills as new-candidate evidence. Resolve the explicit universal-license owner
 decisions, actual deployment inventory/PKI/OIDC, simultaneous-restart recovery,
 off-host capacity/soak and operational ownership before any deployment claim.
