@@ -10,9 +10,12 @@ Reviewable changes are stacked draft pull requests, in dependency order:
 [hardening #260](https://github.com/andymac4182/agentuplink/pull/260),
 [offline authority #261](https://github.com/andymac4182/agentuplink/pull/261),
 [authenticated authority transports #263](https://github.com/andymac4182/agentuplink/pull/263),
-and [replacement-process canary #262](https://github.com/andymac4182/agentuplink/pull/262).
-The narrow trust-expiry classification fix M6-C232 is on
-`codex/trust-expiry-classification`, under combined validation.
+the [replacement-process canary #262](https://github.com/andymac4182/agentuplink/pull/262),
+[trust-expiry classification #264](https://github.com/andymac4182/agentuplink/pull/264),
+and [credential replacement drill #265](https://github.com/andymac4182/agentuplink/pull/265).
+The online authority and actual-CLI forwarded-reconnect proof are isolated
+work in progress. The C131 diagnostic branch is evidence instrumentation,
+separate from the deployment candidate.
 None of these changes has been merged or deployed.
 
 Existing task IDs in `tasks.md` retain their acceptance criteria. A historical
@@ -44,10 +47,10 @@ not a background scheduler.
 
 | Priority | Work | Evidence / existing tasks | Closure condition |
 | --- | --- | --- | --- |
-| P0 | Complete the external cluster and recovery authority | M6-C22/M6-C231; offline signer and authenticated checkpoint-client/Redis-publisher transports implemented in draft PRs. Continuous publisher, checkpoint responder and independent durable authority state remain missing | Shipped membership/checkpoint services and executed three-relay startup, rotation and recovery procedures |
-| P0 | Verify credential replacement before expiry | M6-C56; same-device renewal remains owner-deferred because the relay cannot register its new SPKI. Re-enrolment as a new device is the approved workaround | Execute re-enrolment, grant migration, old-device revocation and restart; deliver same-device renewal separately when taken up |
+| P0 | Complete the external cluster and recovery authority | M6-C22/C234; offline signer and authenticated transports verified. Online service, independent durable approvals/counters and required-mTLS checkpoints implemented; initial three-relay application proof passes. Final real-daemon fault paths and candidate checks are in progress | Shipped services, packaged operator execution and three-relay startup, rotation and recovery procedures |
+| P0 | Verify deployed credential replacement before expiry | M6-C56 remains owner-deferred for same-device renewal. M6-C233 locally verifies the approved new-device workaround, including migrated grants, revocation, restart and actual expiry | Execute the procedure against the real deployment inventory before expiry; deliver same-device renewal separately when taken up |
 | P0 | Prove durable recovery | M6-C82; the single-relay continuity witness is process-local | Simultaneous restart recovers with an independent witness; rollback remains refused; restore drill completed |
-| P0 | Preserve quiet forwarded sessions and release vanished devices | M6-C68/C229; compatible heartbeats and ingress timeout pass real positive/red controls and the registered local/hosted M7 gate | Final combined acceptance; retain bounded owner release and fresh same-device library reconnect evidence. Automatic CLI retry is a separate scope |
+| P0 | Complete vanished-device CLI recovery evidence | M6-C68; remote owner release and fresh library reconnect pass complete cluster acceptance. M6-C229 quiet-session fix is verified. Actual CLI through a cut-client/held-relay proxy remains in progress | Same CLI PID reaches a fresh ready session after remote owner cleanup within the stated bounds, with real echo and negative controls; full combined acceptance |
 | P1 | Stabilize cluster membership and key changes | M7-C06/C80/C81/C83/C86/C131/C150; M8-C46/C47/C48/C61; narrow M6-C232 fix under validation | Repeatable re-sign, trust-expiry, rotation and restart acceptance; retain intermittent failures |
 | P1 | Finish limits and real adapter acceptance | M4-21/68/70/72/73/74; M3-12/13/37/41/42/44 | Enforced advertised limits, long-lived streams and framework clients across peer hops/rotation/revocation |
 | P1 | Establish load and recovery budgets | M6-03/C125/C126/C183/C192/C201 | Off-host multi-tenant load and soak at declared capacity, explicit latency/error/recovery targets, Redis peak-memory/AOF rewrite evidence |
@@ -57,12 +60,18 @@ not a background scheduler.
 
 ## Verification ledger
 
-- Combined candidate `89552a1f` includes all four draft PRs plus M6-C232.
+- Accepted runtime candidate `89552a1f` includes hardening, offline authority,
+  authenticated transports, replacement canary and M6-C232. Later `fd03cdee`
+  changes only verification documents. This is the pre-online-service stack.
   Rust 1.95.0 formatting, strict workspace/all-target Clippy and locked workspace
   tests pass: 2,848 passed, zero failed, 102 ignored, across 173 suite results.
   Separate required-mTLS HTTPS tests (3), authority CLI tests (10), actual
   CLI-to-Redis recovery (1), publisher Redis TLS/ACL (1), and replacement-process
-  SPKI/canary (1, 24.35 seconds) pass. Full combined acceptance remains due.
+  SPKI/canary (1, 24.35 seconds) pass. Complete local M1 passed in 22.19 seconds,
+  accelerated M2 plus faults in 32.68 seconds, and the entire M7 script in
+  1,784.40 seconds, including expiry, forwarded liveness, replacement, all fault
+  gates, C11 and OG02. Binaries/logs were preserved with SHA-256 hashes before
+  cache reuse. New service/barrier changes need their own combined acceptance.
   The environment has a non-reaping PID 1, so process tests run under a child
   subreaper; assertions are unchanged. Ignored real-Redis gates run separately.
 - Full local M7 at `89acdcad` failed existing M7-C131: the expired target was
@@ -76,7 +85,10 @@ not a background scheduler.
   failure in pairs 2 and 17. No run was retried or discarded. The immutable
   hashes, all outcomes and limitations are recorded in the
   [comparison report](m7-c131-expiry-comparison-2026-10-31.md).
-  Final combined M7 remains due; M7-C131 remains open.
+  The subsequent complete M7 run passed; its expiry gate took 10,016 ms.
+  M7-C131 remains open for the required causal timeline. M6-C235 is a separate,
+  opt-in passive capture of exact request/deadline/latch observations; it is
+  not a production behavior change or a blanket C131 closure.
 - Hosted CI at `89acdcad` passed every job, including M7:
   [41156405921](https://github.com/andymac4182/agentuplink/actions/runs/41156405921).
   Offline-authority candidate `8997e7f6` also passed every job:
@@ -84,6 +96,12 @@ not a background scheduler.
   Both built and verified all five release platforms; draft publication and
   provenance attestation were skipped. Hosted success does not erase local
   intermittent failure. Latest combined hosted checks remain required.
+- Authority transports at `6a304214` and replacement canary at `ba120f71` also
+  passed every hosted CI job, including full M7, in runs
+  [41158151084](https://github.com/andymac4182/agentuplink/actions/runs/41158151084)
+  and [41158468116](https://github.com/andymac4182/agentuplink/actions/runs/41158468116).
+  Their five-platform optimized build/archive matrices passed in release runs
+  41158151070 and 41158467654; draft attestation/publication were skipped.
 - The actual optimized Linux CI archive from offline-authority release
   [41156556410](https://github.com/andymac4182/agentuplink/actions/runs/41156556410)
   passed all seven archive checks and planted negative controls. Its documented
@@ -98,8 +116,9 @@ not a background scheduler.
   now proves a fresh device's different relay boot/session and higher owner
   epoch, exact public canary through a peer, stable owner/generation and clean
   stop. Two isolated whole-fixture runs and four intentional negative controls
-  validate the new checks; the combined candidate passes once. Broader combined
-  acceptance remains due.
+  validate the new checks; the combined candidate passes once. Complete local
+  M7 at `89552a1f` and hosted M7 at `ba120f71` subsequently passed, completing
+  the corrected C06 scope.
 - M1 real-socket acceptance and M2 accelerated rotation/fault gates passed.
   Three actual 300-second rotations passed with 18,913 records; hosted runs at
   `89acdcad` and `8997e7f6` subsequently passed M2. Earlier configured fixture
@@ -128,7 +147,7 @@ not a background scheduler.
   need that root override. These branch results do not close default-branch
   dependency alerts.
 
-## Implemented changes awaiting final acceptance
+## Implemented slices and remaining integration
 
 - M6-C68/C229: ingress WebSocket heartbeat plus absolute inbound timeout, and
   compatible owner protocol heartbeat. Real three-relay proof stays healthy
@@ -144,6 +163,25 @@ not a background scheduler.
 - M6-C231: strict paired checkpoint client identity without anonymous fallback,
   and explicit publisher Redis TLS. Real mTLS/ACL tests cover correct identity,
   wrong trust/name/credentials, denied authorization and unrelated writes.
+- M6-C233: the complete new-device workaround passes locally through shipped
+  commands. Two users retain their grant operations/expiry; old revocation is
+  observed before actual certificate expiry, replacement epochs increase across
+  client/relay restarts, and exact canaries still pass beyond the old expiry.
+  Full provisioning acceptance passes 8 catalog, 3 Redis-stage and 9 process
+  gates. Four intentional controls fail correctly. Full workspace tests pass
+  2,848/0 failed/103 ignored with strict Clippy. This is single-relay local
+  evidence; M6-C56 remains deferred for same-device renewal.
+- M6-C234: the online service has independent durable approvals and separate
+  membership/checkpoint counters, exclusive writer locking, required client
+  identity/pins, and fixed confirmed expiry during refresh failures. Initial
+  actual-service acceptance passed in 115.80 seconds, including exact traffic
+  through a non-owner relay, two refreshes and authority restart without
+  replacing the device session. Independent review then reproduced a publisher
+  queue-starvation schedule; the bounded queue fix passes its regression while
+  retaining the I/O watchdog. Final real-daemon lost-reply/restart paths and
+  full candidate validation remain in progress. Never restore older authority
+  volume state: whole-volume rollback cannot be detected from that same volume.
+  M6-C236 records the retained directory's 32 historical node-ID slots.
 - M6-C232: reconciliation preserves TrustExpired when the admitted stream's
   existing deadline has already passed. Two regressions fail without the fix;
   pre-expiry revocation retains its original reason. Admission lifetime, retry
@@ -183,12 +221,8 @@ lease cleanup and dedicated-guest acceptance.
 
 ## Next action
 
-Finish full acceptance on the combined candidate, retaining every failure.
-M6-C233 is implementing the approved re-enrolment drill, including migrated
-grants, revocation, client/relay restart and the old certificate's actual expiry.
-M6-C234 is implementing the continuous publisher and required-mTLS checkpoint
-service with independent durable authority state. Both are isolated work in
-progress. Then exercise three-relay startup, rotation, recovery and rollback
-refusal, and establish actual deployment identity, configuration and operational
-ownership. Keep this goal active while any completion criterion or required
+Finish the actual-service fault gates, causal expiry capture and actual-CLI
+forwarded reconnect proof; integrate and run complete candidate acceptance.
+Then execute packaged three-relay/recovery procedures and establish actual
+hosting identity, certificates, monitoring, capacity and operational ownership. Keep this goal active while any completion criterion or required
 deployment input remains unresolved.
