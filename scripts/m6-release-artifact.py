@@ -177,7 +177,7 @@ PINNED_RUST = "1.95.0"
 # room for ordinary movement, and above zero by enough that an empty input
 # cannot clear them.
 MIN_BUNDLE_FILES = 10
-MIN_EXECUTABLES = 3
+MIN_EXECUTABLES = 4
 MIN_NOTICE_CRATES = 300
 MIN_EXAMPLES = 2
 # Measured at ec663a7: 628 licence files totalling 3,145,598 bytes across the
@@ -191,6 +191,8 @@ MIN_EMBEDDED_LICENCE_BYTES = 300_000
 #   tunnel-client   the device CLI -- the thing a tester runs.
 #   tunnel-relay    the server half; without it a tester has one end of a
 #                   tunnel.
+#   tunnel-authority the separate offline operator tool; its signing keys
+#                   must never be installed on ordinary relay hosts.
 #   tunnel-deadman  NOT a product command.  It is the parent-death sentinel
 #                   that `tunnel_deadman::sentinel_path()` looks for beside
 #                   the running executable.  It is in this list because it is
@@ -199,7 +201,7 @@ MIN_EMBEDDED_LICENCE_BYTES = 300_000
 #
 # `tunnel-test-harness` and the three `*-fixture` binaries are deliberately
 # absent: they are test scaffolding, not something an outside tester runs.
-BUNDLE_BINARIES = ("tunnel-client", "tunnel-relay", "tunnel-deadman")
+BUNDLE_BINARIES = ("tunnel-client", "tunnel-relay", "tunnel-deadman", "tunnel-authority")
 
 # Configuration examples a tester needs in order to run the config checks at
 # all.  These are the same files CI dry-runs.
@@ -1240,6 +1242,7 @@ CLI_PROBES = (
     ("tunnel-client", ["--help"], "tunnel-client"),
     ("tunnel-client", ["--version"], "tunnel-client "),
     ("tunnel-relay", ["--help"], "tunnel-relay"),
+    ("tunnel-authority", ["--help"], "sign-recovery-approval"),
 )
 
 
@@ -1650,7 +1653,7 @@ DOCS_SHAPE_ONLY_PERMITTED = {
 #: Flags that make a permitted command runnable offline, so a shape-only
 #: command carrying one is a demoted executable command.
 DOCS_SHAPE_ONLY_REFUSED_FLAGS = ("--dry-run",)
-DOCS_BINARIES = ("tunnel-client", "tunnel-relay", "tunnel-deadman")
+DOCS_BINARIES = BUNDLE_BINARIES
 # **Pinned, not floored.**  The first version had a floor of 20 executed
 # commands against 35 measured, so 43% of the guide could vanish silently
 # (Fable review of `b041e0a`).  Each section's executed commands, output
@@ -1681,7 +1684,7 @@ DOCS_PINNED_SECTIONS: dict[str, tuple[int, int, int]] = {
     # shows the backoff events of one retry (five assertion lines), then the
     # `--no-reconnect` one-shot (two lines, as the old example had): +2
     # commands, +5 assertions.
-    "3. Deployment": (11, 15, 2),
+    "3. Deployment": (17, 20, 2),
     # M6-C65 added `rebind-redis-run` to section 4 as a third shape-only
     # command.
     "4. Service installation, upgrade, backup and recovery": (0, 0, 3),

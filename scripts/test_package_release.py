@@ -118,6 +118,8 @@ class PackagingTests(unittest.TestCase):
             # The relay is in every Unix bundle and in no Windows bundle.
             has_relay = any("tunnel-relay" in name for name in names)
             self.assertEqual(has_relay, not manifest["target"].endswith("windows-msvc"), file.name)
+            has_authority = any("tunnel-authority" in name for name in names)
+            self.assertEqual(has_authority, has_relay, file.name)
             self.assertEqual(manifest["sourceSha"], self.sha)
             # M6-C50: the guide and exactly the documents it links ship.
             documents = sorted(name for name in names if name.startswith("docs/"))
@@ -286,6 +288,7 @@ class PackagingTests(unittest.TestCase):
             self.assertIn("bin/tunnel-client", names)
             self.assertIn("bin/tunnel-deadman", names)
             self.assertNotIn("bin/tunnel-relay", names)
+            self.assertNotIn("bin/tunnel-authority", names)
             self.assertFalse([n for n in names if n.startswith("examples/") and "relay" in n], names)
         published = assets(self.output, version(self.root, self.sha, "123"))
         self.assertEqual(len(published), 2 * len(TARGETS))
@@ -339,6 +342,11 @@ class PackagingTests(unittest.TestCase):
 
     def test_missing_helper_fails(self):
         (self.root / "target" / TARGETS[0] / "release" / "tunnel-deadman").unlink()
+        with self.assertRaises(ValueError):
+            package(self.root, TARGETS[0], self.sha, "123", self.output, {"packages": []})
+
+    def test_missing_offline_authority_fails_server_package(self):
+        (self.root / "target" / TARGETS[0] / "release" / "tunnel-authority").unlink()
         with self.assertRaises(ValueError):
             package(self.root, TARGETS[0], self.sha, "123", self.output, {"packages": []})
 

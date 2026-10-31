@@ -32,7 +32,8 @@ prints, not left to a reader to infer:
                (M6-C102); every relative link in the shipped documents resolves
   cli          help, version, every subcommand's `--help` (D6), `config check`
                on the shipped client example, and (Unix) the relay's help and
-               `check-serve-config` on every shipped serving example
+               `check-serve-config` on every shipped serving example, plus the
+               separate offline authority's signing/key-generation help
   portability  every binary's dynamic dependencies are system libraries a
                clean machine of that OS has (ELF DT_NEEDED, Mach-O `otool -L`,
                PE import table)
@@ -387,6 +388,12 @@ def check_cli(root: Path, target: str, work: Path) -> Result:
             if completed.returncode != 0:
                 return fail("cli", "serving-config-check", f"check-serve-config on {config.name} exited "
                                                            f"{completed.returncode}: {completed.stderr[:160]}")
+    if "tunnel-authority" in binaries_for(target):
+        completed = probe(root / "bin" / "tunnel-authority", ["--help"], work)
+        probes += 1
+        if (completed.returncode != 0 or "generate-key" not in completed.stdout
+                or "sign-recovery-approval" not in completed.stdout):
+            return fail("cli", "authority-help", "tunnel-authority --help lacks its offline commands")
     result = Result("cli", True, f"{probes} probes from the unpacked archive, including "
                                  f"{len(CLIENT_SUBCOMMAND_HELP)} client subcommand --help, config check "
                                  f"and {len(serving)} serving dry run(s)")
@@ -639,6 +646,14 @@ def controls(root: Path, archive: Path, checksum: Path, target: str,
         client.chmod(0o755)
         return check_cli(copy, target, tmp)
     expect("a subcommand --help exits 2 (D6)", "subcommand-help", help_broken)
+
+    def authority_help_broken(tmp):
+        if "tunnel-authority" not in binaries_for(target):
+            return None
+        copy = _copy(root, tmp)
+        _decoy(copy / "bin" / "tunnel-authority", 0)
+        return check_cli(copy, target, tmp)
+    expect("authority replaced by a program exiting 0", "authority-help", authority_help_broken)
 
     def planted_import(tmp):
         # Through check_portability itself: the real reader parses the real

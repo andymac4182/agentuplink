@@ -256,6 +256,8 @@ jobs:
         run: cargo +1.95.0 build --workspace --bins --locked
       - name: Test authoritative Redis catalog
         run: cargo +1.95.0 test -p tunnel-catalog --test redis_catalog --locked -- --ignored
+      - name: Verify offline authority approvals through real Redis recovery
+        run: cargo +1.95.0 test -p tunnel-authority --test recovery_redis --locked -- --ignored
       - name: Verify production relay, client, authorization and transport failures
         run: cargo +1.95.0 run --locked -p tunnel-test-harness -- verify
       - name: Verify Redis AOF restart and explicit recovery
