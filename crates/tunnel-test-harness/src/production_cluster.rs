@@ -242,8 +242,9 @@ pub use fs_adapters_rotation::{
     verify as verify_fs_adapters_rotation,
 };
 pub use fs_client_e2e::{
-    DeviceLedger, FsClientE2eEvidence, validate_fs_client_e2e_evidence as validate_fs_client_e2e,
-    verify as verify_fs_client_e2e,
+    DeviceLedger, FsClientE2eEvidence, FsFidOrderingEvidence,
+    validate_fs_client_e2e_evidence as validate_fs_client_e2e, validate_fs_fid_ordering_evidence,
+    verify as verify_fs_client_e2e, verify_fid_ordering as verify_fs_fid_ordering,
 };
 mod http_forward_rotation;
 pub use http_forward_rotation::{
