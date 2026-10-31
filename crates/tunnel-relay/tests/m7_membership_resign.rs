@@ -267,6 +267,33 @@ impl Fixture {
     fn identity() -> MembershipPeerIdentity {
         MembershipPeerIdentity::new(NODE_ID, BOOT_ID, SPKI_SHA256)
     }
+
+    /// Keep the record and a replacement key valid while the admitted peer's
+    /// exact key expires. No supervisor or snapshot runs an expiry sweep.
+    async fn admit_short_lived_peer(&self) -> tunnel_relay::PeerAdmission {
+        let signed: tunnel_cluster::membership::SignedMembershipRecord =
+            serde_json::from_slice(&self.peer_record.read().await.bytes).unwrap();
+        let mut record = signed.record();
+        record.record_version = 2;
+        let mut replacement = record.keys[0].clone();
+        replacement.key_id = "peer-key-replacement".to_owned();
+        replacement.spki_sha256 = REPLACEMENT_SPKI_SHA256.to_owned();
+        record.keys[0].expires_at = Utc::now() + chrono::Duration::seconds(2);
+        record.keys.push(replacement);
+        self.set_peer_record(SignedMembershipRecord {
+            version: record.record_version,
+            bytes: self.issuer.sign_membership_bytes(record).unwrap(),
+        })
+        .await;
+        self.resign(2).await;
+        self.runtime
+            .admit_peer(MembershipPeerIdentity::new(
+                PEER_NODE_ID,
+                "boot-peer",
+                PEER_SPKI_SHA256,
+            ))
+            .expect("admit the peer before its short key window ends")
+    }
 }
 
 fn sign_record(
@@ -642,6 +669,79 @@ async fn an_admission_past_its_deadline_is_not_re_bound_by_a_renewal() {
         stream.is_cancelled(),
         "M7-C80: an admission past its deadline was re-bound and resurrected"
     );
+    assert_eq!(
+        stream.reason(),
+        Some(PeerInvalidationReason::TrustExpired),
+        "M6-C232: a renewal must retain the passed admission deadline as the cause"
+    );
+    assert!(stream.trust_expired());
+}
+
+/// The reconcile, rather than an expiry sweep, first observes a naturally
+/// expired peer key in an unchanged signed record. Binding refusal must not
+/// turn the admission's already-passed deadline into a revocation.
+#[tokio::test]
+async fn a_reconcile_first_observing_an_expired_peer_key_preserves_expiry() {
+    let fixture = Fixture::ready().await;
+    let admission = fixture.admit_short_lived_peer().await;
+    let stream = admission.cancellation();
+    tokio::time::sleep_until(
+        tokio::time::Instant::from_std(admission.deadline().expires_at())
+            + Duration::from_millis(50),
+    )
+    .await;
+    assert!(admission.deadline().is_expired());
+    assert!(
+        !stream.is_cancelled(),
+        "no expiry sweep ran before reconcile"
+    );
+    fixture.runtime.reconcile_once().await.unwrap();
+    assert_eq!(
+        stream.reason(),
+        Some(PeerInvalidationReason::TrustExpired),
+        "M6-C232: natural peer-key expiry was mislabeled as revocation"
+    );
+    assert!(stream.is_cancelled());
+    assert!(stream.trust_expired());
+    assert_eq!(fixture.runtime.readiness(), MembershipReadiness::Ready);
+}
+
+/// An actual revocation observed while the admission is live stays the first
+/// cause after its old deadline passes. Later expiry must not rewrite it.
+#[tokio::test]
+async fn a_revocation_before_the_deadline_stays_revocation_after_expiry() {
+    let fixture = Fixture::ready().await;
+    let admission = fixture.admit_short_lived_peer().await;
+    let stream = admission.cancellation();
+    fixture
+        .set_peer_record(sign_record(
+            &fixture.issuer,
+            PEER_NODE_ID,
+            3,
+            "peer-key-1",
+            PEER_SPKI_SHA256,
+            30,
+            true,
+        ))
+        .await;
+    fixture.resign(3).await;
+    assert!(!admission.deadline().is_expired());
+    assert!(stream.is_cancelled());
+    assert_eq!(
+        stream.reason(),
+        Some(PeerInvalidationReason::MembershipRevoked)
+    );
+    tokio::time::sleep_until(
+        tokio::time::Instant::from_std(admission.deadline().expires_at())
+            + Duration::from_millis(50),
+    )
+    .await;
+    fixture.runtime.reconcile_once().await.unwrap();
+    assert_eq!(
+        stream.reason(),
+        Some(PeerInvalidationReason::MembershipRevoked)
+    );
+    assert!(!stream.trust_expired());
 }
 
 /// An equal-version record with different bytes is refused **by the
