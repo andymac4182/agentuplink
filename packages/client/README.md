@@ -114,6 +114,26 @@ adapter })`, `new Workspace({ filesystem })`, `new Bash({ fs })`,
 `ai.uploadFile({ api })` — against the same loopback harness. It needs the
 install and is therefore **not** part of `npm test`.
 
+The root manifest overrides Mastra's exact `@modelcontextprotocol/server`
+dependency from `2.0.0` to `2.3.0`, which fixes its HTTP isolation, audience and
+request-limit advisories. Mastra core references that package only for
+`ElicitRequest`, `ElicitResult` and `ServerContext` types; its `MCPServerBase`
+is abstract, and the filesystem adapter does not serve MCP. The override keeps
+Mastra `1.65.0` because tested upgrades to `1.68.0`, `1.69.0` and `1.81.0`
+omit the first tool result from the Agent transcript used by our demo. The
+unchanged Agent contract passes with this override. Additional peer tests
+exercise the actual replacement server SDK's initialization, tools,
+concurrent principal isolation, wrong-audience refusal and HTTP body bound.
+The audience and body-bound tests fail against `2.0.0`.
+
+**npm overrides apply only at an application's root.** A consuming application
+using this Mastra pin must carry the same override in its own root manifest
+(or use a separately verified fixed Mastra release); this private package's
+override does not propagate into a consuming application's dependency tree.
+These checks do not certify the separately packaged `@mastra/mcp` server or
+every application configuration. Run `npm audit --audit-level=high` alongside
+`npm run check`; no advisory is ignored by this package.
+
 Two things a consumer has to know, both found by running the real packages:
 `createFilesAdapter` takes the consumer's own `FilesError` class, because
 `files-sdk`'s retry gate rebuilds a foreign error as a *retryable* one — it must

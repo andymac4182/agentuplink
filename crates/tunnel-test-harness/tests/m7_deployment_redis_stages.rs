@@ -33,9 +33,7 @@ use tokio::{
 use tokio_rustls::TlsAcceptor;
 use tokio_util::sync::CancellationToken;
 use tunnel_catalog::RedisCatalog;
-use tunnel_test_harness::{
-    FixturePki, HarnessError, ManagedProcess, OidcFixture, ProcessSpec, Result,
-};
+use tunnel_test_harness::{FixturePki, HarnessError, ManagedProcess, OidcFixture, Result};
 use tunnel_transport::load_server_config_from_pem;
 use uuid::Uuid;
 
@@ -532,8 +530,7 @@ async fn run_stage(stage: RedisFaultStage) -> Result<()> {
 async fn run_process(fixture: &mut ProcessFixture) -> Result<()> {
     let mut process = ManagedProcess::spawn(
         format!("m7-redis-stage-{}", fixture.stage.name()),
-        ProcessSpec::new(&fixture.relay_binary)
-            .arg("serve")
+        common::relay_serve_process_spec(&fixture.relay_binary)
             .arg("--config")
             .arg(fixture.config_path.display().to_string()),
     )

@@ -1,5 +1,5 @@
 // A plain MCP server built on the pinned official TypeScript SDK
-// (@modelcontextprotocol/sdk 1.30.1: McpServer + StreamableHTTPServerTransport,
+// (@modelcontextprotocol/sdk 1.32.0: McpServer + StreamableHTTPServerTransport,
 // stateful, 2025-11-25), used by scripts/m3-sdk-conformance.sh (task row
 // M3-17) as the device-exported backend for the Python SDK's tools, resources,
 // prompts and notification cases.

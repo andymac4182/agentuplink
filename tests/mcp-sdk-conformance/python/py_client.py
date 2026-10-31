@@ -36,6 +36,11 @@ import httpx2
 from mcp import Client
 from mcp.client.streamable_http import streamable_http_client
 
+# Python 3.10 is supported by the harness and its lockfile. AnyIO uses the
+# already-pinned backport there; the built-in type exists only from 3.11.
+if sys.version_info < (3, 11):
+    from exceptiongroup import BaseExceptionGroup
+
 FAILURES = 0
 
 

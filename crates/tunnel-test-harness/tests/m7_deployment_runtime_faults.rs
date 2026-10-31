@@ -208,8 +208,7 @@ async fn run_configured_case(
     initialize_state(&fixture.relay_binary, &fixture.config_path).await?;
     let mut process = ManagedProcess::spawn(
         format!("m7-runtime-fault-{}", dependency.name()),
-        ProcessSpec::new(&fixture.relay_binary)
-            .arg("serve")
+        common::relay_serve_process_spec(&fixture.relay_binary)
             .arg("--config")
             .arg(fixture.config_path.display().to_string()),
     )

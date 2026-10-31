@@ -23,9 +23,13 @@ ENV RUSTUP_TOOLCHAIN=1.95.0 \
     CARGO_TERM_COLOR=never
 WORKDIR /src
 COPY . .
+# Optional CA bundle for builders behind an HTTPS proxy. It is mounted only
+# for Cargo and never copied into the image. Ordinary builders use system CAs.
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/src/target,sharing=locked \
-    cargo build --locked --release -p tunnel-relay --bin tunnel-relay \
+    --mount=type=secret,id=cargo_ca \
+    if [ -f /run/secrets/cargo_ca ]; then export CARGO_HTTP_CAINFO=/run/secrets/cargo_ca; fi \
+ && cargo build --locked --release -p tunnel-relay --bin tunnel-relay \
  && install -m 0755 target/release/tunnel-relay /usr/local/bin/tunnel-relay
 
 FROM debian:trixie-slim@sha256:a99cfc517144bc59b1978475ec53b46ecabec7e43635402ee5b77cc54cd1b20a

@@ -1227,6 +1227,12 @@ pub struct PeerServerRecv {
 }
 
 impl PeerServerRecv {
+    /// Configured idle bound for this peer's request body.
+    #[must_use]
+    pub fn idle_timeout(&self) -> Duration {
+        self.idle_timeout
+    }
+
     /// Receive one bounded request body chunk.
     pub async fn recv_chunk(&mut self) -> Result<Option<PeerBodyChunk>, PeerTransportError> {
         recv_server_chunk(&mut self.inner, &self.budget, self.idle_timeout).await

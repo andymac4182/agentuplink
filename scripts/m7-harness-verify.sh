@@ -106,6 +106,11 @@ gate "live membership boot replacement tests" \
 gate "privileged RPC analogue tests" \
   cargo test -p tunnel-test-harness --test m7_privileged_rpc --locked -- --test-threads=1
 
+gate "forwarded device control survives quiet peer idle and releases a blackholed device" \
+  cargo test -p tunnel-test-harness --lib --locked \
+    production_cluster::forwarded_control_liveness::m6c68_forwarded_control_releases_a_blackholed_device_and_reconnects \
+    -- --ignored --exact --test-threads=1 --nocapture
+
 gate "M7 transport acceptance" \
   cargo run --locked -p tunnel-test-harness -- verify-m7-transport
 gate "M7 authenticated peer body fragmentation and malformed records" \
