@@ -2649,10 +2649,12 @@ pub(crate) async fn main() -> ExitCode {
             }
         }
         [command] if command == "verify-m4-fs-adapters-rotation" => {
+            async {
             let evidence = tunnel_test_harness::production_cluster::verify_fs_adapters_rotation().await?;
             tunnel_test_harness::production_cluster::validate_fs_adapters_rotation_evidence(&evidence)?;
             println!("M4 installed-framework rotation passed: {}", serde_json::to_string(&evidence).map_err(HarnessError::Json)?);
-            Ok(())
+            Ok::<(), HarnessError>(())
+            }.await
         }
         [command] if command == "verify-m4-fs-client-e2e" => {
             match tokio::time::timeout(
