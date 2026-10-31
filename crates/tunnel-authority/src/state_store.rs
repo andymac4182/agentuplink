@@ -269,6 +269,16 @@ mod platform {
         }
     }
 
+    impl Drop for LockedPath {
+        fn drop(&mut self) {
+            // The guard owns the writer lease. Closing its descriptor alone
+            // can leave the lock held by a duplicate inherited before exec.
+            // If explicit unlock fails, File still closes normally; a remaining
+            // duplicate may keep the state unavailable until its final close.
+            let _ = self.lock.unlock();
+        }
+    }
+
     struct Temporary<'a> {
         directory: &'a Directory,
         name: OsString,
@@ -590,6 +600,41 @@ mod platform {
             assert_eq!(reopened.load().unwrap(), b"new");
             drop(reopened);
             assert!(StateStore::initialize(&fixture.state, b"overwrite").is_err());
+        }
+
+        #[test]
+        fn writer_guard_releases_lock_while_a_duplicate_descriptor_remains_open() {
+            let fixture = Fixture::new();
+            let store = StateStore::initialize(&fixture.state, b"old").unwrap();
+            let lock_path = fixture.directory.join(".state.json.lock");
+            let lock_before = fs::metadata(&lock_path).unwrap();
+            // A clone shares the lock's open file description, as does a
+            // descriptor inherited by another thread's child before exec.
+            let old_duplicate = store.path.lock.try_clone().unwrap();
+            assert_eq!(
+                StateStore::open(&fixture.state).unwrap_err(),
+                "authority state is already open"
+            );
+            assert_eq!(store.load().unwrap(), b"old");
+            drop(store);
+
+            let mut successor = StateStore::open(&fixture.state)
+                .expect("dropping the writer must release its lock while a duplicate is open");
+            assert_eq!(successor.load().unwrap(), b"old");
+            assert!(same_inode(&lock_before, &old_duplicate.metadata().unwrap()));
+            drop(old_duplicate);
+            assert_eq!(
+                StateStore::open(&fixture.state).unwrap_err(),
+                "authority state is already open",
+                "closing the old duplicate released the successor's writer lock"
+            );
+            successor.replace(b"new").unwrap();
+            assert!(same_inode(&lock_before, &fs::metadata(&lock_path).unwrap()));
+            drop(successor);
+            assert_eq!(
+                StateStore::open(&fixture.state).unwrap().load().unwrap(),
+                b"new"
+            );
         }
 
         #[test]
