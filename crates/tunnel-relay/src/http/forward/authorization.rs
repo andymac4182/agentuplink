@@ -87,9 +87,28 @@ pub(crate) fn resource_origin(
     authority_is_plain(&authority).then(|| format!("https://{authority}"))
 }
 
-/// The `WWW-Authenticate` value for a refused consumer credential on an
-/// `http-forward` route, or `None` when the refusal is the relay's own fault
-/// (`503`), which is not a credential challenge.
+/// Add the protected-resource challenge to either initial authentication or
+/// a known token expiry before dispatch. Preserve the boundary's status and
+/// body, replacing any generic consumer challenge with exactly one header.
+pub(crate) fn with_bearer_challenge(
+    mut response: Response,
+    exports: &HttpForwardExports,
+    headers: &HeaderMap,
+    uri: &axum::http::Uri,
+    error: &OidcError,
+    scopes: &[String],
+) -> Response {
+    let origin = resource_origin(exports, headers, uri);
+    if let Some(challenge) = bearer_challenge(origin.as_deref(), uri.path(), error, scopes) {
+        response
+            .headers_mut()
+            .insert(header::WWW_AUTHENTICATE, challenge);
+    }
+    response
+}
+
+/// Format the protected-resource challenge without changing its credential
+/// verdict or the published scope set.
 pub(crate) fn bearer_challenge(
     origin: Option<&str>,
     resource_path: &str,
@@ -237,6 +256,45 @@ mod tests {
             .map(|value| value.to_str().expect("ASCII").to_owned())
             .as_deref(),
             Some("Bearer scope=\"http:invoke\"")
+        );
+    }
+
+    #[tokio::test]
+    async fn late_expiry_keeps_its_body_and_one_protected_resource_challenge() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, HeaderValue::from_static("relay.test"));
+        let uri = "/v1/devices/d/services/s/http/mcp".parse().expect("URI");
+        let response = with_bearer_challenge(
+            refused_consumer_token_response("consumer token expired before dispatch"),
+            &HttpForwardExports::new(),
+            &headers,
+            &uri,
+            &OidcError::ClaimsRejected,
+            &["http:invoke".to_owned()],
+        );
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            response
+                .headers()
+                .get_all(header::WWW_AUTHENTICATE)
+                .iter()
+                .count(),
+            1
+        );
+        assert_eq!(
+            response.headers()[header::WWW_AUTHENTICATE],
+            "Bearer error=\"invalid_token\", resource_metadata=\"https://relay.test/.well-known/oauth-protected-resource/v1/devices/d/services/s/http/mcp\", scope=\"http:invoke\""
+        );
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .expect("bounded body");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).expect("response JSON"),
+            serde_json::json!({
+                "code": "UNAUTHORIZED",
+                "execution": "not_dispatched",
+                "message": "consumer token expired before dispatch",
+            })
         );
     }
 

@@ -897,6 +897,15 @@ it must not be relabelled as success against a logical count.
 
 ## Filesystem API and framework interoperability
 
+The [M4-68 installed-framework rotation gate](m4-adapters-rotation.md) specifies
+the real 300-second run, independent host oracle, per-stream fence proof and
+revocation cases. At `3ebe8b48`, the corrected full gate passed locally in
+312.455 seconds after seven focused Rust controls and scoped strict checks.
+The first failed attempt, its exact 404 contract correction and both frozen
+artifact identities remain recorded. Full Node checks passed at 601 offline
+and 33 peer tests with all 58 inputs unchanged at this run. Final aggregate
+and hosted acceptance remain separate.
+
 Test the common path from each framework's native adapter through the shared TypeScript filesystem client, authenticated binary WebSocket, relay logical stream, and confined Rust 9P2000.L server. Use the endpoint discovery and session contract in [filesystem-api.md](filesystem-api.md); constructing a compatible-looking object or passing an in-process mock proves neither endpoint interoperability nor authorization. Consumer filesystem sockets are separate from the device's two steady-state sockets; monitor both classes so multiple mounted clients do not produce a false rotation-bound failure.
 
 ### Contract compilation and capability profiles

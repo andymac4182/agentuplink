@@ -3,7 +3,6 @@ use std::{convert::TryFrom, sync::Arc};
 use bytes::Buf;
 use http::{Request, StatusCode};
 
-use tokio::sync::mpsc::UnboundedSender;
 #[cfg(feature = "tracing")]
 use tracing::instrument;
 
@@ -20,7 +19,7 @@ use crate::{
         headers::Header,
     },
     qpack,
-    quic::{self, SendStream, StreamId},
+    quic::{self, SendStream},
     shared_state::{ConnectionState, SharedState},
 };
 
@@ -36,10 +35,56 @@ where
     #[doc(hidden)]
     // TODO: make this private
     pub frame_stream: FrameStream<C::BidiStream, B>,
-    pub(super) request_end_send: UnboundedSender<StreamId>,
+    pub(super) request_end: Arc<RequestEnd>,
     pub(super) send_grease_frame: bool,
     pub(super) max_field_section_size: u64,
     pub(super) shared: Arc<SharedState>,
+}
+
+// These guards are opt-in: existing resolve_request callers retain their API.
+// Construct the first guard before returning the future, so even an unpolled
+// future releases the request with a reset instead of an empty response FIN.
+struct RejectResolverOnDrop<C, B>
+where
+    C: quic::Connection<B>,
+    B: Buf,
+{
+    resolver: Option<RequestResolver<C, B>>,
+    error_code: Code,
+}
+
+impl<C, B> Drop for RejectResolverOnDrop<C, B>
+where
+    C: quic::Connection<B>,
+    B: Buf,
+{
+    fn drop(&mut self) {
+        if let Some(resolver) = self.resolver.take() {
+            resolver.reject(self.error_code);
+        }
+    }
+}
+
+struct RejectResolvedOnDrop<C, B>
+where
+    C: quic::Connection<B>,
+    B: Buf,
+{
+    stream: Option<RequestStream<C::BidiStream, B>>,
+    error_code: Code,
+}
+
+impl<C, B> Drop for RejectResolvedOnDrop<C, B>
+where
+    C: quic::Connection<B>,
+    B: Buf,
+{
+    fn drop(&mut self) {
+        if let Some(stream) = self.stream.as_mut() {
+            stream.stop_stream(self.error_code);
+            stream.stop_sending(self.error_code);
+        }
+    }
 }
 
 impl<C, B> ConnectionState for RequestResolver<C, B>
@@ -64,6 +109,70 @@ where
     C: quic::Connection<B>,
     B: Buf,
 {
+    /// Reject this request without resolving its headers or dispatching it.
+    /// Resets both stream directions and releases its ongoing-request entry.
+    pub fn reject(mut self, error_code: Code) {
+        self.frame_stream.reset(error_code.value());
+        self.frame_stream.stop_sending(error_code);
+    }
+
+    /// Resolve the request, resetting it with `error_code` if the returned
+    /// future is dropped before completion, including before its first poll.
+    /// Use `H3_REQUEST_REJECTED` only before application dispatch. Normal
+    /// successful resolution transfers ownership to the returned stream;
+    /// ordinary resolution errors retain their original error classification.
+    pub fn resolve_request_with_rejection_on_cancel(
+        self,
+        error_code: Code,
+    ) -> impl std::future::Future<
+        Output = Result<(Request<()>, RequestStream<C::BidiStream, B>), StreamError>,
+    > {
+        let mut unresolved = RejectResolverOnDrop {
+            resolver: Some(self),
+            error_code,
+        };
+        async move {
+            let frame = std::future::poll_fn(|cx| {
+                unresolved
+                    .resolver
+                    .as_mut()
+                    .expect("resolver retained until header frame completes")
+                    .frame_stream
+                    .poll_next(cx)
+            })
+            .await;
+            let resolver = unresolved
+                .resolver
+                .take()
+                .expect("resolver retained until header frame completes");
+            let ResolvedRequest {
+                request_stream,
+                decoded,
+                max_field_section_size,
+            } = resolver.accept_with_frame(frame)?;
+            let mut resolved = RejectResolvedOnDrop::<C, B> {
+                stream: Some(request_stream),
+                error_code,
+            };
+            let result = ResolvedRequest::<C, B>::resolve_parts(
+                resolved
+                    .stream
+                    .as_mut()
+                    .expect("stream retained during resolution"),
+                decoded,
+                max_field_section_size,
+            )
+            .await;
+            // Disarm on both success and an ordinary error: cancellation
+            // cleanup must not rewrite a malformed-request/protocol error.
+            let stream = resolved
+                .stream
+                .take()
+                .expect("stream retained during resolution");
+            result.map(|request| (request, stream))
+        }
+    }
+
     /// Returns a future to await the request headers and return a `Request` object
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     pub async fn resolve_request(
@@ -142,10 +251,7 @@ where
         };
 
         let request_stream = RequestStream {
-            request_end: Arc::new(RequestEnd {
-                request_end: self.request_end_send.clone(),
-                stream_id: self.frame_stream.send_id(),
-            }),
+            request_end: self.request_end,
             inner: connection::RequestStream::new(
                 self.frame_stream,
                 self.max_field_section_size,
@@ -195,11 +301,25 @@ where
     pub async fn resolve(
         mut self,
     ) -> Result<(Request<()>, RequestStream<C::BidiStream, B>), StreamError> {
-        let fields = match self.decoded {
+        let request = Self::resolve_parts(
+            &mut self.request_stream,
+            self.decoded,
+            self.max_field_section_size,
+        )
+        .await?;
+        Ok((request, self.request_stream))
+    }
+
+    async fn resolve_parts(
+        request_stream: &mut RequestStream<C::BidiStream, B>,
+        decoded: Result<qpack::Decoded, u64>,
+        max_field_section_size: u64,
+    ) -> Result<Request<()>, StreamError> {
+        let fields = match decoded {
             Ok(v) => v.fields,
             Err(cancel_size) => {
                 // Send and await the error response
-                self.request_stream
+                request_stream
                     .send_response(
                         http::Response::builder()
                             .status(StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE)
@@ -210,7 +330,7 @@ where
 
                 return Err(StreamError::HeaderTooBig {
                     actual_size: cancel_size,
-                    max_size: self.max_field_section_size,
+                    max_size: max_field_section_size,
                 });
             }
         };
@@ -230,8 +350,8 @@ where
                 //# Malformed requests or responses that are
                 //# detected MUST be treated as a stream error of type H3_MESSAGE_ERROR.
                 let error_code = Code::H3_MESSAGE_ERROR;
-                self.request_stream.stop_stream(error_code);
-                self.request_stream.stop_sending(error_code);
+                request_stream.stop_stream(error_code);
+                request_stream.stop_sending(error_code);
 
                 return Err(StreamError::StreamError {
                     code: error_code,
@@ -254,6 +374,6 @@ where
         #[cfg(feature = "tracing")]
         tracing::trace!("replying with: {:?}", req);
 
-        Ok((req, self.request_stream))
+        Ok(req)
     }
 }

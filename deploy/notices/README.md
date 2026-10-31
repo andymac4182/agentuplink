@@ -26,7 +26,8 @@ and bounded Redis rewrite checks; [the dated acceptance report](../../docs/m6-co
 records immutable image IDs, failed attempts, cleanup corrections and remaining
 distribution work.
 
-Eight locked crates omit standalone notice files from their crates.io archives:
+The initial eight supplements cover crates omitting standalone notice files
+from their crates.io archives:
 `asn1-rs-impl` 0.2.0, `agent-client-protocol`, `agent-client-protocol-derive` and
 `agent-client-protocol-http` 2.1.0, `agent-client-protocol-schema` 1.7.0 and
 `defmt-parser` 1.0.0, plus the test graph's `rmcp` 3.4.0 and `yasna` 0.5.2.
@@ -36,6 +37,20 @@ declared license. File URLs and SHA-256 hashes are retained. These are copied
 upstream bytes, not replacement license text or policy exceptions. A package
 upgrade must match a newly reviewed supplement or fail.
 
+Six more exact entries cover `jni` and `jni-macros` 0.22.4,
+`jni-sys-macros` 0.4.1, `valuable` 0.1.1, and `r-efi` 5.3.0/6.0.0.
+The first four use complete upstream license files from their packaged VCS
+commits. Both `r-efi` archives already contain their licensing text inside
+`AUTHORS`; the exact supplements retain that whole file, including its license
+grants, copyright and contributor list. An arbitrary `AUTHORS` file is not a
+notice candidate. The `r-efi` SPDX alternatives remain unchanged; preserving
+its grants and links does not establish that the full terms of every offered
+license are present. [Follow-up provenance](../../docs/m6-container-notice-followup-2026-10-31.md)
+records the exact bytes and unresolved cases. All 53 focused checks and the
+392-identity cached-source inventory smoke pass. Host-selected emitted bundles,
+including manifests, remain byte-identical to the earlier actual images, which
+were built with the initial eight-entry registry. No image was rebuilt here.
+
 Release archives use the same recursive collector and pinned supplement lookup.
 Their dependency inventory records the notice paths and supplement source URLs;
 an unresolved entry now carries `notice_status: "unresolved upstream notice
@@ -43,12 +58,14 @@ text"`. The archive dependency scope remains its existing Cargo metadata graph,
 including test and non-host dependencies. Unlike the container build, archives
 retain their existing expression-only allowance for unresolved upstream notice
 files. This is explicit remaining work, not complete archive notice coverage.
-Source inspection found additional omissions in `eventsource-stream` 0.2.3,
-`jni` and `jni-macros` 0.22.4, `jni-sys-macros` 0.4.1, `r-efi` 5.3.0 and
-6.0.0, `rustls-platform-verifier-android` 0.1.1 and `valuable` 0.1.1. The Android
-crate has no packaged VCS commit. These are outside the host-filtered notice
-smoke, and the full all-target graph must be reconciled separately. This change
-does not alter the platform or binary selection.
+After the six new entries, `eventsource-stream` 0.2.3 and
+`rustls-platform-verifier-android` 0.1.1 remain unresolved. The former's exact
+source records only a license expression; the latter has no packaged VCS
+commit and ships a generated Android archive whose source linkage is not
+attested. The cached-source inventory accounts for all 392 lock identities;
+it is not a fresh all-platform Cargo resolution or platform build. Hosted
+release acceptance remains separate, including the root-owned C249 checksum
+sidecar correction. This change does not alter platform or binary selection.
 
 The Redis image carries `/usr/local/share/licenses/agentuplink-redis/`. Its
 pinned base identifies the Redis 8.4.0 source archive using

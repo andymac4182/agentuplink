@@ -414,8 +414,8 @@ def package(root, target, sha, run, output, metadata, binaries=None):
                     record["notice_status"] = "unresolved upstream notice text"
                 else:
                     destination.mkdir(exist_ok=True)
-                for filename, data, url in supplements:
-                    target_notice = destination / filename
+                for notice_filename, data, url in supplements:
+                    target_notice = destination / notice_filename
                     target_notice.write_bytes(data)
                     record["notice_files"].append(target_notice.relative_to(staging).as_posix())
                     record.setdefault("notice_sources", []).append(url)

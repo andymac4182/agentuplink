@@ -289,7 +289,7 @@ async fn admit(
                 StatusCode::FORBIDDEN => "ACCESS_DENIED",
                 _ => "UNAUTHENTICATED",
             };
-            fs_error(refusal.status, code, refusal.message)
+            refusal.with_bearer_challenge(fs_error(refusal.status, code, refusal.message))
         })?;
     let device_id = parse_uuid(device).map_err(|()| {
         // A nonexistent and an undiscoverable export get the same external

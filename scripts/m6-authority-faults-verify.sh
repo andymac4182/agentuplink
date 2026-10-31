@@ -11,6 +11,13 @@
 
 set -euo pipefail
 
+# Validate every explicit artifact before even probing Docker. Frozen mode
+# consumes an already built test executable; the acceptance preparation records
+# the real locked build separately. Partial or invalid overrides are fatal.
+readonly ARTIFACT_SELECTOR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/m6-authority-fault-artifacts.py"
+ARTIFACT_MODE="$(python3 "${ARTIFACT_SELECTOR}" --mode)"
+readonly ARTIFACT_MODE
+
 readonly REDIS_IMAGE="redis:8.4.0-alpine@sha256:6cbef353e480a8a6e7f10ec545f13d7d3fa85a212cdcc5ffaf5a1c818b9d3798"
 
 if ! command -v docker >/dev/null 2>&1; then
@@ -147,9 +154,10 @@ export TUNNEL_CATALOG_REDIS_URL="${REDIS_URL}"
 export TUNNEL_AUTHORITY_REDIS_CONTAINER="${CONTAINER_NAME}"
 export TUNNEL_AUTHORITY_REDIS_OWNER="${RUN_ID}"
 
-cargo build --locked -p tunnel-authority -p tunnel-relay --bins
-cargo test --locked -p tunnel-test-harness --test m6_online_authority \
-    online_authority_fault_ -- --ignored --test-threads=1 --nocapture >"${GATE_LOG}" 2>&1 &
+if [[ "${ARTIFACT_MODE}" == source ]]; then
+    cargo build --locked -p tunnel-authority -p tunnel-relay --bins
+fi
+python3 "${ARTIFACT_SELECTOR}" --run-tests >"${GATE_LOG}" 2>&1 &
 harness_pid=$!
 set +e
 wait "${harness_pid}"

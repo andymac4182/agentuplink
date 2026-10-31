@@ -51,6 +51,8 @@ gate "independent online authority publication, mTLS and durable restart refusal
     online_authority_publishes_for_three_relays_and_fails_closed_across_lifecycle -- --ignored --exact --test-threads=1
 gate "online authority committed publication lost reply and real Redis restart refusal" \
   bash scripts/m6-authority-faults-verify.sh
+gate "shipped authority and recovery CLI across three configured relays and an older Redis backup" \
+  bash scripts/m6-authority-recovery-verify.sh
 gate "Redis recovery integration tests" \
   cargo test -p tunnel-catalog --test redis_recovery --locked -- --ignored --test-threads=1
 gate "Redis recovery-race integration tests" \

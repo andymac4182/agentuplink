@@ -233,9 +233,14 @@ pub use fs_write_restart::{
     FsWriteRestartEvidence, WriteRestartObservation, classify_held_outcome,
     validate_fs_write_restart_evidence, verify as verify_fs_write_restart,
 };
+mod fs_adapters_rotation;
 /// Gate 6's end-to-end half: the real `@agent-tunnel/client`, run by `node`,
 /// against this cluster's real relay and device sockets.
 mod fs_client_e2e;
+pub use fs_adapters_rotation::{
+    FsAdaptersRotationEvidence, validate_fs_adapters_rotation_evidence,
+    verify as verify_fs_adapters_rotation,
+};
 pub use fs_client_e2e::{
     DeviceLedger, FsClientE2eEvidence, validate_fs_client_e2e_evidence as validate_fs_client_e2e,
     verify as verify_fs_client_e2e,

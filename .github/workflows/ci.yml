@@ -31,6 +31,15 @@ jobs:
           python3 -m venv "$RUNNER_TEMP/mcp-audit"
           "$RUNNER_TEMP/mcp-audit/bin/pip" install pip-audit==2.10.1
           "$RUNNER_TEMP/mcp-audit/bin/pip-audit" --require-hashes --disable-pip --progress-spinner off --requirement tests/mcp-sdk-conformance/python/requirements.txt
+      # M3-50 preparation: exercise the fail-closed checker with seeded
+      # archives. The live universal licence gate remains blocked on explicit
+      # policy disposition; see docs/mcp-test-dependency-gate.md. This is not
+      # evidence that the real dependency graph satisfies the licence policy.
+      - name: Exercise MCP dependency gate failure controls
+        run: |
+          python3 -m venv "$RUNNER_TEMP/mcp-license-checker"
+          "$RUNNER_TEMP/mcp-license-checker/bin/pip" install --require-hashes --only-binary=:all: -r scripts/m3-test-dependency-gate-requirements.txt
+          "$RUNNER_TEMP/mcp-license-checker/bin/python" -m unittest discover -s scripts -p test_m3_test_dependency_gate.py -v
 
   typescript:
     name: TypeScript client and framework adapters
@@ -514,13 +523,15 @@ jobs:
           persist-credentials: false
       - name: Install Rust 1.95.0
         run: rustup toolchain install 1.95.0 --profile minimal
-      # Gate 6 runs the shared TypeScript client's own sources under node,
-      # which needs native type stripping (packages/client: node >= 24). The
-      # gate imports no npm package, so there is no install step.
-      - name: Install Node 24
+      # M4-68 executes installed frameworks across the actual 300-second
+      # policy interval, in addition to gate 6's dependency-free client.
+      - name: Install pinned Node for framework rotation
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: "24"
+          node-version-file: packages/client/.node-version
+      - name: Install exact framework dependencies
+        working-directory: packages/client
+        run: npm ci
       - name: Run M4 filesystem harness gates
         run: sh scripts/m4-harness-verify.sh
       # Task row M4-08's last gap: a real mount inside an export on Linux,

@@ -3722,6 +3722,7 @@ where
                                 .cancelled_streams
                                 .fetch_add(1, Ordering::AcqRel);
                         }
+                        resolver.reject(h3::error::Code::H3_REQUEST_REJECTED);
                         continue;
                     }
                 };
@@ -3841,7 +3842,12 @@ where
                             // dispatching; it is a bounded late-admission
                             // observation, not an application success.
                             if let Ok(Ok((_request, mut stream))) =
-                                timeout_at(drain_wait_deadline, resolver.resolve_request()).await
+                                timeout_at(
+                                    drain_wait_deadline,
+                                    resolver.resolve_request_with_rejection_on_cancel(
+                                        h3::error::Code::H3_REQUEST_REJECTED,
+                                    ),
+                                ).await
                             {
                                 stream.stop_sending(h3::error::Code::H3_REQUEST_REJECTED);
                                 stream.stop_stream(h3::error::Code::H3_REQUEST_REJECTED);
@@ -4043,6 +4049,7 @@ where
     let planned_token = planned.token.clone();
     let result = async {
         if !pin_provider.snapshot().contains(identity.spki_sha256()) {
+            resolver.reject(h3::error::Code::H3_REQUEST_CANCELLED);
             cancel.cancel();
             return Err(PeerTransportError::Authentication(
                 "peer SPKI pin was revoked".to_owned(),
@@ -4052,7 +4059,12 @@ where
             biased;
             _ = cancel.cancelled() => return Ok(()),
             _ = planned.token.cancelled() => return Ok(()),
-            result = timeout(limits.idle_timeout, resolver.resolve_request()) => {
+            result = timeout(
+                limits.idle_timeout,
+                resolver.resolve_request_with_rejection_on_cancel(
+                    h3::error::Code::H3_REQUEST_REJECTED,
+                ),
+            ) => {
                 result
                     .map_err(|_| PeerTransportError::Timeout)?
                     .map_err(|error| PeerTransportError::H3(error.to_string()))?
@@ -4108,6 +4120,10 @@ where
     );
     result
 }
+
+#[cfg(test)]
+#[path = "peer_resolver_lifecycle_tests.rs"]
+mod resolver_lifecycle_tests;
 
 #[cfg(test)]
 mod tests {

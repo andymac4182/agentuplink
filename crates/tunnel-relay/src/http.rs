@@ -1150,12 +1150,7 @@ async fn echo(
         }
     };
     if validated.expires_at <= Utc::now() {
-        return error_response(
-            StatusCode::UNAUTHORIZED,
-            "UNAUTHORIZED",
-            "consumer token expired before dispatch",
-            "not_dispatched",
-        );
+        return refused_consumer_token_response("consumer token expired before dispatch");
     }
     if let Some(response) = cluster_unready_response(&state) {
         return response;
@@ -1188,12 +1183,7 @@ async fn echo(
                             // The token was already accepted above; only
                             // re-framing it for the owner failed.  Same text
                             // as every other refused token (M6-C53).
-                            return error_response(
-                                StatusCode::UNAUTHORIZED,
-                                "UNAUTHORIZED",
-                                CONSUMER_TOKEN_REFUSED,
-                                "not_dispatched",
-                            );
+                            return refused_consumer_token_response(CONSUMER_TOKEN_REFUSED);
                         }
                     };
                 let envelope = RequestEnvelope::new(
@@ -2427,11 +2417,26 @@ async fn authenticate(
 /// same cause gets the same status and the same message on every route.
 /// `stage` is logged by the relay and never sent: the consumer is not told
 /// which check failed.
+/// `challenge` describes only the credential verdict; a grant denial and an
+/// unavailable verifier are never labelled as an insufficient token scope.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ConsumerRefusal {
     pub(crate) status: StatusCode,
     pub(crate) message: &'static str,
     pub(crate) stage: &'static str,
+    challenge: Option<&'static str>,
+}
+
+impl ConsumerRefusal {
+    fn with_bearer_challenge(self, mut response: Response) -> Response {
+        if let Some(challenge) = self.challenge {
+            response.headers_mut().insert(
+                header::WWW_AUTHENTICATE,
+                HeaderValue::from_static(challenge),
+            );
+        }
+        response
+    }
 }
 
 /// The message for every presented-but-refused credential.  It is true of
@@ -2459,17 +2464,20 @@ pub(crate) fn classify_consumer_refusal(error: &OidcError) -> ConsumerRefusal {
         status: StatusCode::UNAUTHORIZED,
         message: CONSUMER_TOKEN_REFUSED,
         stage,
+        challenge: Some("Bearer error=\"invalid_token\""),
     };
     match error {
         OidcError::Catalog(_) => ConsumerRefusal {
             status: StatusCode::SERVICE_UNAVAILABLE,
             message: "consumer authorization is unavailable",
             stage: "identity_lookup_unavailable",
+            challenge: None,
         },
         OidcError::MissingBearer => ConsumerRefusal {
             status: StatusCode::UNAUTHORIZED,
             message: "a consumer access token is required",
             stage: "bearer",
+            challenge: Some("Bearer"),
         },
         OidcError::InvalidToken => refused("token"),
         OidcError::DisallowedAlgorithm => refused("algorithm"),
@@ -2482,11 +2490,13 @@ pub(crate) fn classify_consumer_refusal(error: &OidcError) -> ConsumerRefusal {
             status: StatusCode::SERVICE_UNAVAILABLE,
             message: "consumer authorization is unavailable",
             stage: "verifier_configuration",
+            challenge: None,
         },
         OidcError::InsufficientScope => ConsumerRefusal {
             status: StatusCode::FORBIDDEN,
             message: "the consumer access token does not grant this route's scope",
             stage: "scope",
+            challenge: Some("Bearer error=\"insufficient_scope\""),
         },
     }
 }
@@ -2563,7 +2573,24 @@ fn consumer_authentication_response(error: &OidcError, route: &'static str) -> R
         StatusCode::FORBIDDEN => "FORBIDDEN",
         _ => "UNAUTHORIZED",
     };
-    error_response(refusal.status, code, refusal.message, "not_dispatched")
+    refusal.with_bearer_challenge(error_response(
+        refusal.status,
+        code,
+        refusal.message,
+        "not_dispatched",
+    ))
+}
+
+/// A token accepted at ingress was refused before dispatch. Keep this
+/// boundary's existing message while publishing the same safe challenge as
+/// the initial verifier, without manufacturing another refusal log event.
+fn refused_consumer_token_response(message: &'static str) -> Response {
+    classify_consumer_refusal(&OidcError::InvalidToken).with_bearer_challenge(error_response(
+        StatusCode::UNAUTHORIZED,
+        "UNAUTHORIZED",
+        message,
+        "not_dispatched",
+    ))
 }
 
 fn bearer(headers: &HeaderMap) -> &str {
@@ -5032,7 +5059,17 @@ fn peer_failure_response(error: PeerRuntimeError) -> Response {
             "unknown",
         ),
     };
-    error_response(status, code, "owner forwarding did not complete", execution)
+    let mut response = error_response(status, code, "owner forwarding did not complete", execution);
+    // This mapper is used only by consumer echo, stream and HTTP forwarding.
+    // The peer gives us a status, not its credential verdict: challenge a
+    // 401 without inventing an error, and never call an opaque 403 a scope
+    // failure (it can be an envelope or grant-policy refusal).
+    if status == StatusCode::UNAUTHORIZED {
+        response
+            .headers_mut()
+            .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
+    }
+    response
 }
 
 /// The consumer answer for a refusal from this relay's own actor, as the
@@ -6521,17 +6558,24 @@ mod consumer_authentication_status_tests {
         // The credential was never evaluated, so calling it rejected tells a
         // consumer holding good credentials that they were refused, and is
         // indistinguishable at the HTTP boundary from a real refusal.
-        let response = consumer_authentication_response(
-            &OidcError::Catalog(CatalogError::Conflict("catalog unreachable")),
-            "unit",
-        );
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-        let body = axum::body::to_bytes(response.into_body(), 1024)
-            .await
-            .expect("bounded body");
-        let body: serde_json::Value = serde_json::from_slice(&body).expect("response JSON");
-        assert_eq!(body["code"], "AUTHORIZATION_UNAVAILABLE");
-        assert_eq!(body["execution"], "not_dispatched");
+        for error in [
+            OidcError::Catalog(CatalogError::Conflict("catalog unreachable")),
+            OidcError::InvalidConfiguration,
+        ] {
+            let response = consumer_authentication_response(&error, "unit");
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert!(
+                !response
+                    .headers()
+                    .contains_key(super::header::WWW_AUTHENTICATE)
+            );
+            let body = axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .expect("bounded body");
+            let body: serde_json::Value = serde_json::from_slice(&body).expect("response JSON");
+            assert_eq!(body["code"], "AUTHORIZATION_UNAVAILABLE");
+            assert_eq!(body["execution"], "not_dispatched");
+        }
     }
 
     #[tokio::test]
@@ -6555,6 +6599,23 @@ mod consumer_authentication_status_tests {
                 StatusCode::UNAUTHORIZED,
                 "an evaluated credential failure must stay a rejection"
             );
+            let expected = if matches!(error, OidcError::MissingBearer) {
+                "Bearer"
+            } else {
+                "Bearer error=\"invalid_token\""
+            };
+            assert_eq!(
+                response
+                    .headers()
+                    .get_all(super::header::WWW_AUTHENTICATE)
+                    .iter()
+                    .count(),
+                1
+            );
+            assert_eq!(
+                response.headers()[super::header::WWW_AUTHENTICATE],
+                expected
+            );
             let body = axum::body::to_bytes(response.into_body(), 1024)
                 .await
                 .expect("bounded body");
@@ -6562,6 +6623,65 @@ mod consumer_authentication_status_tests {
             assert_eq!(body["code"], "UNAUTHORIZED");
             assert_eq!(body["execution"], "not_dispatched");
         }
+    }
+
+    #[tokio::test]
+    async fn late_consumer_token_refusals_keep_their_body_and_publish_invalid_token() {
+        for message in [
+            "consumer token expired before dispatch",
+            super::CONSUMER_TOKEN_REFUSED,
+        ] {
+            let response = super::refused_consumer_token_response(message);
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            assert_eq!(
+                response.headers()[super::header::WWW_AUTHENTICATE],
+                "Bearer error=\"invalid_token\""
+            );
+            let body = axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .expect("bounded body");
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&body).expect("response JSON"),
+                serde_json::json!({
+                    "code": "UNAUTHORIZED", "execution": "not_dispatched", "message": message,
+                })
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn opaque_peer_refusals_challenge_only_401_without_inventing_a_scope_verdict() {
+        for status in [StatusCode::UNAUTHORIZED, StatusCode::FORBIDDEN] {
+            let response =
+                super::peer_failure_response(super::PeerRuntimeError::RemoteStatus(status));
+            assert_eq!(response.status(), status);
+            let challenge = response.headers().get(super::header::WWW_AUTHENTICATE);
+            assert_eq!(
+                challenge.and_then(|value| value.to_str().ok()),
+                (status == StatusCode::UNAUTHORIZED).then_some("Bearer")
+            );
+            let body = axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .expect("bounded body");
+            let body: serde_json::Value = serde_json::from_slice(&body).expect("response JSON");
+            assert_eq!(body["execution"], "not_dispatched");
+            assert_eq!(body["message"], "owner forwarding did not complete");
+            assert_eq!(
+                body["code"],
+                if status == StatusCode::UNAUTHORIZED {
+                    "UNAUTHORIZED"
+                } else {
+                    "FORBIDDEN"
+                }
+            );
+        }
+        let grant = super::local_consumer_admission_response("unit", super::RelayError::Forbidden);
+        assert_eq!(grant.status(), StatusCode::FORBIDDEN);
+        assert!(
+            !grant
+                .headers()
+                .contains_key(super::header::WWW_AUTHENTICATE)
+        );
     }
 }
 
