@@ -68,7 +68,7 @@ mkdir -p "$C11_CHILD_FAILURE_DIR"
 # CPU hogs they fail four times out of four with `Database(timed out)` during
 # fixture setup, and they pass every standalone run.  The product bound is not
 # the thing to relax, so the schedule is.
-SERIAL='credential-expiry|recovery-attempts|goaway|peer-capacity|timing-boundaries|queue-saturation|og02|c11-diagnostics|chaos|tunnel-catalog'
+SERIAL='credential-expiry|recovery-attempts|goaway|peer-capacity|timing-boundaries|queue-saturation|og02|c11-diagnostics|chaos|tunnel-catalog|membership_publisher_tls'
 
 python3 - "$REPO/scripts/m7-harness-verify.sh" <<'PY' > "$out/gates.list"
 import re, sys

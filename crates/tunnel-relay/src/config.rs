@@ -339,6 +339,13 @@ pub struct ClusterConfig {
     )]
     pub checkpoint_authority_trust_path: PathBuf,
 
+    /// Optional HTTPS client identity, separate from membership signing trust.
+    /// Both paths must be configured together. Required by an mTLS authority.
+    #[serde(default)]
+    pub checkpoint_authority_client_cert_chain: Option<PathBuf>,
+    #[serde(default)]
+    pub checkpoint_authority_client_private_key: Option<PathBuf>,
+
     /// Required local high-water fence file.  The relay opens this path in
     /// persisted cluster mode and never silently creates an empty state.
     #[serde(
@@ -460,6 +467,21 @@ impl ClusterConfig {
             &self.checkpoint_authority_trust_path,
             "cluster.checkpoint_authority_trust_path",
         )?;
+        match (
+            &self.checkpoint_authority_client_cert_chain,
+            &self.checkpoint_authority_client_private_key,
+        ) {
+            (Some(chain), Some(key)) => {
+                validate_config_path(chain, "cluster.checkpoint_authority_client_cert_chain")?;
+                validate_config_path(key, "cluster.checkpoint_authority_client_private_key")?;
+            }
+            (None, None) => {}
+            _ => {
+                return Err(ConfigError::Invalid(
+                    "cluster checkpoint authority client certificate and private key must be set together",
+                ));
+            }
+        }
         validate_config_path(
             &self.membership_version_state_path,
             "cluster.membership_version_state_path",
@@ -2479,5 +2501,40 @@ consumer_tls_private_key = "consumer-key.pem"
         let input = valid_cluster_toml().replace("allowed_ports = [8443]", "allowed_ports = [0]");
         let error = ServeConfig::parse(&input).expect_err("accepted zero endpoint port");
         assert!(error.to_string().contains("unique and nonzero"));
+    }
+
+    #[test]
+    fn checkpoint_client_identity_paths_are_optional_and_paired() {
+        let input = valid_cluster_toml();
+        let legacy = ServeConfig::parse(&input).unwrap();
+        assert!(
+            legacy
+                .cluster
+                .unwrap()
+                .checkpoint_authority_client_cert_chain
+                .is_none()
+        );
+        let anchor = "checkpoint_authority_trust_path = \"checkpoint-ca.pem\"";
+        for fields in [
+            "checkpoint_authority_client_cert_chain = \"client.pem\"",
+            "checkpoint_authority_client_private_key = \"client.key\"",
+            "checkpoint_authority_client_cert_chain = \"\"\ncheckpoint_authority_client_private_key = \"client.key\"",
+        ] {
+            assert!(
+                ServeConfig::parse(&input.replace(anchor, &format!("{anchor}\n{fields}"))).is_err()
+            );
+        }
+        let paired = input.replace(anchor, &format!(
+            "{anchor}\ncheckpoint_authority_client_cert_chain = \"client.pem\"\ncheckpoint_authority_client_private_key = \"client.key\""
+        ));
+        let cluster = ServeConfig::parse(&paired).unwrap().cluster.unwrap();
+        assert_eq!(
+            cluster.checkpoint_authority_client_cert_chain.as_deref(),
+            Some(Path::new("client.pem"))
+        );
+        assert_eq!(
+            cluster.checkpoint_authority_client_private_key.as_deref(),
+            Some(Path::new("client.key"))
+        );
     }
 }

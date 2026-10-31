@@ -178,7 +178,9 @@ validate the combined candidate and release artifacts. The M6-C22 offline
 recovery signer is implemented and has local CLI and real-Redis recovery
 evidence; optimized release builds, the full operator session and hosted
 platform checks remain owed. Implement and verify the membership publisher and
-checkpoint service next, including compatible checkpoint client authentication.
+checkpoint service next. Compatible checkpoint client authentication and explicit
+publisher Redis TLS are implemented as the M6-C231 transport prerequisite;
+combined acceptance remains tracked in that row.
 The signer alone does not close the cluster-authority or durable-recovery goals.
 Keep the production goal open while required gates or deployment inputs remain
 unresolved.

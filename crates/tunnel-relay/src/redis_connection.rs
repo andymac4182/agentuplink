@@ -476,7 +476,9 @@ fn reject_insecure_tls_url(redis_url: &str) -> Result<(), RedisConnectionError> 
     Ok(())
 }
 
-fn read_material(
+// Also used for checkpoint client material; that boundary maps these internal
+// field-labelled failures to its own payload-free authority error.
+pub(crate) fn read_material(
     path: &Path,
     kind: RedisTlsMaterialKind,
     private: bool,
