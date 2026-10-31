@@ -39,8 +39,8 @@ Fly profile is an intermediate step, not a reduction of that requirement.
 | P0 | Deliver the external cluster and recovery authority | M6-C22; no `tunnel-authority` workspace member | Shipped signing/publishing/checkpoint commands and executed recovery/cluster procedures |
 | P0 | Verify the credential-rotation procedure before expiry | M6-C56; same-device renewal remains owner-deferred because the relay cannot register its new SPKI. Re-enrolment as a new device is the approved workaround | Execute re-enrolment, grant migration, old-device revocation and restart; deliver same-device renewal separately when taken up |
 | P0 | Prove durable recovery | M6-C82; the single-relay continuity witness is process-local | Simultaneous restart recovers with an independent witness; rollback remains refused; restore drill completed |
-| P0 | Preserve quiet forwarded sessions across peer idle expiry | M6-C229; quiet control closes at fixture peer idle despite WebSocket Pongs; production timeout is 60 s | Real quiet-session proof beyond the production idle window, compatible heartbeat and vanished-device controls |
-| P0 | End vanished forwarded device sessions | M6-C68; non-owner ingress control path lacks liveness enforcement | Real cluster network-cut test releases ownership and reconnects within the declared bound |
+| P0 | Preserve quiet forwarded sessions across peer idle expiry | M6-C229; compatible owner heartbeat fix and real positive/red controls pass; full acceptance pending | Real quiet-session proof beyond the production idle window, compatible heartbeat and vanished-device controls |
+| P0 | End vanished forwarded device sessions | M6-C68; ingress timeout implemented; real positive/red controls pass | Real cluster network-cut test releases ownership and reconnects within the declared bound |
 | P1 | Stabilize cluster membership and key changes | M7-C80/C81/C83/C86/C131/C150; M8-C46/C47/C48/C61 | Repeatable re-sign, trust-expiry, rotation and restart acceptance |
 | P1 | Finish limits and real adapter acceptance | M4-21/68/70/72/73/74; M3-12/13/37/41/42/44 | Enforced advertised limits, long-lived stream behavior and framework clients across peer hops/rotation/revocation |
 | P1 | Establish load and recovery budgets | M6-03/C125/C126/C183/C192/C201 | Off-host multi-tenant load and soak at declared capacity, with explicit latency/error/recovery targets |
@@ -92,7 +92,9 @@ Fly profile is an intermediate step, not a reduction of that requirement.
   This proves a local container deployment, not the live Fly machines.
 - M1 real-socket acceptance and M2 accelerated rotation/fault gates passed.
   Three actual 300-second rotations also passed with 18,913 records. The full
-  M7 suite is running separately.
+  M7 is being rerun for the final heartbeat change. An earlier local attempt
+  stopped at an absent uuidgen utility after its Redis integration tests passed;
+  a local Python UUID helper supplies that test-environment prerequisite.
 - Actual Fly credentials, deployed image, certificates, Redis backup state and
   monitoring are not available through the environment's configured identities.
   Repository deployment notes are historical evidence, not a live inspection.
@@ -102,7 +104,15 @@ Fly profile is an intermediate step, not a reduction of that requirement.
 - M6-C68: forwarded device control now sends heartbeats and expires silent
   devices, cancelling both peer halves on exit. Three deterministic scheduler
   tests cover silence, continuing owner output and a Pong at the deadline.
-  A real cluster network-cut/reconnect test is still needed; this row is open.
+  A real three-relay test now proves 70 seconds of healthy idleness followed
+  by remote owner release within 30.05 seconds of a control-path blackhole and
+  fresh same-device echo within 30.15 seconds. Disabling just the ingress
+  timeout leaves OWNER_BUSY beyond 35 seconds. Full acceptance is still owed.
+- M6-C229: the owner now sends existing protocol PING/PONG heartbeats while
+  retaining an absolute inbound-only peer deadline. Without this fix, the
+  regression closes a healthy session at 59.99 seconds despite answered WS
+  Pings. With both fixes, 70-second quiet sessions and subsequent network-cut
+  recovery pass. The combined real gate is registered in the M7 script.
 - M6-C222: the Fly Redis image now limits the dataset to 160 MiB with
   `noeviction`; the container proof exercises refusal without eviction.
 - M6-C223: the restore procedure requires reconciliation of later revocations

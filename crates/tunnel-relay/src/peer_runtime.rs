@@ -2363,6 +2363,13 @@ pub struct InboundPeerRecv {
 }
 
 impl InboundPeerRecv {
+    /// Configured peer idle bound. Control heartbeats use a shorter cadence
+    /// while retaining this bound for a peer that stops sending anything.
+    #[must_use]
+    pub fn idle_timeout(&self) -> Duration {
+        self.recv.idle_timeout()
+    }
+
     /// Return the peer identity for owner-side diagnostics.
     #[must_use]
     pub fn identity(&self) -> &TlsIdentity {

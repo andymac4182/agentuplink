@@ -3592,29 +3592,71 @@ async fn handle_peer_device_control(
     let welcome = registration.welcome;
     let mut outbound = registration.rx;
     let mut cleanup = handle.control_cleanup_guard(key.clone());
+    let peer_idle_timeout = recv.idle_timeout();
+    let mut last_peer_inbound = tokio::time::Instant::now();
+    let mut pings = peer_control_ping_ticker(peer_idle_timeout);
     let result: Result<(), PeerRuntimeError> = async {
         send.respond(StatusCode::OK).await?;
         send.send_message(PeerRecordKind::CompleteControlText, welcome.as_bytes())
             .await?;
         loop {
-            tokio::select! {
-                inbound = recv.recv_message() => {
-                    let Some(record) = inbound? else { break; };
+            // A ticker or owner output must not restart the peer's receive
+            // timeout. Keep one absolute deadline until a peer frame arrives.
+            let deadline = last_peer_inbound + peer_idle_timeout;
+            match next_peer_control_event(
+                recv.recv_message_until(deadline),
+                outbound.recv(),
+                &mut pings,
+                deadline,
+            )
+            .await
+            {
+                PeerControlEvent::Inbound(inbound) => {
+                    let Some(record) = inbound? else {
+                        break;
+                    };
+                    last_peer_inbound = tokio::time::Instant::now();
                     if record.kind() != PeerRecordKind::CompleteControlText {
                         break;
                     }
-                    let message = wire::parse_control(record.body()).map_err(|_| PeerRuntimeError::Closed)?;
-                    handle.inbound_control(key.clone(), message).await.map_err(|_| PeerRuntimeError::Closed)?;
+                    let message =
+                        wire::parse_control(record.body()).map_err(|_| PeerRuntimeError::Closed)?;
+                    handle
+                        .inbound_control(key.clone(), message)
+                        .await
+                        .map_err(|_| PeerRuntimeError::Closed)?;
                 }
-                item = outbound.recv() => {
-                    match item {
-                        Some(crate::actor::ControlOutbound::Text(mut text)) => {
-                            let sent = send.send_message(PeerRecordKind::CompleteControlText, text.as_bytes()).await;
-                            text.release();
-                            sent?;
-                        }
-                        Some(crate::actor::ControlOutbound::Close) | None => break,
+                PeerControlEvent::Outbound(item) => match item {
+                    Some(crate::actor::ControlOutbound::Text(mut text)) => {
+                        let sent = send
+                            .send_message(PeerRecordKind::CompleteControlText, text.as_bytes())
+                            .await;
+                        text.release();
+                        sent?;
                     }
+                    Some(crate::actor::ControlOutbound::Close) | None => break,
+                },
+                PeerControlEvent::Ping => {
+                    // WebSocket Pongs terminate at the ingress. This existing
+                    // protocol PING reaches the device through the peer hop;
+                    // its PONG keeps the otherwise quiet H3 request alive.
+                    // Session and epoch, not a changing data generation, bind
+                    // it across rotation. Both supported device clients
+                    // already answer this protocol message.
+                    let ping = wire::encode_control_message(
+                        &tunnel_protocol::ControlMessage::Ping(tunnel_protocol::Ping::new(
+                            wire::random_token(),
+                            key.session_id.clone(),
+                            key.epoch,
+                            Uuid::new_v4().as_u64_pair().0,
+                        )),
+                    )
+                    .map_err(|_| PeerRuntimeError::Closed)?;
+                    send.send_message(PeerRecordKind::CompleteControlText, ping.as_bytes())
+                        .await?;
+                }
+                PeerControlEvent::IdleTimeout => {
+                    return Err(PeerRuntimeError::Transport(PeerTransportError::Timeout));
                 }
             }
         }
@@ -3639,6 +3681,49 @@ async fn handle_peer_device_control(
         Ok(()) => send.finish().await,
         Err(error) => Err(error),
     }
+}
+
+/// The owner must keep a quiet peer control stream active without allowing
+/// its own writes to extend the inbound idle bound.
+enum PeerControlEvent<P, O> {
+    Inbound(P),
+    Outbound(O),
+    Ping,
+    IdleTimeout,
+}
+
+async fn next_peer_control_event<F, P, G, O>(
+    inbound: F,
+    outbound: G,
+    pings: &mut tokio::time::Interval,
+    deadline: tokio::time::Instant,
+) -> PeerControlEvent<P, O>
+where
+    F: std::future::Future<Output = P>,
+    G: std::future::Future<Output = O>,
+{
+    tokio::select! {
+        biased;
+        // Buffered inbound traffic wins a simultaneous deadline. Otherwise
+        // neither periodic heartbeats nor a busy owner can starve expiry.
+        received = inbound => PeerControlEvent::Inbound(received),
+        () = tokio::time::sleep_until(deadline) => PeerControlEvent::IdleTimeout,
+        _ = pings.tick() => PeerControlEvent::Ping,
+        item = outbound => PeerControlEvent::Outbound(item),
+    }
+}
+
+fn peer_control_ping_ticker(peer_idle_timeout: Duration) -> tokio::time::Interval {
+    // Configured peer idle bounds are 1..=60 seconds. Dividing in Duration
+    // retains a subsecond cadence at the one-second minimum. The transport
+    // API also accepts smaller positive test bounds; never pass interval_at
+    // a zero period when their division rounds down.
+    let period = DEVICE_CONTROL_PING_INTERVAL
+        .min(peer_idle_timeout / 3)
+        .max(Duration::from_nanos(1));
+    let mut pings = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+    pings.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    pings
 }
 
 async fn handle_peer_device_data(
@@ -5442,6 +5527,100 @@ mod tests {
             liveness.deadline(),
             tokio::time::Instant::now() + super::DEVICE_CONTROL_IDLE_TIMEOUT,
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn peer_control_heartbeats_keep_the_configured_inbound_deadline() {
+        use super::{PeerControlEvent, next_peer_control_event, peer_control_ping_ticker};
+        // Exercise both validated configuration endpoints. In particular,
+        // integer-second division must not turn the one-second bound into a
+        // zero-period ticker, and emitted heartbeats cannot defer expiry.
+        for seconds in [1, 60] {
+            let idle = std::time::Duration::from_secs(seconds);
+            let admitted = tokio::time::Instant::now();
+            let deadline = admitted + idle;
+            let mut pings = peer_control_ping_ticker(idle);
+            let mut ping_count = 0;
+            loop {
+                let event = next_peer_control_event(
+                    std::future::pending::<()>(),
+                    std::future::pending::<()>(),
+                    &mut pings,
+                    deadline,
+                )
+                .await;
+                match event {
+                    PeerControlEvent::Ping => {
+                        ping_count += 1;
+                        assert!(tokio::time::Instant::now() < deadline);
+                        assert!(ping_count <= 6, "heartbeats must not postpone expiry");
+                    }
+                    PeerControlEvent::IdleTimeout => break,
+                    _ => panic!("neither pending stream can produce an event"),
+                }
+            }
+            assert!(ping_count >= 2, "multiple heartbeats precede idle expiry");
+            assert_eq!(tokio::time::Instant::now(), deadline);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn peer_control_busy_owner_cannot_starve_heartbeat_or_expiry() {
+        use super::{PeerControlEvent, next_peer_control_event, peer_control_ping_ticker};
+        let idle = std::time::Duration::from_secs(60);
+        let deadline = tokio::time::Instant::now() + idle;
+        let mut pings = peer_control_ping_ticker(idle);
+        assert!(matches!(
+            next_peer_control_event(
+                std::future::pending::<()>(),
+                std::future::ready(()),
+                &mut pings,
+                deadline,
+            )
+            .await,
+            PeerControlEvent::Outbound(()),
+        ));
+        tokio::time::advance(super::DEVICE_CONTROL_PING_INTERVAL).await;
+        assert!(matches!(
+            next_peer_control_event(
+                std::future::pending::<()>(),
+                std::future::ready(()),
+                &mut pings,
+                deadline,
+            )
+            .await,
+            PeerControlEvent::Ping,
+        ));
+        tokio::time::advance(idle - super::DEVICE_CONTROL_PING_INTERVAL).await;
+        assert!(matches!(
+            next_peer_control_event(
+                std::future::pending::<()>(),
+                std::future::ready(()),
+                &mut pings,
+                deadline,
+            )
+            .await,
+            PeerControlEvent::IdleTimeout,
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn peer_control_buffered_inbound_wins_a_simultaneous_deadline() {
+        use super::{PeerControlEvent, next_peer_control_event, peer_control_ping_ticker};
+        let idle = std::time::Duration::from_secs(60);
+        let deadline = tokio::time::Instant::now() + idle;
+        let mut pings = peer_control_ping_ticker(idle);
+        tokio::time::advance(idle).await;
+        assert!(matches!(
+            next_peer_control_event(
+                std::future::ready("buffered inbound"),
+                std::future::ready(()),
+                &mut pings,
+                deadline,
+            )
+            .await,
+            PeerControlEvent::Inbound("buffered inbound"),
+        ));
     }
 
     use super::{

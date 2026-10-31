@@ -188,6 +188,16 @@ Terminate device mTLS in the Rust device listener in the initial deployment. A p
 
 ## Peer topology and HTTP/3 listener
 
+Forwarded device control has separate device-path and peer-path heartbeats
+(M6-C68/M6-C229). The ingress sends WebSocket Pings every 10 seconds and expires
+30 seconds without device input, cancelling both peer halves to release the
+remote owner. WebSocket Pongs terminate at the ingress. To keep a healthy quiet
+H3 control stream active, the owner sends the existing protocol `PING` at
+`min(10 seconds, peer_idle_timeout / 3)` and the device's protocol `PONG` traverses
+the hop. The owner uses one absolute receive deadline, renewed only by inbound
+records; neither its ticker nor outbound traffic resets it. Peer admission,
+signed-trust expiry, device authorization and owner fencing still apply.
+
 Use bounded on-demand direct connections. Relay A opens one outgoing HTTP/3 connection to relay B when A needs to forward work; B may separately open one outgoing connection to A. Reuse each outgoing connection for many HTTP requests, and retire idle connections after 60 seconds. Limit simultaneous connection attempts per destination to one and aggregate attempts globally. Back off with jitter after failures.
 
 At 32 nodes, the steady-state ceiling is 31 outgoing plus 31 incoming peer connections per node. Permit at most four additional key-rotation replacement connections per node across both directions, each subject to the 30-second drain budget; additional work returns overload before allocating payload queues. A fully connected deployment is the maximum observed topology, not a requirement to eagerly dial every peer at startup. There is no gossip routing or transitive trust.

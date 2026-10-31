@@ -96,6 +96,18 @@ Control messages use bounded UTF-8 JSON WebSocket messages for initial inspectab
 | `GOAWAY` | Stop admitting new streams and begin bounded shutdown. |
 | `PRINCIPAL_SESSIONS_END` | Owner to device, advisory (task row M3-16): one consumer's authorization for one service ended, so the export ends that consumer's application sessions. See below. |
 
+For a device connected through another relay, the ingress enforces the same
+10-second WebSocket Ping and 30-second inbound-silence bound. Owner output never
+renews that device deadline. Expiry cancels both peer stream halves before the
+bounded WebSocket close, allowing the owner to release its session (M6-C68).
+The owner additionally sends protocol `PING` messages through the peer hop at
+the shorter of 10 seconds and one third of its configured peer idle timeout
+(M6-C229). The device answers with the existing session/epoch-bound `PONG`.
+These messages keep a quiet peer stream active across data rotations; they
+neither authorize operations nor extend a grant or owner lease. Only inbound
+peer records move the owner's absolute receive deadline. Heartbeat writes and
+other owner output cannot keep a silent ingress alive.
+
 **`PRINCIPAL_SESSIONS_END`** (task row M3-16, applied by default pending owner confirmation, 2026-09-25) carries `message_id`, `session_id`, `epoch` (decimal string), `service_id`, `principal_binding` and `reason` (`AUTHORIZATION_REVOKED`). The binding is the opaque 32-hex-digit value the relay already puts on each of that consumer's requests to a session-keyed export (M3-04, [mcp.md](mcp.md#the-principal-binding)); the message never names an identity. The owner relay records, per device session, each consumer it admitted to such an export (at most 64 per session; one past that keeps working and falls back to the export's idle expiry). It re-reads each one's grant from the catalog about once a second. When the grant is gone, expired or no longer allows `http:invoke`, it sends the message once and stops watching. A catalog read that fails ends nothing. The device ignores a message for another session or epoch, and otherwise ends every session the named export holds for that binding: a stdio session's child process group is killed, and a Streamable HTTP export forgets the backend sessions it bound to it. Nothing else is touched, and a second message ends nothing. The message is **not** the authorization decision, which the relay enforces on every request independently. It is not journaled or replayed, and a device session that ends first takes the watches with it; either way the affected sessions fall back to the export's `session_idle_seconds`. A connector that predates the message would refuse it as an unknown kind and end its whole session. The owner therefore sends it **only** to a connector that advertised `principal-sessions-end-v1` in `HELLO`'s `features` (this repository's M2 connector does). For any other connector the revocation is counted as `principal_sessions_end_unsupported`, and its sessions fall back to idle expiry. On the same revocation, the owner refuses any request of that consumer held across a rotation freeze (M3-15), with `Forbidden`, `not_dispatched`, counted as `refused_on_revocation`, so the request is not admitted after the freeze with the grant it was held with. Watched grants are re-read at most 32 at a time per relay, each about every 1 to 1.5 s (a 1 s interval plus up to 500 ms of jitter).
 
 `OPEN` names an advertised adapter and an allowed operation, not an arbitrary local executable, filesystem root or network URL. The connector independently enforces its local allowlist. Adapter metadata is bounded and validated before work starts.
