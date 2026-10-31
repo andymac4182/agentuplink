@@ -43,7 +43,7 @@ Symlink components, parent traversal and hard links are refused. Run the offline
 Use canonical absolute paths; `/var/run` and some macOS temporary paths are symlinks. The
 service does not chmod, create directories or repair unexpected files.
 
-The Redis credential file contains a single `rediss://USER:PASSWORD@HOST:PORT/0`
+The Redis credential file contains a single `rediss://<user>:<password>@HOST:PORT/0`
 URL. Use a named ACL user with a nonempty password, percent-encoded as required
 by URL syntax. The client verifies the explicit Redis CA and server name. If
 Redis requires mTLS, configure both Redis client identity paths. Grant only
