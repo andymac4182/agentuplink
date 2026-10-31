@@ -77,14 +77,35 @@ pub async fn verify() -> Result<FsAdaptersRotationEvidence> {
     let mut cluster = match ProductionCluster::start(&mut harness).await {
         Ok(cluster) => cluster,
         Err(error) => {
-            let _ = harness.shutdown().await;
-            return Err(error);
+            let mut errors = Vec::new();
+            push_cleanup_error(
+                &mut errors,
+                "catalog setup cleanup",
+                harness
+                    .shutdown_until(tokio::time::Instant::now() + CLEANUP_TIMEOUT)
+                    .await,
+            );
+            return finish_scenario_with_cleanup(Err(error), errors);
         }
     };
     let scenario = run(&mut cluster, &harness).await;
     let mut errors = Vec::new();
-    push_cleanup_error(&mut errors, "relay cleanup", cluster.shutdown().await);
-    push_cleanup_error(&mut errors, "catalog cleanup", harness.shutdown().await);
+    push_cleanup_error(
+        &mut errors,
+        "relay cleanup",
+        cluster
+            .shutdown_until(tokio::time::Instant::now() + CLEANUP_TIMEOUT)
+            .await,
+    );
+    // Each later resource still gets a bounded cleanup attempt if an earlier
+    // one used its entire allowance. Never return early on a cleanup error.
+    push_cleanup_error(
+        &mut errors,
+        "catalog cleanup",
+        harness
+            .shutdown_until(tokio::time::Instant::now() + CLEANUP_TIMEOUT)
+            .await,
+    );
     let mut evidence = finish_scenario_with_cleanup(scenario, errors)?;
     evidence.cleanup_joined = true;
     if let Err(error) = validate_fs_adapters_rotation_evidence(&evidence) {
@@ -169,7 +190,7 @@ async fn run(
         .ok_or_else(|| fail("owner not running"))?
         .device_addr;
     let profiles = tempfile::tempdir().map_err(HarnessError::Io)?;
-    let proxy = TcpProxy::bind(device_addr, ProxyConfig::default()).await?;
+    let mut proxy = TcpProxy::bind(device_addr, ProxyConfig::default()).await?;
     let prepared: Result<_> = (|| {
         let mut profile = write_device_profile(
             profiles.path(),
@@ -213,7 +234,13 @@ async fn run(
         Ok(profile) => profile,
         Err(error) => {
             let mut errors = Vec::new();
-            push_cleanup_error(&mut errors, "proxy setup cleanup", proxy.shutdown().await);
+            push_cleanup_error(
+                &mut errors,
+                "proxy setup cleanup",
+                proxy
+                    .shutdown_until(tokio::time::Instant::now() + CLEANUP_TIMEOUT)
+                    .await,
+            );
             return finish_scenario_with_cleanup(Err(error), errors);
         }
     };
@@ -231,8 +258,15 @@ async fn run(
     let mut client = match connected {
         Ok(Ok(client)) => client,
         _ => {
-            let _ = proxy.shutdown().await;
-            return Err(fail("connector startup failed"));
+            let mut errors = Vec::new();
+            push_cleanup_error(
+                &mut errors,
+                "proxy startup cleanup",
+                proxy
+                    .shutdown_until(tokio::time::Instant::now() + CLEANUP_TIMEOUT)
+                    .await,
+            );
+            return finish_scenario_with_cleanup(Err(fail("connector startup failed")), errors);
         }
     };
     let mut drivers = Vec::new();
@@ -295,8 +329,25 @@ async fn run(
         Ok(result) => result.map_err(|_| fail("connector cleanup failed")),
         Err(_) => Err(fail("connector cleanup deadline")),
     };
+    let retry_join = stopped.is_err();
     push_cleanup_error(&mut errors, "connector cleanup", stopped);
-    push_cleanup_error(&mut errors, "proxy cleanup", proxy.shutdown().await);
+    push_cleanup_error(
+        &mut errors,
+        "proxy cleanup",
+        proxy
+            .shutdown_until(tokio::time::Instant::now() + CLEANUP_TIMEOUT)
+            .await,
+    );
+    if retry_join {
+        // stop() retains its join handle when its caller times out. Closing
+        // the transport may unblock it; retain and join that same supervisor,
+        // without erasing the initial cleanup failure or restarting anything.
+        let joined = match timeout(CLEANUP_TIMEOUT, client.stop()).await {
+            Ok(result) => result.map_err(|_| fail("connector final join failed")),
+            Err(_) => Err(fail("connector final join deadline")),
+        };
+        push_cleanup_error(&mut errors, "connector final join", joined);
+    }
     finish_scenario_with_cleanup(scenario, errors)
 }
 
@@ -875,10 +926,10 @@ fn host_path(root: &Path, adapter: &str, role: &str) -> Result<PathBuf> {
         .take(2)
         .collect::<std::io::Result<Vec<_>>>()
         .map_err(HarnessError::Io)?;
-    if let [entry] = entries.as_slice() {
-        if entry.file_type().map_err(HarnessError::Io)?.is_file() {
-            return Ok(entry.path());
-        }
+    if let [entry] = entries.as_slice()
+        && entry.file_type().map_err(HarnessError::Io)?.is_file()
+    {
+        return Ok(entry.path());
     }
     Err(fail(
         "AI upload directory did not contain exactly one regular file",

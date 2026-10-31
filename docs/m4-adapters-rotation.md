@@ -1,7 +1,7 @@
 # Installed framework rotation gate (M4-68)
 
 `verify-m4-fs-adapters-rotation` is being implemented against the production
-three-relay fixture. Its first Rust build and real-resource run are pending.
+three-relay fixture. Its focused Rust controls pass; strict checks and the real-resource run are pending.
 The TypeScript driver preflight is not rotation or relay acceptance evidence.
 
 The gate uses the installed Files SDK 2.4.0, Mastra 1.65.0, AI SDK 7.0.94
@@ -102,7 +102,12 @@ the driver preflight green; no production adapter change was needed.
 The Rust validator includes deliberate invalid witnesses for accelerated
 timing, late host checks, undispatched writes, missing/changing fences,
 uncorrelated replies, duplicate write counts, replay, incorrect revocation,
-collateral grant loss and detached cleanup. Those Rust controls and the real
-300-second scenario still require compilation and execution at an identified
-candidate. Separate local evidence will not substitute for final combined
+collateral grant loss and detached cleanup. The first Rust build and all five gate controls passed. Independent review
+then found unbounded consuming proxy/catalog shutdown calls in this new gate.
+All branches now use the existing deadline cleanup APIs, retain errors while
+continuing later teardown, and retain the connector join through transport
+cleanup. The five controls pass again after correction. The first scoped
+strict Clippy run found one collapsible-if style error; its log is retained
+and the corrected strict rerun is pending. The real 300-second scenario has
+not run yet. Separate local evidence will not substitute for final combined
 production acceptance.
