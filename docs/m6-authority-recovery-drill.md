@@ -255,7 +255,8 @@ restart freshness, recovered publication and inventory/client-revocation checks
 remain in phases before relay startup or after all relays stop. The isolated
 lost-write and Redis-run fault scenarios never start relays. No direct HTTP
 coverage was dropped; only the concurrent continuity observation changed.
-Focused observation controls and the next corrected process run are pending.
+The corrected observation controls pass at the source and scope below. The
+next corrected process run is still pending.
 
 
 The preapproval old-startup witness was missing from both retained attempts:
@@ -264,7 +265,8 @@ incarnation. The new control runs before the first reconciliation, signing,
 recovery or inventory approval. Generic connection, TLS, timeout and later
 incarnation-mismatch failures cannot count as changed-run refusal. This is
 additional missing acceptance coverage, not a reproduced runtime defect.
-Its source and pure cause-selection control await compilation and live proof.
+Its source and pure cause-selection control compile and pass in the focused
+validation below; the actual startup witnesses still await live proof.
 
 
 A reviewer initially inferred that startup clears persisted confirmation and
@@ -278,3 +280,23 @@ not validate the corrected source. Their logs and executable are retained at
 A replacement pure control requires unchanged old confirmation and a spent
 unconfirmed reservation to wait, a genuinely new confirmation to yield a fixed
 target, and any unexpected clearing to fail. No runtime defect is inferred.
+
+
+## Corrected passive fixture validation
+
+Exact clean source `7a522bead3e0b40e25586f27daa351f0a969be26` compiles the
+integration target in 4.28 seconds. All 13 nonignored controls pass (including
+five passive observation controls and the preapproval refusal selector); four
+actual-process tests remain ignored. Strict Clippy for this integration target
+passes in 2.34 seconds. Six Python wrapper guards also pass. These are focused
+fixture checks, not a workspace or recovery-drill pass.
+
+The test executable is frozen outside Cargo at
+`/workspace/agentuplink-review-artifacts/c243-passive-proof-7a522bea/binaries/m6_online_authority`,
+SHA-256 `f0d36173fb4750dc44e3cdfb098f65bd789c33a8068656e9dc637ecb1059468c`.
+The adjacent `execution-inputs.json` pins the clean source, all five Rust
+fixture input hashes, validation logs and the unchanged C241 optimized
+executable copies, whose hashes were rechecked against the image report.
+The wrapper manifest now also records the passive observer and diagnostic
+module hashes. All earlier failed attempts remain retained. The corrected
+full recovery attempt and historical hosted lifecycle failure remain open.

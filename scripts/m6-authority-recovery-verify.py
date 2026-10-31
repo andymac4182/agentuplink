@@ -249,6 +249,8 @@ def main() -> int:
         source_files = [
             "crates/tunnel-test-harness/tests/m6_online_authority.rs",
             "crates/tunnel-test-harness/tests/m6_online_authority/recovery.rs",
+            "crates/tunnel-test-harness/tests/common/authority_publication_observer.rs",
+            "crates/tunnel-test-harness/tests/common/authority_canary_diagnostics.rs",
             "crates/tunnel-test-harness/tests/common/recovery_fixture_snapshot.rs",
             "scripts/m6-authority-recovery-verify.py",
         ]
