@@ -23,7 +23,17 @@ then [container notices #272](https://github.com/andymac4182/agentuplink/pull/27
 and [integrated acceptance #273](https://github.com/andymac4182/agentuplink/pull/273),
 then [filesystem confirmation #274](https://github.com/andymac4182/agentuplink/pull/274).
 
-Integrated candidate `8c8c14fc9f6bb164daad224ad7300c04389a296f` now passes
+Latest integrated source `88083555ffec868012938e0d253e9090177deec2` passes
+required Rust checks with 2,932 tests, native three-relay authority lifecycle,
+lost-reply/Redis-restart faults and older-backup/operator recovery. The
+[C251 report](m6-c251-authority-lock-2026-10-31.md#integrated-checks-at-88083555)
+retains the failed post-test artifact selector, separate successful selection
+recovery, first disk-guard setup failure and successful recovery-only run.
+New-candidate hosted checks, optimized artifacts and actual-image verification
+remain pending; earlier binaries and images are not relabelled as this source.
+The next stacked draft is prepared on `codex/production-limits` after #274.
+
+Earlier integrated candidate `8c8c14fc9f6bb164daad224ad7300c04389a296f` passes
 complete local Rust checks (2,922 tests), all 90 frozen M1/M2/M7 stages, all
 14 hosted CI jobs, packaging, and all five optimized release builds/native
 archive verifiers. Hosted checkout `f2945e8196187bc7aec1d4415a58d3dde19b4e8b`
@@ -31,8 +41,8 @@ has the identical tree `d6969b5a8e13cf09ade1cf6b410848f7ced2851f`.
 Fresh hosted full M4 includes all four installed frameworks across a real
 300-second rotation. Four separate drills with unchanged original Linux
 archive binaries pass: authority lifecycle, older-backup/operator recovery,
-actual CLI reconnect and three synthetic CLI rotations. The current actual
-authority image separately passes its lifecycle, notices and startup checks.
+actual CLI reconnect and three synthetic CLI rotations. The actual authority
+image built from 8c separately passes its lifecycle, notices and startup checks.
 The [exact-candidate evidence](m6-final-candidate-2026-10-31.md) records hashes,
 commands, timings, fixture boundaries and local/hosted distinctions.
 
@@ -56,8 +66,10 @@ The [follow-up evidence](m6-final-candidate-2026-10-31.md#hosted-follow-up-at-10
 preserves the actual checkout and failed log. A separately reproduced duplicate-
 descriptor lock-lifetime defect now has an independently reviewed correction
 and 21 passing authority tests; [C251 evidence](m6-c251-authority-lock-2026-10-31.md)
-keeps historical causation unproven. Integrated required checks, hosted checks
-and affected authority lifecycle/recovery are still required. No overall CI pass is claimed.
+keeps historical causation unproven. Integrated required checks and affected
+native lifecycle/fault/recovery now pass at880. New-candidate hosted checks,
+optimized artifacts and actual-image verification remain required. No overall
+new-candidate CI pass is claimed.
 
 Mastra depth enforcement (M4-75) now rejects descriptor-ceiling overrides and
 incomplete default listings, preserving explicit bounded views. Its 610 offline
@@ -73,7 +85,7 @@ MIT-0, PSF-2.0 and Windows bundled LGPL obligations; seeded checker tests are
 not a live-policy pass. Actual target inventory, credential/PKI/OIDC setup,
 off-host capacity and soak, monitoring/alerts and recovery ownership remain
 unverified. The [separate default-UID mounted-secret/state proof](m6-authority-default-user-2026-10-31.md)
-now passes with the actual image as UID 10002, retaining its first fixture
+now passes with the actual 8c image as UID 10002, retaining its first fixture
 provisioning failure. It does not prove readiness or production provisioning.
 The three-relay requirement
 is unchanged. The C131 diagnostic feature remains outside this candidate;
@@ -127,8 +139,8 @@ these completion criteria are evidenced; scheduling is not verification.
 
 ## Verification ledger
 
-- **Current integrated evidence:** [8c8c14fc final-candidate report](m6-final-candidate-2026-10-31.md)
-  supersedes the pending-verification statements in the dated entries below.
+- **Prior complete acceptance baseline:** [8c8c14fc final-candidate report](m6-final-candidate-2026-10-31.md)
+  supersedes the pending-verification statements for that source in the dated entries below.
   It supplies final local/hosted acceptance, exact original release archives,
   packaged operator drills and current actual-image lifecycle evidence.
   The following entries retain earlier attempts and scope; their failed

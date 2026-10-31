@@ -4,8 +4,9 @@
 responder together, under one independent operator identity (M6-C234). It uses
 the existing signed membership and checkpoint formats. It does not provision
 catalog users/devices, issue certificates, reconcile a restored catalog or
-activate recovery. M6-C22 remains open until the complete three-relay operator,
-deployment and recovery acceptance is recorded.
+activate recovery. M6-C22 records the shipped-authority/operator verification
+at `8c8c14fc`. New-candidate authority validation is tracked in M6-C251; actual
+deployment provisioning and the production goal remain separate (M6-C221).
 
 Use one authority process and a durable local filesystem on Linux or macOS.
 The Windows workspace builds, but this service refuses its unsupported private
