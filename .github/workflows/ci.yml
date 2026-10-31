@@ -59,6 +59,8 @@ jobs:
           cache-dependency-path: packages/client/package-lock.json
       - run: npm ci --ignore-scripts
       - run: npm run check
+      - name: Verify consuming-root npm override behavior
+        run: npm run test:consumer-overrides
       - run: npm audit --audit-level=high
       - name: Audit the pinned MCP conformance dependencies
         working-directory: tests/mcp-sdk-conformance

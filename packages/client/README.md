@@ -158,10 +158,41 @@ exercise the actual replacement server SDK's initialization, tools,
 concurrent principal isolation, wrong-audience refusal and HTTP body bound.
 The audience and body-bound tests fail against `2.0.0`.
 
+The scoped just-bash override resolves its `minimatch` dependency to `11.0.1`
+for GHSA-g3hv-75wg-m249. Direct framework pins remain unchanged. The advisory
+concerns pattern amplification at `optimizationLevel >= 2`; the actual Bash
+matcher normally uses the default level. Peer tests cover the fixed split
+bound and large-set behavior in a bounded child, ordinary match semantics,
+native Bash globs and the remote filesystem view. These controls do not claim
+a reproduced exploit through the remote adapter's default configuration.
+
+The lockfile delta is limited to `minimatch` 10.2.6 → 11.0.1 and new
+`@isaacs/nonrecursive-glob-match` 1.0.3; locked `brace-expansion` 5.0.12
+is unchanged. Both changed packages declare `BlueOak-1.0.0`. That license
+was already present in this client graph but is outside the current
+`deny.toml` allowlist; the MCP lockfile license check does not cover the
+client peer graph. M6-C253 tracks the missing coverage and policy resolution.
+Functional and advisory passes do not approve that license or an exception.
+
 **npm overrides apply only at an application's root.** A consuming application
-using this Mastra pin must carry the same override in its own root manifest
-(or use a separately verified fixed Mastra release); this private package's
-override does not propagate into a consuming application's dependency tree.
+using either affected pin must carry its override in its own root manifest
+(or use a separately verified fixed framework release):
+
+```json
+{
+  "overrides": {
+    "@mastra/core": { "@modelcontextprotocol/server": "2.3.0" },
+    "just-bash": { "minimatch": "11.0.1" }
+  }
+}
+```
+
+This private package's overrides do not propagate into a consuming
+application's dependency tree. `npm run test:consumer-overrides` packs this
+package and runs npm's real lockfile resolver for two isolated consumers:
+without the application override, just-bash still resolves minimatch 10.x;
+with it, the dependency resolves to 11.0.1. This explicit CI gate needs registry
+access, executes no package scripts and installs no consumer node_modules.
 These checks do not certify the separately packaged `@mastra/mcp` server or
 every application configuration. Run `npm audit --audit-level=high` alongside
 `npm run check`; no advisory is ignored by this package.
