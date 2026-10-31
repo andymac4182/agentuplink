@@ -15,9 +15,16 @@ the [replacement-process canary #262](https://github.com/andymac4182/agentuplink
 [credential replacement drill #265](https://github.com/andymac4182/agentuplink/pull/265),
 [online authority #266](https://github.com/andymac4182/agentuplink/pull/266),
 [actual CLI reconnect #267](https://github.com/andymac4182/agentuplink/pull/267),
-and [stale authorization #268](https://github.com/andymac4182/agentuplink/pull/268).
-The clean-EOF expiry correction is stacked next. The combined runtime candidate
-is entering full acceptance; earlier isolated successes do not complete it.
+and [stale authorization #268](https://github.com/andymac4182/agentuplink/pull/268),
+followed by [clean-EOF expiry #269](https://github.com/andymac4182/agentuplink/pull/269),
+[placeholder scan correction #270](https://github.com/andymac4182/agentuplink/pull/270)
+and [Redis AOF headroom #271](https://github.com/andymac4182/agentuplink/pull/271).
+Combined runtime candidate `20b92455` passes the required local Rust checks,
+M1 and both M2 plans. Full M7 failed at the timing-boundaries gate; a separate
+continuation cannot convert that result into a full pass. The current
+[acceptance report](production-acceptance-2026-10-31.md) retains that failure
+and the additional hosted failures. Image notices, composite filesystem
+deadlines and the operator recovery drill are being prepared separately.
 The C131 diagnostic feature remains outside the deployment candidate. Its
 [causal evidence](m7-c131-diagnostic-evidence-2026-10-31.md) and source-reconstruction
 instructions are retained separately; the source artifacts and raw captures
@@ -28,7 +35,10 @@ Existing task IDs in `tasks.md` retain their acceptance criteria. A historical
 green gate is not evidence that the current release is production ready. The
 three-relay requirement remains in scope; validating the shipped single-relay
 Fly profile is an intermediate step. This document is a persistent work tracker,
-not a background scheduler.
+not itself a background scheduler. A separately enabled hourly continuation
+task, "Agent Uplink production readiness", resumes available work and checks
+this goal. It must report unavailable execution access honestly and stop once
+these completion criteria are evidenced; scheduling is not verification.
 
 ## Completion criteria
 
@@ -66,6 +76,18 @@ not a background scheduler.
 
 ## Verification ledger
 
+- Current combined runtime `20b92455`: fmt and strict workspace/all-target
+  Clippy pass; locked workspace tests pass with 2,889 passed, zero failed and
+  107 ignored across 174 suite results. M1 passes in 80.63 seconds, accelerated
+  M2 with faults in 32.27 seconds, and three actual 300-second rotations in
+  912.67 seconds with 18,987 records and zero replayed records. Full M7 fails
+  after 1,273.73 seconds at EC-055's authorization cause assertion. Earlier
+  gates in that run pass, including actual CLI reconnect (same PID ready in
+  30.415 seconds) and clean-EOF trust expiry (10.059 seconds). Hosted runtime
+  CI also fails that timing assertion, plus an authority serializer test;
+  earlier authority CI fails GOAWAY cleanup within OG-02. These are retained
+  blockers, not waived flakes. Detailed evidence and limits are in the
+  [current report](production-acceptance-2026-10-31.md).
 - Accepted runtime candidate `89552a1f` includes hardening, offline authority,
   authenticated transports, replacement canary and M6-C232. Later `fd03cdee`
   changes only verification documents. This is the pre-online-service stack.
