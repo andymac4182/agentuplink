@@ -153,7 +153,10 @@ async function heldCase(plan: Plan, kind: Case, command: () => Promise<string>) 
   let parallel: ReturnType<typeof remote.readDirectory> | undefined;
   try {
     wire.arm(kind === 'walk' ? 'Rwalk' : 'Rclunk');
-    const caller = observe(remote.stat('/held.bin', { timeoutMs: OPERATION_MS }));
+    // Record caller settlement in its own observer, not when the later probe
+    // finishes: setup overload must fail the declared ordering honestly.
+    const caller = observe(remote.stat('/held.bin', { timeoutMs: OPERATION_MS }))
+      .then((result) => ({ result, settled: wire.tick() }));
     const original = await until(() => wire.event(wire.sent, 'Twalk'));
     if (original.message.kind !== 'Twalk') throw new Error('walk-absent');
     const fid = original.message.newfid;
@@ -172,8 +175,7 @@ async function heldCase(plan: Plan, kind: Case, command: () => Promise<string>) 
     const providerProbeKind = probeReply.message.kind;
     const providerProbeSize = probeReply.message.kind === 'Rgetattr' ? Number(probeReply.message.size) : 0;
     const providerProbeErrno = probeReply.message.kind === 'Rlerror' ? probeReply.message.ecode : 0;
-    const callerResult = await bounded(caller);
-    const callerSettled = wire.tick();
+    const { result: callerResult, settled: callerSettled } = await bounded(caller);
     const reservedAfterCaller = session.openFids;
     const prematureClunks = kind === 'walk' ? wire.sent.filter((event) => event.message.kind === 'Tclunk' && event.message.fid === fid).length : 0;
 

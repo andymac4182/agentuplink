@@ -42,7 +42,8 @@ unchanged control session/epoch and Redis owner before releasing Node. A
 directory iterator keeps the parallel fid live across the fault, making the
 later exact reuse of the original number unambiguous. Wire tag/fid identifiers
 and monotonic event ordinals establish receive, delivery, cancellation and
-cleanup ordering. After all three consumer sessions close, the device must
+cleanup ordering. The caller settlement ordinal is captured by its own promise
+observer, so a delayed provider probe cannot fabricate an earlier ordering. After all three consumer sessions close, the device must
 record exactly three completed exchanges, no mutation dispatch and no written
 bytes. Host files and directory membership must remain unchanged; the device
 session must remain active without rotation or recovery.
