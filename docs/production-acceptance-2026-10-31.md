@@ -50,7 +50,10 @@ acceptance. The original executable was captured from the still-running parent
 and matched the pre-run SHA-256
 `3ab527f69de07fc2b2d1ff8711b5541d2a35082ae45aaf903c346aa547741abb`.
 A single separate repeat now uses this create-only immutable copy and frozen
-companions outside Cargo's output tree. Its outer bound is 1,550 seconds,
+companions outside Cargo's output tree. It passes in 232.393 seconds with ten
+complete rows and all artifact hashes unchanged (log SHA-256
+`09a89b0c418e29496237f78839abfcf6151f5c6a2711bea9df3ce78921119bf1`).
+Its outer bound is 1,550 seconds,
 covering the existing 1,500-second OG-02 bundle timeout and cleanup. The
 continuation's arbitrary 300-second outer bound did not fire but was shorter
 than the harness contract. Neither continuation nor repeat replaces the failed
@@ -121,6 +124,23 @@ are the inspected literal placeholder. This does not attest to a credential
 provider, rotate a real secret or claim coverage of all GitHub-only refs.
 
 ## Outstanding deployment proof
+
+The next integration candidate contains the C245 exact stale-refresh matcher
+(seven focused tests and one live timing pass, 53.614 seconds) and C247's
+deterministic queue-budget fixture (twenty tests and scoped strict Clippy pass;
+production timing unchanged). C243's recovery executable compiles and four
+snapshot controls pass; the actual old-backup recovery sequence has not yet
+run. C248's bounded failure diagnostics are source-ready and still need
+compilation. The TypeScript deadline and fid work passes pinned Node 24.21.0,
+598 offline tests, 25 installed-framework tests and the existing real-path
+filesystem demo. None of these claims is a full integrated-candidate pass.
+
+The C246 investigation has reproduced two real HTTP/3 connection-isolation
+defects with actual mTLS/H3 sockets: unresolved planned cancellation and
+capacity refusal each drop a request without response headers, producing
+`H3_FRAME_UNEXPECTED` and interrupting an admitted sibling. Two corresponding
+controls pass. No production fix has yet been applied, and the evidence does
+not identify which exact request caused the historical hosted failure.
 
 The final combined candidate still needs all required gates passing, the
 unchanged predeclared expiry comparison, corrected image traffic/recovery and

@@ -18,13 +18,19 @@ the [replacement-process canary #262](https://github.com/andymac4182/agentuplink
 and [stale authorization #268](https://github.com/andymac4182/agentuplink/pull/268),
 followed by [clean-EOF expiry #269](https://github.com/andymac4182/agentuplink/pull/269),
 [placeholder scan correction #270](https://github.com/andymac4182/agentuplink/pull/270)
-and [Redis AOF headroom #271](https://github.com/andymac4182/agentuplink/pull/271).
+and [Redis AOF headroom #271](https://github.com/andymac4182/agentuplink/pull/271),
+then [container notices #272](https://github.com/andymac4182/agentuplink/pull/272).
 Combined runtime candidate `20b92455` passes the required local Rust checks,
 M1 and both M2 plans. Full M7 failed at the timing-boundaries gate; a separate
 continuation cannot convert that result into a full pass. The current
 [acceptance report](production-acceptance-2026-10-31.md) retains that failure
-and the additional hosted failures. Image notices, composite filesystem
-deadlines and the operator recovery drill are being prepared separately.
+and the additional hosted failures. The three actual images now pass their
+[local notice and runtime checks](m6-container-notices-2026-10-31.md).
+The next candidate integrates composite filesystem deadlines and confirmed
+fid cleanup, deterministic publisher-queue evidence, the exact stale-refresh
+timing assertion, an operator recovery drill and bounded canary diagnostics.
+Its combined acceptance remains pending. Two reproducible unresolved-request
+HTTP/3 defects can interrupt an admitted sibling; M6-C246 remains a blocker.
 The C131 diagnostic feature remains outside the deployment candidate. Its
 [causal evidence](m7-c131-diagnostic-evidence-2026-10-31.md) and source-reconstruction
 instructions are retained separately; the source artifacts and raw captures
@@ -76,6 +82,27 @@ these completion criteria are evidenced; scheduling is not verification.
 
 ## Verification ledger
 
+- Filesystem client deadline/fid work passes the official SHA-256-verified
+  Node 24.21.0 check: 598 offline tests and 25 installed-framework tests, plus
+  lint, type checking and build. The actual relay/device filesystem demo with
+  frozen `20b92455` companions passes 22 host checks, live revocation in
+  221 ms and complete namespace cleanup. A blocked JavaScript event loop can
+  process a final acknowledged reply before its delayed expiry callback;
+  this is documented completion ordering, not a hard wall-time guarantee.
+  Later composite dispatch still refuses after the monotonic deadline.
+- M6-C245's corrected exact stale-refresh assertion passes seven focused tests
+  and one actual timing gate in 53.614 seconds. M6-C247 reproduces the original
+  queue-margin assumption and replaces it with controlled timer barriers
+  around real signing/fsync: all twenty authority tests and scoped strict
+  Clippy pass, with unchanged production budgets. These local corrections
+  still require combined and hosted acceptance.
+- The exact historical guide-placeholder correction passes local controls and
+  hosted dependency/license/secret jobs 124447394040 and 124447619897. M3-50 is
+  a separate unresolved policy gap: its universal MCP test lock inspection
+  finds MIT-0, PSF-2.0 and a Windows wheel with bundled LGPL obligations outside
+  the current policy. [The prepared gate](mcp-test-dependency-gate.md) keeps all
+  platforms and has no active exceptions. The owner's platform/license
+  disposition remains pending; seeded checker tests are not a live-policy pass.
 - Current combined runtime `20b92455`: fmt and strict workspace/all-target
   Clippy pass; locked workspace tests pass with 2,889 passed, zero failed and
   107 ignored across 174 suite results. M1 passes in 80.63 seconds, accelerated
