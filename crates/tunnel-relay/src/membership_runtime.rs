@@ -2857,12 +2857,17 @@ impl RuntimeState {
                     expires_at.min(binding.valid_until())
                         < peer.admission.deadline.trust_expires_at()
                 });
+            // Reconcile may observe the old deadline before an expiry sweep
+            // does. Keep that positive evidence for both the re-bind refusal
+            // and its cause: the new candidate cannot turn an expired
+            // admission into a membership change or revocation (M6-C232).
+            let deadline_expired = peer.admission.deadline.is_expired();
             let permitted = rebind_permitted(RebindCheck {
                 previous_version: peer.record_version,
                 current_version,
                 binding_changed,
                 trust_deadline_shrank,
-                deadline_expired: peer.admission.deadline.is_expired(),
+                deadline_expired,
             });
             match current {
                 Ok(binding) if permitted => {
@@ -2902,7 +2907,9 @@ impl RuntimeState {
                         token: peer.admission.invalidation,
                         reason_cell: peer.admission.invalidation_reason,
                         callback: self.callback.clone(),
-                        reason: if current.is_err() {
+                        reason: if deadline_expired {
+                            PeerInvalidationReason::TrustExpired
+                        } else if current.is_err() {
                             PeerInvalidationReason::MembershipRevoked
                         } else {
                             default_reason
