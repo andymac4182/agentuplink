@@ -1012,6 +1012,16 @@ impl PeerAdmissionCancellation {
         }
     }
 
+    /// Model the reason-CAS-before-token-cancel interval without dispatching
+    /// cancellation. Only receive-path tests may construct this intermediate state.
+    #[cfg(test)]
+    pub(crate) fn with_reason_for_test(self, reason: PeerInvalidationReason) -> Self {
+        self.reason
+            .compare_exchange(0, reason.code(), Ordering::AcqRel, Ordering::Acquire)
+            .expect("test admission reason is not already latched");
+        self
+    }
+
     #[must_use]
     pub fn token(&self) -> CancellationToken {
         self.token.clone()

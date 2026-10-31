@@ -477,6 +477,22 @@ fn admission_cancellation_error(
     }
 }
 
+/// Classify a clean body EOF using this admission's state at classification.
+/// Call only after decoder finish succeeds, so truncation keeps its typed
+/// error and releases partial-record reservations before expiry is considered.
+/// A passed local deadline is expiry evidence; EOF itself does not prove why
+/// the peer ended the stream. Existing explicit non-expiry reasons take
+/// precedence through `trust_expired`, and absent or live admissions keep EOF.
+fn classify_clean_peer_eof(
+    cancellation: Option<&PeerAdmissionCancellation>,
+) -> Result<Option<PeerRecord>, PeerRuntimeError> {
+    if cancellation.is_some_and(PeerAdmissionCancellation::trust_expired) {
+        Err(PeerRuntimeError::MembershipExpired)
+    } else {
+        Ok(None)
+    }
+}
+
 /// Attribute a peer reset or close observed after this admission's signed
 /// trust deadline to membership expiry.
 ///
@@ -2095,7 +2111,7 @@ impl PeerExchangeRecv {
                 };
             let Some(chunk) = chunk else {
                 self.decoder.finish()?;
-                return Ok(None);
+                return classify_clean_peer_eof(self.admission_context.as_ref());
             };
             self.pending.extend(self.decoder.push(chunk.as_bytes())?);
         }
@@ -2446,7 +2462,7 @@ impl InboundPeerRecv {
                     .await?
             else {
                 self.decoder.finish()?;
-                return Ok(None);
+                return classify_clean_peer_eof(self.admission_context.as_ref());
             };
             self.pending.extend(self.decoder.push(chunk.as_bytes())?);
         }
