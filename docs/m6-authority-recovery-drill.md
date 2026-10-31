@@ -163,8 +163,13 @@ authority each retain seven catalog connections, using 28. A separate actual
 CLI needs seven more: its primary and first three lanes fill 32, then its
 fourth lane is refused. This is fixture capacity, not evidence of a production
 Redis or authorization defect. An independent bounded verified-TLS operator
-proxy/config to the same owned Redis is the approved fixture repair; the
-serving proxy limit and all acceptance predicates remain unchanged.
+proxy/config to the same owned Redis is the approved fixture repair. It is now
+implemented separately from the retained attempt: the serving proxy limit and
+all acceptance predicates remain unchanged. A pure exact-config/endpoint
+control and actual read-only observation plus wrong-CA refusal check endpoint
+identity and retained TLS verification. Independent proxy cleanup joins its
+connections and verifies listener release. The corrected artifact run remains
+pending.
 
 Evidence is retained privately under
 `/workspace/agentuplink-review-artifacts/c243-c248-artifact-proof-3d092deb/`,

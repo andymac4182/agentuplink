@@ -264,15 +264,134 @@ async fn publisher_acl(
     .await
 }
 
+struct OperatorChannel {
+    proxy: RedisTlsProxy,
+    config: PathBuf,
+}
+
+fn operator_config_text(original: &str, serving: &str, operator: &str) -> GateResult<String> {
+    let port = |url: &str| -> GateResult<u16> {
+        let value = url
+            .strip_prefix("rediss://localhost:")
+            .and_then(|value| value.strip_suffix("/0"))
+            .and_then(|value| value.parse::<u16>().ok())
+            .ok_or("operator fixture requires a verified loopback TLS endpoint")?;
+        require(
+            value != 0 && value != 16379,
+            "operator fixture refuses reserved Redis ports",
+        )?;
+        Ok(value)
+    };
+    require(
+        port(serving)? != port(operator)?,
+        "operator and serving TLS listeners must be distinct",
+    )?;
+    let before = format!("redis_url = {}", toml_string(serving));
+    require(
+        original
+            .lines()
+            .filter(|line| line.starts_with("redis_url = "))
+            .count()
+            == 1
+            && original.lines().filter(|line| *line == before).count() == 1
+            && original.matches(&before).count() == 1
+            && original
+                .lines()
+                .filter(|line| line.starts_with("redis_tls_root_ca_path = "))
+                .count()
+                == 1,
+        "operator fixture config did not name exactly one known TLS authority and trust path",
+    )?;
+    Ok(original.replacen(
+        &before,
+        &format!("redis_url = {}", toml_string(operator)),
+        1,
+    ))
+}
+
+impl OperatorChannel {
+    async fn create(fixture: &Fixture, owned_upstream: SocketAddr) -> GateResult<Self> {
+        // The serving proxy retains its original 32-slot bound: 3 relays and
+        // one publisher use 28 slots. CLI commands open seven more lanes on
+        // this separately bounded, verified TLS fixture channel to the same
+        // previously checked owned Redis endpoint.
+        let identity = fixture
+            .pki
+            .issue_server("recovery-operator-redis")
+            .map_err(|_| "operator Redis TLS identity")?;
+        let tls = load_server_config_from_pem(
+            identity.certificate_pem.as_bytes(),
+            identity.private_key_pem.as_bytes(),
+            None,
+        )
+        .map_err(|_| "operator Redis TLS configuration")?;
+        let proxy = RedisTlsProxy::bind(owned_upstream, tls)
+            .await
+            .map_err(|_| "operator Redis TLS listener")?;
+        let configured = (|| {
+            let original = fs::read_to_string(&fixture.relays[0].config)
+                .map_err(|_| "read serving config for operator copy")?;
+            let serving = fixture
+                .proxy
+                .as_ref()
+                .ok_or("serving Redis proxy missing")?
+                .url();
+            let changed = operator_config_text(&original, &serving, &proxy.url())?;
+            let config = fixture
+                .files
+                .write("operator-relay.toml", changed.as_bytes())
+                .map_err(|_| "write separate operator config")?;
+            require(
+                fs::read_to_string(&fixture.relays[0].config)
+                    .map_err(|_| "recheck serving config")?
+                    == original,
+                "operator setup changed the serving relay config",
+            )?;
+            Ok::<_, &'static str>(config)
+        })();
+        match configured {
+            Ok(config) => Ok(Self { proxy, config }),
+            Err(error) => {
+                let cleanup = proxy.shutdown_allow_unused().await;
+                if cleanup.is_err() {
+                    eprintln!("c243 operator_proxy_cleanup=failed_after_setup_refusal");
+                }
+                Err(error)
+            }
+        }
+    }
+
+    async fn shutdown(self) -> GateResult {
+        let url = self.proxy.url();
+        let port = url
+            .strip_prefix("rediss://localhost:")
+            .and_then(|value| value.strip_suffix("/0"))
+            .and_then(|value| value.parse::<u16>().ok())
+            .ok_or("operator cleanup endpoint identity")?;
+        // Setup failures may occur before the positive TLS probe. Even then,
+        // join and release the listener; success is independently contingent
+        // on the live positive and wrong-CA checks inside the drill.
+        self.proxy
+            .shutdown_allow_unused()
+            .await
+            .map_err(|_| "operator Redis TLS proxy cleanup")?;
+        require(
+            std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, port)).is_ok(),
+            "operator Redis TLS listener survived cleanup",
+        )
+    }
+}
+
 fn candidate_configs(
     fixture: &mut Fixture,
+    operator_config: &Path,
     recovery_trust: &Path,
     fence: &Path,
 ) -> GateResult<PathBuf> {
     // TOML fields have one exact occurrence in this fixture renderer. Check
     // before replacement; do not silently edit a different setting.
     let original =
-        fs::read_to_string(&fixture.relays[0].config).map_err(|_| "read relay recovery config")?;
+        fs::read_to_string(operator_config).map_err(|_| "read operator recovery config")?;
     let recovery = format!(
         "{original}\n[recovery]\nfence_path = {}\ntrusted_keys_path = {}\ndeployment_incarnation = {}\n",
         toml_path(fence),
@@ -540,10 +659,10 @@ impl Revocations {
         }
     }
 
-    async fn revoke(&self, fixture: &Fixture) -> GateResult {
+    async fn revoke(&self, fixture: &Fixture, operator_config: &Path) -> GateResult {
         let base = [
             "--config".into(),
-            fixture.relays[0].config.display().to_string(),
+            operator_config.display().to_string(),
             "--tenant".into(),
             fixture.tenant_id.to_string(),
         ];
@@ -672,6 +791,7 @@ async fn drill(
     old: &Container,
     candidate: &Container,
     catalog: RedisCatalog,
+    operator_config: &Path,
 ) -> GateResult {
     let mut admin = admin_connection(url).await?;
     let prefix = format!("tunnel-catalog:{namespace}:");
@@ -707,7 +827,7 @@ async fn drill(
             &fs::read(&offline_trust).map_err(|_| "offline public trust")?,
         )
         .map_err(|_| "install public recovery trust")?;
-    let recovery_config = candidate_configs(fixture, &trust, &fence)?;
+    let recovery_config = candidate_configs(fixture, operator_config, &trust, &fence)?;
     command(
         &fixture.relay_binary,
         &[
@@ -718,6 +838,58 @@ async fn drill(
     )
     .await?;
     let empty_fence = fence_bytes(&fence, None)?;
+    // A read-only positive probe and a wrong-CA refusal establish that the
+    // independent operator channel retained endpoint verification. Neither
+    // command may open/consume the recovery fence or mutate catalog authority.
+    let operator_observation = observe(fixture, &recovery_config).await?;
+    require(
+        operator_observation["redis_run_id"] == fixture.redis_run,
+        "operator TLS endpoint did not reach the independently checked owned Redis run",
+    )?;
+    let foreign = FixturePki::new().map_err(|_| "untrusted operator CA fixture")?;
+    let foreign_ca = fixture
+        .files
+        .write(
+            "untrusted-operator-ca.pem",
+            foreign.server_ca.certificate_pem.as_bytes(),
+        )
+        .map_err(|_| "untrusted operator CA file")?;
+    let original =
+        fs::read_to_string(&recovery_config).map_err(|_| "read operator TLS control config")?;
+    let ca_lines: Vec<_> = original
+        .lines()
+        .filter(|line| line.starts_with("redis_tls_root_ca_path = "))
+        .collect();
+    require(
+        ca_lines.len() == 1,
+        "operator TLS trust-path control is ambiguous",
+    )?;
+    let wrong = original.replacen(
+        ca_lines[0],
+        &format!("redis_tls_root_ca_path = {}", toml_path(&foreign_ca)),
+        1,
+    );
+    let wrong = fixture
+        .files
+        .write("operator-untrusted-ca.toml", wrong.as_bytes())
+        .map_err(|_| "wrong-CA control config")?;
+    let refused = capture(
+        &fixture.relay_binary,
+        &[
+            "recovery-observe".into(),
+            "--config".into(),
+            wrong.display().to_string(),
+        ],
+    )
+    .await?;
+    refusal(&refused, "class=tls_certificate")?;
+    require(
+        fence_bytes(&fence, None)? == empty_fence,
+        "read-only operator TLS controls mutated the recovery fence",
+    )?;
+    println!(
+        "c243 phase=operator-channel same_owned_run=true verified_tls=true wrong_ca_refused=true serving_limit=32 operator_limit=32"
+    );
 
     // Capture the old physical backup before any device sessions/tickets.
     // The named publisher ACL is control-plane input, copied separately.
@@ -781,7 +953,7 @@ async fn drill(
         .canary_with_token("grant-before-revocation", &revocations.token, false)
         .await?;
     revocations.credential_probe(false).await?;
-    revocations.revoke(fixture).await?;
+    revocations.revoke(fixture, operator_config).await?;
     revocations.denied(fixture).await?;
     println!("c243 phase=live-three-relays positive_canary=true credential_and_grant_revoked=true");
     fence_processes(fixture).await?;
@@ -1114,6 +1286,7 @@ async fn online_authority_three_relay_cli_recovery_preserves_reconciled_revocati
     let username = format!("recovery-publisher-{suffix}");
     let password = Uuid::new_v4().simple().to_string();
     let mut fixture = None;
+    let mut operator = None;
     let outcome = timeout(DRILL_BOUND, async {
         let mut admin = admin_connection(&url).await?;
         publisher_acl(&mut admin, &namespace, &username, &password).await?;
@@ -1136,6 +1309,10 @@ async fn online_authority_three_relay_cli_recovery_preserves_reconciled_revocati
             )
             .await?,
         );
+        operator = Some(
+            OperatorChannel::create(fixture.as_ref().ok_or("recovery fixture missing")?, address)
+                .await?,
+        );
         drill(
             fixture.as_mut().ok_or("recovery fixture missing")?,
             &url,
@@ -1143,6 +1320,7 @@ async fn online_authority_three_relay_cli_recovery_preserves_reconciled_revocati
             &old,
             &candidate,
             catalog,
+            &operator.as_ref().ok_or("operator channel missing")?.config,
         )
         .await
     })
@@ -1156,7 +1334,50 @@ async fn online_authority_three_relay_cli_recovery_preserves_reconciled_revocati
     } else {
         Ok(())
     };
+    let operator_cleanup = if let Some(operator) = operator {
+        operator.shutdown().await
+    } else {
+        Ok(())
+    };
     outcome
         .and(cleanup)
+        .and(operator_cleanup)
         .expect("actual three-relay operator recovery drill");
+}
+
+#[test]
+fn operator_tls_config_changes_only_the_independent_endpoint() {
+    let original = "redis_url = \"rediss://localhost:30001/0\"\nredis_tls_root_ca_path = \"/fixture/ca.pem\"\nnode_id = \"relay-a\"\n";
+    let changed = operator_config_text(
+        original,
+        "rediss://localhost:30001/0",
+        "rediss://localhost:30002/0",
+    )
+    .unwrap();
+    assert_eq!(changed, original.replace("30001", "30002"));
+    for wrong in [
+        "redis://localhost:30002/0",
+        "rediss://other-host:30002/0",
+        "rediss://localhost:0/0",
+        "rediss://localhost:16379/0",
+        "rediss://localhost:30001/0",
+    ] {
+        assert!(operator_config_text(original, "rediss://localhost:30001/0", wrong).is_err());
+    }
+    assert!(
+        operator_config_text(
+            &format!("{original}redis_url = \"rediss://localhost:30001/0\"\n"),
+            "rediss://localhost:30001/0",
+            "rediss://localhost:30002/0"
+        )
+        .is_err()
+    );
+    assert!(
+        operator_config_text(
+            "redis_url = \"rediss://localhost:30001/0\"\n",
+            "rediss://localhost:30001/0",
+            "rediss://localhost:30002/0"
+        )
+        .is_err()
+    );
 }
