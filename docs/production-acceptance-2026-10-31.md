@@ -1,6 +1,6 @@
 # Combined production-candidate acceptance
 
-Status at 2026-10-31T16:38:38+10:00: **not accepted for deployment**.
+Status at 2026-10-31T16:50:12+10:00: **not accepted for deployment**.
 
 This report records runtime `20b92455706baaacc1f2329c26afba41c48f906a`,
 tree `79d6e525a79f5b26cf2437e7c1a8a1d2dc14b61e`. The source remained clean
@@ -245,6 +245,27 @@ entries remain unchanged after this failed run. All six owned PIDs are gone
 and its unique Redis namespace has zero remaining keys. Private evidence is
 under `/workspace/agentuplink-review-artifacts/m4c68/`; failed log SHA-256
 `7665f061c74fab0720bd3cd9e156138676ee3c961d29ec82344399128d9463b6`.
+
+The corrected matcher first reproduces a separate weakness: malformed text
+containing the expected code was accepted. Exact nested JSON matching now
+rejects that case, wrong statuses/codes/shapes and an actual upgrade. A bounded
+failure diagnostic emits only closed labels. The fixed seven library controls,
+scoped strict Clippy, binary build and formatting pass. At exact source
+`3ebe8b483d94b2062dcdd1952defcfc1d0250e50`, the second full attempt **passes**
+once in 312.455 seconds with frozen executable
+`06ebd4ad901fd5a8e5a76cad763d7d198da72698266ce8b3921127d8bcddfd4d`.
+Host effects precede freeze (295.032 s versus 300.387 s), resumption takes
+1.382 s, native revocation takes 468 ms, eight completed exchanges record
+20,480 bytes and replay stays zero. The exact 404 matches; snapshots show no
+new refused stream and the next independently granted control receives ID14
+after the last revoked stream13, ruling out a transient intervening allocation.
+Both harness copies, source/Node/dependency manifests remain unchanged; all
+six owned PIDs are gone and the unique namespace is empty. Passing log SHA-256
+is `0a3675931e6bc719ebfc5913a7a9363fde42e5648cbcfa9570b33e66e8501c88`;
+parsed evidence SHA-256 is
+`56bfcb04ef91e681870bb0ea34c9dc7aed2de65bdc2bf5cacfb83074b26185f9`.
+The [framework report](m4-adapters-rotation.md) preserves both attempts and
+the wider M4 limitations. No final aggregate or hosted pass is inferred.
 
 C246's unresolved-request cancellation and capacity refusal reproduce real
 HTTP/3 connection errors that interrupt siblings. The narrow fix now resets

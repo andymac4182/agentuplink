@@ -43,14 +43,21 @@ also proves all four old-config startup refusals before approval. These local
 passes retain the original failures and do not qualify the combined runtime.
 Consumer Bearer challenges pass fourteen focused checks. The four-framework
 scheduled-rotation gate passes 601 offline and 33 installed-framework checks;
-five Rust library controls, scoped Clippy and its binary build also pass.
+seven Rust library controls, scoped Clippy and its binary build also pass.
 Its first real 300-second attempt fails the final fresh-admission assertion:
 the fixture expects 403 where the documented undiscoverability contract
 requires exact 404 EXPORT_NOT_FOUND. The actual failed response was discarded,
-so its wire classification is not claimed. A correction and stronger retained
-diagnostics are in progress; completed rotation observations do not pass the gate.
+so its wire classification is not claimed. The corrected full gate passes once
+at `3ebe8b48` in 312.455 seconds, including exact 404 matching, no new device
+stream allocation, scheduled rotation, host effects, zero replay and native
+unknown revocation outcomes. Both attempts and their unchanged inputs/cleanup
+remain recorded in the [framework report](m4-adapters-rotation.md).
+This source-scoped result still needs final aggregate and hosted acceptance.
 M6-C250 prepares independent frozen executable copies for combined acceptance,
 including nested children, after the retained mixed-artifact OG-02 incident.
+Its reviewed plan preserves all 90 M1/M2/M7 stages and a separate 15-stage M4
+suite. Nineteen offline preparation controls pass; no actual final build or
+frozen combined suite has executed yet.
 The C131 diagnostic feature remains outside the deployment candidate. Its
 [causal evidence](m7-c131-diagnostic-evidence-2026-10-31.md) and source-reconstruction
 instructions are retained separately; the source artifacts and raw captures
