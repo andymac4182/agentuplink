@@ -128,8 +128,8 @@ service without broadening policy, and the replacement must serve after
 client and relay restarts and beyond the old expiry. This is not a live
 tester credential rehearsal, a CA rollover, multi-relay acceptance or
 same-device renewal. The local drill and four independent negative controls
-passed on 2026-10-31; [M6-C233](tasks.md) records the exact evidence. Hosted
-execution of this gate is tracked separately.
+passed on 2026-10-31; repository task M6-C233 records the exact evidence.
+Hosted execution of this gate is tracked separately.
 
 The same check also compares the client exit-code table in
 [runtime.md](runtime.md#client-exit-codes) with the `Cause` mapping in
