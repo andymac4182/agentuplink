@@ -1775,9 +1775,8 @@ struct M2Actor {
     rotations_completed: u64,
     /// The filesystem mutation ledger, summed over completed exchanges.
     ///
-    /// Folded in at `HttpActorRequest::Done`, which is the one place a
-    /// filesystem exchange's own counters reach the actor, and published in
-    /// every status snapshot from there on.
+    /// Folded in exactly once from the completed report slot at retirement or
+    /// from `HttpActorRequest::Done`, then retained in every status snapshot.
     fs_counters: crate::FsCounters,
     status: watch::Sender<ConnectionStatus>,
     cancellation: CancellationToken,
@@ -6154,6 +6153,7 @@ impl M2Actor {
             // STREAM_FORGET, so the journal stays bounded by the streams the
             // session still holds rather than by the streams it has served.
             self.open_journal.release_matching(stream_id, &operation_id);
+            self.collect_completed_fs_report(stream_id);
             self.streams.remove(&stream_id);
             self.pending_forgets.remove(&stream_id);
             // Reclamation is progress: exhaustion is a latency again.
@@ -9641,6 +9641,8 @@ mod tests {
     use super::*;
     pub(super) mod c240_actor_loop;
     mod c240_queue_boundary;
+    #[cfg(unix)]
+    mod fs_report_retirement;
     use crate::test_hooks;
     use futures_util::{SinkExt, StreamExt};
     use std::sync::{Arc, atomic::AtomicBool};

@@ -120,11 +120,25 @@ pub(super) struct DeviceHttpState {
     request_tracker: RecordTracker,
     pub(super) cancel_received: bool,
     task: Option<JoinHandle<()>>,
+    /// Completed provider accounting is owned by the stream, independently of
+    /// the bounded actor request queue and the remaining carrier pumps.
+    fs_report: Option<oneshot::Receiver<CompletedFsReport>>,
     /// M6-C190: when the exchange started, and when (after how many
     /// milliseconds) its first authorization confirmation arrived.
     created_at: std::time::Instant,
     pub(super) confirmations: u32,
     pub(super) first_confirmation_ms: Option<u64>,
+}
+
+/// Both delivery paths own this bounded claim, including a Done queued on
+/// another worker after retirement checked an empty slot but before task abort.
+struct CompletedFsReport {
+    report: crate::fs_export::FsExchangeReport,
+    accounted: Arc<std::sync::atomic::AtomicBool>,
+}
+
+fn claim_completed_fs_report(accounted: &std::sync::atomic::AtomicBool) -> bool {
+    !accounted.swap(true, std::sync::atomic::Ordering::Relaxed)
 }
 
 impl std::fmt::Debug for DeviceHttpState {
@@ -219,6 +233,7 @@ impl DeviceHttpState {
             request_tracker: RecordTracker::new(),
             cancel_received: false,
             task,
+            fs_report: None,
             created_at: std::time::Instant::now(),
             confirmations: 0,
             first_confirmation_ms: None,
@@ -227,6 +242,20 @@ impl DeviceHttpState {
 
     pub(super) fn age_ms(&self) -> u64 {
         u64::try_from(self.created_at.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    fn take_completed_fs_report(&mut self) -> Option<CompletedFsReport> {
+        match self.fs_report.as_mut()?.try_recv() {
+            Ok(report) => {
+                self.fs_report = None;
+                Some(report)
+            }
+            Err(oneshot::error::TryRecvError::Empty) => None,
+            Err(oneshot::error::TryRecvError::Closed) => {
+                self.fs_report = None;
+                None
+            }
+        }
     }
 
     /// M6-C190: an authorization confirmation for this stream was accepted.
@@ -463,7 +492,12 @@ impl M2Actor {
                 report: Some(report),
                 ..DeviceHttpExchangeRecord::default()
             };
-            let _ = sink.send(HttpActorRequest::Done { record }).await;
+            let _ = sink
+                .send(HttpActorRequest::Done {
+                    record,
+                    fs_accounted: None,
+                })
+                .await;
         });
         DeviceHttpState::new(notifier, receive_window, freeze, Some(task))
     }
@@ -500,26 +534,66 @@ impl M2Actor {
             stream_id,
         };
         let freeze = PauseController::new(self.writes_frozen);
+        let (report_tx, report_rx) = oneshot::channel();
+        let accounted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let report_accounted = Arc::clone(&accounted);
         let task = tokio::spawn(async move {
             let (report, _, _) = tokio::join!(
-                crate::fs_export::serve(export, grant, authority, request_rx, response_tx),
+                async move {
+                    let report =
+                        crate::fs_export::serve(export, grant, authority, request_rx, response_tx)
+                            .await;
+                    // Publication is synchronous: the same task cannot poll
+                    // its outbound pump's provider FIN/RESET before this slot
+                    // owns the completed report. A peer RESET can still retire
+                    // an incomplete provider; no report is invented for it.
+                    let _ = report_tx.send(CompletedFsReport {
+                        report,
+                        accounted: report_accounted,
+                    });
+                    report
+                },
                 pump_outbound(response_rx, writer),
                 pump_inbound(reader, request_tx),
             );
             // The exchange record is shaped for HTTP heads and has nothing to
-            // hold for a 9P stream — **except the report**, which is the only
-            // path the provider's mutation ledger has to the actor and so to a
-            // status snapshot. An earlier round of this gate discarded it here,
-            // which left the whole outcome ledger recorded nowhere a running
-            // binary could read.
+            // hold for a 9P stream except its diagnostic report. Accounting is
+            // claimed exactly once through the slot or this Done, including
+            // when valid STREAM_FORGET races with report publication.
             let record = DeviceHttpExchangeRecord {
                 stream_id,
                 fs: Some(Box::new(report)),
                 ..DeviceHttpExchangeRecord::default()
             };
-            let _ = sink.send(HttpActorRequest::Done { record }).await;
+            let _ = sink
+                .send(HttpActorRequest::Done {
+                    record,
+                    fs_accounted: Some(accounted),
+                })
+                .await;
         });
-        DeviceHttpState::new(notifier, receive_window, freeze, Some(task))
+        let mut state = DeviceHttpState::new(notifier, receive_window, freeze, Some(task));
+        state.fs_report = Some(report_rx);
+        state
+    }
+
+    /// Retain actual completed FS accounting before Done or normal stream
+    /// retirement consumes its owner. This never waits on the exchange task or
+    /// changes any transport/authorization/STREAM_FORGET predicate.
+    pub(super) fn collect_completed_fs_report(&mut self, stream_id: u64) -> bool {
+        let report = self
+            .streams
+            .get_mut(&stream_id)
+            .and_then(|stream| stream.http.as_mut())
+            .and_then(DeviceHttpState::take_completed_fs_report);
+        if let Some(report) = report
+            && claim_completed_fs_report(&report.accounted)
+        {
+            self.fs_counters.absorb(&report.report.stats);
+            true
+        } else {
+            false
+        }
     }
 
     /// Publish the writer freeze to every HTTP exchange; called after each
@@ -559,7 +633,10 @@ impl M2Actor {
                 let _ = reply.send(true);
                 Ok(())
             }
-            HttpActorRequest::Done { mut record } => {
+            HttpActorRequest::Done {
+                mut record,
+                fs_accounted,
+            } => {
                 if http_exchange_log_enabled()
                     && record
                         .report
@@ -585,11 +662,13 @@ impl M2Actor {
                     record.request_framing_invalid = request.invalid;
                     record.cancel_received = http.cancel_received;
                 }
-                if let Some(fs) = record.fs.as_ref() {
-                    // Folded into the session total here and nowhere else, so
-                    // the ledger is published in every status snapshot from
-                    // this point on. Counters only; nothing here can carry a
-                    // path, a name or a byte of content.
+                if let Some(fs) = record.fs.as_ref()
+                    && fs_accounted.is_none_or(|accounted| claim_completed_fs_report(&accounted))
+                {
+                    // A late Done after retirement retains diagnostics but
+                    // cannot count an already collected report twice. If the
+                    // provider completed after retirement's empty-slot read,
+                    // the actual late Done still retains its original ledger.
                     self.fs_counters.absorb(&fs.stats);
                     self.publish_status();
                 }
@@ -984,6 +1063,58 @@ fn merge_json(target: &mut serde_json::Value, extra: serde_json::Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Direct claim/slot ordering controls, not an executed multi-worker reset
+    // schedule. The real provider/actor coverage lives in fs_report_retirement.
+    fn accounting_slot() -> (
+        Arc<std::sync::atomic::AtomicBool>,
+        oneshot::Sender<CompletedFsReport>,
+        oneshot::Receiver<CompletedFsReport>,
+    ) {
+        let accounted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (sender, receiver) = oneshot::channel();
+        (accounted, sender, receiver)
+    }
+
+    fn accounting_envelope(accounted: &Arc<std::sync::atomic::AtomicBool>) -> CompletedFsReport {
+        CompletedFsReport {
+            report: crate::fs_export::FsExchangeReport::default(),
+            accounted: Arc::clone(accounted),
+        }
+    }
+
+    #[test]
+    fn fs_report_claim_late_done_survives_empty_slot_retirement() {
+        let (done_claim, sender, mut receiver) = accounting_slot();
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        drop(receiver);
+        // Completion after the empty read/removal cannot publish to that slot,
+        // but Done's independent claim still retains the completed accounting.
+        assert!(sender.send(accounting_envelope(&done_claim)).is_err());
+        assert!(claim_completed_fs_report(&done_claim));
+        assert!(!claim_completed_fs_report(&done_claim));
+    }
+
+    #[test]
+    fn fs_report_claim_retirement_then_done_is_exactly_once() {
+        let (done_claim, sender, mut receiver) = accounting_slot();
+        assert!(sender.send(accounting_envelope(&done_claim)).is_ok());
+        let report = receiver.try_recv().expect("completed report");
+        assert!(claim_completed_fs_report(&report.accounted));
+        assert!(!claim_completed_fs_report(&done_claim));
+    }
+
+    #[test]
+    fn fs_report_claim_done_then_retirement_is_exactly_once() {
+        let (done_claim, sender, mut receiver) = accounting_slot();
+        assert!(sender.send(accounting_envelope(&done_claim)).is_ok());
+        assert!(claim_completed_fs_report(&done_claim));
+        let report = receiver.try_recv().expect("completed report");
+        assert!(!claim_completed_fs_report(&report.accounted));
+    }
     use tunnel_http_bridge::ResetSignal;
     use tunnel_protocol::reset_reason;
 

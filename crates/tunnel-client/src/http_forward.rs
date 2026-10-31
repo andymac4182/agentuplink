@@ -104,11 +104,10 @@ pub struct DeviceHttpExchangeRecord {
     pub report: Option<ExchangeReport>,
     /// The filesystem exchange's own payload-free report, for a `fs_9p` stream.
     ///
-    /// `None` for every HTTP exchange, and the carrier for the provider's
-    /// mutation ledger on a filesystem one: the record is how a completed
-    /// exchange reaches the actor, so it is where the ledger has to travel to
-    /// be published in a status snapshot at all. Counters and closed labels
-    /// only, like everything else here.
+    /// `None` for every HTTP exchange. A filesystem report also reaches the
+    /// actor through its stream-owned completion slot; the two paths share a
+    /// private accounting claim so retirement and late Done count it once.
+    /// This diagnostic copy holds counters and closed labels only.
     /// Boxed, because it is present on one exchange kind in two and the
     /// record travels inside `HttpActorRequest::Done`: carrying the counters
     /// inline widened every variant of that enum by the size of a ledger no
@@ -527,6 +526,9 @@ pub(crate) enum HttpActorRequest {
     },
     Done {
         record: DeviceHttpExchangeRecord,
+        /// FS retirement and late completion share one bounded accounting
+        /// claim. This is private actor state, never public diagnostics.
+        fs_accounted: Option<Arc<std::sync::atomic::AtomicBool>>,
     },
 }
 
