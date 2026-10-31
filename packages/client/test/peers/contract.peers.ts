@@ -49,6 +49,7 @@ import { scriptedModel } from '../../demo/scripted-model.ts';
 import { FilesystemError } from '../../src/errors.ts';
 import type { RemoteFilesystem } from '../../src/filesystem.ts';
 import { closeAll, waitFor, wire } from '../adapters/wiring.ts';
+import { descriptorFixture } from '../harness/descriptor.ts';
 import type { FakeProvider } from '../harness/provider.ts';
 
 after(closeAll);
@@ -212,6 +213,40 @@ describe('Files SDK: the real wrapper over the real adapter', () => {
  * ---------------------------------------------------------------------- */
 
 describe('Mastra: a real Workspace over the real filesystem provider', () => {
+  it('retains typed depth refusals and explicit bounded views through the installed Workspace', async () => {
+    const wired = await wire({ 'a/b/f.txt': 'deep', 'ok.txt': 'live' }, {
+      limits: { ...descriptorFixture().limits, maxTraversalDepth: 1 },
+    });
+    const workspace = new Workspace({
+      filesystem: new TunnelMastraFilesystem({ remote: wired.remote, errors: workspaceModule }),
+    });
+    await workspace.init();
+    try {
+      const depthRefusal = (error: unknown): boolean => {
+        assert.ok(error instanceof workspaceModule.FilesystemError);
+        assert.equal(error.code, 'TUNNEL_ELOOP');
+        assert.ok(error.cause instanceof FilesystemError);
+        assert.equal(error.cause.outcome, 'not_started');
+        return true;
+      };
+      const before = wired.connection.received.length;
+      await assert.rejects(
+        async () => workspace.filesystem.readdir('/', { recursive: true, maxDepth: 2 }),
+        depthRefusal,
+      );
+      assert.equal(wired.connection.received.length, before);
+      await assert.rejects(
+        async () => workspace.filesystem.readdir('/', { recursive: true }),
+        depthRefusal,
+      );
+      const entries = await workspace.filesystem.readdir('/', { recursive: true, maxDepth: 1 });
+      assert.deepEqual(entries.map((entry) => entry.name), ['a', 'a/b', 'ok.txt']);
+      assert.equal(await workspace.filesystem.readFile('/ok.txt', { encoding: 'utf8' }), 'live');
+    } finally {
+      await workspace.destroy();
+    }
+  });
+
   it('mounts in new Workspace({ filesystem }) and runs its operations', async () => {
     const { remote, wired } = await remoteOver({ 'notes.txt': 'hello' });
     const filesystem = new TunnelMastraFilesystem({ remote, errors: workspaceModule });

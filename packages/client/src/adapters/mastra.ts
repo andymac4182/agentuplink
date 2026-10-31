@@ -412,8 +412,9 @@ export class TunnelMastraFilesystem implements WorkspaceFilesystem {
    *   and `s` selects nothing. A suffix test would have let `s` match.
    *
    * "Materialized directory/file results fail on limits rather than silently
-   * truncate": the entry budget is the descriptor's and a listing that reaches
-   * it is an error, not a short array that reads as a complete directory.
+   * truncate": the entry and depth budgets are the descriptor's. An explicit
+   * `maxDepth` selects a bounded view within that ceiling; without it, a
+   * recursive listing must complete or fail rather than return a short array.
    */
   async readdir(path: string, options?: ListOptions): Promise<FileEntry[]> {
     return await this.guard('readdir', path, async () => {
@@ -422,7 +423,28 @@ export class TunnelMastraFilesystem implements WorkspaceFilesystem {
         ? undefined
         : (Array.isArray(options.extension) ? options.extension : [options.extension]);
       const limits = this.remote.descriptor.limits;
-      const maxDepth = options?.maxDepth ?? limits.maxTraversalDepth;
+      const requestedDepth = options?.maxDepth;
+      if (requestedDepth !== undefined) {
+        if (!Number.isInteger(requestedDepth) || requestedDepth < 0) {
+          throw new FilesystemError({
+            code: 'EINVAL',
+            operation: 'readdir',
+            path: root,
+            outcome: 'not_started',
+            retryable: false,
+          });
+        }
+        if (requestedDepth > limits.maxTraversalDepth) {
+          throw new FilesystemError({
+            code: 'ELOOP',
+            operation: 'readdir',
+            path: root,
+            outcome: 'not_started',
+            retryable: false,
+          });
+        }
+      }
+      const maxDepth = requestedDepth ?? limits.maxTraversalDepth;
       const out: FileEntry[] = [];
       let seen = 0;
       const visit = async (at: string, prefix: string, depth: number): Promise<void> => {
@@ -441,11 +463,17 @@ export class TunnelMastraFilesystem implements WorkspaceFilesystem {
           if (record.type === 'directory' || matchesExtension(entry.name, extensions)) {
             out.push(record);
           }
-          if (
-            options?.recursive === true &&
-            entry.kind === 'directory' &&
-            depth + 1 <= maxDepth
-          ) {
+          if (options?.recursive === true && entry.kind === 'directory') {
+            if (depth + 1 > maxDepth) {
+              if (requestedDepth !== undefined) continue;
+              throw new FilesystemError({
+                code: 'ELOOP',
+                operation: 'readdir',
+                path: root,
+                outcome: 'not_started',
+                retryable: false,
+              });
+            }
             await visit(
               at === '/' ? `/${entry.name}` : `${at}/${entry.name}`,
               `${prefix}${entry.name}/`,
