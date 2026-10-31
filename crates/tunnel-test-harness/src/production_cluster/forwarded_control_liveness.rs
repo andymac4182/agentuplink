@@ -50,6 +50,8 @@ use tunnel_protocol::{
 };
 use uuid::Uuid;
 
+mod cli_reconnect;
+
 type DeviceSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 const PHASE: Duration = Duration::from_secs(10);
 // The stated 30 s device idle + 5 s disconnect hand-off. Reconnect must also

@@ -18086,7 +18086,7 @@ pub struct ListenerSocketOptions {
     pub consumer_upgrade_barrier: Option<Arc<crate::http::ConsumerUpgradeBarrier>>,
     /// Optional fixture-only hold immediately before remote H3 admission.
     pub consumer_peer_admission_barrier: Option<Arc<crate::http::PeerAdmissionBarrier>>,
-    /// Optional one-shot fixture gate on an owner-local device control socket,
+    /// Optional one-shot fixture gate on an owner-local or forwarded control socket,
     /// after the device's HELLO and before the WELCOME-producing registration.
     pub device_control_attach_barrier: Option<Arc<crate::http::ControlAttachBarrier>>,
     /// The `http-forward/1` profiles served on the public HTTP routes and
@@ -18251,13 +18251,17 @@ impl Relay {
         })?;
         let (peer_runtime, peer_task, peer_diagnostics, peer_planned_cancel) =
             if let Some((peer, peer_runtime)) = peer {
-                let owner_callback = http::peer_ingress_handler_with_http_forward(
+                let owner_callback = http::peer_ingress_handler_with_control_attach_barrier(
                     handle.clone(),
                     catalog.clone(),
                     options.oidc.clone(),
                     options.node_id.clone(),
                     options.boot_id.clone(),
                     listener_options.http_forward.clone(),
+                    listener_options
+                        .device_control_attach_barrier
+                        .clone()
+                        .map(|barrier| (barrier, options.limits.operation_timeout)),
                 );
                 let (policy, handler) = peer_runtime.server_components(owner_callback);
                 let server = PeerServer::new_with_pin_provider(

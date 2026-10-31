@@ -67,6 +67,23 @@ The transport command exercises real mTLS/H3 fault cases. The cluster command
 uses a synthetic owner callback. The production command uses real relay actors,
 CLI/device WebSockets and public consumers across three relays.
 
+The M7 script also runs the exact ignored test
+`production_cluster::forwarded_control_liveness::cli_reconnect::m6c68_cli_reconnects_after_both_forwarded_paths_vanish`.
+It starts the shipped CLI through ingress B onto remote owner A, requires 70
+seconds of healthy control-session idleness, then cuts both current client TCP
+sockets while retaining their relay halves. Same-session M2 data recovery during
+idle time is recorded separately; it is not a control reconnect. The old actor
+session and owner token must disappear within 35 seconds, before a renewed lease
+expires. The same CLI PID must report `disconnected`, `OWNER_BUSY` backoff, and a
+second `ready`/`reconnected` session with a higher epoch within 40 seconds. The
+fixture caps retry delays at one second, matching the existing single-relay gate;
+it does not change production liveness deadlines. Exact public canaries through
+C and a successful stopped event complete the check. The separate raw forwarded
+control gate still proves protocol heartbeat bindings and isolates cleanup from
+the production 60-second peer timeout. All three negative controls and the
+restored CLI/raw/barrier checks passed locally; M6-C68 remains open for the
+complete combined candidate workspace and M1/M2/M7 gates.
+
 `verify-m7-production` also records and asserts the IN-10/OG-05 heartbeat,
 liveness and shutdown evidence, printed as a
 `M7 production heartbeat/liveness/shutdown:` line and enforced by
