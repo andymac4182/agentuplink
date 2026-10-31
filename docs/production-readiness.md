@@ -34,10 +34,18 @@ succeed for all five targets, but native archive verification exposes a
 checksum filename regression (M6-C249). Its narrow local fix and corrected
 Linux archive pass; final hosted qualification remains required.
 Two reproduced unresolved-request
-HTTP/3 defects have a narrow local fix passing83 transport tests; M6-C246 still
+HTTP/3 defects have a narrow local fix passing 83 transport tests; M6-C246 still
 requires final combined acceptance. The operator recovery drill has two retained
 failures: fixture TLS capacity and competing checkpoint observation. Their
-repairs must pass without weakening traffic, revocation or recovery assertions.
+corrected fixture now passes one recovery drill and one separate authority
+lifecycle run with unchanged C241 optimized service binaries. The recovery
+also proves all four old-config startup refusals before approval. These local
+passes retain the original failures and do not qualify the combined runtime.
+Consumer Bearer challenges pass fourteen focused checks. The four-framework
+scheduled-rotation gate passes 601 offline and 33 installed-framework checks;
+its first Rust compilation and real 300-second run remain pending.
+M6-C250 prepares independent frozen executable copies for combined acceptance,
+including nested children, after the retained mixed-artifact OG-02 incident.
 The C131 diagnostic feature remains outside the deployment candidate. Its
 [causal evidence](m7-c131-diagnostic-evidence-2026-10-31.md) and source-reconstruction
 instructions are retained separately; the source artifacts and raw captures

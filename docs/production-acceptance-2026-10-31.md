@@ -1,6 +1,6 @@
 # Combined production-candidate acceptance
 
-Status at 2026-10-31T16:03:54+10:00: **not accepted for deployment**.
+Status at 2026-10-31T16:17:30+10:00: **not accepted for deployment**.
 
 This report records runtime `20b92455706baaacc1f2329c26afba41c48f906a`,
 tree `79d6e525a79f5b26cf2437e7c1a8a1d2dc14b61e`. The source remained clean
@@ -198,14 +198,29 @@ simultaneous connection per node. The competing observer can consume its slot,
 causing the legitimate relay to fail closed. Later persisted floors and
 confirmation timestamps are not event-time readiness snapshots. This is a
 source-backed fixture-contention explanation for this occurrence, not proof
-of the exact cause in the older hosted31-second failure. A passive observer
-with independently verified adoption by all three actual relays is in progress;
-no authority limit or canary predicate is relaxed.
+of the exact cause in the older hosted31-second failure. The corrected passive
+observer requires independently verified adoption by all three actual relays;
+no authority limit or canary predicate is relaxed. Its exact source
+`7a522bead3e0b40e25586f27daa351f0a969be26` passes thirteen nonignored controls
+and strict scoped Clippy. One corrected recovery attempt passes in 116.23 s
+(wrapper 117.109 s), then one separate native lifecycle passes in 118.31 s
+(driver 119.096 s). Both run in a coordinated quiet window with frozen harness
+`f0d36173fb4750dc44e3cdfb098f65bd789c33a8068656e9dc637ecb1059468c`
+and unchanged C241 image-extracted authority/relay binaries. All three exact
+owned Redis containers are removed. Recovery now includes changed-run refusal
+by all three old relays and the old authority before reconciliation/approval,
+with unchanged durable state. The lifecycle preserves canaries and identities
+through authority restart and checks original-expiry outage. Complete hashes,
+retained failures and scope are in the [recovery report](m6-authority-recovery-drill.md).
+These are local optimized-artifact checks, not final combined runtime, hosted
+or live-deployment acceptance.
 
 The TypeScript deadline and fid work passes pinned Node24.21.0, 598 offline
 tests,25 installed-framework tests and the existing real-path filesystem demo.
-The separate four-framework scheduled-rotation gate is being implemented;
-its preflight does not establish real-relay rotation acceptance.
+The separate four-framework scheduled-rotation gate at `41746cf5` passes the
+full Node check with 601 offline and 33 installed-framework tests. Its first
+Rust compilation and real 300-second attempt remain pending; preflight does
+not establish real-relay rotation acceptance.
 
 C246's unresolved-request cancellation and capacity refusal reproduce real
 HTTP/3 connection errors that interrupt siblings. The narrow fix now resets
@@ -217,6 +232,23 @@ to the client; that failed control is retained, and its corrected assertion
 checks the exact server protocol error. Full aggregate acceptance and exact
 historical hosted-stream attribution remain separate. No production change
 has been merged or deployed.
+
+C94 adds cause-derived Bearer challenges while retaining consumer response
+statuses and bodies. Exact leaf `0899818d` passes fourteen focused tests,
+including the initially failing real-router matrix, scoped strict Clippy and
+formatting. Final combined acceptance remains required. C240's proposed quota
+misclassification was not reproduced: source review finds the earlier retained
+capacity check already returns QueueLimit. The tracker preserves the corrected
+premise and the still-unexecuted boundary-test scope.
+
+C250's fixture-only frozen-artifact support passes eleven selector controls,
+including fifteen invalid wrapper invocations that stop before Docker. The
+new preparation plan requires real final fmt, Clippy, workspace-test, test-build
+and runtime-build receipts before copying 39 independent executables. It retains
+all 86 M7 stages, duplicate invocations and exact test arguments. No final
+frozen acceptance has executed yet; the earlier mixed-artifact run remains
+inconclusive. The combined source at `479056199f746a94e779f432411359c452d1a155`
+integrates these slices, including M4-68, and still awaits whole-candidate checks.
 
 The final combined candidate still needs all required gates passing, corrected image traffic/recovery and
 headroom checks, and hosted release checks. The unchanged predeclared expiry
