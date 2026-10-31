@@ -1,0 +1,50 @@
+{
+  "base_image": "redis:8.4.0-alpine@sha256:4eec4565e45aa0b3966554c866bc73211e281b0b3d89fe9a33c982e6faca809d",
+  "coverage": "Redis core archive notices and Agent Uplink wrapper only; externally built modules and inherited OS distribution obligations remain separate and unresolved",
+  "files": {
+    "agentuplink-LICENSE": {
+      "bytes": 1075,
+      "sha256": "e7a62762fe3dccd3c9e1a1fa3d2a0a2850b07a48ca48072542f3e5f2b66450ea"
+    },
+    "redis-8.4.0/LICENSE.txt": {
+      "bytes": 72266,
+      "sha256": "4a0e416b9537688f30dfe69ddaceb2ca64d96b7df02a0a6760d376890ddc4e40"
+    },
+    "redis-8.4.0/REDISCONTRIBUTIONS.txt": {
+      "bytes": 1853,
+      "sha256": "aa6a56234e5ca27f09010693d1c31ca83988d7a0dc80fb253603e052d1d7f0d1"
+    },
+    "redis-8.4.0/deps/fpconv/LICENSE.txt": {
+      "bytes": 1338,
+      "sha256": "c9bff75738922193e67fa726fa225535870d2aa1059f91452c411736284ad566"
+    },
+    "redis-8.4.0/deps/hdr_histogram/COPYING.txt": {
+      "bytes": 7048,
+      "sha256": "a2010f343487d3f7618affe54f789f5487602331c0a8d03f49e9a7c547cf0499"
+    },
+    "redis-8.4.0/deps/hdr_histogram/LICENSE.txt": {
+      "bytes": 2161,
+      "sha256": "c124afa369aae960fa33f6944c82e161e482f2e998d6f07b37ae2c018f3c6c69"
+    },
+    "redis-8.4.0/deps/hiredis/COPYING": {
+      "bytes": 1588,
+      "sha256": "dca05ce8fc87a8261783b4aed0deef8becc9350b6aa770bc714d0c1833b896eb"
+    },
+    "redis-8.4.0/deps/jemalloc/COPYING": {
+      "bytes": 1709,
+      "sha256": "94aa2caa98c25d942f58b956c71dba6a99ff98fc3a31cbc669fe2a4cd0268b53"
+    },
+    "redis-8.4.0/deps/lua/COPYRIGHT": {
+      "bytes": 1528,
+      "sha256": "ee5e3e82af1e1b543c4f216e399d7c8cfee797711913f349e385101c4ae60a79"
+    },
+    "redis-8.4.0/deps/xxhash/LICENSE": {
+      "bytes": 1389,
+      "sha256": "6ffedbc0f7878612d2b23589f1ff2ab15633e1df7963a5d9fc750ec5500c7e7a"
+    }
+  },
+  "schema": 1,
+  "source_archive": "https://github.com/redis/redis/archive/refs/tags/8.4.0.tar.gz",
+  "source_commit": "60ba86f3c8b4e1ec96451171753a0a38e5c45a0c",
+  "source_sha256": "b947d9015622669b5bee8ec954f658b3278d42dbefae23a92d9b7704bfe143f9"
+}

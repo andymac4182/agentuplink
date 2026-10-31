@@ -10,6 +10,7 @@ import tempfile
 import tomllib
 import zipfile
 from pathlib import Path, PurePosixPath
+from container_notices import notice_paths, regular, source_supplements
 
 ROOT = Path(__file__).resolve().parents[1]
 BINARIES = ("tunnel-client", "tunnel-relay", "tunnel-deadman", "tunnel-authority")
@@ -377,16 +378,47 @@ def package(root, target, sha, run, output, metadata, binaries=None):
         notices.mkdir()
         dependencies = []
         for dep in sorted(metadata["packages"], key=lambda item: (item["name"], item["version"])):
-            dependencies.append({key: dep.get(key) for key in ("name", "version", "license", "source")})
+            record = {key: dep.get(key) for key in ("name", "version", "license", "source")}
+            dependencies.append(record)
             directory = Path(dep["manifest_path"]).parent
             destination = notices / f'{dep["name"]}-{dep["version"]}'
-            names = {p for pattern in ("LICENSE*", "COPYING*", "NOTICE*", "COPYRIGHT*", "UPSTREAM_PATCH.md") for p in directory.glob(pattern) if p.is_file()}
+            names = notice_paths(directory)
             if dep.get("license_file"):
-                names.add(directory / dep["license_file"])
+                declared = Path(dep["license_file"])
+                if declared.is_absolute() or ".." in declared.parts:
+                    raise ValueError("license_file escapes source package")
+                names.add(directory / declared)
+            record["notice_files"] = []
             if names:
                 destination.mkdir(exist_ok=True)
                 for source in sorted(names):
-                    shutil.copy2(source, destination / source.name)
+                    regular(source, directory)
+                    target_notice = destination / source.relative_to(directory)
+                    target_notice.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(source, target_notice)
+                    record["notice_files"].append(target_notice.relative_to(staging).as_posix())
+            elif dep.get("id") in metadata.get("workspace_members", []) and dep.get("source") is None and dep.get("license") == "MIT":
+                directory.relative_to(root)
+                record["notice_files"] = ["LICENSE"]
+            else:
+                locked = tomllib.loads((root / "Cargo.lock").read_text())["package"]
+                matches = [p for p in locked if p["name"] == dep["name"] and p["version"] == dep["version"] and p.get("source") == dep.get("source")]
+                if len(matches) != 1:
+                    raise ValueError("notice source does not uniquely match Cargo.lock")
+                supplements = source_supplements(root, dep, matches[0].get("checksum"))
+                if not supplements:
+                    # Preserve the archive's existing expression-only scope
+                    # for unresolved entries in its all-target metadata graph.
+                    # Unlike the container build, this is not complete notice
+                    # coverage. Make the gap machine-readable (M6-C241).
+                    record["notice_status"] = "unresolved upstream notice text"
+                else:
+                    destination.mkdir(exist_ok=True)
+                for filename, data, url in supplements:
+                    target_notice = destination / filename
+                    target_notice.write_bytes(data)
+                    record["notice_files"].append(target_notice.relative_to(staging).as_posix())
+                    record.setdefault("notice_sources", []).append(url)
         (notices / "dependencies.json").write_text(json.dumps(dependencies, indent=2) + "\n")
         manifest = {"version": tag, "sourceSha": sha, "ciRun": run, "target": target, "channel": "development"}
         (staging / "release.json").write_text(json.dumps(manifest, indent=2) + "\n")

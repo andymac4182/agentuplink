@@ -82,6 +82,53 @@ class PackagingTests(unittest.TestCase):
         for target in TARGETS:
             package(self.root, target, self.sha, "123", self.output, {"packages": []})
 
+    def notice_dependency(self):
+        directory = self.root / "dependency"
+        directory.mkdir()
+        (directory / "Cargo.toml").write_text('[package]\nname="dep"\nversion="1.0.0"\n')
+        (self.root / "Cargo.lock").write_text('version=4\n[[package]]\nname="dep"\nversion="1.0.0"\nsource="registry+fixture"\nchecksum="abc"\n')
+        dep = {"name": "dep", "version": "1.0.0", "license": "MIT", "source": "registry+fixture", "manifest_path": str(directory / "Cargo.toml")}
+        return directory, {"packages": [dep]}
+
+    def test_nested_notices_are_retained_and_declared_escape_refused(self):
+        directory, metadata = self.notice_dependency()
+        nested = directory / "native"
+        nested.mkdir()
+        (nested / "COPYING").write_bytes(b"Native library notice\r\n")
+        archive = package(self.root, TARGETS[0], self.sha, "123", self.output, metadata)
+        with tarfile.open(archive) as handle:
+            self.assertEqual(handle.extractfile("notices/dep-1.0.0/native/COPYING").read(), b"Native library notice\r\n")
+        metadata["packages"][0]["license_file"] = "../LICENSE"
+        with self.assertRaisesRegex(ValueError, "escapes source package"):
+            package(self.root, TARGETS[0], self.sha, "123", self.output, metadata)
+
+    def test_unresolved_archive_notice_is_explicit_and_supplement_must_match(self):
+        import hashlib
+        directory, metadata = self.notice_dependency()
+        supplements = self.root / "deploy/notices/rust"
+        supplements.mkdir(parents=True)
+        registry = supplements / "supplements.json"
+        registry.write_text(json.dumps({"schema": 1, "packages": []}))
+        archive = package(self.root, TARGETS[0], self.sha, "123", self.output, metadata)
+        with tarfile.open(archive) as handle:
+            unresolved = json.load(handle.extractfile("notices/dependencies.json"))[0]
+            self.assertEqual(unresolved["notice_files"], [])
+            self.assertEqual(unresolved["notice_status"], "unresolved upstream notice text")
+        data = b"Exact upstream license text\n"
+        (supplements / "dep-LICENSE").write_bytes(data)
+        (directory / ".cargo_vcs_info.json").write_text(json.dumps({"git": {"sha1": "1" * 40}}))
+        registry.write_text(json.dumps({"schema": 1, "packages": [{
+            "name": "dep", "version": "1.0.0", "source": "registry+fixture", "license": "MIT",
+            "crate_checksum": "abc", "vcs_commit": "1" * 40,
+            "notices": [{"file": "dep-LICENSE", "sha256": hashlib.sha256(data).hexdigest(), "url": "https://example.invalid/commit/LICENSE"}],
+        }]}))
+        archive = package(self.root, TARGETS[0], self.sha, "123", self.output, metadata)
+        with tarfile.open(archive) as handle:
+            self.assertEqual(handle.extractfile("notices/dep-1.0.0/dep-LICENSE").read(), data)
+        (directory / ".cargo_vcs_info.json").write_text(json.dumps({"git": {"sha1": "2" * 40}}))
+        with self.assertRaisesRegex(ValueError, "locked source identity"):
+            package(self.root, TARGETS[0], self.sha, "123", self.output, metadata)
+
     def test_publish_refuses_a_crlf_checksum(self):
         # M6-C217: the last gate before publishing compares bytes.
         self.build_all()
