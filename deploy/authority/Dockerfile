@@ -3,14 +3,16 @@
 FROM rust:1.95.0@sha256:f49565f188ee00bc2a18dd418183f2c5f23ef7d6e691890517ed341a598f67c3 AS build
 ENV RUSTUP_TOOLCHAIN=1.95.0 CARGO_TERM_COLOR=never
 ARG CARGO_BUILD_JOBS=2
-WORKDIR /src
-COPY . .
-RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+# Bind the allowlisted source read-only for this build. It need not occupy a
+# separate intermediate image layer; keep generated files in the target cache.
+RUN --mount=type=bind,source=.,target=/source,readonly \
+    --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/src/target,sharing=locked \
     --mount=type=secret,id=cargo_ca \
     if [ -f /run/secrets/cargo_ca ]; then export CARGO_HTTP_CAINFO=/run/secrets/cargo_ca; fi \
- && cargo build --locked --release -p tunnel-authority --bin tunnel-authority \
- && install -m 0755 target/release/tunnel-authority /usr/local/bin/tunnel-authority
+ && cargo build --manifest-path /source/Cargo.toml --target-dir /src/target \
+      --locked --release -p tunnel-authority --bin tunnel-authority \
+ && install -m 0755 /src/target/release/tunnel-authority /usr/local/bin/tunnel-authority
 
 FROM debian:trixie-slim@sha256:a99cfc517144bc59b1978475ec53b46ecabec7e43635402ee5b77cc54cd1b20a
 RUN useradd --system --uid 10002 --user-group --home-dir /var/lib/agentuplink-authority \
