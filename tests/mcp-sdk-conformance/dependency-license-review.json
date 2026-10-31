@@ -1,0 +1,543 @@
+{
+  "component_evidence": [
+    {
+      "artifact_sha256": "bde982589473a060ae145e3406e9a5333fe538c97229ba841f5a7f92be004f81",
+      "name": "mcp",
+      "path": "mcp/os/win32/utilities.py",
+      "sha256": "98e87c776a14cf326e63f8da007119156d3ad643ae7fbf27e9b6e6ef1dc534bf",
+      "version": "2.2.0"
+    },
+    {
+      "artifact_sha256": "772235332b5d1024c696f11cea1ae4be7930f0a8b894bb43db14e3f435f1ff7e",
+      "name": "pywin32",
+      "path": "adodbapi/adodbapi.py",
+      "sha256": "4f5717c2b086ecdb1b047e17caa4644bb3d02827cd2da0e602d9d1e38543081d",
+      "version": "312"
+    }
+  ],
+  "counts": {
+    "npm": 147,
+    "python": 32
+  },
+  "errors": [
+    {
+      "identity": "python:cffi==2.1.1;platform_python_implementation != \"PyPy\"",
+      "reason": "disallowed-license: MIT-0"
+    },
+    {
+      "identity": "python:pywin32==312;sys_platform == \"win32\"",
+      "reason": "unknown-legacy-license"
+    },
+    {
+      "identity": "python:typing-extensions==4.16.0;",
+      "reason": "disallowed-license: PSF-2.0"
+    }
+  ],
+  "finished_at_unix": 1793421960,
+  "input_sha256": {
+    "LICENSE": "e7a62762fe3dccd3c9e1a1fa3d2a0a2850b07a48ca48072542f3e5f2b66450ea",
+    "deny.toml": "02ff20bc1ddcadd52b895c68f249314c19fcb06e60f5104f09a92a7cde49af62",
+    "tests/mcp-sdk-conformance/package-lock.json": "f3301cf506007b5826ed8f8cb20932a4ab9a426da79698fd963a15a47e0c2812",
+    "tests/mcp-sdk-conformance/package.json": "1dbaed6e361b2ef4c54f36660c3cff0d0c2000cb20dea36a0d5d5eb09be4a944",
+    "tests/mcp-sdk-conformance/python/requirements.txt": "d8d407f21719ec2c91ffd9094ed55717c45c7b5754425b6c1801a7a97f0994d4"
+  },
+  "license_blockers": [
+    {
+      "advisories": [],
+      "artifact_filename": "cffi-2.1.1-cp310-cp310-macosx_10_15_x86_64.whl",
+      "artifact_sha256": "baed1e86cc735622097354b9d1281406caf42ff42a886d29faa8e8d1630333be",
+      "artifact_url": "https://files.pythonhosted.org/packages/b6/d2/2cde336b375f55c76ca670f0be3978cc048e31e24f3b4d7ce8473150a388/cffi-2.1.1-cp310-cp310-macosx_10_15_x86_64.whl",
+      "ecosystem": "python",
+      "hashes": [
+        "046bfc24911b37851ee1b51aab8bffe713d89c68c6a057b09484ce9fd5f69b4e",
+        "06c72bb76605a4b0cd0aad6930b69d4baf7dd5d806cfc409b824191099700e66",
+        "0beceaabe56af686895136a2de78db54ecd8e4046b236b8fd6d6cb61389e9bf2",
+        "154852545011f779917b11c78db2358d095da62a9a172b78ad0a583ee5adc0d0",
+        "194cffa889098ced9976c3fc6340305e43f6303657d298da55366907c05c22d6",
+        "19ee6127ee34de7d83ce3d371ebc5ed91addbdcc39f9ab15ce4eb35a4e534971",
+        "1a18a57b58cfb21fc28d72e876acf10eaed67a1ed96226f92af4df681d571c4c",
+        "1aa5645c30469b09530c4ebca77ebf8f17618293c58f8549cb1a543a50236e7d",
+        "1dea0e4d7d4f11f619fe8c1d76caf49e24405b4b5743c0e3be16a500ecd930c9",
+        "208f941bb9d18e768138677f0a6d2ce01f590df56043dda1df1535ac57c88517",
+        "210019b6c7cf07f081b4c54635c8cf744377001350e29cc0f81c4377b4797735",
+        "246fa40ce8645a614ff682e0b70f37134e460eaf93a775e0cbe3cca585a67a80",
+        "25792eac27877609e7bb06d42ff88278a6624fff2ba9bbb523c09616b117e80f",
+        "27350daa11d4f10c540e6e89dada4c54feb7256ad03e9a4dc075ebad7ba360d1",
+        "28907ab9bfb6aa13184cfc17c6b8e1023c5ab6fd7076d8c20a35e59fe04f8f29",
+        "2ae64be792b8966f2c69538199728b290e34726562896df1e5dc8ffd8d8188e8",
+        "31348097ff5bbe827ccc41795d4dd099d9f0625e7def00ee653c137a490c2a6c",
+        "3143d81e29e1e20a9ce10901ec369012947876596f75a222235965f2b7ae832e",
+        "3222ba5d678f80a030e6afbcc33dc1ae5cb45facabb61cee2c7016b8432fde48",
+        "3311ed60d36f83378794e1009ac6258bafbf81f7888b4caa7b35a521e3f95813",
+        "334644fbac4eff73d985a17a91226df55d0f394160c4cfb880e084c8f7161cac",
+        "34e261f78cb6ceaaa36f42f2613f4380d94d9c759a9c73c769ee6e0247364632",
+        "363e05fa78e15116c3c32c210ee36884fd6b9afa6d440e47112c3bd511d64cb6",
+        "398aff33cee2767e3e781d2554c54bd0dff386bb437581e0d8011fde1a942ec1",
+        "3d22a20b1fb1632cc72c22f95f7b0d2961c3e1c235f245ba4c606c4771035659",
+        "42a494cee34437f05546455144f2b5d9ac09b1face62bcfce597d2e521066688",
+        "42e2f76b9455f5a9a844f770bf3e200ed3da0e15f5df3db9c31fe80b04b3d004",
+        "42f6930c31dc7f50732c9ae793c2786c7b6b044195967bbdde40bb9be81c4cc0",
+        "456a61fa52d579ebf9df2e9552ead5129855dbaff6c1e5a9b1bc408809bdc062",
+        "471cee653ae88de62096552e6d24ccb4a5adb8c8c9f10b5054d0122c15bf2779",
+        "49cbc70e6542d4ccccb936558d1064a8012541e78f821f955cff24e357776c94",
+        "4a7c934f7360e8cd64fe9efadcbd10c7c6364f531e432b9a4bf5ccbc9e0e8b50",
+        "4be96343e422f2dfcd12ab5c9f5aebe03f82f737c6bffeca6830b3875cb44aab",
+        "4f42141fc14250de6dde5ee7ea4432be017252d91f19c5ad043c084cea629cac",
+        "507a24c282e0f42f8ed737cf048572cbf580468da5555764a8331735e9c736b6",
+        "51b31d1c98274844cfd7838ce00bfc27c7423a4dc00fc0772fc3331c2cc90676",
+        "58acb8ab8e295e6c5ea12f888cbb13cf21511ef2a3303a23f4325c29d17fe5c1",
+        "5a59cc1c4442bc3d5c703bf720b51138d0bfc173618807c9ee2490a7541dd3d9",
+        "5bb4e7ea95dcd6a014a6fef62e62467d67d8e582326443f3d68e71d6320a9fcf",
+        "5c58fe613dc5e5336357eff555824a314d8e43282600435c8d1cb6a7a2fedd13",
+        "5e7cecbaadb83884793e05828cee59b210b24583b9c7425d0ba6a754fe22eb4e",
+        "616f097f2fe415bc92a247f02e11f634e1f9e9a83d327e3c915c15089c87869e",
+        "63bbfd5ded17c4840ac07cd8f1c21ba9d9708141f840b324f422f41b207e3973",
+        "64faea20f4e2613363a1a9b9c7dd73058f3ecd00133a511e72ad7c511658f527",
+        "661c298b4821edebead0c91edd2b00374d67ad7c5a1f7a91d4442633b79d6a72",
+        "68e62fe11f30d5ca8289242866f0a5291402d8529ca2178ab8afc5c9694ae890",
+        "6a8dddef476fab96d066d578fc88526767b836ab5ab21754e1d5bf3879c31c7c",
+        "6e192623c49c94421616a5778fba35cf0d5a8d000650c1967ef4448ee5cdd990",
+        "7225e4514edb64eb6740324353e0da0711954fd8d7da4576755b1c6e09b697cd",
+        "75f80557d1389eddbd0de2681f6a390a0c5338c31ddaa821381c203fc3fd50d9",
+        "770de9db11e84213beec501cfcaa013b019820ca881e03344dea5844f7876d94",
+        "7750c6449dff7864bb9bb27ddfb0267756189201a3afc911d82b3caacd70dfc3",
+        "7bde5e4cc5c10140859842b9d383af292b22639a4dffb725314baf45968cef80",
+        "7ce713ace7c0e4520535b42b77eaa742c16dab813978064913e5a3cf82973b41",
+        "7da0c5eff80f0197f3b3d1232ec5a682a9325f4ae9016a78f5f5ca35f9ced1f5",
+        "7dbb61fe3a7699468030f71bbe5f8a0e326a151daa91beb11a6fc1f980c55e1c",
+        "811bd1e21d32de12efca32393a0ab3f5133b54fce9bd44b8bd77ab07da14bf6a",
+        "8ef53b2de9bcb9197d31854256575d59dbac0cba72ac627bb291ef5eceb74be4",
+        "937c0052c05a31ca1daf18de3158eed4dbfcb9cc107adbea227728d647be701e",
+        "9d2055050ea716bd38b7f7f1579c275386646b4894c155a3e2f3cd62ed41b7c6",
+        "9f8d177621de5cb38ee3e731eda45d421db093ec0739f46a5594babda7987a98",
+        "a2d7755bef5a12ed488f4ef1f1b69ee9191d7396083b755a5d2295f6edb4768b",
+        "a48d62ab9d6f4f98c983223a547af44be6ca3691074c31cecced6facd3ba2dc1",
+        "a4f00aa42f75d6e4595e8866e748cc1705adc0cddfeb2ca86d0d03993d63ba03",
+        "a6e721d4b0e45d5b65e87534470e67b18dcd092c83f68fba09f152b9cbc061af",
+        "a730a083190634c65cca36ba5f489531576ebd79bcd5c8e172130f6453127231",
+        "a931079504ecc49efed7744c476a5c343a92fabf66dec2db95edb1b2fdc770e2",
+        "aa9511c62d14da7aacc9b4bf51f3f697a621e83b2d6919008243c3aad168eea3",
+        "ab36d55f9ed2d067327667c2fea18dda018eb628dd6347aa01dda6cf1f5d3836",
+        "ad2c86c495b899d862ea0f4b42891b8713a3bd45dd4105c7fd51c2a72f39f3a5",
+        "aeae0e330c9f6acd681f647d46cefd30c29f93e3392882e792e82080c9691399",
+        "b0431303acaea1089ad4b3e9ce4e6518193def1118d4073ca848635ee4ea2e96",
+        "b5bdfd1c873d4e093aabc0ca84c4ca6dbc4f752afb5c86f146d9742580c9da2e",
+        "baed1e86cc735622097354b9d1281406caf42ff42a886d29faa8e8d1630333be",
+        "c1453022f490d2459a11819d83ad1d586e9ff65a12ac3e705ffebd46d3685dcf",
+        "c26608d2222fb1e94487e4a387d85f13eb55d5ed725cb25a0c589ac4ee60e7bc",
+        "c7659f22557c5a0bc4855cd635f55edec690cc008a40768527762cb9fb263455",
+        "c8c69575568085ba0b1b10c0249d779a214aea6f6522e949a0fc9fb0fcb449d0",
+        "c8d2c9fd1f2d16f780d15127abb050d13d1a76c03a4bd87d7e4980e45e511e12",
+        "ca82be1a1d406ecfe1d25dc16cb33488e5a16bf4438c9fb590484ea29d92478b",
+        "cc572dace3f60ef98d7b12ff411d20f5362feb31a0439eab0085bbfd349982d7",
+        "d18e5ac0f2f03f4f518d3e23db0f0cad7faa1da8620e9c09461d443bbf6e6692",
+        "d28630f5854ab07ab1fd4aba756de52326c82e6be15d414b12793f1975048b54",
+        "d9c275eaacd24aa73f94ffd6de08fc3f932424d8b6c376f4bed7cde376fe7bc3",
+        "da0e573f9f97159390c89d9f1a9e41908b66d408cc5b58d08cf3847d844c531b",
+        "dd31f52ea1086513bb9df30f8fcee9b8918323ae067a3d5b78bc826a000712be",
+        "dddad92b554513a31f272570678ba307fb9f618f05e3d4a5eacafff9eae03e1d",
+        "df423d40ee8654634421812bc3b196da3f9bd7d32929da813f8394c4348a5358",
+        "df913725b79db7bcf03448f36b7bf8815363417d5b58deecf9305e3e30f0f21a",
+        "e0bcb7e0f677f543555d2adff3bf19c05f66cdb4796e5ff602442ab2fe3c4ef7",
+        "e2d65b31f36619cda3999b78b2aa9632e76b78448e7a56fc4240824200e7c4fc",
+        "e6e8cff14d6fb0be70a09c0bdc58096f501952d04624ebf867e0e56da2df8960",
+        "f16c709686a78c727bbbf059f92b0bf41c6fc60deec706d2dc19f529175a6125",
+        "f24fb43132a4c6b4cb4eb029492919b2db645be6808d738f244fd146c03c32cb",
+        "f53e442b08449d42821fa4a4fba000095af9f62742a500f978a9f557ec44339a",
+        "f5cfbc5fe74540d335175b656c725d74d90e3730c626d92575eea35029d9afaa",
+        "f81b3b8f3d4e343550fa4baa0e479bba9f2d29ce9c2e9b51d1ce1718d7442fcf",
+        "f8ec5e643a9a937f64e1999eb9f75d072263751912dc5cd06d3c85f8f44be7c3",
+        "fb92203a88b3d3053034db775110081c49d28be6551923805e039924093761e4",
+        "fcd22650c908d7b7da162bbfaab594a1227a15d1643a98c68b122ac642fa2264"
+      ],
+      "license": "MIT-0",
+      "license_files": {
+        "cffi-2.1.1.dist-info/licenses/LICENSE": "5ba24ddc57067f9249add644c3afc41a5d6dc37e23433ef759d95df370b0af63"
+      },
+      "license_sources": {
+        "classifiers": [],
+        "expression": "MIT-0",
+        "legacy": null
+      },
+      "marker": "platform_python_implementation != \"PyPy\"",
+      "metadata_sha256": "558bafb9093a8e790175d9ecff9688382981d744877dad86fd6770db0f4dc918",
+      "name": "cffi",
+      "release_metadata_sha256": "2255e530e3f80593a354e3d84a29966924d0e10309d1e3a6d50f845ab7d8df66",
+      "release_metadata_url": "https://pypi.org/pypi/cffi/2.1.1/json",
+      "version": "2.1.1"
+    },
+    {
+      "advisories": [],
+      "artifact_filename": "pywin32-312-cp310-cp310-win32.whl",
+      "artifact_sha256": "772235332b5d1024c696f11cea1ae4be7930f0a8b894bb43db14e3f435f1ff7e",
+      "artifact_url": "https://files.pythonhosted.org/packages/fe/1b/9cfdeac80ee45bebbbcb31f1b7b99a0d81a1c72de48d837be984e0e88b1d/pywin32-312-cp310-cp310-win32.whl",
+      "ecosystem": "python",
+      "hashes": [
+        "02ebca0f0242b75292e218065004310d6a477407c09fa449bfe4f6022bc0c0fc",
+        "17948aeadbdb091f0ced6ef0841620794e68327b94ee415571c1203594b7215c",
+        "3020656e34f1cf7faeb7bccd2b84653a607c6ff0c55ada85e6487d61716deabd",
+        "59aba5d5940842075343a5ddc6b11f1cdf0d1567fe745290359dfbcc7c2eb831",
+        "5c1fbe4a937a73ae9297384a3da38518cbc694c68ad8a809b2e19acd350f03ed",
+        "5dbc35d2b5320dc07f25fa31269cfb767471002b17de5eb067d03da68c7cb2db",
+        "6017c58e12f6809fbb0555b75df144c2922a9ffd18e4b9b5afa863b6c1a9d950",
+        "772235332b5d1024c696f11cea1ae4be7930f0a8b894bb43db14e3f435f1ff7e",
+        "7a27df850933d16a8eabfbaeb73d52b273e2da667f80d70b01a89d1f6828d02c",
+        "9fce94568364e0155e6dfb781ac5d95903be8baf28670632beab1b523f300daa",
+        "a4dd3a848290ef724347b19f301045831d8e802fa4464f491b98b1e0a081432e",
+        "a77a90fbb6881238d2ca9c6fd797b25817f3768fe78d214a90137ff055a75f5b",
+        "a8597d28f267b39074aef51fa593530082b39cbe5a074226096857b1fed2dfb9",
+        "b2200a054ca6d6625c4842fc56a4976a4b47f96b73dbe5538c3f813a80359f47",
+        "b457f6d628a47e8a7346ce22acb7e1a46a4a78b52e1d17e1af56871bd19a93bc",
+        "c2f03a0f73f804a13c2735b99392b0cd426bb4f2c4d0178e5ac966a0f21618d5",
+        "c53e878d15a1c44788082bfe712a905433473aa38f86375b7cf8b45e3acbaaf9",
+        "d11417d84412f859b722fad0841b3614459ed0047f7542d8362e77884f6b6e8a",
+        "d620900033cc7531e50727c3c8333091df5dd3ffe6d68cdca38c03f5821408d5",
+        "dab4f65ac9c4e48400a2a0530c46c3c579cd5905ecd11b80692373915269208b",
+        "dc90147579a905b8635e1b0ec6514967dcb07e6e0d9c42f1477feef14cac23bb"
+      ],
+      "license_files": {
+        "pywin32-312.dist-info/licenses/adodbapi/license.txt": "5ea2f23c7f00c3006bacf267183e816d8d4b6dc95ea57a4ddb0ff81de6d8719e",
+        "pywin32-312.dist-info/licenses/com/License.txt": "fad39c18fc3825fa278db1c86fd52cf88d7c525b3c2fbf7817fa383cbae4d423",
+        "pywin32-312.dist-info/licenses/com/win32comext/mapi/src/MAPIStubLibrary/LICENSE": "1c4cf44d2fb8bf2d10214d6da80cc9e05502824cc4460f35be4c7bcb4cde53da",
+        "pywin32-312.dist-info/licenses/isapi/README.txt": "41383bcc95edb8138d37077ae54bfdcbd2a3b77bf745a8529a9c161146e22303",
+        "pywin32-312.dist-info/licenses/pythonwin/License.txt": "a74d826efb242db087b850348e20abbfd591b51e2081f2048735290913872924",
+        "pywin32-312.dist-info/licenses/pythonwin/Scintilla/License.txt": "57ec79bbeab4fd1cf7460a7ad450d2ab01471810459aeae9e75e4c66b472095f",
+        "pywin32-312.dist-info/licenses/pythonwin/pywin/idle/LICENSE.txt": "a0fa1e7b8a4230055685e796548ac084a6c0eea395294574093bba72efd9191b",
+        "pywin32-312.dist-info/licenses/win32/License.txt": "a74d826efb242db087b850348e20abbfd591b51e2081f2048735290913872924"
+      },
+      "license_sources": {
+        "classifiers": [
+          "License :: OSI Approved :: Python Software Foundation License"
+        ],
+        "expression": null,
+        "legacy": "PSF"
+      },
+      "marker": "sys_platform == \"win32\"",
+      "metadata_sha256": "77f53e90408dd3bdcf5f73a20d6548504313dee2ad34f8b3794b2202583a84b1",
+      "name": "pywin32",
+      "release_metadata_sha256": "f142c39d2740c13a932c795fb7f47af150185dbf6713cefa93ee5bd1e030d31f",
+      "release_metadata_url": "https://pypi.org/pypi/pywin32/312/json",
+      "version": "312"
+    },
+    {
+      "advisories": [],
+      "artifact_filename": "typing_extensions-4.16.0-py3-none-any.whl",
+      "artifact_sha256": "481caa481374e813c1b176ada14e97f1f67a4539ce9cfeb3f350d78d6370c2e8",
+      "artifact_url": "https://files.pythonhosted.org/packages/49/d3/b8441a820a491ddfc024b0b0cf0393375b75ea13866d9c66727e54c2fc80/typing_extensions-4.16.0-py3-none-any.whl",
+      "ecosystem": "python",
+      "hashes": [
+        "481caa481374e813c1b176ada14e97f1f67a4539ce9cfeb3f350d78d6370c2e8",
+        "dc983d19a509c94dba722ee6abd33940f7c05a89e243c47e907eb4db6f1a43e5"
+      ],
+      "license": "PSF-2.0",
+      "license_files": {
+        "typing_extensions-4.16.0.dist-info/licenses/LICENSE": "3b2f81fe21d181c499c59a256c8e1968455d6689d269aa85373bfb6af41da3bf"
+      },
+      "license_sources": {
+        "classifiers": [],
+        "expression": "PSF-2.0",
+        "legacy": null
+      },
+      "marker": "",
+      "metadata_sha256": "b05084ca1d50879865178d9fff9fabeab61bdfb1f361bfbde95421ffc8f9be46",
+      "name": "typing-extensions",
+      "release_metadata_sha256": "2140da00d62dde967f52d0be0ae28444f1d6a3fe603f52c83c23988c32122d5a",
+      "release_metadata_url": "https://pypi.org/pypi/typing-extensions/4.16.0/json",
+      "version": "4.16.0"
+    }
+  ],
+  "npm_advisories": {
+    "exit_status": 0,
+    "report": {
+      "auditReportVersion": 2,
+      "metadata": {
+        "dependencies": {
+          "dev": 147,
+          "optional": 27,
+          "peer": 0,
+          "peerOptional": 0,
+          "prod": 1,
+          "total": 147
+        },
+        "vulnerabilities": {
+          "critical": 0,
+          "high": 0,
+          "info": 0,
+          "low": 0,
+          "moderate": 0,
+          "total": 0
+        }
+      },
+      "vulnerabilities": {}
+    },
+    "report_sha256": "3aa12cb203db76a7527704deee3c3224d6c0ea1da1a3675903c8e5846488df8c"
+  },
+  "passed": false,
+  "python_advisories": [
+    {
+      "advisories": [],
+      "marker": "",
+      "name": "annotated-types",
+      "release_metadata_sha256": "a6e8e5b10c8fd2f596bba53e015cd37f6279fb5cec26ce0c5e9968625be4fefa",
+      "release_metadata_url": "https://pypi.org/pypi/annotated-types/0.8.0/json",
+      "version": "0.8.0"
+    },
+    {
+      "advisories": [],
+      "marker": "",
+      "name": "anyio",
+      "release_metadata_sha256": "e2ee22fad2fab3e66be503cba9b41945607d3076c9b7aa49b6e2f95ac323efab",
+      "release_metadata_url": "https://pypi.org/pypi/anyio/4.15.1/json",
+      "version": "4.15.1"
+    },
+    {
+      "advisories": [],
+      "marker": "",
+      "name": "attrs",
+      "release_metadata_sha256": "a882bf941fb4a0bb748d0194df544121cc130f5fb15a710ab6b804c17d2899b7",
+      "release_metadata_url": "https://pypi.org/pypi/attrs/26.1.0/json",
+      "version": "26.1.0"
+    },
+    {
+      "advisories": [],
+      "marker": "platform_python_implementation != \"PyPy\"",
+      "name": "cffi",
+      "release_metadata_sha256": "2255e530e3f80593a354e3d84a29966924d0e10309d1e3a6d50f845ab7d8df66",
+      "release_metadata_url": "https://pypi.org/pypi/cffi/2.1.1/json",
+      "version": "2.1.1"
+    },
+    {
+      "advisories": [],
+      "marker": "sys_platform != \"emscripten\"",
+      "name": "click",
+      "release_metadata_sha256": "4e36adc9b46f837e10ce801b7a478f9146fefdfb287292b7668fc64b1474e41d",
+      "release_metadata_url": "https://pypi.org/pypi/click/8.5.0/json",
+      "version": "8.5.0"
+    },
+    {
+      "advisories": [],
+      "marker": "",
+      "name": "cryptography",
+      "release_metadata_sha256": "6173d893ced0fe6e155dcbc85531df981c7412d4bead511f8eeaad0e667f31c9",
+      "release_metadata_url": "https://pypi.org/pypi/cryptography/50.0.1/json",
+      "version": "50.0.1"
+    },
+    {
+      "advisories": [],
+      "marker": "python_full_version < \"3.11\"",
+      "name": "exceptiongroup",
+      "release_metadata_sha256": "71b05dd0b3dc3bbca085f196a000f2baeba414f4aba0028a0b758e090277adbc",
+      "release_metadata_url": "https://pypi.org/pypi/exceptiongroup/1.3.1/json",
+      "version": "1.3.1"
+    },
+    {
+      "advisories": [],
+      "marker": "sys_platform != \"emscripten\"",
+      "name": "h11",
+      "release_metadata_sha256": "97f4efb9cc00826f0408076983adc1a1e48e8f2cabf403aaf250f724e081440d",
+      "release_metadata_url": "https://pypi.org/pypi/h11/0.16.0/json",
+      "version": "0.16.0"
+    },
+    {
+      "advisories": [],
+      "marker": "sys_platform != \"emscripten\"",
+      "name": "httpcore2",
+      "release_metadata_sha256": "e05fcfc2623a09a7b5810145a7f5ace8e591eba606865de10b63dd310afc3b3d",
+      "release_metadata_url": "https://pypi.org/pypi/httpcore2/2.13.1/json",
+      "version": "2.13.1"
+    },
+    {
+      "advisories": [],
+      "marker": "",
+      "name": "httpx2",
+      "release_metadata_sha256": "572d2e63f8bc0d606a86c2a948d03cabe1520d0dc315a8c892f1b83ce6f52b2e",
+      "release_metadata_url": "https://pypi.org/pypi/httpx2/2.13.1/json",
+      "version": "2.13.1"
+    },
+    {
+      "advisories": [],
+      "marker": "python_full_version >= \"3.12\" and sys_platform == \"emscripten\"",
+      "name": "httpx2-jsfetch",
+      "release_metadata_sha256": "7ae7d80d1c8ceff8a4a825ff4b54184ba5064780fdff1acdc01ff11ee73b45df",
+      "release_metadata_url": "https://pypi.org/pypi/httpx2-jsfetch/1.0/json",
+      "version": "1.0"
+    },
+    {
+      "advisories": [],
+      "marker": "",
+      "name": "idna",
+      "release_metadata_sha256": "e7cbd26e23ce60f6cb3a151d2adf3b1b087bb8f10ac2d9d6db70fdccbf3bb041",
+      "release_metadata_url": "https://pypi.org/pypi/idna/3.20/json",
+      "version": "3.20"
+    },
+    {
+      "advisories": [],
+      "marker": "",
+      "name": "jsonschema",
+      "release_metadata_sha256": "d0c9ccdfa30c3cdc57b048c2be21123dfb0c2f4d6bef2e8324dcb4eac985cfcf",
+      "release_metadata_url": "https://pypi.org/pypi/jsonschema/4.26.0/json",
+      "version": "4.26.0"
+    },
+    {
+      "advisories": [],
+      "marker": "",
+      "name": "jsonschema-specifications",
+      "release_metadata_sha256": "91810d8f79384375ad0c0cf631e06903e2790b030d3fad2f1ad657b20ddd839e",
+      "release_metadata_url": "https://pypi.org/pypi/jsonschema-specifications/2025.9.1/json",
+      "version": "2025.9.1"
+    },
+    {
+      "advisories": [],
+      "marker": "",
+      "name": "mcp",
+      "release_metadata_sha256": "1983ff600264ca5a21d531b282d349c4fac4d3d2b05e1e8592b4e739f013f538",
+      "release_metadata_url": "https://pypi.org/pypi/mcp/2.2.0/json",
+      "version": "2.2.0"
+    },
+    {
+      "advisories": [],
+      "marker": "",
+      "name": "mcp-types",
+      "release_metadata_sha256": "0427211766ffeb6015200ebbca9a0cb1e682ac12956154502267da21d6f125a1",
+      "release_metadata_url": "https://pypi.org/pypi/mcp-types/2.2.0/json",
+      "version": "2.2.0"
+    },
+    {
+      "advisories": [],
+      "marker": "",
+      "name": "opentelemetry-api",
+      "release_metadata_sha256": "8f8e7481c7bd41f5f33387baf18b6960994aee806f4f4fadb7a40c6370c06e87",
+      "release_metadata_url": "https://pypi.org/pypi/opentelemetry-api/1.45.1/json",
+      "version": "1.45.1"
+    },
+    {
+      "advisories": [],
+      "marker": "implementation_name != \"PyPy\" and platform_python_implementation != \"PyPy\"",
+      "name": "pycparser",
+      "release_metadata_sha256": "13939b01403db93c94e8f9c5b0e3441c9cdccb4304e43ec6820031f7da71a793",
+      "release_metadata_url": "https://pypi.org/pypi/pycparser/3.0/json",
+      "version": "3.0"
+    },
+    {
+      "advisories": [],
+      "marker": "",
+      "name": "pydantic",
+      "release_metadata_sha256": "0e9b8743b2df09783024c3b503f2679874d5af25c520d6d0fbd1e676c28c4067",
+      "release_metadata_url": "https://pypi.org/pypi/pydantic/2.13.5/json",
+      "version": "2.13.5"
+    },
+    {
+      "advisories": [],
+      "marker": "",
+      "name": "pydantic-core",
+      "release_metadata_sha256": "2b7ff790445e6ef989d018eabde2440fe85fe557be67f157ad3c2f7b887a312f",
+      "release_metadata_url": "https://pypi.org/pypi/pydantic-core/2.46.5/json",
+      "version": "2.46.5"
+    },
+    {
+      "advisories": [],
+      "marker": "",
+      "name": "pyjwt",
+      "release_metadata_sha256": "d7d239d115c9442eed19860676c23a4132a38a3880d5722da57fe2e0bd80f570",
+      "release_metadata_url": "https://pypi.org/pypi/pyjwt/2.15.0/json",
+      "version": "2.15.0"
+    },
+    {
+      "advisories": [],
+      "marker": "",
+      "name": "python-multipart",
+      "release_metadata_sha256": "f94ae178a5196b01730490f0b3b10b2ad32bf92aa2fba5c3f7ffd6b5235c9697",
+      "release_metadata_url": "https://pypi.org/pypi/python-multipart/0.0.32/json",
+      "version": "0.0.32"
+    },
+    {
+      "advisories": [],
+      "marker": "sys_platform == \"win32\"",
+      "name": "pywin32",
+      "release_metadata_sha256": "f142c39d2740c13a932c795fb7f47af150185dbf6713cefa93ee5bd1e030d31f",
+      "release_metadata_url": "https://pypi.org/pypi/pywin32/312/json",
+      "version": "312"
+    },
+    {
+      "advisories": [],
+      "marker": "",
+      "name": "referencing",
+      "release_metadata_sha256": "a67968d8e03aa45e650fc2ff0d07796676db1a7841ce8e810bf2dba5af689464",
+      "release_metadata_url": "https://pypi.org/pypi/referencing/0.37.0/json",
+      "version": "0.37.0"
+    },
+    {
+      "advisories": [],
+      "marker": "python_full_version < \"3.11\"",
+      "name": "rpds-py",
+      "release_metadata_sha256": "3d483a85d90018b0d75e321e3795121cb4658e7e8296e5f2af3a27ed53f88d61",
+      "release_metadata_url": "https://pypi.org/pypi/rpds-py/0.30.0/json",
+      "version": "0.30.0"
+    },
+    {
+      "advisories": [],
+      "marker": "python_full_version >= \"3.11\"",
+      "name": "rpds-py",
+      "release_metadata_sha256": "c791bb0eaf9f18668ca978bd500d8dd8e25cdf692cf5bc92229d1c2854e8d852",
+      "release_metadata_url": "https://pypi.org/pypi/rpds-py/2026.6.3/json",
+      "version": "2026.6.3"
+    },
+    {
+      "advisories": [],
+      "marker": "",
+      "name": "sse-starlette",
+      "release_metadata_sha256": "977c19b3a2c479bc97edecf5ff73e12c81c9ced7dad1582ea2048a255ad1329b",
+      "release_metadata_url": "https://pypi.org/pypi/sse-starlette/3.4.11/json",
+      "version": "3.4.11"
+    },
+    {
+      "advisories": [],
+      "marker": "",
+      "name": "starlette",
+      "release_metadata_sha256": "bb99192bfa57ca9de6fbe4260f1a6e2a7c60c8cba54217413c049e402b06d2bb",
+      "release_metadata_url": "https://pypi.org/pypi/starlette/1.7.0/json",
+      "version": "1.7.0"
+    },
+    {
+      "advisories": [],
+      "marker": "sys_platform != \"emscripten\"",
+      "name": "truststore",
+      "release_metadata_sha256": "3e16e870d07a788b28b43497bbaed860d1297c6045d4815d5b00e10fddd9ab0d",
+      "release_metadata_url": "https://pypi.org/pypi/truststore/0.10.4/json",
+      "version": "0.10.4"
+    },
+    {
+      "advisories": [],
+      "marker": "",
+      "name": "typing-extensions",
+      "release_metadata_sha256": "2140da00d62dde967f52d0be0ae28444f1d6a3fe603f52c83c23988c32122d5a",
+      "release_metadata_url": "https://pypi.org/pypi/typing-extensions/4.16.0/json",
+      "version": "4.16.0"
+    },
+    {
+      "advisories": [],
+      "marker": "",
+      "name": "typing-inspection",
+      "release_metadata_sha256": "0605416f2f37f2df04e45360cf5ce4ca5eeca6d414bb6ddb1ec5a9893c62ac30",
+      "release_metadata_url": "https://pypi.org/pypi/typing-inspection/0.4.4/json",
+      "version": "0.4.4"
+    },
+    {
+      "advisories": [],
+      "marker": "sys_platform != \"emscripten\"",
+      "name": "uvicorn",
+      "release_metadata_sha256": "a308e83961793f6114221aefe9e046ef587da0fc986c4dc50ace1ee43fbe9bcb",
+      "release_metadata_url": "https://pypi.org/pypi/uvicorn/0.54.0/json",
+      "version": "0.54.0"
+    }
+  ],
+  "python_artifact_scope": "one lock-hash-bound wheel per exact marked pin",
+  "schema": 1,
+  "scope": "MCP test-only universal pins",
+  "started_at_unix": 1793421958,
+  "status": "Preparation evidence; live gate failed. No policy exceptions approved.",
+  "tool": {
+    "packaging": "26.3",
+    "script_sha256": "f12e90b441e67b3801bf485694b57d6706207045c5ae90ad1c676736a39bd3ca"
+  }
+}

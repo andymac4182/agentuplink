@@ -31,6 +31,15 @@ jobs:
           python3 -m venv "$RUNNER_TEMP/mcp-audit"
           "$RUNNER_TEMP/mcp-audit/bin/pip" install pip-audit==2.10.1
           "$RUNNER_TEMP/mcp-audit/bin/pip-audit" --require-hashes --disable-pip --progress-spinner off --requirement tests/mcp-sdk-conformance/python/requirements.txt
+      # M3-50 preparation: exercise the fail-closed checker with seeded
+      # archives. The live universal licence gate remains blocked on explicit
+      # policy disposition; see docs/mcp-test-dependency-gate.md. This is not
+      # evidence that the real dependency graph satisfies the licence policy.
+      - name: Exercise MCP dependency gate failure controls
+        run: |
+          python3 -m venv "$RUNNER_TEMP/mcp-license-checker"
+          "$RUNNER_TEMP/mcp-license-checker/bin/pip" install --require-hashes --only-binary=:all: -r scripts/m3-test-dependency-gate-requirements.txt
+          "$RUNNER_TEMP/mcp-license-checker/bin/python" -m unittest discover -s scripts -p test_m3_test_dependency_gate.py -v
 
   typescript:
     name: TypeScript client and framework adapters
