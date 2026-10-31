@@ -128,6 +128,41 @@ async fn run_spki_replacement_gate() -> Result<()> {
     }
 }
 
+#[test]
+fn configured_relay_filter_overrides_error_only_parent_logging() {
+    // Apply the inherited environment and then the fixture's child overrides
+    // just as ManagedProcess does, without changing this test process's env.
+    let spec = common::relay_serve_process_spec("fixture-relay");
+    let probe = |overrides: &[(String, String)]| {
+        std::process::Command::new("sh")
+            .env("RUST_LOG", "error")
+            .envs(overrides.iter().map(|(key, value)| (key, value)))
+            .args(["-c", "test \"$RUST_LOG\" = info"])
+            .status()
+            .expect("child environment probe")
+            .success()
+    };
+    assert!(
+        !probe(&[]),
+        "the inherited error-only filter is insufficient"
+    );
+    assert!(
+        probe(&spec.env),
+        "fixture must enable its required INFO/WARN evidence"
+    );
+}
+
+#[test]
+fn probe_failure_count_includes_events_after_the_diagnostic_prefix() {
+    let warning = "authenticated peer readiness probe failed";
+    let capture = format!(
+        "{}\n{warning}\n{warning}\n",
+        "startup diagnostic ".repeat(300)
+    );
+    assert_eq!(count_probe_failures(&common::truncate(&capture)), 0);
+    assert_eq!(count_probe_failures(&capture), 2);
+}
+
 // ---------------------------------------------------------------------------
 // Evidence
 // ---------------------------------------------------------------------------
@@ -1201,8 +1236,7 @@ impl SpkiReplacementFixture {
     ) -> Result<u32> {
         let process = ManagedProcess::spawn(
             label,
-            ProcessSpec::new(&self.relay_binary)
-                .arg("serve")
+            common::relay_serve_process_spec(&self.relay_binary)
                 .arg("--config")
                 .arg(config.display().to_string()),
         )
@@ -1288,12 +1322,20 @@ impl SpkiReplacementFixture {
         .await
     }
 
-    fn slot_diagnostic(&self, label: &str) -> Result<String> {
-        self.processes
+    fn slot_probe_failures(&self, label: &str) -> Result<usize> {
+        let process = &self
+            .processes
             .iter()
             .find(|slot| slot.label == label)
-            .map(|slot| process_diagnostic(&slot.process))
-            .ok_or_else(|| HarnessError::Process(format!("missing process slot {label}")))
+            .ok_or_else(|| HarnessError::Process(format!("missing process slot {label}")))?
+            .process;
+        // ManagedProcess already bounds each capture to 1 MiB. The 4096-char
+        // human diagnostic is a prefix, so counting it would stop observing
+        // new failures once unrelated startup output filled that prefix.
+        Ok(
+            count_probe_failures(&String::from_utf8_lossy(&process.stdout()))
+                + count_probe_failures(&String::from_utf8_lossy(&process.stderr())),
+        )
     }
 
     async fn exercise(&mut self, deadline: Instant) -> Result<SpkiReplacementEvidence> {
@@ -1403,7 +1445,7 @@ impl SpkiReplacementFixture {
         // Phase 4: an impostor presenting the retired certificate at B's
         // endpoint.  A dials it for its readiness probe, fails the pin check
         // and never opens a request stream.
-        let a_probe_failures_before = count_probe_failures(&self.slot_diagnostic("relay-a")?);
+        let a_probe_failures_before = self.slot_probe_failures("relay-a")?;
         let impostor = ImpostorServer::start(
             self.b_peer_bind,
             &self.old_credential,
@@ -1413,16 +1455,17 @@ impl SpkiReplacementFixture {
         let impostor_end = (Instant::now() + IMPOSTOR_DEADLINE).min(deadline);
         loop {
             let snapshot = impostor.snapshot();
+            let a_probe_failures_now = self.slot_probe_failures("relay-a")?;
             if snapshot.connections_from_relay_a >= 1
                 && snapshot.closes_without_stream >= snapshot.connections_from_relay_a
-                && count_probe_failures(&self.slot_diagnostic("relay-a")?) > a_probe_failures_before
+                && a_probe_failures_now > a_probe_failures_before
             {
                 break;
             }
             if Instant::now() >= impostor_end {
                 let _ = impostor.stop().await;
                 bail!(
-                    "relay A did not dial and reject the retired-certificate endpoint before the bounded deadline: {snapshot:?}"
+                    "relay A did not dial and reject the retired-certificate endpoint before the bounded deadline: {snapshot:?}; probe_failures_before={a_probe_failures_before} probe_failures_now={a_probe_failures_now}"
                 );
             }
             sleep(POLL_INTERVAL).await;
@@ -1440,7 +1483,7 @@ impl SpkiReplacementFixture {
             );
         }
         let a_probe_failure_diagnostic =
-            count_probe_failures(&self.slot_diagnostic("relay-a")?) > a_probe_failures_before;
+            self.slot_probe_failures("relay-a")? > a_probe_failures_before;
         wait_for_ports_released(self.b_consumer_bind, self.b_device_bind, self.b_peer_bind).await?;
 
         // Phase 5: the replacement process with the new certificate takes
@@ -2094,8 +2137,7 @@ async fn start_relay(
 ) -> Result<ManagedProcess> {
     let mut process = ManagedProcess::spawn(
         name,
-        ProcessSpec::new(binary)
-            .arg("serve")
+        common::relay_serve_process_spec(binary)
             .arg("--config")
             .arg(config.display().to_string()),
     )

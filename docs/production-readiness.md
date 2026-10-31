@@ -41,7 +41,7 @@ Fly profile is an intermediate step, not a reduction of that requirement.
 | P0 | Prove durable recovery | M6-C82; the single-relay continuity witness is process-local | Simultaneous restart recovers with an independent witness; rollback remains refused; restore drill completed |
 | P0 | Preserve quiet forwarded sessions across peer idle expiry | M6-C229; compatible owner heartbeat fix and real positive/red controls pass; full acceptance pending | Real quiet-session proof beyond the production idle window, compatible heartbeat and vanished-device controls |
 | P0 | End vanished forwarded device sessions | M6-C68; ingress timeout implemented; real positive/red controls pass | Real cluster network-cut test releases ownership and reconnects within the declared bound |
-| P1 | Stabilize cluster membership and key changes | M7-C80/C81/C83/C86/C131/C150; M8-C46/C47/C48/C61 | Repeatable re-sign, trust-expiry, rotation and restart acceptance |
+| P1 | Stabilize cluster membership and key changes | M7-C06/C80/C81/C83/C86/C131/C150; M8-C46/C47/C48/C61 | Repeatable re-sign, trust-expiry, rotation and restart acceptance |
 | P1 | Finish limits and real adapter acceptance | M4-21/68/70/72/73/74; M3-12/13/37/41/42/44 | Enforced advertised limits, long-lived stream behavior and framework clients across peer hops/rotation/revocation |
 | P1 | Establish load and recovery budgets | M6-03/C125/C126/C183/C192/C201 | Off-host multi-tenant load and soak at declared capacity, with explicit latency/error/recovery targets |
 | P1 | Close release and operator verification gaps | M6-01/C217/C220; M3-50 | Exact candidate checks, clean-machine archives and executed deployment guide |
@@ -65,8 +65,8 @@ Fly profile is an intermediate step, not a reduction of that requirement.
   M3-49 remains explicit, rather than being counted as passing. It is an accepted
   exception for authenticated non-browser endpoints; Origin refusal is checked.
 - Rust 1.95.0 formatting and strict workspace/all-target Clippy passed after
-  the dependency/provider changes. Locked workspace tests passed: 2,825
-  passed, zero failed, 99 ignored, across 168 suite results. The workspace
+  the dependency/provider changes. Locked workspace tests passed after M6-C230: 2,830
+  passed, zero failed, 100 ignored, across 168 suite results. The workspace
   uses a non-reaping PID 1, so the unchanged suite ran under a child-subreaper
   wrapper to reap exited orphan children; no test assertion was weakened.
   Ignored real-Redis gates are executed separately by M7 acceptance.
@@ -85,16 +85,28 @@ Fly profile is an intermediate step, not a reduction of that requirement.
   Consuming applications must apply that override in their root manifest too.
 - The actual Fly Dockerfiles built successfully. Candidate image plus rebuilt
   candidate client passed `deploy/fly/local-proof.sh`, nonce
-  `m6c60-proof-20261031T003837Z-85148`: verified TLS, enrollment, echo, all seven
-  catalog commands, revocation, 169 ms orderly shutdown, relay restart,
+  `m6c60-proof-20261031T010953Z-132985`: verified TLS, enrollment, echo, all seven
+  catalog commands, revocation, bounded orderly shutdown, relay restart,
   Redis-down refusal, AOF recovery with real device traffic within 60 seconds
   and a fresh relay startup. Serving containers were capped at 256 MiB.
   This proves a local container deployment, not the live Fly machines.
 - M1 real-socket acceptance and M2 accelerated rotation/fault gates passed.
-  Three actual 300-second rotations also passed with 18,913 records. The full
-  M7 is being rerun for the final heartbeat change. An earlier local attempt
-  stopped at an absent uuidgen utility after its Redis integration tests passed;
-  a local Python UUID helper supplies that test-environment prerequisite.
+  Three actual 300-second rotations also passed with 18,913 records before
+  the owner-heartbeat change; the final d7c13572 hosted rerun also passed. Full local
+  M7 stopped at configured SPKI replacement; a separate continuation stopped
+  at bootstrap diagnostics. Both require WARN events suppressed by inherited
+  error-only RUST_LOG (M6-C230). Corrected fixtures pass SPKI, bootstrap and
+  M8 rekey under an explicitly error-only parent; a fresh full M7 run is active.
+  No full M7 pass is claimed. A local Python UUID helper supplies
+  the environment's missing uuidgen prerequisite.
+- Hosted CI at d7c13572 passed all three Rust platforms, M1 Linux/macOS,
+  M3/M4, TypeScript, RustSec, Python audit and the Fly Docker proof. Five release
+  platforms built and verified their archives in run 41154229128. M0 and M2 also passed; M7
+  remains pending in run 41154229124; publication was skipped for this draft PR.
+- M7-C06 is reopened: current SPKI replacement acceptance proves readiness
+  and new-pin adoption, but omits the replacement-process device/consumer
+  canary claimed by historical completion text. The guide now states its
+  actual scope; the missing application-level gate remains required.
 - Actual Fly credentials, deployed image, certificates, Redis backup state and
   monitoring are not available through the environment's configured identities.
   Repository deployment notes are historical evidence, not a live inspection.
@@ -120,7 +132,7 @@ Fly profile is an intermediate step, not a reduction of that requirement.
   is explicitly unsafe.
 - M6-C224: CI now includes the full TypeScript checks, high-severity npm audit,
   current RustSec advisories, and the actual Fly image proof. These new jobs
-  must pass on hosted CI before the candidate is eligible for release.
+  passed on hosted CI at d7c13572; the remaining candidate gates still apply.
 - M6-C225: compatible SDK/test dependency updates and direct interoperability
   checks pass locally, including the scoped Mastra override. No advisory
   ignore was added to pass the gate.

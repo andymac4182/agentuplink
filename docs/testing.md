@@ -503,35 +503,20 @@ forwarders and the catalog namespace. The deterministic statement of the same
 replacement rule is `tunnel-cluster`'s
 `membership::tests::peer_key_replacement_walks_old_then_overlap_then_new`.
 
-The replacement process is then required to serve, not merely to converge. Once
-A is ready again, the gate waits for the replacement's own `/readyz`, attaches a
-fresh device session to the device listener that process now owns, reads the
-owner claim back from Redis and requires it to name the same node and deployment
-incarnation under a **different `boot_id`** from the claim the retired process
-held, with a fresh session id and a higher owner epoch, and then drives a public
-consumer request into relay A which must return the exact canary and payload
-bytes across the replaced peer route. The session must still be the one the
-replacement served when it is stopped, and its generation must not have moved
-across the canary. Typical evidence is
-`replacement_epoch=2 replacement_device_generation=1 replacement_canary_attempts=9`.
+The current replacement phase starts relay B with the replacement certificate
+and waits for relay A to recover readiness. It does not wait for replacement
+B's public readiness, attach a fresh device to B, read a replacement owner
+claim, or send a public canary across the replacement route. These remain the
+reopened M7-C06 acceptance requirements: a changed boot/session, higher epoch,
+exact canary through A, stable owner/generation, and clean device shutdown.
 
-Two convergence tolerances are bounded and counted rather than silent. The
-device attach is retried inside the transition deadline, because a relay that
-is still failing closed refuses it at the upgrade or during the control
-handshake. The canary tolerates the typed `503` pre-dispatch boundary
-(`CLUSTER_UNREADY` while A's readiness is still converging, `PEER_UNTRUSTED`
-while A's peer trust for the replacement is), and at most two `401` outcomes.
-The `401` allowance exists because the relay maps a *catalog* failure inside
-consumer authentication to `UNAUTHORIZED` rather than to the
-`AUTHORIZATION_UNAVAILABLE` boundary that sits beside it in the same function,
-so an authority blip during convergence is indistinguishable at the HTTP
-boundary from a real rejection; the third `401` fails the gate, so a genuinely
-broken authorization can never be waited out. Both counts appear in the
-evidence line, and four consecutive local runs recorded `pre_dispatch_401=0`.
-Relay A's own signed record is also re-issued at a higher version before the
-replacement process boots: every record in this fixture carries a lifetime
-shorter than the relay's 60-second bound, and without that refresh the
-replacement's peer trust for relay A ages out mid-phase.
+A source/history review on 2026-10-31 found that the 2026-09-15 documentation
+claim of four successful replacement-canary runs was not backed by committed
+code in this test: phase 5 still contains its original explicit exclusion of
+public admission. The historical tracker entry remains recorded, but is not
+current candidate evidence. Its old claim of tolerated 401 responses also does
+not describe this test. New acceptance must fail authentication refusals and
+allow only explicitly bounded, typed pre-dispatch convergence outcomes.
 
 One boundary is deliberate and not claimed by this gate: the typed public
 outcome across the retired route is the readiness boundary rather than
@@ -548,10 +533,9 @@ was reachable but momentarily unready refused the probe and the prober observed
 Reachability is now measured independently of the responder's own readiness; see
 the readiness paragraph in [cluster.md](cluster.md) and the deterministic
 regressions `real_h3_probe_converges_while_peer_cluster_readiness_is_withdrawn`
-and `real_h3_probe_converges_across_a_peer_readiness_flap`. With that fix in
-place the replacement boot is now asserted through the replacement process
-itself as described above, so a device session and consumer request served *by*
-the replaced process are covered by this gate.
+and `real_h3_probe_converges_across_a_peer_readiness_flap`. Those regressions establish the readiness fix separately. Application traffic
+served by the replacement process is still missing from the configured SPKI
+gate and must be demonstrated before M7-C06 is closed again.
 
 ### Live-catalog Redis process restart
 

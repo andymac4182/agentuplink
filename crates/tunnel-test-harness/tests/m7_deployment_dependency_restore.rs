@@ -574,8 +574,7 @@ async fn initialize_state(binary: &Path, config: &Path) -> Result<()> {
 async fn start_relay(fixture: &RestorationFixture) -> Result<ManagedProcess> {
     let mut process = ManagedProcess::spawn(
         "m7-configured-restoration-relay",
-        ProcessSpec::new(&fixture.relay_binary)
-            .arg("serve")
+        common::relay_serve_process_spec(&fixture.relay_binary)
             .arg("--config")
             .arg(fixture.config_path.display().to_string())
             .env("RUST_LOG", RELAY_LOG_FILTER),
