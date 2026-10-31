@@ -76,8 +76,13 @@ reserved against the session quota. A local timeout or flush alone cannot
 prove a clunk released the number.
 No mutation is replayed. Caller abort keeps its original-reply-before-`Rflush`
 semantics, and a known completed operation can return success while cleanup
-finishes. Synchronous caller code cannot be preempted; dispatch checks the
-monotonic clock when that code returns.
+finishes. A valid final reply processed before the expiry callback can also
+return success after the nominal deadline when the event loop was blocked.
+This preserves the acknowledged result; the next application request still
+refuses at the original monotonic deadline. If the timer is processed first,
+an unacknowledged dispatched mutation remains `unknown`. Synchronous code
+cannot be preempted, so this is not a hard wall-time guarantee during an
+event-loop stall.
 
 This is a budget for each shared-client operation. Separate adapter calls such
 as `mkdir` followed by `writeFile` do not yet share a whole-framework-call budget.
