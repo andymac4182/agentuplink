@@ -1,7 +1,9 @@
 # Three-relay operator recovery drill
 
 M6-C243 adds a bounded, test-only local acceptance drill for the existing
-M6-C22 recovery contract. **Source implementation is not yet verified.** No
+M6-C22 recovery contract. **The live recovery drill is not yet verified.** Targeted compilation, four
+bounded snapshot controls and six pure wrapper guards pass at their narrow
+scope. No
 production service behavior changes, deployment or automatic reconciler are
 included. Keep M6-C22 open beyond this local drill.
 
