@@ -503,20 +503,36 @@ forwarders and the catalog namespace. The deterministic statement of the same
 replacement rule is `tunnel-cluster`'s
 `membership::tests::peer_key_replacement_walks_old_then_overlap_then_new`.
 
-The current replacement phase starts relay B with the replacement certificate
-and waits for relay A to recover readiness. It does not wait for replacement
-B's public readiness, attach a fresh device to B, read a replacement owner
-claim, or send a public canary across the replacement route. These remain the
-reopened M7-C06 acceptance requirements: a changed boot/session, higher epoch,
-exact canary through A, stable owner/generation, and clean device shutdown.
+The replacement phase refreshes A's signed record at version 2 and B's at
+version 4 before starting B with the replacement certificate. Both records
+keep the fixture's 55-second lifetime; refreshing A prevents its initial
+record from expiring during replacement convergence. After B's own public
+readiness and A's recovered readiness, a fresh device attaches to B's existing
+listener. Its Redis owner must name the same tenant, device, node and deployment
+incarnation as the retired owner, with a different nonempty boot/session and a
+strictly higher epoch. The session and epoch must also match the new connector's
+reported `DataReady` identity.
+
+A public request through A must return the exact canary plus payload from that
+replacement session. Its owner token and active generation must remain
+unchanged across the exchange, and the device must stop cleanly before the
+unsigned-record phase begins. The new attach, canary and stop sequence shares
+one 20-second deadline inside the existing 150-second gate deadline. A request
+may be retried only after `503 CLUSTER_UNREADY` or `503 PEER_UNTRUSTED` explicitly
+reports `not_dispatched`. Authentication refusals, other statuses/codes,
+untyped errors, transport failures, ambiguous execution and changed response
+bytes fail immediately. Evidence reports replacement boot/session/epoch,
+generation, attempt/refusal counts, stable ownership and clean shutdown without
+payloads or credentials.
 
 A source/history review on 2026-10-31 found that the 2026-09-15 documentation
 claim of four successful replacement-canary runs was not backed by committed
-code in this test: phase 5 still contains its original explicit exclusion of
-public admission. The historical tracker entry remains recorded, but is not
-current candidate evidence. Its old claim of tolerated 401 responses also does
-not describe this test. New acceptance must fail authentication refusals and
-allow only explicitly bounded, typed pre-dispatch convergence outcomes.
+code in this test at `89acdcad`: phase 5 still contained its original explicit
+exclusion of public admission. The historical tracker entry remains recorded,
+but is not current candidate evidence. Its old claim of tolerated 401 responses also does
+not describe this test. The replacement acceptance above was added after that
+review; current runs and negative controls are recorded on M7-C06, separately
+from the unsupported historical claim.
 
 One boundary is deliberate and not claimed by this gate: the typed public
 outcome across the retired route is the readiness boundary rather than
@@ -533,9 +549,9 @@ was reachable but momentarily unready refused the probe and the prober observed
 Reachability is now measured independently of the responder's own readiness; see
 the readiness paragraph in [cluster.md](cluster.md) and the deterministic
 regressions `real_h3_probe_converges_while_peer_cluster_readiness_is_withdrawn`
-and `real_h3_probe_converges_across_a_peer_readiness_flap`. Those regressions establish the readiness fix separately. Application traffic
-served by the replacement process is still missing from the configured SPKI
-gate and must be demonstrated before M7-C06 is closed again.
+and `real_h3_probe_converges_across_a_peer_readiness_flap`. Those regressions
+establish the readiness fix separately; replacement application traffic is
+now required by the configured SPKI gate itself.
 
 ### Live-catalog Redis process restart
 
