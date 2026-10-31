@@ -221,6 +221,15 @@ the hop. The owner uses one absolute receive deadline, renewed only by inbound
 records; neither its ticker nor outbound traffic resets it. Peer admission,
 signed-trust expiry, device authorization and owner fencing still apply.
 
+An accepted peer request owns its ongoing-request cleanup entry before header
+resolution starts. Planned cancellation, header-read timeout, and capacity
+refusal before dispatch reset that request with `H3_REQUEST_REJECTED`, including
+when resolution is never polled or is cancelled while headers are incomplete.
+They must not finish an empty response or poison an admitted sibling. Dropping
+an unresolved request releases its cleanup entry so GOAWAY can complete; normal
+resolution transfers that ownership to the stream. Malformed HTTP/3 frames keep
+their existing connection-level protocol errors (M6-C246).
+
 Use bounded on-demand direct connections. Relay A opens one outgoing HTTP/3 connection to relay B when A needs to forward work; B may separately open one outgoing connection to A. Reuse each outgoing connection for many HTTP requests, and retire idle connections after 60 seconds. Limit simultaneous connection attempts per destination to one and aggregate attempts globally. Back off with jitter after failures.
 
 At 32 nodes, the steady-state ceiling is 31 outgoing plus 31 incoming peer connections per node. Permit at most four additional key-rotation replacement connections per node across both directions, each subject to the 30-second drain budget; additional work returns overload before allocating payload queues. A fully connected deployment is the maximum observed topology, not a requirement to eagerly dial every peer at startup. There is no gossip routing or transitive trust.
