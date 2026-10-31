@@ -258,6 +258,16 @@ jobs:
         run: cargo +1.95.0 test -p tunnel-catalog --test redis_catalog --locked -- --ignored
       - name: Verify offline authority approvals through real Redis recovery
         run: cargo +1.95.0 test -p tunnel-authority --test recovery_redis --locked -- --ignored
+      - name: Verify replacement-device credential-expiry workaround
+        shell: bash
+        env:
+          TUNNEL_CLIENT_BIN: ${{ github.workspace }}/target/debug/tunnel-client
+        run: |
+          cargo +1.95.0 test -p tunnel-relay --test m6_provisioning_process --locked \
+            reenrolment_drill::m6c233_reenrolment_preserves_access_and_retires_old_identity \
+            -- --ignored --exact --nocapture | tee "$RUNNER_TEMP/reenrolment.log"
+          grep -F "test result: ok. 1 passed" "$RUNNER_TEMP/reenrolment.log"
+          grep -F "m6c233-reenrolment ok nonce=" "$RUNNER_TEMP/reenrolment.log"
       - name: Verify production relay, client, authorization and transport failures
         run: cargo +1.95.0 run --locked -p tunnel-test-harness -- verify
       - name: Verify Redis AOF restart and explicit recovery

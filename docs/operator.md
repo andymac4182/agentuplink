@@ -46,10 +46,20 @@ describing a procedure the code does not have.**
 >    [section 2.5](#25-day-2-catalog-changes-more-users-and-devices-grants-revocation).
 >    The new profile's `device_id` and its export names must be the **new**
 >    device and service UUIDs, not the old ones.
+>    Recreate every affected user's grant with the same operations and
+>    optional expiry. Keep the original records as the migration inventory;
+>    there is no automatic grant migration command. An ungranted user must
+>    remain ungranted.
 > 3. Switch `connect` to the new profile, and switch every cloud caller to
 >    the new device and service IDs: requests addressed to the old ones stop
 >    working once it is revoked.
-> 4. `revoke-device` the old device.
+> 4. Verify the new identity serves each migrated caller, then `revoke-device`
+>    the old device while its certificate is still valid. This also revokes
+>    its credentials and grants; a subsequent `revoke-credential` for one of
+>    those credentials correctly refuses with `no active credential`.
+> 5. Restart `connect` with the new profile to verify the persisted key and
+>    certificate. At the next relay restart, verify a fresh device session
+>    and service for the migrated callers, plus refusal of the old identity.
 >
 > [deploy-fly.md section 6.5](deploy-fly.md#65-certificate-expiry-and-rotation)
 > describes the same path on Fly.
@@ -108,6 +118,18 @@ also runs the provisioning and day-2 commands, `serve` and `connect` end to end
 with cargo-built binaries (sections 2.3 and 2.5), and
 `scripts/m6-reconnect-verify.sh` runs `connect`'s reconnect across a relay
 restart (section 3.1).
+
+M6-C233 adds a bounded re-enrolment drill to `m6-provisioning-verify.sh`
+and Linux acceptance. It uses one configured relay, a disposable Redis
+namespace and synthetic issuer credentials. The old certificate really
+expires after 120 seconds; live old-device revocation must be observed
+before that expiry. Two existing users' grants move to a new device and
+service without broadening policy, and the replacement must serve after
+client and relay restarts and beyond the old expiry. This is not a live
+tester credential rehearsal, a CA rollover, multi-relay acceptance or
+same-device renewal. The local drill and four independent negative controls
+passed on 2026-10-31; [M6-C233](tasks.md) records the exact evidence. Hosted
+execution of this gate is tracked separately.
 
 The same check also compares the client exit-code table in
 [runtime.md](runtime.md#client-exit-codes) with the `Cause` mapping in
