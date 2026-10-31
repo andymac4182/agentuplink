@@ -238,7 +238,10 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
 cargo build --workspace --bins --locked
 TEST_REDIS_URL=redis://127.0.0.1:16379/ cargo test -p tunnel-test-harness \
-  --test m6_online_authority --locked -- --ignored --test-threads=1
+  --test m6_online_authority --locked \
+  online_authority_publishes_for_three_relays_and_fails_closed_across_lifecycle \
+  -- --ignored --exact --test-threads=1
+bash scripts/m6-authority-faults-verify.sh
 ```
 
 The process gate uses generated PKI, an isolated publisher ACL and namespace,
@@ -246,8 +249,14 @@ the real authority binary, Redis TLS and three configured relay processes. It
 checks exact binary canaries through a non-owner ingress while the same device
 owner/session/carrier survives two confirmed refreshes and an authority restart,
 then separately exercises outage expiry, pending client revocation and run
-mismatch. Storage
-tests separately exercise actual crash/rename boundaries, stable locks, permanent
+mismatch. The fault script owns a pinned disposable Redis container: one test
+severs a successful publication reply after commit and requires a higher reserved
+round before any successful checkpoint; the other restarts that actual Redis
+process, preserves its ACL/AOF, and proves the running authority refuses the new
+run without changing approval or publishing new records. The restart checks the
+container ownership label, immutable ID and exact loopback port before acting; it
+never restarts the shared test Redis. Both tests must run for the script to pass.
+Storage tests separately exercise actual crash/rename boundaries, stable locks, permanent
 failure and cancellation. Local tests do not attest deployment DNS, real volume
 crash durability, hosted archives or independent recovery execution. Keep those
 remaining M6-C22 obligations visible in the production deployment goal.

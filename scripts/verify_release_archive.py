@@ -391,9 +391,11 @@ def check_cli(root: Path, target: str, work: Path) -> Result:
     if "tunnel-authority" in binaries_for(target):
         completed = probe(root / "bin" / "tunnel-authority", ["--help"], work)
         probes += 1
-        if (completed.returncode != 0 or "generate-key" not in completed.stdout
-                or "sign-recovery-approval" not in completed.stdout):
-            return fail("cli", "authority-help", "tunnel-authority --help lacks its offline commands")
+        required = ("generate-key", "sign-recovery-approval", "initialize-membership",
+                    "approve-membership", "check-config", "serve")
+        if (completed.returncode != 0 or any(
+                f"tunnel-authority {command}" not in completed.stdout for command in required)):
+            return fail("cli", "authority-help", "tunnel-authority --help lacks required authority commands")
     result = Result("cli", True, f"{probes} probes from the unpacked archive, including "
                                  f"{len(CLIENT_SUBCOMMAND_HELP)} client subcommand --help, config check "
                                  f"and {len(serving)} serving dry run(s)")
@@ -654,6 +656,17 @@ def controls(root: Path, archive: Path, checksum: Path, target: str,
         _decoy(copy / "bin" / "tunnel-authority", 0)
         return check_cli(copy, target, tmp)
     expect("authority replaced by a program exiting 0", "authority-help", authority_help_broken)
+
+    def authority_offline_only(tmp):
+        if "tunnel-authority" not in binaries_for(target) or os.name == "nt":
+            return None
+        copy = _copy(root, tmp)
+        authority = copy / "bin" / "tunnel-authority"
+        authority.write_text("#!/bin/sh\nprintf '%s\\n' 'tunnel-authority generate-key' "
+                             "'tunnel-authority sign-recovery-approval'\n")
+        authority.chmod(0o755)
+        return check_cli(copy, target, tmp)
+    expect("authority exposes only the old offline commands", "authority-help", authority_offline_only)
 
     def planted_import(tmp):
         # Through check_portability itself: the real reader parses the real

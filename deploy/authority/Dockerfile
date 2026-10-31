@@ -2,6 +2,7 @@
 # Build from the repository root. No runtime secrets belong in the context.
 FROM rust:1.95.0@sha256:f49565f188ee00bc2a18dd418183f2c5f23ef7d6e691890517ed341a598f67c3 AS build
 ENV RUSTUP_TOOLCHAIN=1.95.0 CARGO_TERM_COLOR=never
+ARG CARGO_BUILD_JOBS=2
 WORKDIR /src
 COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \

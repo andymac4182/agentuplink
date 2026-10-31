@@ -4,7 +4,7 @@
 #![cfg(any(target_os = "linux", target_os = "macos"))]
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     env, fs,
     io::Read,
     net::SocketAddr,
@@ -44,8 +44,11 @@ use tunnel_test_harness::{
 use tunnel_transport::load_server_config_from_pem;
 use uuid::Uuid;
 
+#[path = "common/authority_fault_proxy.rs"]
+mod authority_fault_proxy;
 #[path = "common/m7_deployment.rs"]
 mod common;
+use authority_fault_proxy::FaultProxy;
 use common::{
     FixtureFiles, ProcessConfigFixture, RedisTlsProxy, free_tcp_addr, jwks_json,
     parse_plaintext_upstream, relay_binary_path, toml_path, toml_string, wait_for_exit,
@@ -1425,4 +1428,509 @@ async fn online_authority_publishes_for_three_relays_and_fails_closed_across_lif
         assert!((0..=1).contains(&removed));
     }
     outcome.expect("online authority real-process acceptance");
+}
+
+// These two faults share only the disposable wrapper-owned Redis daemon.
+// Serialize them even when someone omits the wrapper's --test-threads=1.
+static FAULT_TEST_SERIALIZER: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+struct OwnedRedis {
+    container_id: String,
+    name: String,
+    owner: String,
+    address: SocketAddr,
+}
+
+async fn docker_output(args: &[String]) -> GateResult<Vec<u8>> {
+    let mut spec = ProcessSpec::new("docker");
+    for arg in args {
+        spec = spec.arg(arg);
+    }
+    let mut child = ManagedProcess::spawn("m6-owned-redis-command", spec)
+        .await
+        .map_err(|_| "start owned Redis command")?;
+    let status = wait_for_exit(&mut child, PROCESS_BOUND)
+        .await
+        .map_err(|_| "owned Redis command deadline");
+    let output = child.stdout();
+    child
+        .shutdown(Duration::from_millis(100))
+        .await
+        .map_err(|_| "reap owned Redis command")?;
+    require(status?.success(), "owned Redis Docker command failed")?;
+    Ok(output)
+}
+
+impl OwnedRedis {
+    async fn from_environment(address: SocketAddr) -> GateResult<Self> {
+        let name = env::var("TUNNEL_AUTHORITY_REDIS_CONTAINER")
+            .map_err(|_| "isolated authority Redis wrapper is required")?;
+        let owner = env::var("TUNNEL_AUTHORITY_REDIS_OWNER")
+            .map_err(|_| "isolated Redis ownership token is required")?;
+        require(
+            owner.len() == 32
+                && owner
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()),
+            "invalid isolated Redis ownership token",
+        )?;
+        require(
+            name == format!("agentuplink-authority-faults-{owner}")
+                && address.ip().is_loopback()
+                && address.port() != 16379,
+            "refusing an unowned or shared Redis fault target",
+        )?;
+        let mut owned = Self {
+            container_id: String::new(),
+            name,
+            owner,
+            address,
+        };
+        owned.container_id = owned.inspect().await?;
+        Ok(owned)
+    }
+
+    async fn inspect(&self) -> GateResult<String> {
+        // Read only selected public identity fields, never Docker's complete
+        // environment/configuration. Bind the Redis URL to this exact owned
+        // container's published6379 port before ACL SAVE or any restart.
+        let format = "{{.Id}}\n{{index .Config.Labels \"agentuplink.authority-fault-owner\"}}\n{{.Name}}\n{{range (index .NetworkSettings.Ports \"6379/tcp\")}}{{.HostIp}}:{{.HostPort}}{{end}}";
+        let bytes = docker_output(&[
+            "inspect".into(),
+            "--type".into(),
+            "container".into(),
+            "--format".into(),
+            format.into(),
+            self.name.clone(),
+        ])
+        .await?;
+        let output = std::str::from_utf8(&bytes).map_err(|_| "owned Redis inspection encoding")?;
+        let fields: Vec<_> = output.trim().lines().collect();
+        require(fields.len() == 4, "owned Redis inspection shape")?;
+        require(
+            fields[0].len() == 64
+                && fields[0].bytes().all(|byte| byte.is_ascii_hexdigit())
+                && fields[1] == self.owner
+                && fields[2] == format!("/{}", self.name)
+                && fields[3] == self.address.to_string(),
+            "Redis container ownership or published port did not match the fixture URL",
+        )?;
+        Ok(fields[0].to_owned())
+    }
+
+    async fn restart(&self, admin: &mut redis::aio::MultiplexedConnection) -> GateResult {
+        require(
+            self.inspect().await? == self.container_id,
+            "owned Redis container was replaced",
+        )?;
+        redis::cmd("ACL")
+            .arg("SAVE")
+            .query_async::<()>(admin)
+            .await
+            .map_err(|_| "persist fixture ACL before owned Redis restart")?;
+        // Use the inspected immutable ID, so a same-name replacement cannot
+        // turn the name guard into a restart of another container.
+        docker_output(&[
+            "restart".into(),
+            "--time".into(),
+            "1".into(),
+            self.container_id.clone(),
+        ])
+        .await?;
+        Ok(())
+    }
+}
+
+async fn admin_connection(url: &str) -> GateResult<redis::aio::MultiplexedConnection> {
+    let client = redis::Client::open(url).map_err(|_| "fixture Redis URL")?;
+    timeout(IO_BOUND, client.get_multiplexed_async_connection())
+        .await
+        .map_err(|_| "fixture Redis connection deadline")?
+        .map_err(|_| "fixture Redis connection")
+}
+
+async fn reconnect_admin(url: &str) -> GateResult<redis::aio::MultiplexedConnection> {
+    timeout(Duration::from_secs(12), async {
+        loop {
+            if let Ok(connection) = admin_connection(url).await {
+                return Ok::<_, &'static str>(connection);
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .map_err(|_| "restarted fixture Redis did not return")?
+}
+
+async fn redis_run(admin: &mut redis::aio::MultiplexedConnection) -> GateResult<String> {
+    let info: String = redis::cmd("INFO")
+        .arg("SERVER")
+        .query_async(admin)
+        .await
+        .map_err(|_| "read actual Redis run identity")?;
+    let run = info
+        .lines()
+        .find_map(|line| line.strip_prefix("run_id:"))
+        .ok_or("Redis run identity absent")?
+        .trim();
+    require(
+        run.len() == 40 && run.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "invalid actual Redis run identity",
+    )?;
+    Ok(run.to_owned())
+}
+
+async fn raw_memberships(
+    admin: &mut redis::aio::MultiplexedConnection,
+    namespace: &str,
+) -> GateResult<BTreeMap<String, Vec<u8>>> {
+    let entries: Vec<(String, Vec<u8>)> = redis::cmd("HGETALL")
+        .arg(format!(
+            "tunnel-catalog:{namespace}:membership:operator:directory"
+        ))
+        .query_async(admin)
+        .await
+        .map_err(|_| "read isolated membership directory")?;
+    require(
+        entries.len() <= 32 && entries.iter().all(|(_, bytes)| bytes.len() <= 256 * 1024),
+        "membership evidence exceeded fixture bounds",
+    )?;
+    Ok(entries.into_iter().collect())
+}
+
+async fn committed_reply_fault(
+    fixture: &mut Fixture,
+    proxy: &FaultProxy,
+    catalog: &RedisCatalog,
+) -> GateResult {
+    proxy.arm_next_committed_publish()?;
+    fixture.start_authority().await?;
+    proxy.wait_committed_cut().await?;
+    require(
+        proxy.cut_count() == 1,
+        "lost-reply fault did not cut exactly one committed reply",
+    )?;
+    let attempts = proxy.attempts();
+    let spent = attempts
+        .first()
+        .ok_or("no observed real membership EVAL")?
+        .1;
+    let state = fixture.state()?;
+    require(
+        state["membership_high_water"].as_u64() == Some(spent) && state["confirmed"].is_null(),
+        "initial lost-reply round was not durably spent and unconfirmed",
+    )?;
+    let committed = catalog
+        .read_signed_memberships()
+        .await
+        .map_err(|_| "read committed lost-reply membership")?;
+    require(
+        !committed.is_empty() && committed.len() < fixture.relays.len(),
+        "fault did not prove a committed partial inventory round",
+    )?;
+    for record in &committed {
+        let signed: tunnel_cluster::membership::SignedMembershipRecord =
+            serde_json::from_slice(&record.bytes)
+                .map_err(|_| "committed membership signed shape")?;
+        require(
+            record.version == spent
+                && signed.record_version == spent
+                && signed.deployment_id == fixture.deployment
+                && signed.deployment_incarnation == fixture.incarnation
+                && attempts.contains(&(signed.node_id, spent)),
+            "actual committed bytes did not match the spent publication attempt",
+        )?;
+    }
+    let client = fixture.client(&fixture.relays[0].identity)?;
+    require(
+        matches!(
+            client.fetch_checkpoint(fixture.request()).await,
+            Err(CheckpointAuthorityError::HttpStatus(503))
+        ),
+        "partial or lost-reply publication produced a successful checkpoint",
+    )?;
+    let recovered = fixture.wait_checkpoint(&client).await?;
+    require(
+        recovered.minimum_versions.len() == 3
+            && recovered
+                .minimum_versions
+                .values()
+                .all(|version| *version > spent),
+        "recovery reused the ambiguously committed record version",
+    )?;
+    let final_records = catalog
+        .read_signed_memberships()
+        .await
+        .map_err(|_| "read higher recovered membership round")?;
+    require(
+        final_records.len() == 3 && final_records.iter().all(|record| record.version > spent),
+        "recovery did not replace every partial-round record with higher versions",
+    )?;
+    fixture.stop_authority().await?;
+    let attempts = proxy.attempts();
+    let unique: BTreeSet<_> = attempts.iter().collect();
+    require(
+        unique.len() == attempts.len(),
+        "daemon retried a node publication at a spent version",
+    )?;
+    require(
+        proxy.cut_count() == 1,
+        "fault proxy cut an unarmed recovery reply",
+    )?;
+    eprintln!(
+        "online authority fault: real committed partial round stayed unconfirmed; every retry used a higher durable version; cut_count=1"
+    );
+    Ok(())
+}
+
+async fn actual_redis_restart_fault(
+    fixture: &mut Fixture,
+    owned: &OwnedRedis,
+    url: &str,
+    username: &str,
+    password: &str,
+    namespace: &str,
+    admin: &mut redis::aio::MultiplexedConnection,
+) -> GateResult {
+    fixture.start_authority().await?;
+    let client = fixture.client(&fixture.relays[0].identity)?;
+    let confirmed = fixture.wait_checkpoint(&client).await?;
+    let before = fixture.state()?;
+    let prior_run = redis_run(admin).await?;
+    require(
+        prior_run == fixture.redis_run,
+        "fixture did not pin the actual original Redis process",
+    )?;
+    let prior_records = raw_memberships(admin, namespace).await?;
+    require(
+        prior_records.len() == 3,
+        "initial publication did not reach actual Redis",
+    )?;
+    owned.restart(admin).await?;
+    *admin = reconnect_admin(url).await?;
+    let next_run = redis_run(admin).await?;
+    require(
+        next_run != prior_run,
+        "owned Redis restart did not change process run identity",
+    )?;
+    let mut credential_check = admin_connection(url).await?;
+    redis::cmd("AUTH")
+        .arg(username)
+        .arg(password)
+        .query_async::<()>(&mut credential_check)
+        .await
+        .map_err(|_| "persisted publisher ACL did not survive Redis restart")?;
+    let pong: String = redis::cmd("PING")
+        .query_async(&mut credential_check)
+        .await
+        .map_err(|_| "publisher ACL after restart")?;
+    require(pong == "PONG", "publisher ACL was unusable after restart")?;
+
+    let mut process = fixture
+        .authority
+        .take()
+        .ok_or("live authority process missing during Redis fault")?;
+    // One reserved publication can discover the broken old connection; the
+    // next20s tick reconnects, observes the new run and fatally refuses it.
+    let status = wait_for_exit(&mut process, Duration::from_secs(50))
+        .await
+        .map_err(|_| "daemon did not fail closed after actual Redis restart");
+    let diagnostic = String::from_utf8_lossy(&process.stderr()).into_owned();
+    let refusal = diagnostic.contains("Redis run differs from independent durable approval")
+        || diagnostic.contains(
+            "membership publication conflict; independent authority state review required",
+        );
+    process
+        .shutdown(Duration::from_millis(100))
+        .await
+        .map_err(|_| "reap authority after actual Redis restart")?;
+    require(
+        !status?.success() && refusal,
+        "actual Redis restart did not hit the independent run fence",
+    )?;
+    require(
+        client.fetch_checkpoint(fixture.request()).await.is_err(),
+        "authority served a checkpoint after fatal Redis-run detection",
+    )?;
+    let after = fixture.state()?;
+    require(
+        after["expected_redis_run_id"] == before["expected_redis_run_id"]
+            && after["inventory"] == before["inventory"]
+            && after["confirmed"] == before["confirmed"],
+        "daemon silently reapproved new Redis run or confirmed a new publication",
+    )?;
+    require(
+        after["membership_high_water"]
+            .as_u64()
+            .ok_or("post-restart membership counter")?
+            >= before["membership_high_water"]
+                .as_u64()
+                .ok_or("pre-restart membership counter")?
+            && after["checkpoint_high_water"] == before["checkpoint_high_water"],
+        "Redis restart reset or spuriously advanced authority allocators",
+    )?;
+    require(
+        raw_memberships(admin, namespace).await? == prior_records,
+        "unapproved new Redis process received a new membership publication",
+    )?;
+    require(
+        after["confirmed"]["membership_version"].as_u64()
+            == Some(confirmed.minimum_versions["relay-a"]),
+        "failed daemon changed its last confirmed membership floor",
+    )?;
+    eprintln!(
+        "online authority fault: owned Redis changed run while daemon lived; persisted ACL remained usable; daemon exited without reapproval or new membership writes"
+    );
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum FaultCase {
+    CommittedReply,
+    RedisRestart,
+}
+
+async fn run_owned_fault(case: FaultCase) -> GateResult {
+    let url = env::var("TEST_REDIS_URL").map_err(|_| "TEST_REDIS_URL required")?;
+    let upstream = parse_plaintext_upstream(&url)
+        .map_err(|_| "fault gate requires disposable loopback Redis")?;
+    let owned = OwnedRedis::from_environment(upstream).await?;
+    let mut admin = admin_connection(&url).await?;
+    let suffix = Uuid::new_v4().simple().to_string();
+    let namespace = format!("test-authority-fault-{suffix}");
+    let username = format!("fault-publisher-{suffix}");
+    let password = Uuid::new_v4().simple().to_string();
+    let mut catalog = None;
+    let mut fixture = None;
+    let mut proxy = None;
+    let outcome = timeout(Duration::from_secs(90), async {
+        redis::cmd("ACL")
+            .arg("SETUSER")
+            .arg(&username)
+            .arg("reset")
+            .arg("on")
+            .arg(format!(">{password}"))
+            .arg(format!("~tunnel-catalog:{namespace}:membership:operator:*"))
+            .arg(&[
+                "+ping", "+info", "+eval", "+hget", "+hlen", "+hset", "+expire",
+            ])
+            .query_async::<()>(&mut admin)
+            .await
+            .map_err(|_| "create isolated fault publisher ACL")?;
+        catalog = Some(
+            RedisCatalog::connect_for_recovery(&url, &namespace, "authority-incarnation-a")
+                .await
+                .map_err(|_| "fault fixture catalog")?,
+        );
+        let catalog = catalog.as_ref().ok_or("fault catalog missing")?;
+        catalog
+            .activate_deployment_incarnation()
+            .await
+            .map_err(|_| "fault fixture incarnation activation")?;
+        let proxied_upstream = if matches!(case, FaultCase::CommittedReply) {
+            proxy = Some(FaultProxy::start(upstream).await?);
+            proxy.as_ref().ok_or("fault proxy missing")?.address()
+        } else {
+            upstream
+        };
+        fixture = Some(
+            Fixture::create(
+                proxied_upstream,
+                &namespace,
+                &username,
+                &password,
+                catalog.bound_redis_run_id(),
+                catalog,
+            )
+            .await?,
+        );
+        let fixture = fixture.as_mut().ok_or("fault authority fixture missing")?;
+        match case {
+            FaultCase::CommittedReply => {
+                committed_reply_fault(
+                    fixture,
+                    proxy.as_ref().ok_or("lost-reply proxy missing")?,
+                    catalog,
+                )
+                .await
+            }
+            FaultCase::RedisRestart => {
+                actual_redis_restart_fault(
+                    fixture, &owned, &url, &username, &password, &namespace, &mut admin,
+                )
+                .await
+            }
+        }
+    })
+    .await
+    .map_err(|_| "owned authority fault scenario deadline")
+    .and_then(|result| result);
+
+    let fixture_cleanup = if let Some(fixture) = fixture {
+        fixture.cleanup().await
+    } else {
+        Ok(())
+    };
+    let proxy_cleanup = if let Some(proxy) = proxy {
+        proxy.shutdown().await
+    } else {
+        Ok(())
+    };
+    // The old catalog is deliberately pinned to the pre-restart process.
+    // Teardown opens an explicitly fresh handle only to the isolated test
+    // namespace; the authority never gets that new run's handle or approval.
+    let keys_cleanup = if catalog.is_some() {
+        match RedisCatalog::connect(&url, &namespace).await {
+            Ok(fresh) => fresh
+                .cleanup_fixture_namespace()
+                .await
+                .map_err(|_| "remove isolated fault namespace"),
+            Err(_) => Err("connect for isolated fault namespace cleanup"),
+        }
+    } else {
+        Ok(())
+    };
+    let user_cleanup = async {
+        require(
+            owned.inspect().await? == owned.container_id,
+            "owned Redis changed before ACL cleanup",
+        )?;
+        let mut fresh = reconnect_admin(&url).await?;
+        redis::cmd("ACL")
+            .arg("DELUSER")
+            .arg(&username)
+            .query_async::<i64>(&mut fresh)
+            .await
+            .map_err(|_| "remove isolated fault publisher ACL")?;
+        redis::cmd("ACL")
+            .arg("SAVE")
+            .query_async::<()>(&mut fresh)
+            .await
+            .map_err(|_| "persist isolated fault ACL cleanup")?;
+        Ok::<_, &'static str>(())
+    }
+    .await;
+    outcome
+        .and(fixture_cleanup)
+        .and(proxy_cleanup)
+        .and(keys_cleanup)
+        .and(user_cleanup)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "run scripts/m6-authority-faults-verify.sh; requires its owned isolated Redis container"]
+async fn online_authority_fault_committed_publish_reply_uses_a_higher_round() {
+    let _serial = FAULT_TEST_SERIALIZER.lock().await;
+    run_owned_fault(FaultCase::CommittedReply)
+        .await
+        .expect("actual daemon committed lost-reply acceptance");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "run scripts/m6-authority-faults-verify.sh; never restart a shared Redis instance"]
+async fn online_authority_fault_actual_redis_restart_requires_independent_approval() {
+    let _serial = FAULT_TEST_SERIALIZER.lock().await;
+    run_owned_fault(FaultCase::RedisRestart)
+        .await
+        .expect("actual daemon owned Redis restart acceptance");
 }
