@@ -23,30 +23,90 @@ then [container notices #272](https://github.com/andymac4182/agentuplink/pull/27
 and [integrated acceptance #273](https://github.com/andymac4182/agentuplink/pull/273),
 then [filesystem confirmation #274](https://github.com/andymac4182/agentuplink/pull/274)
 and [Mastra depth / authority lock #275](https://github.com/andymac4182/agentuplink/pull/275),
-then [terminal retirement observer #276](https://github.com/andymac4182/agentuplink/pull/276).
+then [terminal retirement observer #276](https://github.com/andymac4182/agentuplink/pull/276)
+and [client matcher correction #277](https://github.com/andymac4182/agentuplink/pull/277).
 
-Current hosted candidate [#276](https://github.com/andymac4182/agentuplink/pull/276)
-head `2f3686b7615e74000a65be8a805e64b8060ffe28` and actual runner checkout
-`2f30edffc45cb430f822ee76e3d7d9a011fef15f` share tree
-`736c7bbc8247e89ec41b19313d05f2d997903a65`. At the latest recorded observation,
-13 CI jobs pass and full M7 is still running. Full M4 passes, including the
-unchanged300-second framework rotation and corrected C244 terminal observer.
-The hosted fixture records3 completed exchanges with1 retained stream, then
-reaches3/0/0 and all original final predicates. All three Rust platforms pass;
-Ubuntu's all-target scope totals2931/0/108 across150 suites, distinct from
-local decc's workspace2938/0/108/174 including doctests. Packaging passes;
-no new optimized release workflow is observed. C244's narrow scope is verified;
-M4-21, candidate-wide CI and production readiness remain separate.
+The next C240 implementation is locally verified at
+`bf21e353ede811088cf31b64f8b9076d28378f11` (tree
+`2b3aa8f155d65c4ac07b327e835fbf440216de78`): all six new real actor-loop tests
+and four existing handler controls pass on the first compiled run,10/0/0 in
+2.78s. A separate full workspace format check passes. The first overall
+attempt remains **failed before Clippy** because tmp capacity was138,395,648B
+below its required startup reserve; no lint process or automatic retry ran.
+[Exact actor evidence and retained failure](m6-c240-queue-boundary.md#first-real-actor-loop-run-and-retained-validation-failure)
+keep public C240 scope B and full candidate validation open. A new stacked
+draft will carry this tested implementation plus documentation; the prior
+hosted and image results below retain their exact original identities.
 
-Clean dependency proposal `95eb2d83db9bd5cd2c30e84e950398600b7df76e`
-implements C252's scoped just-bash/minimatch correction. Local pinned Node
-checks pass610 offline/40 peers, the actual consumer-root resolver controls pass,
-and a fresh audit has zero findings. Its first actual300-second framework gate now passes309.108s with unchanged
-assertions and joined cleanup; hosted verification remains pending.
-[Exact C252 input binding and proof](m6-client-followup-2026-10-31.md#c252-actual-framework-integration)
-distinguishes the older frozen Rust driver from the actual new TypeScript graph. The distinct [C253 client license coverage gap](m6-client-license-coverage-2026-10-31.md)
-requires an owner policy decision and artifact-aware enforcement; no license
-exception is approved. New dependency proof is isolated from prior frozen trees.
+Latest fully successful hosted baseline [#277](https://github.com/andymac4182/agentuplink/pull/277)
+head `bd93cfbd828a2d23415e5e406120f9a70e9e92c0` and actual runner checkout
+`3615d7a2ff4ffb5837a8e0f894f353ea68115ac4` share tree
+`00fcf8d247642d9ace69b6223c7500858385e6d3`.
+[CI run 41202356267, attempt 1](https://github.com/andymac4182/agentuplink/actions/runs/41202356267)
+completed successfully at 2026-10-31T23:22:58+10:00: all 14 jobs pass, including
+all Rust platforms, TypeScript 610 offline / 40 installed peers, actual consuming-root
+resolver controls and audit 0, full M4 and full M7. M7 retains 10 complete OG-02 rows
+and zero incomplete rows. The hosted framework gate preserves the 300-second
+schedule, 8 completed exchanges / 20,480 bytes, 1546 ms resumption, 465 ms revocation,
+zero replay/recovery/forced retirement and joined cleanup. Packaging passes;
+no new optimized-release workflow or live deployment is claimed.
+
+C252's scoped just-bash/minimatch correction is verified within its declared
+advisory and compatibility scope. The separate local clean `95eb2d83` actual framework
+gate passed 309.108 s, alongside pinned Node checks, matcher negatives, resolver
+controls and a fresh zero-finding audit. [Exact local input binding and proof](m6-client-followup-2026-10-31.md#c252-actual-framework-integration)
+distinguishes the older frozen Rust driver from the actual new TypeScript graph.
+The distinct [C253 client license coverage gap](m6-client-license-coverage-2026-10-31.md)
+remains blocked on owner policy and artifact-aware enforcement; neither advisory
+checks nor successful CI grant a license exception. New dependency evidence
+remains separate from older frozen trees and optimized archives.
+
+The previous PR #276 (`2f3686b7` / `2f30edff`) candidate shares tree `736c7bbc`; its full M4 and Rust
+platform results established C244's narrow confirmation scope. Its earlier
+13-pass/M7-pending observation remains in the dated evidence report. The current
+PR #277 pass adds the corrected dependency graph's own hosted evidence; it does
+not rewrite any earlier failed run or close broader M4-21.
+
+Actual authority image
+`sha256:52606609ffc52ed3206fd7dbe26b34fdf8d213368983a556beff338ff480f956`
+built from clean `2f3686b7` in the second guarded attempt. The optimized build and
+212-package / 389-file notice staging pass. A conservative 713-tracked-input
+comparison confirms the authority Docker build inputs match `bd93cfbd`, while the
+whole trees differ; no rebuild at `bd93cfbd` or byte-reproducibility claim follows.
+The first build attempt remains failed before build launch because Buildx did
+not support its inspection flag. The reviewed correction validates the actual
+plugin and exact BuildKit cache records while keeping pinned FROM digests and
+all resource guards.
+
+The current image now passes its separate lifecycle and mounted default-UID
+proofs. Lifecycle attempt 3 runs the selected decc native test in 130.74 s
+(command 130.794 s; total controller 140.000 s), with the original5909 relay's
+explicitly unchanged runtime/build closure. Four inspection and ten runtime
+containers are absent, all 53 owned process groups are gone, and 51 protected
+inputs are unchanged. Extracted authority bytes and the 212-package / 389-file
+normal/build Cargo notice manifest are verified; OS package coverage is separate.
+The lifecycle fixture uses UID1000, while startup UID/help/missing-config checks
+and the following independent proof exercise the image's default user.
+
+The first mounted default-UID attempt passes in 42.200 s at UID10002/GID999
+without --user, with no network, read-only root/secrets and writable whole state
+directory. It verifies exact initialization, revision1→2, changed state inode,
+stable lock, temporary collision preservation, seven exact refusals and clean
+stop/reopen. All 15 containers and 218 owned groups are absent; 56 protected
+inputs are unchanged and synthetic material is removed. This default-UID proof
+expects pending/publication-unavailable startup; it does not establish successful
+publication, recovery, target deployment or crash/fsync durability.
+
+Both earlier lifecycle attempts remain **failed**: malformed inspection JSON
+before creation, then an absent optional HostConfig.Init projection that also
+blocked automatic cleanup of one stopped inspection container. Separate cleanup
+receipt31550cf3 succeeds without relabelling either failed attempt. The reviewed
+v4 correction passed 135 pure controls and used the measured197787648B first-
+container allocation to set2271084544B startup headroom with unchanged active
+bounds. Older8c image and5909 archive successes retain their original scope.
+C251's proven descriptor-lifetime correction and current checks are verified;
+its exact historical PR274 failure remains unattributed, so that full diagnosis
+row stays open.
 
 Previous hosted candidate [#275](https://github.com/andymac4182/agentuplink/pull/275)
 head `b13f43cd38c356863dfdd9a99a4573c191d58965` and actual checkout
@@ -72,8 +132,9 @@ retains failed artifact selection, separate selection recovery, first disk-guard
 setup failure and successful recovery-only run. PR275 now passes Ubuntu's
 original permission test and all21 authority tests; the historical PR274
 failure's exact cause remains unattributed. M4-75 closes only its Mastra
-traversal-depth/framework scope. Full current CI, current actual image,
-M4-47, C252 integration and C253 license policy/enforcement remain explicit follow-up work.
+traversal-depth/framework scope. Current PR #277 CI and C252 integration now pass as recorded above. Current image proofs now pass at their declared scopes. Exact historical C251
+attribution, M4-47 and C253 license policy/enforcement remain explicit follow-up
+work.
 
 Earlier integrated candidate `8c8c14fc9f6bb164daad224ad7300c04389a296f` passes
 complete local Rust checks (2,922 tests), all 90 frozen M1/M2/M7 stages, all
@@ -93,7 +154,8 @@ in the [acceptance history](production-acceptance-2026-10-31.md). The earlier
 mixed-binary OG-02 result remains inconclusive. No unchanged retry or narrower
 continuation converts those attempts to passes. C240's expected-green valid
 queue-boundary tests now pass without a runtime change; its broader claim
-remains open. C244 [real-endpoint fid confirmation](m6-fid-confirmation.md) now passes its
+remains open. The new C240 actor-loop draft is source-only;
+no actor-level test pass or public-close acceptance is claimed. C244 [real-endpoint fid confirmation](m6-fid-confirmation.md) now passes its
 positive and meaningful premature-release controls at source8804, with restored
 source passing again. The invalid first clunk control is retained and excluded.
 These follow-up tests do not change the accepted8c runtime identity; their
@@ -109,9 +171,10 @@ preserves the actual checkout and failed log. A separately reproduced duplicate-
 descriptor lock-lifetime defect now has an independently reviewed correction
 and 21 passing authority tests; [C251 evidence](m6-c251-authority-lock-2026-10-31.md)
 keeps historical causation unproven. Integrated required checks and affected
-native lifecycle/fault/recovery now pass at880. New-candidate hosted checks,
-optimized artifacts and actual-image verification remain required. No overall
-new-candidate CI pass is claimed.
+native lifecycle/fault/recovery now pass at880. That earlier statement left new-candidate hosted checks, optimized artifacts
+and image verification pending. The current PR277 hosted pass and separate
+2f image build/lifecycle/default-UID proofs above update only their named scopes;
+no deployment or historical-causation claim follows.
 
 Mastra depth enforcement (M4-75) now rejects descriptor-ceiling overrides and
 incomplete default listings, preserving explicit bounded views. Its 610 offline
@@ -126,8 +189,8 @@ The universal MCP dependency policy still requires owner disposition of
 MIT-0, PSF-2.0 and Windows bundled LGPL obligations; seeded checker tests are
 not a live-policy pass. Actual target inventory, credential/PKI/OIDC setup,
 off-host capacity and soak, monitoring/alerts and recovery ownership remain
-unverified. The [separate default-UID mounted-secret/state proof](m6-authority-default-user-2026-10-31.md)
-now passes with the actual 8c image as UID 10002, retaining its first fixture
+unverified. The earlier [default-UID mounted-secret/state proof](m6-authority-default-user-2026-10-31.md)
+passed with the actual 8c image as UID 10002, retaining its first fixture
 provisioning failure. It does not prove readiness or production provisioning.
 The three-relay requirement
 is unchanged. The C131 diagnostic feature remains outside this candidate;
@@ -173,8 +236,8 @@ these completion criteria are evidenced; scheduling is not verification.
 | Verified at 8c | Vanished-device CLI recovery | M6-C68; remote owner release and fresh library reconnect pass complete cluster acceptance. M6-C229 quiet-session fix is verified. Actual CLI through the cut-client/held-relay proxy and all three negative controls pass; same PID regains readiness in 30.643 s after owner release at 30.021 s. Final 8c combined and original packaged CLI acceptance pass | Same CLI PID reaches a fresh ready session after remote owner cleanup within the stated bounds, with real echo and negative controls; full combined acceptance |
 | P1 | Stabilize cluster membership and key changes | M7-C06/C80/C81/C83/C86/C131/C150; M8-C46/C47/C48/C61; M6-C232 passes prior combined acceptance. C235 identifies an additional clean-EOF path; C238 has deterministic regressions and a completed fixed20/20 versus control19/20 comparison; final 8c full local and hosted M7 pass | Repeatable re-sign, trust-expiry, rotation and restart acceptance; retain intermittent failures |
 | P1 | Finish limits and real adapter acceptance | M4-21/47/68/70/72/73/74; M4-75 is verified at its narrow depth/integration scope; M3-12/13/37/41/42/44 | Enforced advertised limits, long-lived streams and framework clients across peer hops/rotation/revocation |
-| P1 | Resolve authority state test bootstrap lock collision | M6-C251; PR #274 failure remains retained/unattributed. Duplicated-descriptor regression, correction, required Rust, native/original-packaged authority drills and PR275 hosted authority tests pass; current actual-image follow-up remains separate | Causal regression, correction without weakened lock checks, required and hosted candidate checks |
-| P1 | Correct current dependency advisory | M6-C252; the baseline reports two moderate graph nodes for GHSA-g3hv-75wg-m249. Clean95eb scoped11.0.1 correction passes local610/40 and fresh audit0; actual framework gate passes309.108s; hosted acceptance remains pending, threshold unchanged | Compatible graph correction, fresh audit, real framework checks and explicit consumer override contract if applicable |
+| P1 | Resolve authority state test bootstrap lock collision | M6-C251; duplicated-descriptor regression/correction, required/native/original-packaged/hosted checks and current image lifecycle/default-UID proofs pass. Exact PR274 cause remains unattributed; both failed lifecycle controllers stay retained | Preserve the proven mechanism and current verification; establish the exact historical diagnosis before closing the full row |
+| Verified at declared scope | Correct current dependency advisory | M6-C252; scoped 11.0.1 correction passes local 610/40, matcher/resolver controls, audit 0 and actual 309.108 s framework gate. PR #277 same-tree `bd93cfbd` / `3615d7a2` passes all 14 CI jobs including affected TypeScript/full M4 and full M7; completed 2026-10-31T23:22:58+10:00. C253 license policy remains separate and open | Compatible graph correction, fresh audit, real framework checks and explicit consumer override contract; no broader license or production approval |
 | P1 | Define and enforce client dependency license coverage | M6-C253; separate client graph is outside Cargo/MCP gates; existing BlueOak/LGPL declarations plus one new BlueOak dependency remain unapproved | Owner-reviewed client policy, artifact-aware alias-capable gate, unchanged universal scope and complete graph result |
 | P1 | Establish load and recovery budgets | M6-03/C125/C126/C183/C192/C201/C239 | Off-host multi-tenant load and soak at declared capacity, explicit latency/error/recovery targets, Redis peak-memory/AOF rewrite evidence |
 | P1 | Close release and operator verification gaps | M6-01/C217/C220/C241; M3-50 | Exact final-candidate checks, clean-machine archives and executed deployment guide |
@@ -182,6 +245,10 @@ these completion criteria are evidenced; scheduling is not verification.
 | Restricted | CUA is not eligible for ordinary production enablement | M5-C28/C29 and remaining OS/backend gates | Per-operation caller grants, revocation, lease expiry and dedicated-VM acceptance |
 
 ## Verification ledger
+
+- **Current PR #277 candidate:** run 41202356267 attempt 1 passes all 14 jobs at `bd93cfbd` / same-tree `3615d7a2`, including full M7 with 10 complete OG-02 rows. C252 closes at its declared advisory/compatibility scope; local, hosted, image-build and live deployment remain separate evidence.
+
+- **Current authority image:** actual2f image52606609 has713tracked build inputs matchingbd93 and now passes lifecycle130.74s plus separate mounted default-UID42.200s proof. Exact image/binary/notice identities and owned cleanup are retained; both earlier failed controllers remain failed. The default-UID network-none proof does not claim publication, recovery or crash durability.
 
 - **New C244 local correction:** clean `decc5b58` passes its controlled negative, eleven fixed controls, required Rust checks (2938/0/108/174), and one actual gate13.0765s. The real run observes handler completion before stream/replay retirement and then reaches the unchanged terminal assertions. PR276 full M4 and all Rust platforms now pass, closing the declared C244 scope; [local evidence](m6-production-followup-2026-10-31.md#verified-observer-correction-at-decc5b58) and [hosted evidence](m6-client-followup-2026-10-31.md) preserve their separate identities.
 
@@ -417,15 +484,15 @@ lease cleanup and dedicated-guest acceptance.
 
 ## Next action
 
-Finish observing PR276 full CI without retrying or relabelling the failed PR275
-M4 run. C244 local and hosted verification is complete within its declared scope. Verify the current actual
-authority image/default-user layout; preserve the existing8c image proof as its
-own scope. Complete the M4-47 correction when the recorded account-security
-access requirement is satisfied, and complete M6-C252 hosted verification against the locally verified new
-isolated dependency tree. Settle the distinct C253 client license
-policy and artifact-aware enforcement without silently granting exceptions. Do not repeat completed8c core/comparison/archive
-drills as new-candidate evidence. Resolve the explicit universal-license owner
-decisions, actual deployment inventory/PKI/OIDC, simultaneous-restart recovery,
-off-host capacity/soak and operational ownership before any deployment claim.
-Keep this goal and its automation active while a completion criterion or actual
-deployment input remains unresolved.
+Settle C253's client license policy and artifact-aware enforcement without
+silently granting exceptions. PR #277 full CI, C252's declared advisory scope,
+and the current authority image's lifecycle/default-UID fixture proofs are
+complete within their stated bounds. C251 retains an unattributed historical
+failure; no further image-pending claim remains. Keep the new six-test C240
+actor-loop draft at source-only status until actual compilation and acceptance;
+public-close proof remains separate. complete M4-47 when its recorded account-security requirement is
+satisfied. Resolve universal-license decisions, actual deployment inventory/
+PKI/OIDC, simultaneous-restart recovery, off-host capacity/soak and operational
+ownership before any deployment claim. Preserve all failed attempts and older
+artifact identities. Keep this goal active while any criterion or deployment
+input remains unresolved.

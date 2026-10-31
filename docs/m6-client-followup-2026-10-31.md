@@ -154,3 +154,32 @@ Private receipts are in `c252-minimatch` and the retained
 `/dev/shm/agentuplink-minimatch-evidence/native-attempt-1` attempt. They are local
 workspace artifacts, not hosted or live-deployment evidence. Hosted C252 and
 C253 licensing/enforcement remain open; no merge or deployment follows.
+
+## Final hosted and current-image follow-up
+
+PR277 run41202356267 attempt1 passes all14CIjobs at2026-10-31T13:22:58Z.
+Headbd93cfbd and actual3615d7a2 checkout share tree00fcf8d2. TypeScript610/40,
+consumer-root resolver controls, audit0, fullM4 and fullM7 with10complete
+OG-02 rows pass. Combined with the separate local309.108s framework proof,
+C252 completes its advisory/compatibility scope23:22:58+10:00. C253 remains
+open for owner policy and artifact-aware license enforcement.
+
+Actual image52606609, built from2f with713tracked authority Docker inputs
+identical tobd93, now passes lifecycle attempt3 in130.74s and a separate mounted
+default-UID attempt in42.200s. Extracted binary75a244f6 and normal/build Cargo
+notice manifest4250fff0 are verified. Lifecycle uses the selected decc driver
+and original5909 relay under explicit runtime/build closure. DefaultUID10002/
+GID999 uses no --user, network none, read-only root/secrets and writable whole
+state directory: exact initialization, revision1→2, new state inode/stable lock,
+temporary collision, seven exact refusals and clean stop/reopen pass.
+
+Lifecycle's4inspection+10runtime containers/53owned groups and default-UID's
+15containers/218groups are absent;51and56protected inputs respectively remain
+unchanged. Synthetic default-UID material is removed. That network-none proof
+expects pending/publication-unavailable startup and claims no successful
+publication, recovery, live deployment or crash/fsync durability. Earlier
+malformed-JSON and optional-Init lifecycle attempts remain failed; separate
+exact-owned cleanup31550cf3 stays distinct. C251's current image evidence is
+complete at declared scope, while exact historical PR274 causation remains
+unattributed and its full diagnosis row stays open. The production goal remains
+active; no merge, deployment or licence exception follows.

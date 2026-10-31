@@ -91,3 +91,140 @@ the missing handler-level valid-state proof; it does not independently establish
 the wider actor/public-close or complete production-readiness claims described
 above. The misleading later fallback is unchanged and has not been reached by
 valid accounted input.
+
+
+## Actor-loop preparation observation before execution
+
+A separate source-only continuation from exact `bd93cfbd828a2d23415e5e406120f9a70e9e92c0`
+adds six `c240_actor_` tests in
+`crates/tunnel-client/src/m2_runtime/tests/c240_actor_loop.rs`. The earlier
+handler proof and its recorded run are unchanged. At this preparation
+observation the new tests were **not compiled or executed yet**. Pinned-toolchain formatting of the two changed
+Rust files and diff whitespace checks are source checks only.
+
+The new fixture starts `run_m2_session` empty with a validated256KiB queue,
+two stream slots and negotiated128KiB credit. Encoded OPEN and actual
+OPENED/AUTHORIZATION_CHALLENGE exchanges admit each stream. A peer
+`StreamState` assigns all DATA sequences, validates credit/replay, and consumes
+real ACK/window updates. Three64KiB record payloads fill the192KiB aggregate;
+one further legal byte crosses it. No stream, retained-byte counter,
+authorization flag or writer-freeze latch is injected.
+
+| Prepared case | Required oracle, not yet a result |
+| --- | --- |
+| Normal and real-frozen quota | Natural QueueLimit/RESOURCE_EXHAUSTED/nonretryable before fixture cancellation; exact live wall/monotonic authorization and operation deadlines, stable synthetic grant identity and unchanged rejected-frame sequence/pending state; no DATA/FIN/RESET4001/4006 or recovery/replay request. |
+| Omitted crossing | Actual192KiB stays live; the quota predicate rejects the control. No timer sleep or EOF substitutes for an empty live path. |
+| Matching confirmation | One previously buffered record executes once and produces exactly one sequence1 DATA, including the final joined-peer transcript. |
+| Matching invalidation, normal and frozen | Exactly one RESET4001, no application dispatch, live actor and no QueueLimit. A frozen terminal retains its place without consuming sequence or changing either fence until bilateral abort/closure; after drain only its unacknowledged two-byte replay reason may remain. |
+
+The frozen cases use the actual candidate dial: generated, pinned synthetic
+credentials, a device-role URI SAN, mandatory mTLS, the exact fixture ticket
+and data subprotocol, and a real third WebSocket. PREPARE/DATA_READY/QUIESCE and
+both immutable sequence fences precede delivery of frames already assigned
+before quiesce. The invalidation control closes and joins that candidate peer
+before sending the owner's final ROTATE_ABORTED. It does not set
+`writes_frozen` or use the old state-seeding helper. Initial control/active
+sockets use the existing loopback WebSocket pair helper; the synthetic owner
+is not an authoritative production catalog or public admission proof.
+
+Passive, task-local `#[cfg(test)]` observations capture rejection state,
+application dispatch counts, lifecycle publications and actual task-join
+results. The tests retain a Weak reference to the queue budget created by the
+real session, require its owners to be gone after the actor/peer joins, and
+require the returned actor future to have released its owned stream state.
+This is ownership evidence, not RSS measurement; the copied Closed status's
+queue_bytes is deliberately not treated as post-drop accounting. No HTTP
+exchange-task cleanup is inferred from an echo fixture.
+
+Setup, the live-window scenario and cleanup are independently bounded. A
+scenario timeout is a failure, not quota evidence. Product five-second
+authorization/write/close bounds are unchanged; acceptance also rejects
+cleanup reaching a product close timeout, carrier-task panic or forced-join
+fallback. Test-owned timed-out tasks are aborted and joined, and later cleanup
+still runs after earlier failure. No fixture cancellation precedes collection
+of the natural quota result. No successful execution result is claimed until
+the separately coordinated compiler/artifact/resource plan runs.
+
+C240 remains open. Actor scope A cannot establish the relay/public close code,
+a filesystem consumer's `unknown`/`not_started`, a pending unary call's
+`not_dispatched`, or reconnect policy. Those require the separately planned
+public endpoint scope B. The original quota-to-authorization hypothesis is
+still unproven; this expected-green acceptance slice changes no runtime policy,
+quota, reset mapping, grant semantics or automatic replay behavior. M4-47
+response-budget work is explicitly excluded.
+
+
+Source-only review correction (2026-10-31T23:43:55+10:00): draft v2 encloses the
+control-writer await result and passive join observation in a local block.
+This preserves destruction of the non-Copy result before Closed publication,
+as in the original runtime. Draft v1's private patch and receipt are retained.
+The six tests and their assertions are unchanged and remain uncompiled and
+unexecuted. Formatting/whitespace checks do not close actor scope A, public
+scope B or C240; no cache or frozen artifact is moved by this correction.
+
+
+## First real actor-loop run and retained validation failure
+
+At clean implementation `bf21e353ede811088cf31b64f8b9076d28378f11`, tree
+`2b3aa8f155d65c4ac07b327e835fbf440216de78`, the first actual compile and
+focused run passed all six new actor cases and all four unchanged handler
+controls: **10 passed, 0 failed, 0 ignored, 248 filtered out**, in 2.78 seconds
+(3.010 seconds including the command wrapper). The compiler ran once in
+55.618 seconds; listing the selected executable established 258 tests and
+zero benchmarks before execution. This is the expected-green valid-state
+proof described above, not a reproduced or repaired quota-to-revocation bug.
+
+Rust1.95 Cargo JSON selected the default-feature client library test executable,
+which was copied independently as a regular0555/single-link file outside the
+mutable target. Its45,942,416 bytes have SHA-256
+`da37b1f8b9ac24e3c6d0b371734904ed788973c39c1b4f1e4449676ecaa81e14`.
+The actual compiler output and frozen copy remained byte-identical after the
+attempt. Exact commands were:
+
+```sh
+cargo test --locked --offline -p tunnel-client --lib --no-run --message-format=json
+# The independent copy of the one Cargo-selected executable:
+tunnel-client-c240-tests --list
+tunnel-client-c240-tests c240_ --test-threads=1 --nocapture
+```
+
+The first overall validation attempt is **failed**, not passed: immediately
+before Clippy, free tmp capacity was2,009,088,000 bytes, above the unchanged
+1.5GiB active floor but138,395,648 bytes below the2,147,483,648-byte startup
+requirement. Neither Clippy nor formatting launched in that attempt; no retry
+or source edit followed. Required full workspace Clippy/tests and hosted
+acceptance remain pending for the publication candidate. Passing ten tests
+cannot replace those checks.
+
+The controlled cache-preservation step before compilation retained all25 exact
+inactive integration outputs, round-tripped17 new archive members and reverified
+8 existing independent copies before removing the mutable outputs. It reclaimed
+672,796,672 bytes. This is local derived-cache maintenance, not a production
+backup drill. All frozen/protected inputs, fingerprints and both dependency
+trees remained unchanged; no Docker or Redis action occurred.
+
+The failed test-controller result is
+`084d6bd4c0b243f742ecc27fdb019a533b9c5c1aec1b23d99b9b126071cb1b6f`;
+its final handoff is
+`4a1cd84e67f28d6c93003df17fb08471874e39f42abd3a92b35b6b1af8eb85f1`.
+All88 source/protected/tool checks passed, including the entire1093-file tracked
+source. All three started command groups and the controller were independently
+absent; the OOM counters did not increase. Earlier controller review findings
+and the failed archive-control source-order assertion are retained separately;
+none is relabelled product acceptance.
+
+A separately authorized, read-only `cargo fmt --all -- --check` then passed in
+5.015 seconds (7.262 seconds total controller), without recompilation or fixture
+execution. All92 source/protected/tool checks passed, including both selected
+executable copies and the first failed result; the command group and controller
+were independently absent. Format result SHA-256:
+`9d72aff487170e6e133261b334d915e2943cf9f155e9008c7a70851357efd3b9`.
+This separate pass does not change the original failed attempt.
+
+These observations establish actor scope A at the named implementation only.
+Public endpoint scope B, actual filesystem consumer `unknown`/`not_started`,
+unary `not_dispatched`, the full C240 row and production readiness remain open.
+No claim about current-image recovery, live deployment, license approval or
+M4-47 follows from this run. Publication documentation changes are separate
+from the frozen tested implementation; hosted verification must name its own
+final candidate and actual checkout.
