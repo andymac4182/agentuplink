@@ -53,7 +53,11 @@ is already open` (M6-C251). The hosted M7 job has now passed, including all ten
 OG-02 correlation rows; the final CI result is failure with thirteen successful
 jobs and that one failed Ubuntu job.
 The [follow-up evidence](m6-final-candidate-2026-10-31.md#hosted-follow-up-at-107d94a2)
-preserves the actual checkout and failed log. No overall CI pass is claimed.
+preserves the actual checkout and failed log. A separately reproduced duplicate-
+descriptor lock-lifetime defect now has an independently reviewed correction
+and 21 passing authority tests; [C251 evidence](m6-c251-authority-lock-2026-10-31.md)
+keeps historical causation unproven. Integrated required checks, hosted checks
+and affected authority lifecycle/recovery are still required. No overall CI pass is claimed.
 
 Mastra depth enforcement (M4-75) now rejects descriptor-ceiling overrides and
 incomplete default listings, preserving explicit bounded views. Its 610 offline
@@ -115,7 +119,7 @@ these completion criteria are evidenced; scheduling is not verification.
 | Verified at 8c | Vanished-device CLI recovery | M6-C68; remote owner release and fresh library reconnect pass complete cluster acceptance. M6-C229 quiet-session fix is verified. Actual CLI through the cut-client/held-relay proxy and all three negative controls pass; same PID regains readiness in 30.643 s after owner release at 30.021 s. Final 8c combined and original packaged CLI acceptance pass | Same CLI PID reaches a fresh ready session after remote owner cleanup within the stated bounds, with real echo and negative controls; full combined acceptance |
 | P1 | Stabilize cluster membership and key changes | M7-C06/C80/C81/C83/C86/C131/C150; M8-C46/C47/C48/C61; M6-C232 passes prior combined acceptance. C235 identifies an additional clean-EOF path; C238 has deterministic regressions and a completed fixed20/20 versus control19/20 comparison; final 8c full local and hosted M7 pass | Repeatable re-sign, trust-expiry, rotation and restart acceptance; retain intermittent failures |
 | P1 | Finish limits and real adapter acceptance | M4-21/47/68/70/72/73/74/75; M3-12/13/37/41/42/44 | Enforced advertised limits, long-lived streams and framework clients across peer hops/rotation/revocation |
-| P1 | Resolve authority state test bootstrap lock collision | M6-C251; PR #274 Ubuntu Rust failure occurs before permission-refusal assertions | Causal regression, correction without weakened lock checks, required and hosted candidate checks |
+| P1 | Resolve authority state test bootstrap lock collision | M6-C251; PR #274 Ubuntu Rust failure occurs before permission-refusal assertions; separate duplicated-descriptor regression and scoped correction pass | Causal regression, correction without weakened lock checks, required and hosted candidate checks |
 | P1 | Establish load and recovery budgets | M6-03/C125/C126/C183/C192/C201/C239 | Off-host multi-tenant load and soak at declared capacity, explicit latency/error/recovery targets, Redis peak-memory/AOF rewrite evidence |
 | P1 | Close release and operator verification gaps | M6-01/C217/C220/C241; M3-50 | Exact final-candidate checks, clean-machine archives and executed deployment guide |
 | P1 | Configure operations | M6-C218; private metrics exist, privileged-change audit is deferred | Scraper, alerts, retention, certificate/JWKS rotation and incident/restore ownership verified |
