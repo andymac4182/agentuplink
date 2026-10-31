@@ -20,8 +20,11 @@ retain `/src/target` as their compiler cache. This applies the previously proven
 authority build layout to the relay: under Docker's `vfs` storage driver,
 intermediate source layers copy the whole Rust base filesystem, and the earlier
 authority build exhausted local disk. The change avoids those extra relay
-layers without changing runtime inputs; its new image still needs a build and
-runtime proof.
+layers without changing runtime inputs. The actual relay, authority and Redis
+images now pass local extraction/startup, deployment traffic, authority lifecycle
+and bounded Redis rewrite checks; [the dated acceptance report](../../docs/m6-container-notices-2026-10-31.md)
+records immutable image IDs, failed attempts, cleanup corrections and remaining
+distribution work.
 
 Eight locked crates omit standalone notice files from their crates.io archives:
 `asn1-rs-impl` 0.2.0, `agent-client-protocol`, `agent-client-protocol-derive` and
