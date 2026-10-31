@@ -4,8 +4,9 @@
 responder together, under one independent operator identity (M6-C234). It uses
 the existing signed membership and checkpoint formats. It does not provision
 catalog users/devices, issue certificates, reconcile a restored catalog or
-activate recovery. M6-C22 remains open until the complete three-relay operator,
-deployment and recovery acceptance is recorded.
+activate recovery. M6-C22 records the shipped-authority/operator verification
+at `8c8c14fc`. New-candidate authority validation is tracked in M6-C251; actual
+deployment provisioning and the production goal remain separate (M6-C221).
 
 Use one authority process and a durable local filesystem on Linux or macOS.
 The Windows workspace builds, but this service refuses its unsupported private
@@ -223,6 +224,14 @@ The [systemd example](../examples/service/tunnel-authority.service) runs an
 independent account with an owned persistent directory. The [container](../deploy/authority/Dockerfile)
 contains only the authority executable; mount private configuration/credentials
 read-only and state read-write with the fixed UID. Neither starts an initializer.
+Mount the whole state directory so its stable sibling lock and atomic replacement
+remain on the same durable filesystem. The image's UID is 10002; provision
+owner-only directories and files for that identity before sealing the secrets
+mount. One-time key generation needs a writable secrets child at the normal
+container path, separately from read-only service use. The
+[default-user mounted-layout proof](m6-authority-default-user-2026-10-31.md)
+records actual provisioning, refusal checks and the retained inaccessible-parent
+fixture failure; it does not establish production storage or readiness.
 The CI deployment job builds this Dockerfile after the Fly proof, checks the
 effective non-root UID and requires an unconfigured default startup to fail.
 That image smoke does not replace the three-relay process acceptance below.

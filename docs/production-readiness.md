@@ -20,9 +20,20 @@ followed by [clean-EOF expiry #269](https://github.com/andymac4182/agentuplink/p
 [placeholder scan correction #270](https://github.com/andymac4182/agentuplink/pull/270)
 and [Redis AOF headroom #271](https://github.com/andymac4182/agentuplink/pull/271),
 then [container notices #272](https://github.com/andymac4182/agentuplink/pull/272)
-and [integrated acceptance #273](https://github.com/andymac4182/agentuplink/pull/273).
+and [integrated acceptance #273](https://github.com/andymac4182/agentuplink/pull/273),
+then [filesystem confirmation #274](https://github.com/andymac4182/agentuplink/pull/274).
 
-Integrated candidate `8c8c14fc9f6bb164daad224ad7300c04389a296f` now passes
+Latest integrated source `88083555ffec868012938e0d253e9090177deec2` passes
+required Rust checks with 2,932 tests, native three-relay authority lifecycle,
+lost-reply/Redis-restart faults and older-backup/operator recovery. The
+[C251 report](m6-c251-authority-lock-2026-10-31.md#integrated-checks-at-88083555)
+retains the failed post-test artifact selector, separate successful selection
+recovery, first disk-guard setup failure and successful recovery-only run.
+New-candidate hosted checks, optimized artifacts and actual-image verification
+remain pending; earlier binaries and images are not relabelled as this source.
+The next stacked draft is prepared on `codex/production-limits` after #274.
+
+Earlier integrated candidate `8c8c14fc9f6bb164daad224ad7300c04389a296f` passes
 complete local Rust checks (2,922 tests), all 90 frozen M1/M2/M7 stages, all
 14 hosted CI jobs, packaging, and all five optimized release builds/native
 archive verifiers. Hosted checkout `f2945e8196187bc7aec1d4415a58d3dde19b4e8b`
@@ -30,8 +41,8 @@ has the identical tree `d6969b5a8e13cf09ade1cf6b410848f7ced2851f`.
 Fresh hosted full M4 includes all four installed frameworks across a real
 300-second rotation. Four separate drills with unchanged original Linux
 archive binaries pass: authority lifecycle, older-backup/operator recovery,
-actual CLI reconnect and three synthetic CLI rotations. The current actual
-authority image separately passes its lifecycle, notices and startup checks.
+actual CLI reconnect and three synthetic CLI rotations. The actual authority
+image built from 8c separately passes its lifecycle, notices and startup checks.
 The [exact-candidate evidence](m6-final-candidate-2026-10-31.md) records hashes,
 commands, timings, fixture boundaries and local/hosted distinctions.
 
@@ -44,15 +55,39 @@ remains open. C244 [real-endpoint fid confirmation](m6-fid-confirmation.md) now 
 positive and meaningful premature-release controls at source8804, with restored
 source passing again. The invalid first clunk control is retained and excluded.
 These follow-up tests do not change the accepted8c runtime identity; their
-integrated86fb workspace checks now pass2,931tests; new-head hosted checks
-remain pending.
+integrated86fb workspace checks pass2,931tests. PR #274 at head
+`107d94a2e331f850bcc70a2b9406bc79ccfa1cbf` has a successful full hosted M4
+run, including C244, but its Ubuntu Rust job failed before the authority
+permission-refusal test could begin: reopening state returned `authority state
+is already open` (M6-C251). The hosted M7 job has now passed, including all ten
+OG-02 correlation rows; the final CI result is failure with thirteen successful
+jobs and that one failed Ubuntu job.
+The [follow-up evidence](m6-final-candidate-2026-10-31.md#hosted-follow-up-at-107d94a2)
+preserves the actual checkout and failed log. A separately reproduced duplicate-
+descriptor lock-lifetime defect now has an independently reviewed correction
+and 21 passing authority tests; [C251 evidence](m6-c251-authority-lock-2026-10-31.md)
+keeps historical causation unproven. Integrated required checks and affected
+native lifecycle/fault/recovery now pass at880. New-candidate hosted checks,
+optimized artifacts and actual-image verification remain required. No overall
+new-candidate CI pass is claimed.
+
+Mastra depth enforcement (M4-75) now rejects descriptor-ceiling overrides and
+incomplete default listings, preserving explicit bounded views. Its 610 offline
+and 34 installed-peer checks pass. Separate actual relay/device integration
+passes the unchanged 300-second framework rotation gate in311.020s, with
+zero replay, live revocation and joined cleanup; [exact evidence](m4-mastra-depth-2026-10-31.md)
+retains the prelaunch diagnostic failure. New-candidate hosted evidence remains pending. The separate M4-47 valid-state reproduction demonstrates that
+ordinary in-credit DATA can exhaust the response budget and fence all 33
+streams. That production correction and its complete acceptance remain open.
 
 The universal MCP dependency policy still requires owner disposition of
 MIT-0, PSF-2.0 and Windows bundled LGPL obligations; seeded checker tests are
 not a live-policy pass. Actual target inventory, credential/PKI/OIDC setup,
 off-host capacity and soak, monitoring/alerts and recovery ownership remain
-unverified. Default-UID mounted-secret provisioning is separate from the
-actual image fixture's explicitly overridden UID. The three-relay requirement
+unverified. The [separate default-UID mounted-secret/state proof](m6-authority-default-user-2026-10-31.md)
+now passes with the actual 8c image as UID 10002, retaining its first fixture
+provisioning failure. It does not prove readiness or production provisioning.
+The three-relay requirement
 is unchanged. The C131 diagnostic feature remains outside this candidate;
 its [causal evidence](m7-c131-diagnostic-evidence-2026-10-31.md) is separate.
 No changes have been merged or deployed, and release publication/attestation
@@ -95,7 +130,8 @@ these completion criteria are evidenced; scheduling is not verification.
 | P0 | Prove durable recovery | M6-C82; the single-relay continuity witness is process-local | Simultaneous restart recovers with an independent witness; rollback remains refused; restore drill completed |
 | Verified at 8c | Vanished-device CLI recovery | M6-C68; remote owner release and fresh library reconnect pass complete cluster acceptance. M6-C229 quiet-session fix is verified. Actual CLI through the cut-client/held-relay proxy and all three negative controls pass; same PID regains readiness in 30.643 s after owner release at 30.021 s. Final 8c combined and original packaged CLI acceptance pass | Same CLI PID reaches a fresh ready session after remote owner cleanup within the stated bounds, with real echo and negative controls; full combined acceptance |
 | P1 | Stabilize cluster membership and key changes | M7-C06/C80/C81/C83/C86/C131/C150; M8-C46/C47/C48/C61; M6-C232 passes prior combined acceptance. C235 identifies an additional clean-EOF path; C238 has deterministic regressions and a completed fixed20/20 versus control19/20 comparison; final 8c full local and hosted M7 pass | Repeatable re-sign, trust-expiry, rotation and restart acceptance; retain intermittent failures |
-| P1 | Finish limits and real adapter acceptance | M4-21/68/70/72/73/74; M3-12/13/37/41/42/44 | Enforced advertised limits, long-lived streams and framework clients across peer hops/rotation/revocation |
+| P1 | Finish limits and real adapter acceptance | M4-21/47/68/70/72/73/74/75; M3-12/13/37/41/42/44 | Enforced advertised limits, long-lived streams and framework clients across peer hops/rotation/revocation |
+| P1 | Resolve authority state test bootstrap lock collision | M6-C251; PR #274 Ubuntu Rust failure occurs before permission-refusal assertions; separate duplicated-descriptor regression and scoped correction pass | Causal regression, correction without weakened lock checks, required and hosted candidate checks |
 | P1 | Establish load and recovery budgets | M6-03/C125/C126/C183/C192/C201/C239 | Off-host multi-tenant load and soak at declared capacity, explicit latency/error/recovery targets, Redis peak-memory/AOF rewrite evidence |
 | P1 | Close release and operator verification gaps | M6-01/C217/C220/C241; M3-50 | Exact final-candidate checks, clean-machine archives and executed deployment guide |
 | P1 | Configure operations | M6-C218; private metrics exist, privileged-change audit is deferred | Scraper, alerts, retention, certificate/JWKS rotation and incident/restore ownership verified |
@@ -103,8 +139,8 @@ these completion criteria are evidenced; scheduling is not verification.
 
 ## Verification ledger
 
-- **Current integrated evidence:** [8c8c14fc final-candidate report](m6-final-candidate-2026-10-31.md)
-  supersedes the pending-verification statements in the dated entries below.
+- **Prior complete acceptance baseline:** [8c8c14fc final-candidate report](m6-final-candidate-2026-10-31.md)
+  supersedes the pending-verification statements for that source in the dated entries below.
   It supplies final local/hosted acceptance, exact original release archives,
   packaged operator drills and current actual-image lifecycle evidence.
   The following entries retain earlier attempts and scope; their failed
