@@ -359,3 +359,20 @@ retained serving-relay stderr captures contained the earlier authority-429
 warning. That observation and these local passes do not establish the cause of
 the historical hosted failure. Both failed earlier attempts remain retained;
 C22, combined-candidate acceptance and hosted validation remain open.
+
+The exact harness source is `7a522bead3e0b40e25586f27daa351f0a969be26`;
+the executed wrapper source is `a78e2be67c3c00dcf9d796fa0e47c0af70d0adfe`.
+The service executables are unchanged C241 optimized artifacts, not rebuilt
+from this fixture branch or from later combined runtime changes.
+
+| Artifact | SHA-256 |
+| --- | --- |
+| Frozen test executable | `f0d36173fb4750dc44e3cdfb098f65bd789c33a8068656e9dc637ecb1059468c` |
+| Optimized authority executable | `cc7420062204c7f0d6ce6ad551c7d203ef16c3430a955b21c5d78b47762336f2` |
+| Optimized relay executable | `2827f610c4c553fe9ece6bf0040ad27c8170a692a95e98cd76e058eb8842206c` |
+| Predeclared input manifest | `c856a8541cbb7ed64896192d0fb33b2a447c2a023facecf2064349675b1c108e` |
+| Recovery result JSON | `f695075650c66b5256db04f46a99736b67e525d7419c4cfee2bf3d833ed8ff72` |
+| Recovery test log | `0dad7c472e36044fd86ac74fa81ded9b0f5d798f60f921a364726c7e4801ac8d` |
+| Native lifecycle result JSON | `404db87d7c93a3d35335647a163abedd34f1376165fb71e0e4803204d32a1c71` |
+| Native lifecycle test log | `81beed160eebf1cd41d4f037d09d1463d0ca311cbe24e4989c7e29b030768046` |
+| Post-run integrity manifest | `3722e295d4b900ff7d1aacc03fbedba99f24dce30ee2f924282c880750e122a5` |
