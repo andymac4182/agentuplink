@@ -40,8 +40,12 @@ in the [acceptance history](production-acceptance-2026-10-31.md). The earlier
 mixed-binary OG-02 result remains inconclusive. No unchanged retry or narrower
 continuation converts those attempts to passes. C240's expected-green valid
 queue-boundary tests now pass without a runtime change; its broader claim
-remains open. C244 real-endpoint fid confirmation work is separate follow-up
-verification and does not change the identity of the accepted runtime above.
+remains open. C244 [real-endpoint fid confirmation](m6-fid-confirmation.md) now passes its
+positive and meaningful premature-release controls at source8804, with restored
+source passing again. The invalid first clunk control is retained and excluded.
+These follow-up tests do not change the accepted8c runtime identity; their
+integrated86fb workspace checks now pass2,931tests; new-head hosted checks
+remain pending.
 
 The universal MCP dependency policy still requires owner disposition of
 MIT-0, PSF-2.0 and Windows bundled LGPL obligations; seeded checker tests are

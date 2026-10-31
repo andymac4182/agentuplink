@@ -126,3 +126,12 @@ logs, both complete positive reports and cleanup checks are retained under
 Required aggregate/hosted checks on the integrated source remain separate;
 these focused results do not claim a full M4 rerun, clunk flushed before
 dispatch, or completion of M4-21.
+
+### Integrated local checks
+
+At integrated source `86fb4d70`, formatting, strict workspace/all-target Clippy
+and locked workspace tests pass (2,931passed, zero failed,108ignored). No
+production filesystem behavior changed. The real-endpoint results above remain
+bound to their original8804 source and immutable executable; the integrated
+checks do not pretend to rerun that gate. See the [combined receipt and scope](m6-final-candidate-2026-10-31.md#integrated-test-follow-up).
+New-head hosted full M4 acceptance remains pending, so C244 stays open.

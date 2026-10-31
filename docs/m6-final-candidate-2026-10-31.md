@@ -186,3 +186,35 @@ provide independently accessible hosted evidence.
 The [production goal](production-readiness.md) remains active. Final-candidate
 checks, real deployment topology, recovery/credential inventory, operational
 ownership, capacity and legal policy are distinct completion requirements.
+
+## Integrated test follow-up
+
+The subsequent test/documentation source
+`86fb4d70bd0fd44596b2189c8b4a2f23c044c780`, tree
+`7173d51c34481565898e33178460e642bfd07252`, adds the C240 valid-state queue
+controls and C244 real-endpoint fid confirmation gate. Production runtime
+behavior is unchanged: the only connector addition is inside `cfg(test)`;
+other code additions are harness/TypeScript test drivers and registrations.
+Its required local checks pass: formatting5.004s, strict workspace/all-target
+Clippy91.590s and locked workspace tests344.785s, with2,931passed, zero failed,
+108ignored and174suite results. Source hashes and the protected C94 executable
+remain unchanged, and each check's process group is absent. Native builds ran
+under an exclusive lease; the read-only history scan overlapped part of the
+checks, so this is not described as a quiet timing experiment.
+
+The full accessible-history scan at this source passes2,081commits/6,923blobs
+with zero findings in declared formats and zero oversized blobs. The later
+documentation-only status update receives a separate changed-blob scan; it is
+not described as another full-history run. New-head hosted acceptance is
+pending. The complete local90-stage and hosted results above remain bound to
+8c and its identical hosted tree, not relabelled as a full run on this follow-up.
+
+Private follow-up receipts are under
+`production-evidence-followup/required-checks-86fb4d70/`. The receipt SHA-256 is
+`d64204a04a7d596e2f95d43ef9b052b791af7bc37bf776b02f826cbb76088918`;
+the workspace log SHA-256 is
+`31cbc5ba846851c349e4cce38e1c412d07181fab26fe70dfcae32d848a61ff88`.
+C244's original8804 and final9596 sources were archived with hashes after the
+worker explicitly released the completed source/execution lease, before that
+checkout was reused. Frozen executables, driver copies, dependencies and all
+prior receipts remain untouched.
