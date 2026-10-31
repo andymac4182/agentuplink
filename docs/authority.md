@@ -274,6 +274,20 @@ Local acceptance recorded on 2026-10-31 for the M6-C234 service slice:
 | Three-relay process traffic and lifecycle | Pass in 119.01 s; unchanged device session/carrier and exact non-owner canaries across two refreshes, authority restart and persisted checkpoint/all-node-floor adoption by all three relays. |
 | Actual authority image | Build passes in 188.02 s. Default UID10002, help and unconfigured startup refusal pass. The same unchanged lifecycle gate using the actual image passes in 127.44 s, with original-expiry outage refusal after 53,052 ms and zero residual owned containers. |
 
+M6-C247 subsequently corrected the publisher fairness test after hosted Ubuntu
+job `124443738026` rejected the third HTTP request as busy. The old fixture left
+only about 200 ms beyond two injected 400 ms sleeps for real signing, fsync and
+scheduling; healthy individual writes do not guarantee that total queue wait.
+The hosted log has no per-operation timings; a controlled setup delay reproduces
+the invalid assumption without identifying that runner's exact delay source.
+The replacement uses a paused Tokio test clock with bounded real-time barriers
+around actual signing/fsync. It asserts exact HTTP queue residence of
+0/400/800 ms and publisher residence of 1,200 ms. The old one-second publisher
+budget is red, the unchanged three-second production budget is green, and the
+restored authority unit suite passes all twenty tests. This proves timer-budget
+and FIFO behavior, not real-time I/O margins. The separate real-stall watchdog
+and cancellation tests remain unchanged; hosted re-verification is pending.
+
 The image lifecycle uses a synthetic private fixture directory, host networking
 and fixture UID/GID1000 to preserve its file ownership. Its root filesystem is
 read-only, with all capabilities dropped, no-new-privileges, 256 MiB memory,

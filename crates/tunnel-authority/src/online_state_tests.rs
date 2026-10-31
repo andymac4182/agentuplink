@@ -636,11 +636,48 @@ async fn http_admission_is_bounded_while_publisher_can_join_the_serializer() {
     assert!(!coordinator.fatal.load(Ordering::SeqCst));
 }
 
-// A current-thread async runtime makes admission observations queue evidence:
-// after a spawned call consumes its HTTP slot, this test cannot run again
-// until that call has suspended on the occupied serializer.
+// Timer-budget proof on a current-thread runtime with a paused Tokio clock.
+// Real signing/fsync completes behind explicit barriers before each deliberate
+// 400ms timer advance. This proves FIFO and queue budgets, not real-time I/O
+// margins; the separate real-stall watchdog tests above remain unchanged.
 #[tokio::test]
 async fn publisher_survives_three_admitted_durable_checkpoint_operations() {
+    async fn poll_once<F: std::future::Future>(
+        mut future: std::pin::Pin<&mut F>,
+    ) -> Option<F::Output> {
+        std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(match future.as_mut().poll(cx) {
+                std::task::Poll::Ready(value) => Some(value),
+                std::task::Poll::Pending => None,
+            })
+        })
+        .await
+    }
+
+    // Keep this test runnable while blocking work finishes, preventing Tokio's
+    // automatic idle-clock advance. Every polling loop has a real deadline;
+    // there is no detached spinning task to survive panic or test cancellation.
+    async fn real_wait<F: std::future::Future>(future: F, stage: &str) -> F::Output {
+        tokio::pin!(future);
+        let started = Instant::now();
+        loop {
+            if let Some(value) = poll_once(future.as_mut()).await {
+                return value;
+            }
+            assert!(
+                started.elapsed() < STATE_IO_BUDGET * 3,
+                "real-time fixture watchdog: {stage}"
+            );
+            tokio::task::yield_now().await;
+        }
+    }
+
+    struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+    impl<T> Drop for AbortOnDrop<T> {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
     struct ActiveOperation(Arc<AtomicUsize>);
     impl Drop for ActiveOperation {
         fn drop(&mut self) {
@@ -657,15 +694,13 @@ async fn publisher_survives_three_admitted_durable_checkpoint_operations() {
         })
         .await
         .unwrap();
+    tokio::time::pause();
     let active = Arc::new(AtomicUsize::new(0));
     let completed = Arc::new(AtomicUsize::new(0));
     let overlap = Arc::new(AtomicBool::new(false));
-    let (first_entered, first_started) = tokio::sync::oneshot::channel();
-    let mut first_entered = Some(first_entered);
-    let mut first_started = Some(first_started);
-    let (release, blocked) = mpsc::channel();
-    let release = ReleaseOnDrop(Some(release));
-    let mut blocked = Some(blocked);
+    let queue_residence = Arc::new(Mutex::new(Vec::new()));
+    let mut releases = std::collections::VecDeque::new();
+    let mut checkpointed = std::collections::VecDeque::new();
     let mut http_tasks = Vec::new();
 
     for index in 0..3 {
@@ -673,106 +708,108 @@ async fn publisher_survives_three_admitted_durable_checkpoint_operations() {
         let active = active.clone();
         let completed = completed.clone();
         let overlap = overlap.clone();
-        let entered = first_entered.take();
-        let blocked = blocked.take();
-        http_tasks.push(tokio::spawn(async move {
+        let residence = queue_residence.clone();
+        let (written, observed) = tokio::sync::oneshot::channel();
+        let (release, blocked) = mpsc::channel();
+        releases.push_back(ReleaseOnDrop(Some(release)));
+        checkpointed.push_back(observed);
+        http_tasks.push(AbortOnDrop(tokio::spawn(async move {
+            let queued_at = tokio::time::Instant::now();
             caller
                 .call(false, move |engine| {
+                    residence.lock().unwrap().push((index, queued_at.elapsed()));
                     if active.fetch_add(1, Ordering::SeqCst) != 0 {
                         overlap.store(true, Ordering::SeqCst);
                     }
                     let _active = ActiveOperation(active);
-                    if let Some(entered) = entered {
-                        let _ = entered.send(());
-                    }
-                    if let Some(blocked) = blocked {
-                        blocked
-                            .recv_timeout(STATE_IO_BUDGET * 5)
-                            .map_err(|_| "test queue was not released")?;
-                    }
-                    // The actual production blocking task keeps the serializer,
-                    // then performs the real signing+durable checkpoint write.
-                    // Each operation is safely inside its one-second watchdog;
-                    // the third HTTP call also starts within its one-second wait.
-                    std::thread::sleep(Duration::from_millis(400));
+                    // Perform actual signing and the durable checkpoint write.
+                    // Only the intentional hold of its serializer is virtual.
+                    let real_io_started = Instant::now();
                     let response =
                         engine.checkpoint(format!("queued-checkpoint-nonce-{index:04}"))?;
                     completed.fetch_add(1, Ordering::SeqCst);
+                    let _ = written.send(real_io_started.elapsed());
+                    blocked
+                        .recv_timeout(STATE_IO_BUDGET * 5)
+                        .map_err(|_| "test queue was not released")?;
                     Ok(response)
                 })
                 .await
-        }));
-        if let Some(started) = first_started.take() {
-            tokio::time::timeout(STATE_IO_BUDGET, started)
-                .await
-                .unwrap()
-                .unwrap();
-        }
-        eventually(|| coordinator.admission.available_permits() == 31 - index).await;
+        })));
+        // On this single async thread, observing the consumed HTTP slot means
+        // the call has suspended on the occupied fair serializer (or, for the
+        // first call, spawned the actual blocking operation).
+        real_wait(
+            async {
+                while coordinator.admission.available_permits() != 31 - index {
+                    tokio::task::yield_now().await;
+                }
+            },
+            "HTTP admission",
+        )
+        .await;
     }
-    assert_eq!(completed.load(Ordering::SeqCst), 0);
+    let first_io = real_wait(
+        checkpointed.pop_front().unwrap(),
+        "first durable checkpoint",
+    )
+    .await
+    .unwrap();
+    assert_eq!(completed.load(Ordering::SeqCst), 1);
     assert_eq!(active.load(Ordering::SeqCst), 1);
     let publisher_coordinator = coordinator.clone();
     let publisher_active = active.clone();
     let publisher_completed = completed.clone();
     let publisher_overlap = overlap.clone();
-    let (publisher_entered, publisher_queued) = tokio::sync::oneshot::channel();
-    let mut publisher = tokio::spawn(async move {
-        let _ = publisher_entered.send(());
-        publisher_coordinator
-            .call(true, move |engine| {
-                if publisher_active.fetch_add(1, Ordering::SeqCst) != 0 {
-                    publisher_overlap.store(true, Ordering::SeqCst);
-                }
-                let _active = ActiveOperation(publisher_active);
-                if publisher_completed.load(Ordering::SeqCst) != 3 {
-                    return Err("publisher overtook previously admitted HTTP writes");
-                }
-                engine.reserve_round().map(|round| round.version)
-            })
-            .await
-    });
-    // On this single async thread the publisher has reached its serializer
-    // await before this signal can resume us. The first operation is still
-    // gated, so it cannot complete and reorder the admission setup.
-    tokio::time::timeout(STATE_IO_BUDGET, publisher_queued)
-        .await
-        .unwrap()
-        .unwrap();
+    let publisher_residence = Arc::new(Mutex::new(None));
+    let observed_residence = publisher_residence.clone();
+    let publisher_queued_at = tokio::time::Instant::now();
+    let mut publisher = Box::pin(publisher_coordinator.call(true, move |engine| {
+        *observed_residence.lock().unwrap() = Some(publisher_queued_at.elapsed());
+        if publisher_active.fetch_add(1, Ordering::SeqCst) != 0 {
+            publisher_overlap.store(true, Ordering::SeqCst);
+        }
+        let _active = ActiveOperation(publisher_active);
+        if publisher_completed.load(Ordering::SeqCst) != 3 {
+            return Err("publisher overtook previously admitted HTTP writes");
+        }
+        engine.reserve_round().map(|round| round.version)
+    }));
+    // Poll the actual call to Pending, establishing its fair queue position
+    // behind all three HTTP calls rather than inferring it from task startup.
+    assert!(poll_once(publisher.as_mut()).await.is_none());
     assert_eq!(coordinator.admission.available_permits(), 29);
     assert_eq!(coordinator.permit.available_permits(), 0);
-    let released_at = Instant::now();
-    release.release();
 
-    // Join all admitted work before asserting the expected publisher result,
-    // including on the deliberate red run. Timeouts abort and join callers;
-    // the real blocking operation retains its own permit/watchdog as tested
-    // separately by cancelled_slow_caller_keeps_its_watchdog above.
+    let mut real_io_times = vec![first_io];
     let mut responses = Vec::new();
-    let mut join_failed = false;
-    for mut task in http_tasks {
-        match tokio::time::timeout(STATE_IO_BUDGET * 4, &mut task).await {
-            Ok(Ok(response)) => responses.push(response),
-            _ => {
-                task.abort();
-                let _ = tokio::time::timeout(STATE_IO_BUDGET, task).await;
-                join_failed = true;
-            }
+    let mut publisher_result = None;
+    for (index, task) in http_tasks.iter_mut().enumerate() {
+        if index > 0 {
+            real_io_times.push(
+                real_wait(checkpointed.pop_front().unwrap(), "next durable checkpoint")
+                    .await
+                    .unwrap(),
+            );
         }
+        // Completed signing/fsync and the held permit are established before
+        // moving the timer clock; host scheduling/disk delay cannot consume
+        // another HTTP call's intentional queue-wait margin.
+        tokio::time::advance(Duration::from_millis(400)).await;
+        if index == 2 {
+            assert_eq!(coordinator.permit.available_permits(), 0);
+            // Poll while the final operation still holds the permit. An old
+            // one-second publisher budget must expire here, never win a race
+            // with the subsequent permit release despite being overdue.
+            publisher_result = poll_once(publisher.as_mut()).await;
+        }
+        releases.pop_front().unwrap().release();
+        responses.push(real_wait(&mut task.0, "HTTP completion").await.unwrap());
     }
-    let publisher_result = match tokio::time::timeout(STATE_IO_BUDGET * 4, &mut publisher).await {
-        Ok(Ok(result)) => result,
-        _ => {
-            publisher.abort();
-            let _ = tokio::time::timeout(STATE_IO_BUDGET, publisher).await;
-            Err("publisher test task did not complete")
-        }
+    let publisher_result = match publisher_result {
+        Some(result) => result,
+        None => real_wait(publisher.as_mut(), "publisher completion").await,
     };
-    assert!(!join_failed);
-    assert!(
-        released_at.elapsed() >= Duration::from_millis(1100),
-        "fixture did not exercise a queue longer than the HTTP wait budget"
-    );
     let versions: Vec<u64> = responses
         .into_iter()
         .map(|response| {
@@ -784,16 +821,23 @@ async fn publisher_survives_three_admitted_durable_checkpoint_operations() {
         })
         .collect();
     assert_eq!(versions, [1, 2, 3]);
+    assert_eq!(
+        *queue_residence.lock().unwrap(),
+        [
+            (0, Duration::ZERO),
+            (1, Duration::from_millis(400)),
+            (2, Duration::from_millis(800)),
+        ]
+    );
     assert_eq!(completed.load(Ordering::SeqCst), 3);
     assert_eq!(active.load(Ordering::SeqCst), 0);
     assert!(!overlap.load(Ordering::SeqCst));
     assert!(!coordinator.fatal.load(Ordering::SeqCst));
+    assert_eq!(coordinator.admission.available_permits(), 32);
+    assert_eq!(coordinator.permit.available_permits(), 1);
     assert_eq!(
-        coordinator
-            .engine
-            .lock()
+        State::decode(&fs::read(&fixture.config.state_path).unwrap())
             .unwrap()
-            .state
             .checkpoint_high_water,
         3
     );
@@ -802,5 +846,17 @@ async fn publisher_survives_three_admitted_durable_checkpoint_operations() {
             "publisher must retain its fair queue position behind admitted bounded HTTP writes"
         ),
         2
+    );
+    let publisher_wait = publisher_residence.lock().unwrap().unwrap();
+    assert_eq!(publisher_wait, Duration::from_millis(1200));
+    assert!(publisher_wait > STATE_IO_BUDGET);
+    assert!(publisher_wait < PUBLISHER_QUEUE_BUDGET);
+    eprintln!(
+        "C247 simulated_http_queue_ms=[0,400,800] simulated_publisher_queue_ms={} real_checkpoint_ms={:?}",
+        publisher_wait.as_millis(),
+        real_io_times
+            .iter()
+            .map(Duration::as_millis)
+            .collect::<Vec<_>>()
     );
 }
