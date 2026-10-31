@@ -112,6 +112,26 @@ loaded before Redis records are considered. The
 checkpoint authority trust path remains a PEM CA bundle for the HTTPS
 authority and is independent from the Ed25519 membership signer keys.
 
+For an authority requiring mTLS, configure both
+`cluster.checkpoint_authority_client_cert_chain` and
+`cluster.checkpoint_authority_client_private_key`. The pair identifies this
+relay to the HTTPS authority; it contains no membership-signing key. Configured
+identity errors fail closed without retrying anonymously. The private key is
+loaded with the bounded, no-symlink TLS-file reader and must be owner-readable
+and writable with no group/other permissions on Unix (normally mode 0600).
+Omitting both paths preserves compatibility with existing external
+HTTPS authorities; the planned shipped authority requires mTLS and will reject
+such clients. Certificate authentication does not replace the authority's
+authorization of a node or the relay's signed-checkpoint verification.
+
+Operator publishers can use `RedisMembershipPublisher::connect_with_tls` with
+an explicit Redis CA and optional Redis client identity. This uses the same
+verified `rediss://`, bounded PING/INFO and Redis run-identity checks as the
+catalog. Give the publisher a separate authenticated Redis ACL restricted to
+its membership operator keys. These transport interfaces do not supply a
+publisher daemon, checkpoint responder or durable authority version allocator
+(M6-C22).
+
 Certificates must identify the deployment, node, and relay role using a documented SAN profile and appropriate client/server usage. Certificate names, validity, chain constraints, role, and allowed leaf SPKI SHA-256 digest must all match. A device-role certificate fails the peer listener even if it has a chain to another trusted deployment intermediate. Use distinct relay and device intermediates/listeners by default.
 
 An operator-authorized membership publisher signs records using a standard signature implementation and an unambiguous, versioned canonical encoding. It publishes current records to Redis over authenticated TLS with an ACL restricted to the membership namespace. A relay may renew only its scoped presence and owner leases; it cannot authorize a new peer key. Public keys are public data, but unauthorized registry modification is an integrity incident.

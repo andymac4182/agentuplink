@@ -329,6 +329,20 @@ impl RedisMembershipPublisher {
         })
     }
 
+    /// Connect the operator publisher over verified Redis TLS with explicit
+    /// trust and optional client identity. The existing catalog path enforces
+    /// rediss://, bounded PING/INFO verification and Redis run identity.
+    /// Deployments must supply separate membership-only Redis ACL credentials.
+    pub async fn connect_with_tls(
+        redis_url: &str,
+        namespace: &str,
+        tls: RedisTlsOptions,
+    ) -> Result<Self, CatalogError> {
+        Ok(Self {
+            catalog: RedisCatalog::connect_with_tls(redis_url, namespace, tls).await?,
+        })
+    }
+
     pub async fn publish_signed_membership(
         &self,
         record: &SignedMembershipRecord,

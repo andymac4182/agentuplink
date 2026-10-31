@@ -5668,6 +5668,8 @@ async fn start_relay(
         membership_signer_trust_path: Some(signer_trust_path.clone()),
         checkpoint_authority_endpoint: "https://localhost:443/v1/checkpoint".to_owned(),
         checkpoint_authority_trust_path: server_ca_path.clone(),
+        checkpoint_authority_client_cert_chain: None,
+        checkpoint_authority_client_private_key: None,
         membership_version_state_path: files
             .join(format!("{}-membership-version-state.json", node.node_id)),
         endpoint_policy: tunnel_relay::PrivateEndpointPolicyConfig {

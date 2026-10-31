@@ -84,12 +84,13 @@ build an archive and a checksum itself, and it says in its output that the
 first step then could not have failed for a real download's reason.
 
 Commands marked **shape-only** need a live Redis authority or a live relay,
-so the check cannot run them. Only thirteen may be marked that way:
+so the check cannot run them. Only the explicit `DOCS_SHAPE_ONLY_PERMITTED`
+allowlist in `scripts/m6-release-artifact.py` may be marked that way:
 `tunnel-relay serve`, `tunnel-client connect`, `tunnel-relay recovery-observe`,
-`tunnel-relay recover`, the two provisioning commands that write Redis,
+`tunnel-relay recover`, `tunnel-relay rebind-redis-run`, the provisioning commands
 `tunnel-relay activate-first-incarnation` and `tunnel-relay provision-catalog`,
-and the seven day-2 catalog commands of section 2.5 (never with `--dry-run`,
-which contacts no Redis and is executed below). It
+and the day-2 catalog commands of section 2.5 (never with `--dry-run`, which
+contacts no Redis and is executed below). It
 checks only that the real binary accepts the documented subcommand and flags;
 **their runtime behaviour is not checked by `--check docs`.** A second check,
 `verify --check docs-redis --redis-url redis://HOST:PORT`, executes them
@@ -123,7 +124,7 @@ while it runs (section 2.5). Anything larger is not supported yet:
 
 | Capability | State in this alpha | Row |
 | --- | --- | --- |
-| Download, checksum, provenance and licence notices | A maintainer bundle passing every release check: `aarch64-apple-darwin` only. CI archives for all four targets are built and smoke-tested on native hosted runners and published as prereleases, without those checks | M6-01, M6-C13 |
+| Download, checksum, provenance and licence notices | Recorded full maintainer-bundle acceptance: `aarch64-apple-darwin` only. CI separately runs seven unpacked-archive checks on native runners for all advertised targets; this does not establish maintainer source-parity or the full operator session on other platforms | M6-01, M6-C13 |
 | Device key, CSR, certificate import, local `doctor` | Supported | — |
 | Relay and cluster configuration dry runs, local state initialization | Supported | — |
 | Creating one tenant, user, device, credential record, service and grant in the Redis catalog | Supported, once per namespace, with `tunnel-relay provision-catalog` (section 2.3) | M6-C21 |
@@ -163,13 +164,18 @@ section is the **maintainer bundle**, the format the docs check runs
 The declared release targets live in `[workspace.metadata.release]
 advertised-targets` in the root `Cargo.toml`: `aarch64-apple-darwin`,
 `x86_64-apple-darwin`, `x86_64-pc-windows-msvc` and
-`x86_64-unknown-linux-gnu`. **Only `aarch64-apple-darwin` has a bundle that
-passes the release checks.** Hosted CI builds all four on native runners,
-smoke-tests each build's own binaries there, and publishes the archives as
-GitHub prereleases (for example workflow run 35987957788 at `af23c2f`), but
-none of the checks below has run on the other three (M6-C13), so treat those
-builds as unverified. A verified bundle comes from a maintainer who built it
-with `scripts/m6-release-artifact.py bundle`.
+`x86_64-unknown-linux-gnu`. Hosted release CI builds all four on native
+runners and verifies each unpacked archive with
+`scripts/verify_release_archive.py`: checksum, layout, target, notices, assets,
+CLI and portability checks. Successful main-branch runs publish those archives
+as GitHub prereleases; pull-request runs retain workflow artifacts.
+
+Those seven CI archive checks are separate from the maintainer-bundle checks
+below, including source parity, build receipts and the complete operator-guide
+session. Recorded full maintainer-bundle acceptance exists for
+`aarch64-apple-darwin`; equivalent maintainer-bundle proof for the other declared
+platforms remains outstanding (M6-C13). A maintainer creates that bundle with
+`scripts/m6-release-artifact.py bundle`.
 
 **The Windows bundle has no relay.** The relay runs on Linux and macOS only.
 `x86_64-pc-windows-msvc` ships `tunnel-client` and `tunnel-deadman`, the
@@ -1245,6 +1251,17 @@ The project ships neither the publisher nor the checkpoint authority. The
 contract they must meet is in
 [cluster.md](cluster.md#relay-trust-bootstrap-and-redis-key-distribution).
 
+The checkpoint client supports mTLS through the paired
+`cluster.checkpoint_authority_client_cert_chain` and
+`cluster.checkpoint_authority_client_private_key` paths shown in the example.
+Use this relay's HTTPS client identity; keep publisher and CA signing keys off
+relay hosts. Set the client key to mode 0600 on Unix; it must be a regular file
+without group/other permissions or symlink path components. A missing or invalid
+configured identity refuses startup; the client never falls back to an anonymous request. Both
+paths may be omitted for compatibility with an existing external authority,
+but the planned shipped checkpoint authority requires mTLS. Its publication
+loop, responder and durable version storage remain M6-C22 work.
+
 The configuration and the relay's local state can still be prepared and checked.
 `examples/m7-cluster-relay.toml` is a complete placeholder configuration. Note
 that it has no `boot_id`: cluster mode refuses one and generates a fresh one per
@@ -1323,9 +1340,14 @@ is separate from Ed25519 signing trust. The current client uses TLS 1.3 and
 HTTP/1.1, with TLS resumption and early data disabled.
 
 Membership publishing and checkpoint serving remain unavailable as shipped
-commands. The planned checkpoint responder requires mTLS; the current relay
-checkpoint client has no client-authentication configuration, so that compatible
-client change and its acceptance tests are part of the remaining M6-C22 work.
+commands. The planned checkpoint responder requires mTLS. The relay now supports
+its HTTPS client identity through the paired
+`cluster.checkpoint_authority_client_cert_chain` and
+`cluster.checkpoint_authority_client_private_key` paths described above; invalid
+configured identities fail without anonymous fallback (M6-C231). The publisher
+API also accepts explicit Redis TLS trust and client identity through
+`RedisMembershipPublisher::connect_with_tls`. The publication loop, checkpoint
+responder and durable authority version storage remain M6-C22 work.
 
 Unix server bundles include `tunnel-authority` for the offline recovery part: `generate-key` and
 `sign-recovery-approval`. It cannot observe Redis, reconcile a restored catalog,

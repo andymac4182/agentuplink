@@ -44,6 +44,8 @@ gate "committed owner write with lost reply is not replayed" \
   cargo test -p tunnel-catalog --test redis_authority_lost_reply --locked -- --ignored --test-threads=1
 gate "Redis cluster integration tests" \
   cargo test -p tunnel-catalog --test redis_cluster --locked -- --ignored --test-threads=1
+gate "membership publisher explicit Redis TLS and restricted ACL" \
+  cargo test -p tunnel-test-harness --test m7_membership_publisher_tls --locked -- --ignored --test-threads=1
 gate "Redis recovery integration tests" \
   cargo test -p tunnel-catalog --test redis_recovery --locked -- --ignored --test-threads=1
 gate "Redis recovery-race integration tests" \
