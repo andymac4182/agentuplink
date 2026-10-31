@@ -37,10 +37,25 @@ OWNER_BUSY refusals, three exact canaries and clean stop. The signed peer trust
 expiry gate passed in 10.059 seconds. These narrow successes do not complete
 M6-C68, M7-C131 or full combined acceptance.
 
-A separate continuation starts with pending-owner admission and runs the
-remaining 17 gates against the same binary. Its results are tracked separately;
-it neither retries nor replaces the failed timing-boundaries gate. The
-predeclared 20-pair clean-EOF comparison is prepared but has not run.
+A separate continuation starts with pending-owner admission. The first 16
+remaining gates pass with the original executable unchanged, including C11
+in 153.060 seconds. OG-02 then exits zero in 241.696 seconds with ten complete
+correlation rows, but its artifact identity is inconclusive: an authorized
+integration-test no-run compile implicitly replaced Cargo's top-level harness
+path while this gate spawned children. The coordinator's assumption that this
+compile would leave that binary untouched was wrong. The parent kept the old
+inode; at least one child used the replacement. The before/after hashes and
+complete run are retained, and this result is not counted as exact-artifact
+acceptance. The original executable was captured from the still-running parent
+and matched the pre-run SHA-256
+`3ab527f69de07fc2b2d1ff8711b5541d2a35082ae45aaf903c346aa547741abb`.
+A single separate repeat now uses this create-only immutable copy and frozen
+companions outside Cargo's output tree. Its outer bound is 1,550 seconds,
+covering the existing 1,500-second OG-02 bundle timeout and cleanup. The
+continuation's arbitrary 300-second outer bound did not fire but was shorter
+than the harness contract. Neither continuation nor repeat replaces the failed
+timing-boundaries gate. The predeclared 20-pair clean-EOF comparison is prepared
+but has not run; its isolated source, target and frozen binaries were untouched.
 
 Local artifacts are retained privately under
 `/workspace/agentuplink-review-artifacts/combined-runtime-20b92455`, including
@@ -70,7 +85,7 @@ fails three jobs:
   one-second HTTP bound separately from publisher fairness.
 - Dependency/secret job 124443737877 retains the known authority-guide
   placeholder finding. Downstream #270 fixes only the exact placeholder;
-  it needs hosted verification on that descendant.
+  hosted verification now passes on that descendant (job 124447394040) and on Redis descendant 9866a671 (job 124447619897).
 
 Other jobs in that run pass, including M1, M2, MCP, filesystem, TypeScript,
 macOS/Windows Rust and the image smoke test. Packaging run 41169353260 passes.
@@ -85,6 +100,15 @@ is no causal attribution to the clean-EOF patch. That head's other jobs pass
 except the known secret scan, and optimized release run 41168247771 passes all
 five build/archive targets. Publication and attestations remain separate.
 
+At placeholder-only descendant `d8b4e6c`, M7 job 124447394195 in run
+41170475768 has a distinct failure: the online-authority lifecycle canary is
+refused after 31.04 seconds, during the continuous-publication portion. The
+first exact non-owner canary passed. The current error discards its phase,
+HTTP status and typed failure code, so no product cause is asserted. M6-C248
+tracks payload-free diagnostic attribution; no retry or weaker continuity
+predicate is permitted. Local native and actual-image successes do not erase
+this hosted failure.
+
 ## Historical placeholder verification
 
 The exact authority-guide placeholder exception in #270 has one document path,
@@ -92,7 +116,7 @@ one pattern and the complete 23-byte SHA-256, with no wildcard credential
 allowance. Eight seeded controls pass, including removal of the exception,
 different password bytes at the same path and identical bytes at other paths.
 The local full-accessible-history scan visits 1,998 commits and 6,661 blobs,
-with zero findings and no oversized/skipped blobs. Its five suppressed hits
+with zero findings and no oversized/skipped blobs. Hosted dependency/license/secret jobs 124447394040 and 124447619897 also pass; the wider CI runs retain separate M7 failures. Its five suppressed hits
 are the inspected literal placeholder. This does not attest to a credential
 provider, rotate a real secret or claim coverage of all GitHub-only refs.
 
