@@ -2565,7 +2565,7 @@ pub(crate) type StreamOpenRefusal = Arc<std::sync::OnceLock<&'static str>>;
 /// revocation.
 pub(crate) const OWNER_UNAVAILABLE_CODE: &str = "PEER_UNAVAILABLE";
 
-/// Which bounds of a unary challenge's authorization are still open.
+/// Which bounds of a challenge's authorization are still open.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ChallengeBounds {
     /// The challenge's own window (and, at the send, the dispatch deadline
@@ -13784,7 +13784,22 @@ impl RelayActor {
             .as_millis()
             .min(5_000) as u64;
         if remaining_ms == 0 {
-            self.invalidate_stream_challenge(&key, &challenge, "authorization expired");
+            // Apply the unary path's precedence: actual authority expiry wins
+            // over owner liveness, which wins over a stale challenge window.
+            // A sub-millisecond bound cannot authorize a millisecond wire lease.
+            let bounds = ChallengeBounds {
+                window: challenge_remaining.as_millis() > 0,
+                snapshot: snapshot_remaining.as_millis() > 0,
+                token: token_remaining.as_millis() > 0,
+                owner: owner_remaining.as_millis() > 0,
+                credential: credential_remaining.as_millis() > 0,
+            };
+            let reason = match lapsed_challenge_code(bounds, false) {
+                "AUTHORIZATION_REVOKED" => "authorization expired",
+                OWNER_UNAVAILABLE_CODE => "owner unavailable",
+                _ => "authorization stale",
+            };
+            self.invalidate_stream_challenge(&key, &challenge, reason);
             return;
         }
         let confirmation = wire::authorization_confirmed(wire::AuthorizationConfirmation {
@@ -13844,6 +13859,7 @@ impl RelayActor {
     fn authorization_failure_code(reason: &str) -> &'static str {
         match reason {
             "authorization expired" => "AUTHORIZATION_EXPIRED",
+            "authorization stale" => "AUTHORIZATION_STALE",
             "authorization changed" => "AUTHORIZATION_CHANGED",
             "authorization unavailable" | "control unavailable" => "AUTHORIZATION_UNAVAILABLE",
             "grant unavailable" => "GRANT_UNAVAILABLE",
@@ -14060,6 +14076,14 @@ impl RelayActor {
         challenge: &DeviceChallenge,
         reason: &str,
     ) {
+        // A stale challenge ends this stream without deciding that its grant
+        // was revoked. Preserve the pending/dispatched distinction and never
+        // replay either class automatically.
+        let outcome_code = if reason == "authorization stale" {
+            "AUTHORIZATION_STALE"
+        } else {
+            "AUTHORIZATION_REVOKED"
+        };
         let _ = self.send_control(
             key,
             wire::authorization_invalidated(
@@ -14096,7 +14120,7 @@ impl RelayActor {
             stream.budget_bytes = stream.budget_bytes.saturating_sub(pending_bytes);
             for (_, waiter) in std::mem::take(&mut stream.pending_records) {
                 let _ = waiter.send(Err(EchoOutcome::Failure {
-                    code: "AUTHORIZATION_REVOKED",
+                    code: outcome_code,
                     execution: "not_dispatched",
                 }));
             }
@@ -14105,89 +14129,32 @@ impl RelayActor {
                 .saturating_add(stream.response_records.len());
             for waiter in std::mem::take(&mut stream.response_records) {
                 let _ = waiter.send(Err(EchoOutcome::Failure {
-                    code: "AUTHORIZATION_REVOKED",
+                    code: outcome_code,
                     execution: "unknown",
                 }));
             }
-            // Publish the invalidation on the stream's own reset watch
-            // **before** cancelling `closed`.
+            // Publish before cancelling `closed`: ingress can select that
+            // token before an ordered connector RESET is delivered. Actual
+            // authority loss keeps 4001 / terminal 1008; only the newly
+            // classified challenge-window lapse publishes 4006 / retryable
+            // 1011. Existing unavailable/control/protocol branches still
+            // publish nothing and retain their 1011 close.
             //
-            // A consumer ingress task (`http/fs.rs::pump`,
-            // `http/forward.rs`) selects on `closed.cancelled()` and on this
-            // watch, and maps the observed reason to a close code.  The
-            // connector's own `AUTHORIZATION_EXPIRED` RESET can never arrive
-            // in order here: this stream is terminal and its consumer
-            // registration is cancelled on the next line, so the ordered
-            // delivery path never runs again.  Without publishing the reason
-            // ourselves the ingress task exits through `closed.cancelled()`
-            // with nothing to map and closes the socket **codeless**, where
-            // `http/fs.rs:633-651` and `docs/filesystem-api.md` require
-            // **1008** for every authorization invalidation.  That file's
-            // comment on the `peer_reset` clone warns about exactly this
-            // downgrade.
-            //
-            // **Only an authoritative "the authorization is gone" publishes
-            // it.**  This function has eight call sites and they are not one
-            // kind of event.  Three are the authority answering that the
-            // authorization is gone, and `docs/filesystem-api.md` and
-            // `http/fs.rs:633-651` name exactly these three as the 1008
-            // class -- an expired snapshot, a moved revision and a revoked
-            // grant:
-            //
-            //   * `"authorization expired"` - the snapshot's remaining
-            //     lifetime reached zero;
-            //   * `"authorization changed"` - revision, digest, owner epoch
-            //     or credential no longer match what was challenged;
-            //   * `"grant unavailable"` - the catalog read **succeeded** and
-            //     returned no grant, which is what a revoked grant looks
-            //     like.  This is the one `verify-m4-fs-real-path` drives.
-            //
-            // The rest are **not verdicts about the authorization** and must
-            // not be dressed up as one.  `"authorization unavailable"` is a
-            // catalog read that returned `Err` and `"control unavailable"` is
-            // the relay failing to queue its own confirmation: in both the
-            // relay could not obtain an answer.  A challenge mismatch is a
-            // protocol failure.  `"owner unavailable"` and `"device
-            // authorization unavailable"` are absences this code has no test
-            // for, so they keep the behaviour they already had rather than
-            // acquiring a new one on an argument nobody has measured.
-            //
-            // Why the direction matters: 1008 is what a consumer branches on
-            // to conclude its grant is dead and **stop retrying**, so
-            // publishing it for a transient catalog outage would turn an
-            // outage into a revocation -- the same class as `2aefebc fix:
-            // report an unreachable catalog as unavailable, not as a bad
-            // credential`.  Everything not listed above therefore publishes
-            // nothing and keeps its pre-existing close: the ingress exits
-            // through `closed.cancelled()` and `session_close_for_reset(None)`
-            // maps it to **1011**, which is retryable.
-            //
-            // Note that the `*_UNAVAILABLE` suffix in
-            // `authorization_failure_code` does **not** track this split --
-            // `GRANT_UNAVAILABLE` is an authoritative absence while
-            // `AUTHORIZATION_UNAVAILABLE` is a failed read -- so the match is
-            // on the reason itself and is exhaustive by construction.
-            //
-            // Within the 1008 class the wire carries one reason for the whole
-            // class, so all three map to `AUTHORIZATION_EXPIRED`.
-            // `accept_reset` is idempotent on the first reason, so a
-            // connector RESET that did land first still wins.
-            //
-            // The discarded bytes are returned to the session budget on the
-            // same turn, exactly as the ordered RESET path does at
-            // `inbound_data`: `accept_reset` drops the undelivered chunks and
-            // reports their size, and the charge is the caller's to release.
-            let publishes_invalidation = matches!(
-                reason,
-                "authorization expired" | "authorization changed" | "grant unavailable"
-            );
-            let discarded = if publishes_invalidation {
-                stream.http.as_mut().map_or(0, |http| {
-                    http.accept_reset(tunnel_protocol::reset_reason::AUTHORIZATION_EXPIRED)
-                })
-            } else {
-                0
+            // `accept_reset` preserves the first reason and discards queued
+            // bytes; release that charge exactly as the ordered RESET path.
+            let reset_reason = match reason {
+                "authorization expired" | "authorization changed" | "grant unavailable" => {
+                    Some(tunnel_protocol::reset_reason::AUTHORIZATION_EXPIRED)
+                }
+                "authorization stale" => Some(tunnel_protocol::reset_reason::AUTHORIZATION_STALE),
+                _ => None,
             };
+            let discarded = reset_reason.map_or(0, |reason| {
+                stream
+                    .http
+                    .as_mut()
+                    .map_or(0, |http| http.accept_reset(reason))
+            });
             release_m2_bytes(&session.queue_budget, stream, discarded);
             stream.closed.cancel();
         }
@@ -14200,7 +14167,7 @@ impl RelayActor {
                 key,
                 challenge.stream_id,
                 &operation_id,
-                "AUTHORIZATION_REVOKED",
+                outcome_code,
                 None,
             )
         {
@@ -27414,6 +27381,10 @@ mod challenge_mismatch_tests;
 #[cfg(test)]
 #[path = "actor_unary_challenge_freshness_tests.rs"]
 mod unary_challenge_freshness_tests;
+
+#[cfg(test)]
+#[path = "actor_stream_authorization_stale_tests.rs"]
+mod stream_authorization_stale_tests;
 
 #[cfg(test)]
 #[path = "actor_rotation_freeze_tests.rs"]

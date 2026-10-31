@@ -1149,6 +1149,20 @@ mod tests {
         );
     }
 
+    #[test]
+    fn m4c70_lapse_and_invalidation_keep_distinct_consumer_closes() {
+        for (reason, expected_code, expected_reason) in [
+            (Some(4_006), 1011, "SESSION_LOST"),
+            (Some(4_001), 1008, "AUTH_EXPIRED"),
+            (None, 1011, "SESSION_LOST"),
+        ] {
+            let code = super::session_close_for_reset(reason);
+            let frame = super::close_frame(code).expect("consumer close");
+            assert_eq!(frame.code, expected_code);
+            assert_eq!(frame.reason.as_str(), expected_reason);
+        }
+    }
+
     /// Task row M4-21's review: what the consumer receives when the device
     /// ends a stalled session, taken through the functions `pump` uses for
     /// each case -- the record decoder, `session_close_for_reset` and
