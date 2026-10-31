@@ -9,10 +9,17 @@ RUN --mount=type=bind,source=.,target=/source,readonly \
     --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/src/target,sharing=locked \
     --mount=type=secret,id=cargo_ca \
-    if [ -f /run/secrets/cargo_ca ]; then export CARGO_HTTP_CAINFO=/run/secrets/cargo_ca; fi \
+    if ! python3 -c 'import argparse, hashlib, json, pathlib, tempfile, tomllib' >/dev/null 2>&1; then \
+      apt-get update && apt-get install -y --no-install-recommends python3 \
+      && rm -rf /var/lib/apt/lists/*; \
+    fi \
+ && if [ -f /run/secrets/cargo_ca ]; then export CARGO_HTTP_CAINFO=/run/secrets/cargo_ca; fi \
  && cargo build --manifest-path /source/Cargo.toml --target-dir /src/target \
       --locked --release -p tunnel-authority --bin tunnel-authority \
- && install -m 0755 /src/target/release/tunnel-authority /usr/local/bin/tunnel-authority
+ && install -m 0755 /src/target/release/tunnel-authority /usr/local/bin/tunnel-authority \
+ && python3 /source/scripts/container_notices.py stage --root /source \
+      --package tunnel-authority --binary /usr/local/bin/tunnel-authority \
+      --output /usr/local/share/licenses/agentuplink
 
 FROM debian:trixie-slim@sha256:a99cfc517144bc59b1978475ec53b46ecabec7e43635402ee5b77cc54cd1b20a
 RUN useradd --system --uid 10002 --user-group --home-dir /var/lib/agentuplink-authority \
@@ -20,6 +27,7 @@ RUN useradd --system --uid 10002 --user-group --home-dir /var/lib/agentuplink-au
  && install -d -m 0700 -o authority -g authority /var/lib/agentuplink-authority \
       /var/lib/agentuplink-authority/state /var/lib/agentuplink-authority/secrets
 COPY --from=build /usr/local/bin/tunnel-authority /usr/local/bin/tunnel-authority
+COPY --from=build /usr/local/share/licenses/agentuplink /usr/local/share/licenses/agentuplink
 USER authority:authority
 WORKDIR /var/lib/agentuplink-authority
 EXPOSE 8444

@@ -2,6 +2,9 @@
 !Cargo.toml
 !Cargo.lock
 !rust-toolchain.toml
+!LICENSE
+!scripts/container_notices.py
+!deploy/notices/rust/
 !crates/
 !vendor/
 !examples/

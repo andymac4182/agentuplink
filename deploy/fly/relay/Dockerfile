@@ -28,9 +28,15 @@ COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/src/target,sharing=locked \
     --mount=type=secret,id=cargo_ca \
-    if [ -f /run/secrets/cargo_ca ]; then export CARGO_HTTP_CAINFO=/run/secrets/cargo_ca; fi \
+    if ! python3 -c 'import argparse, hashlib, json, pathlib, tempfile, tomllib' >/dev/null 2>&1; then \
+      apt-get update && apt-get install -y --no-install-recommends python3 \
+      && rm -rf /var/lib/apt/lists/*; \
+    fi \
+ && if [ -f /run/secrets/cargo_ca ]; then export CARGO_HTTP_CAINFO=/run/secrets/cargo_ca; fi \
  && cargo build --locked --release -p tunnel-relay --bin tunnel-relay \
- && install -m 0755 target/release/tunnel-relay /usr/local/bin/tunnel-relay
+ && install -m 0755 target/release/tunnel-relay /usr/local/bin/tunnel-relay \
+ && python3 scripts/container_notices.py stage --root /src --package tunnel-relay \
+      --binary /usr/local/bin/tunnel-relay --output /usr/local/share/licenses/agentuplink
 
 FROM debian:trixie-slim@sha256:a99cfc517144bc59b1978475ec53b46ecabec7e43635402ee5b77cc54cd1b20a
 # A fixed, unprivileged identity. The secrets directory is owner-only because
@@ -41,6 +47,7 @@ RUN useradd --system --uid 10001 --user-group --home-dir /var/lib/agent-tunnel \
       --shell /usr/sbin/nologin relay \
  && install -d -m 0700 -o relay -g relay /var/lib/agent-tunnel /var/lib/agent-tunnel/run
 COPY --from=build /usr/local/bin/tunnel-relay /usr/local/bin/tunnel-relay
+COPY --from=build /usr/local/share/licenses/agentuplink /usr/local/share/licenses/agentuplink
 COPY deploy/fly/relay/entrypoint.sh /usr/local/bin/agent-tunnel-relay-entrypoint
 COPY deploy/fly/relay/relay.toml /etc/agent-tunnel/relay.toml.in
 RUN chmod 0755 /usr/local/bin/agent-tunnel-relay-entrypoint \

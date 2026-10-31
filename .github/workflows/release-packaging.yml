@@ -31,6 +31,7 @@ jobs:
         with:
           persist-credentials: false
       - run: python3 scripts/test_package_release.py
+      - run: python3 scripts/test_container_notices.py
       - run: python3 scripts/test_release_artifact_cli.py
       - run: python3 scripts/test_verify_release_archive.py
       # M6-C219: the bundle-free half of the executed-guide check (fence
