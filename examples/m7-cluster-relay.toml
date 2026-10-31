@@ -37,7 +37,7 @@ peer_tls_client_ca = "examples/credentials/relay-peer-ca.pem"
 membership_signer_trust_path = "examples/credentials/membership-signers.json"
 checkpoint_authority_endpoint = "https://checkpoint.example.internal/v1/checkpoint"
 checkpoint_authority_trust_path = "examples/credentials/checkpoint-ca.pem"
-# Required by the planned mTLS checkpoint authority. These are this relay's
+# Required by tunnel-authority serve. These are this relay's
 # HTTPS authentication credentials, never the membership publisher's key.
 checkpoint_authority_client_cert_chain = "examples/credentials/checkpoint-client-cert-chain.pem"
 checkpoint_authority_client_private_key = "examples/credentials/checkpoint-client-key.pem"

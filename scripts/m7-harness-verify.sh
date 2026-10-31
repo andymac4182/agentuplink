@@ -46,6 +46,11 @@ gate "Redis cluster integration tests" \
   cargo test -p tunnel-catalog --test redis_cluster --locked -- --ignored --test-threads=1
 gate "membership publisher explicit Redis TLS and restricted ACL" \
   cargo test -p tunnel-test-harness --test m7_membership_publisher_tls --locked -- --ignored --test-threads=1
+gate "independent online authority publication, mTLS and durable restart refusal" \
+  cargo test -p tunnel-test-harness --test m6_online_authority --locked \
+    online_authority_publishes_for_three_relays_and_fails_closed_across_lifecycle -- --ignored --exact --test-threads=1
+gate "online authority committed publication lost reply and real Redis restart refusal" \
+  bash scripts/m6-authority-faults-verify.sh
 gate "Redis recovery integration tests" \
   cargo test -p tunnel-catalog --test redis_recovery --locked -- --ignored --test-threads=1
 gate "Redis recovery-race integration tests" \

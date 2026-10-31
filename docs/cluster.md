@@ -128,9 +128,10 @@ Operator publishers can use `RedisMembershipPublisher::connect_with_tls` with
 an explicit Redis CA and optional Redis client identity. This uses the same
 verified `rediss://`, bounded PING/INFO and Redis run-identity checks as the
 catalog. Give the publisher a separate authenticated Redis ACL restricted to
-its membership operator keys. These transport interfaces do not supply a
-publisher daemon, checkpoint responder or durable authority version allocator
-(M6-C22).
+its membership operator keys. The separate `tunnel-authority serve` command combines the publisher, mandatory-mTLS
+checkpoint responder and independent durable version allocators; its explicit
+approval and failure contract is in [authority.md](authority.md) (M6-C234).
+M6-C22 retains the complete deployment/operator/recovery acceptance.
 
 Certificates must identify the deployment, node, and relay role using a documented SAN profile and appropriate client/server usage. Certificate names, validity, chain constraints, role, and allowed leaf SPKI SHA-256 digest must all match. A device-role certificate fails the peer listener even if it has a chain to another trusted deployment intermediate. Use distinct relay and device intermediates/listeners by default.
 

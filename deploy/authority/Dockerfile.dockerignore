@@ -1,0 +1,13 @@
+*
+!Cargo.toml
+!Cargo.lock
+!rust-toolchain.toml
+!crates/
+!vendor/
+!examples/
+**/target
+**/*.pem
+**/*.key
+**/*.der
+**/.env
+**/.env.*
