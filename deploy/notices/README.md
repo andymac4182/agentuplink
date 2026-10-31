@@ -15,6 +15,13 @@ the binary, lockfile, package manifests and every notice's exact bytes. Only
 actual MIT workspace members may use this repository's root `LICENSE`.
 Missing notices, declared files outside a package, symlinks, changed supplements
 and incomplete bundles fail. Python is a build-stage tool only.
+Both Rust image builds bind the allowlisted source read-only at `/source` and
+retain `/src/target` as their compiler cache. This applies the previously proven
+authority build layout to the relay: under Docker's `vfs` storage driver,
+intermediate source layers copy the whole Rust base filesystem, and the earlier
+authority build exhausted local disk. The change avoids those extra relay
+layers without changing runtime inputs; its new image still needs a build and
+runtime proof.
 
 Eight locked crates omit standalone notice files from their crates.io archives:
 `asn1-rs-impl` 0.2.0, `agent-client-protocol`, `agent-client-protocol-derive` and
