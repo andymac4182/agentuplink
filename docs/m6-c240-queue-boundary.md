@@ -4,7 +4,7 @@ M6-C240 began as a source-derived suspicion that pending-input pressure could
 produce authorization reset 4001. Review found an earlier aggregate guard that
 rejects valid accounted input as `ClientError::QueueLimit` before that fallback.
 The hypothesis remains unproven. This slice adds tests only, based on exact
-`8c8c14fc9f6bb164daad224ad7300c04389a296f`; current runtime is expected to pass.
+`8c8c14fc9f6bb164daad224ad7300c04389a296f`; the first run passed as expected.
 No runtime policy, fallback classification, wire code, quota or replay rule is
 changed. No intentionally inconsistent counters or guard bypass is used to
 manufacture a failing baseline.
@@ -45,14 +45,49 @@ must retain `unknown` when its outcome is unavailable, and no ambiguous effect
 may be automatically replayed. This test-only slice does not change or broaden
 those contracts.
 
-Source formatting and `git diff --check` can run without a build lease. The
-coordinator must release an assigned target before Cargo or any live tests:
+Under the exclusive coordinator lease, the first focused run at clean
+`7b1ab7ee259c042c99c85aee1f35284c862a2ced` passed all four tests: zero failures,
+zero ignored and 248 filtered out. The contiguous-quota and explicit-invalidation
+tests each exercise normal and frozen writes, giving six scenario executions.
+Test execution took 0.07 seconds; compile plus wrapper took 19.294 seconds.
+Scoped strict Clippy passed in 24.549 seconds and formatting in 4.967 seconds.
+No failing baseline was manufactured; this is valid-state evidence against the
+original source-derived hypothesis, not a repaired runtime defect.
+
+The exact commands were:
 
 ```sh
-cargo test --locked -p tunnel-client --lib c240_ -- --test-threads=1
+cargo test --locked -p tunnel-client --lib c240_ --message-format=json -- --test-threads=1 --nocapture
 cargo clippy --locked -p tunnel-client --lib --tests -- -D warnings
+cargo fmt --all -- --check
 ```
 
-The parent full frozen candidate at8c remains independently scoped. Compilation,
-execution and any closure claim for these new tests are pending; no red result
-or complete production readiness is claimed.
+Each used Rust 1.95.0 through `python3 /tmp/agentuplink-subreaper.py`, with
+`CARGO_TARGET_DIR=/workspace/agentuplink/target`, `CARGO_BUILD_JOBS=2`,
+`CARGO_PROFILE_DEV_DEBUG=0`, `CARGO_PROFILE_TEST_DEBUG=0` and
+`CARGO_INCREMENTAL=0`. No extra workspace build, broad test, Docker, Redis or
+Node command ran. The target lease was released after preserving the exact
+test artifact; subsequent evidence edits do not change the validated Rust.
+
+Local evidence is retained outside the repository in
+`/workspace/agentuplink-review-artifacts/c240-boundary-proof-7b1ab7ee`.
+`inputs.json` records the clean source, exact commands, environment and protected
+relay executable. `validation-result.json` records all command receipts and log
+hashes. Cargo JSON identified `tunnel_client-b800502f004801af`; its SHA-256 was
+identical before Clippy, after Clippy and after the create-only copy to
+`binaries/tunnel-client-unit-tests`:
+`90b3921372ef816b003e311a322eb4273d52524951fe52e12e6a86bb23e9f0ce`.
+The protected C94 relay test executable also remained unchanged.
+
+| Validated input | SHA-256 |
+| --- | --- |
+| `crates/tunnel-client/src/m2_runtime.rs` | `af1e5044565239e0a9222d744ea67005a8ebd3a2f6313d182d7f777e5a883271` |
+| `crates/tunnel-client/src/m2_runtime/tests/c240_queue_boundary.rs` | `cd80088048f1b4fdb8056ff3eba1852972ea7cdf53f975a4927adb41854140a5` |
+| `Cargo.lock` | `e255f401d45e150b41b86cb69094366fcc9b0ffc4f420caabc52fb02630e0399` |
+| `rust-toolchain.toml` | `97aab3493c1fb14fe9a21c760433577f434714f5725bbb176e67048dde581afe` |
+
+The parent full frozen candidate at8c remains independently scoped. This closes
+the missing handler-level valid-state proof; it does not independently establish
+the wider actor/public-close or complete production-readiness claims described
+above. The misleading later fallback is unchanged and has not been reached by
+valid accounted input.
