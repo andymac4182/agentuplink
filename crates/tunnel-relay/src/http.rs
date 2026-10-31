@@ -202,7 +202,7 @@ impl ConsumerUpgradeBarrier {
 }
 
 /// One-shot fixture seam immediately after the device's `HELLO` has been
-/// received and parsed on an owner-local device control socket, and
+/// received and parsed on an owner-local or forwarded device control socket, and
 /// immediately before the relay registers the control stream and produces the
 /// `WELCOME`.  It mirrors [`ConsumerUpgradeBarrier`] exactly: it is optional,
 /// is `None` on every ordinary relay path, and changes no product behaviour
@@ -766,7 +766,7 @@ pub(crate) struct HttpState {
     /// Fixture-only one-shot gate after public readiness and exact owner-route
     /// resolution but before the remote H3 admission attempt.
     pub(crate) peer_admission_barrier: Option<Arc<PeerAdmissionBarrier>>,
-    /// Fixture-only one-shot gate on an owner-local device control socket,
+    /// Fixture-only one-shot gate on a device control socket,
     /// after the device's HELLO is received and before the relay registers
     /// the control stream and emits the WELCOME.  `None` on every ordinary
     /// relay path, including every consumer route.
@@ -3139,6 +3139,29 @@ pub fn peer_ingress_handler_with_http_forward(
     local_boot_id: String,
     http_forward: Option<crate::http::forward::HttpForwardExports>,
 ) -> impl PeerIngressHandler {
+    peer_ingress_handler_with_control_attach_barrier(
+        handle,
+        catalog,
+        oidc,
+        local_node_id,
+        local_boot_id,
+        http_forward,
+        None,
+    )
+}
+
+/// The ordinary peer callback with the existing bounded, one-shot fixture
+/// barrier also available at forwarded HELLO registration. Production callers
+/// supply `None`; no admission check or registration policy is bypassed.
+pub(crate) fn peer_ingress_handler_with_control_attach_barrier(
+    handle: RelayHandle,
+    catalog: SharedCatalog,
+    oidc: Arc<OidcVerifier>,
+    local_node_id: String,
+    local_boot_id: String,
+    http_forward: Option<crate::http::forward::HttpForwardExports>,
+    control_attach_barrier: Option<(Arc<ControlAttachBarrier>, Duration)>,
+) -> impl PeerIngressHandler {
     move |request: InboundPeerRequest| {
         let handle = handle.clone();
         let catalog = catalog.clone();
@@ -3146,6 +3169,7 @@ pub fn peer_ingress_handler_with_http_forward(
         let local_node_id = local_node_id.clone();
         let local_boot_id = local_boot_id.clone();
         let http_forward = http_forward.clone();
+        let control_attach_barrier = control_attach_barrier.clone();
         async move {
             handle_peer_ingress(
                 request,
@@ -3155,12 +3179,14 @@ pub fn peer_ingress_handler_with_http_forward(
                 &local_node_id,
                 &local_boot_id,
                 http_forward,
+                control_attach_barrier,
             )
             .await
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_peer_ingress(
     request: InboundPeerRequest,
     handle: RelayHandle,
@@ -3169,6 +3195,7 @@ async fn handle_peer_ingress(
     local_node_id: &str,
     local_boot_id: &str,
     http_forward: Option<crate::http::forward::HttpForwardExports>,
+    control_attach_barrier: Option<(Arc<ControlAttachBarrier>, Duration)>,
 ) -> Result<(), PeerRuntimeError> {
     // The owner-side observer starts at the `owner` stage: every check
     // before the stream is split is this relay's own admission decision.
@@ -3198,6 +3225,7 @@ async fn handle_peer_ingress(
         local_boot_id,
         &fault,
         http_forward,
+        control_attach_barrier,
     )
     .await;
     if let Err(error) = &result {
@@ -3216,6 +3244,7 @@ async fn handle_peer_ingress_inner(
     local_boot_id: &str,
     fault: &PeerFaultObserver,
     http_forward: Option<crate::http::forward::HttpForwardExports>,
+    control_attach_barrier: Option<(Arc<ControlAttachBarrier>, Duration)>,
 ) -> Result<(), PeerRuntimeError> {
     let envelope = request.envelope().clone();
     let destination = envelope.destination.clone();
@@ -3325,7 +3354,14 @@ async fn handle_peer_ingress_inner(
                         return Err(error);
                     }
                 };
-            handle_peer_device_control(request, handle.clone(), device, fault).await
+            handle_peer_device_control(
+                request,
+                handle.clone(),
+                device,
+                fault,
+                control_attach_barrier,
+            )
+            .await
         }
         InternalRequest::DeviceData(request_body) => {
             let device =
@@ -3555,6 +3591,7 @@ async fn handle_peer_device_control(
     handle: RelayHandle,
     device: tunnel_catalog::DeviceIdentity,
     fault: &PeerFaultObserver,
+    control_attach_barrier: Option<(Arc<ControlAttachBarrier>, Duration)>,
 ) -> Result<(), PeerRuntimeError> {
     let spki = device.spki_fingerprint.clone();
     let (mut send, mut recv) = request.split();
@@ -3567,6 +3604,9 @@ async fn handle_peer_device_control(
         tunnel_protocol::ControlMessage::Hello(hello) => hello,
         _ => return Err(PeerRuntimeError::UnexpectedRecord(first.kind())),
     };
+    if let Some((barrier, budget)) = control_attach_barrier {
+        barrier.wait_before_control_attach(budget).await;
+    }
     // A refused registration -- a duplicate owner claim, an unauthorized
     // device, or a HELLO this cluster will not admit -- is an ordinary outcome
     // of this request, not a peer protocol violation.  It must be answered on

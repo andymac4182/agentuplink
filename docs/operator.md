@@ -1046,9 +1046,13 @@ relay's 5 s disconnect hand-off; neither value is configurable (both are
 answers each Ping. Anything between a device and the relay -- a load
 balancer or proxy in TCP passthrough, as on Fly -- sees a control frame at
 least every 10 s, so an idle timeout of 30 s or more there never reaps a
-live session. This applies to a device attached to the relay that owns it;
-on a cluster, a device attached through a non-owner relay is not yet covered
-(M6-C68 records it).
+live control session. The same 30-second inbound deadline applies when the
+device's control socket enters through a non-owner relay: the ingress cancels
+both halves of its private control stream, allowing the remote owner to release
+the session. The local three-relay CLI gate measures old-owner release within
+35 seconds and a second ready event from the same process within 40 seconds
+with its retry delay capped at one second. Full candidate acceptance remains
+tracked under M6-C68.
 
 Two limits, both measured (runtime.md has the detail). **After a relay
 crash**, the relay's claim on the device outlives it in Redis for up to the

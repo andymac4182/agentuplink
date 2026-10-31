@@ -2164,7 +2164,7 @@ impl ProductionCluster {
 
     /// Start a three-relay cluster with one-shot device control-attach
     /// barriers keyed by relay node ID.  Each barrier holds exactly one
-    /// owner-local device control socket between its `HELLO` and the
+    /// owner-local or forwarded device control socket between its `HELLO` and the
     /// registration that produces its `WELCOME`.  An empty map preserves the
     /// ordinary production harness path.  The barrier is single-use: once
     /// released it is a pass-through for every later control attach, so a
