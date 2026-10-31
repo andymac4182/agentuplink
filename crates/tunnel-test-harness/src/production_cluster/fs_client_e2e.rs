@@ -60,6 +60,11 @@
 //! Every byte of fixture content is synthetic and generated here; no evidence
 //! field, log line or error message carries a path, a name or file content.
 
+mod fid_ordering;
+pub use fid_ordering::{
+    FsFidOrderingEvidence, validate_fs_fid_ordering_evidence, verify as verify_fid_ordering,
+};
+
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;

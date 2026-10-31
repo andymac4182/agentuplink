@@ -9599,6 +9599,7 @@ async fn close_carrier(mut carrier: Carrier) -> ClosureEvidence {
 #[cfg(test)]
 mod tests {
     use super::*;
+    mod c240_queue_boundary;
     use crate::test_hooks;
     use futures_util::{SinkExt, StreamExt};
     use std::sync::{Arc, atomic::AtomicBool};

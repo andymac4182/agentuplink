@@ -19,50 +19,44 @@ and [stale authorization #268](https://github.com/andymac4182/agentuplink/pull/2
 followed by [clean-EOF expiry #269](https://github.com/andymac4182/agentuplink/pull/269),
 [placeholder scan correction #270](https://github.com/andymac4182/agentuplink/pull/270)
 and [Redis AOF headroom #271](https://github.com/andymac4182/agentuplink/pull/271),
-then [container notices #272](https://github.com/andymac4182/agentuplink/pull/272).
-Combined runtime candidate `20b92455` passes the required local Rust checks,
-M1 and both M2 plans. Full M7 failed at the timing-boundaries gate; a separate
-continuation cannot convert that result into a full pass. The current
-[acceptance report](production-acceptance-2026-10-31.md) retains that failure
-and the additional hosted failures. The three actual images now pass their
-[local notice and runtime checks](m6-container-notices-2026-10-31.md).
-The next candidate integrates composite filesystem deadlines and confirmed
-fid cleanup, deterministic publisher-queue evidence, the exact stale-refresh
-timing assertion, an operator recovery drill and bounded canary diagnostics.
-Its combined acceptance remains pending. Hosted image-notice release builds
-succeed for all five targets, but native archive verification exposes a
-checksum filename regression (M6-C249). Its narrow local fix and corrected
-Linux archive pass; final hosted qualification remains required.
-Two reproduced unresolved-request
-HTTP/3 defects have a narrow local fix passing 83 transport tests; M6-C246 still
-requires final combined acceptance. The operator recovery drill has two retained
-failures: fixture TLS capacity and competing checkpoint observation. Their
-corrected fixture now passes one recovery drill and one separate authority
-lifecycle run with unchanged C241 optimized service binaries. The recovery
-also proves all four old-config startup refusals before approval. These local
-passes retain the original failures and do not qualify the combined runtime.
-Consumer Bearer challenges pass fourteen focused checks. The four-framework
-scheduled-rotation gate passes 601 offline and 33 installed-framework checks;
-seven Rust library controls, scoped Clippy and its binary build also pass.
-Its first real 300-second attempt fails the final fresh-admission assertion:
-the fixture expects 403 where the documented undiscoverability contract
-requires exact 404 EXPORT_NOT_FOUND. The actual failed response was discarded,
-so its wire classification is not claimed. The corrected full gate passes once
-at `3ebe8b48` in 312.455 seconds, including exact 404 matching, no new device
-stream allocation, scheduled rotation, host effects, zero replay and native
-unknown revocation outcomes. Both attempts and their unchanged inputs/cleanup
-remain recorded in the [framework report](m4-adapters-rotation.md).
-This source-scoped result still needs final aggregate and hosted acceptance.
-M6-C250 prepares independent frozen executable copies for combined acceptance,
-including nested children, after the retained mixed-artifact OG-02 incident.
-Its reviewed plan preserves all 90 M1/M2/M7 stages and a separate 15-stage M4
-suite. Nineteen offline preparation controls pass; no actual final build or
-frozen combined suite has executed yet.
-The C131 diagnostic feature remains outside the deployment candidate. Its
-[causal evidence](m7-c131-diagnostic-evidence-2026-10-31.md) and source-reconstruction
-instructions are retained separately; the source artifacts and raw captures
-remain local, not publicly published by these documents.
-None of these changes has been merged or deployed.
+then [container notices #272](https://github.com/andymac4182/agentuplink/pull/272)
+and [integrated acceptance #273](https://github.com/andymac4182/agentuplink/pull/273).
+
+Integrated candidate `8c8c14fc9f6bb164daad224ad7300c04389a296f` now passes
+complete local Rust checks (2,922 tests), all 90 frozen M1/M2/M7 stages, all
+14 hosted CI jobs, packaging, and all five optimized release builds/native
+archive verifiers. Hosted checkout `f2945e8196187bc7aec1d4415a58d3dde19b4e8b`
+has the identical tree `d6969b5a8e13cf09ade1cf6b410848f7ced2851f`.
+Fresh hosted full M4 includes all four installed frameworks across a real
+300-second rotation. Four separate drills with unchanged original Linux
+archive binaries pass: authority lifecycle, older-backup/operator recovery,
+actual CLI reconnect and three synthetic CLI rotations. The current actual
+authority image separately passes its lifecycle, notices and startup checks.
+The [exact-candidate evidence](m6-final-candidate-2026-10-31.md) records hashes,
+commands, timings, fixture boundaries and local/hosted distinctions.
+
+Earlier full-M7, hosted, framework, recovery and disk-reserve failures remain
+in the [acceptance history](production-acceptance-2026-10-31.md). The earlier
+mixed-binary OG-02 result remains inconclusive. No unchanged retry or narrower
+continuation converts those attempts to passes. C240's expected-green valid
+queue-boundary tests now pass without a runtime change; its broader claim
+remains open. C244 [real-endpoint fid confirmation](m6-fid-confirmation.md) now passes its
+positive and meaningful premature-release controls at source8804, with restored
+source passing again. The invalid first clunk control is retained and excluded.
+These follow-up tests do not change the accepted8c runtime identity; their
+integrated86fb workspace checks now pass2,931tests; new-head hosted checks
+remain pending.
+
+The universal MCP dependency policy still requires owner disposition of
+MIT-0, PSF-2.0 and Windows bundled LGPL obligations; seeded checker tests are
+not a live-policy pass. Actual target inventory, credential/PKI/OIDC setup,
+off-host capacity and soak, monitoring/alerts and recovery ownership remain
+unverified. Default-UID mounted-secret provisioning is separate from the
+actual image fixture's explicitly overridden UID. The three-relay requirement
+is unchanged. The C131 diagnostic feature remains outside this candidate;
+its [causal evidence](m7-c131-diagnostic-evidence-2026-10-31.md) is separate.
+No changes have been merged or deployed, and release publication/attestation
+were skipped for the draft PR.
 
 Existing task IDs in `tasks.md` retain their acceptance criteria. A historical
 green gate is not evidence that the current release is production ready. The
@@ -96,11 +90,11 @@ these completion criteria are evidenced; scheduling is not verification.
 
 | Priority | Work | Evidence / existing tasks | Closure condition |
 | --- | --- | --- | --- |
-| P0 | Complete the external cluster and recovery authority | M6-C22/C234; offline signer and authenticated transports verified. Online service, durable independent approvals/counters and mandatory-mTLS checkpoints pass native and actual-container three-relay lifecycle, lost-reply and real Redis-restart gates. Combined acceptance and full operator recovery remain owed | Shipped services, packaged operator execution and three-relay startup, rotation and recovery procedures |
+| Verified at 8c | Ship the cluster and recovery authority | M6-C22/C234; offline signer and authenticated transports verified. Online service, durable independent approvals/counters and mandatory-mTLS checkpoints pass native and actual-container three-relay lifecycle, lost-reply and real Redis-restart gates. Final 8c combined acceptance and original packaged operator recovery pass; actual deployment provisioning remains separate | Shipped services, packaged operator execution and three-relay startup, rotation and recovery procedures |
 | P0 | Verify deployed credential replacement before expiry | M6-C56 remains owner-deferred for same-device renewal. M6-C233 locally verifies the approved new-device workaround, including migrated grants, revocation, restart and actual expiry | Execute the procedure against the real deployment inventory before expiry; deliver same-device renewal separately when taken up |
 | P0 | Prove durable recovery | M6-C82; the single-relay continuity witness is process-local | Simultaneous restart recovers with an independent witness; rollback remains refused; restore drill completed |
-| P0 | Complete vanished-device CLI recovery evidence | M6-C68; remote owner release and fresh library reconnect pass complete cluster acceptance. M6-C229 quiet-session fix is verified. Actual CLI through the cut-client/held-relay proxy and all three negative controls pass; same PID regains readiness in 30.643 s after owner release at 30.021 s. Combined acceptance remains owed | Same CLI PID reaches a fresh ready session after remote owner cleanup within the stated bounds, with real echo and negative controls; full combined acceptance |
-| P1 | Stabilize cluster membership and key changes | M7-C06/C80/C81/C83/C86/C131/C150; M8-C46/C47/C48/C61; M6-C232 passes prior combined acceptance. C235 identifies an additional clean-EOF path; C238 has deterministic regressions and a completed fixed20/20 versus control19/20 comparison; final combined evidence remains owed | Repeatable re-sign, trust-expiry, rotation and restart acceptance; retain intermittent failures |
+| Verified at 8c | Vanished-device CLI recovery | M6-C68; remote owner release and fresh library reconnect pass complete cluster acceptance. M6-C229 quiet-session fix is verified. Actual CLI through the cut-client/held-relay proxy and all three negative controls pass; same PID regains readiness in 30.643 s after owner release at 30.021 s. Final 8c combined and original packaged CLI acceptance pass | Same CLI PID reaches a fresh ready session after remote owner cleanup within the stated bounds, with real echo and negative controls; full combined acceptance |
+| P1 | Stabilize cluster membership and key changes | M7-C06/C80/C81/C83/C86/C131/C150; M8-C46/C47/C48/C61; M6-C232 passes prior combined acceptance. C235 identifies an additional clean-EOF path; C238 has deterministic regressions and a completed fixed20/20 versus control19/20 comparison; final 8c full local and hosted M7 pass | Repeatable re-sign, trust-expiry, rotation and restart acceptance; retain intermittent failures |
 | P1 | Finish limits and real adapter acceptance | M4-21/68/70/72/73/74; M3-12/13/37/41/42/44 | Enforced advertised limits, long-lived streams and framework clients across peer hops/rotation/revocation |
 | P1 | Establish load and recovery budgets | M6-03/C125/C126/C183/C192/C201/C239 | Off-host multi-tenant load and soak at declared capacity, explicit latency/error/recovery targets, Redis peak-memory/AOF rewrite evidence |
 | P1 | Close release and operator verification gaps | M6-01/C217/C220/C241; M3-50 | Exact final-candidate checks, clean-machine archives and executed deployment guide |
@@ -108,6 +102,13 @@ these completion criteria are evidenced; scheduling is not verification.
 | Restricted | CUA is not eligible for ordinary production enablement | M5-C28/C29 and remaining OS/backend gates | Per-operation caller grants, revocation, lease expiry and dedicated-VM acceptance |
 
 ## Verification ledger
+
+- **Current integrated evidence:** [8c8c14fc final-candidate report](m6-final-candidate-2026-10-31.md)
+  supersedes the pending-verification statements in the dated entries below.
+  It supplies final local/hosted acceptance, exact original release archives,
+  packaged operator drills and current actual-image lifecycle evidence.
+  The following entries retain earlier attempts and scope; their failed
+  results and unidentified historical causes have not been rewritten.
 
 - Filesystem client deadline/fid work passes the official SHA-256-verified
   Node 24.21.0 check: 598 offline tests and 25 installed-framework tests, plus
