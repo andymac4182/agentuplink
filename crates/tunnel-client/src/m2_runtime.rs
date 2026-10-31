@@ -1953,6 +1953,8 @@ async fn run_m2_session(
         control_local_addr,
     };
     actor.publish_status();
+    #[cfg(test)]
+    tests::c240_actor_loop::observe(&actor, None);
     let mut deadline_timer = tokio::time::interval_at(
         tokio::time::Instant::now() + M2_DEADLINE_POLL,
         M2_DEADLINE_POLL,
@@ -2059,14 +2061,26 @@ async fn run_m2_session(
         // HTTP exchanges' progress clocks pause for exactly the writer
         // freeze this event may have started or ended.
         actor.publish_http_freeze();
+        #[cfg(test)]
+        tests::c240_actor_loop::observe(&actor, None);
     };
     // Read before this loop cancels the token itself below: only a stop or a
     // dropped handle has cancelled it at this point.
     let result = m2_session_result(cancellation.is_cancelled(), result);
     readiness.send(Readiness::Stopping).ok();
+    #[cfg(test)]
+    tests::c240_actor_loop::phase("stopping");
     cancellation.cancel();
     actor.close_all_carriers().await;
-    let _ = control_writer.await;
+    {
+        // Preserve the original result-drop boundary before Closed publication.
+        let _control_join = control_writer.await;
+        #[cfg(test)]
+        tests::c240_actor_loop::control_joined(matches!(
+            _control_join,
+            Ok(Ok(())) | Ok(Err(ClientError::Cancelled))
+        ));
+    }
     let reason = match &result {
         Ok(()) => "stopped".to_owned(),
         Err(ClientError::Cancelled) => "cancelled".to_owned(),
@@ -2074,6 +2088,8 @@ async fn run_m2_session(
     };
     actor.publish_closed(reason.clone());
     readiness.send(Readiness::Closed { reason }).ok();
+    #[cfg(test)]
+    tests::c240_actor_loop::phase("closed");
     result
 }
 
@@ -2401,6 +2417,8 @@ impl M2Actor {
             .checked_add(additional)
             .is_none_or(|total| total > maximum)
         {
+            #[cfg(test)]
+            tests::c240_actor_loop::observe(self, Some(additional));
             return Err(ClientError::QueueLimit);
         }
         Ok(())
@@ -7127,6 +7145,8 @@ impl M2Actor {
         if deadline.expired() {
             return self.expire_stream(stream_id).await;
         }
+        #[cfg(test)]
+        tests::c240_actor_loop::dispatch(stream_id);
         if http {
             self.http_dispatch_payload(stream_id, payload);
             Ok(())
@@ -9140,7 +9160,12 @@ impl M2Actor {
         if let Some(mut pending) = self.pending_candidate.take() {
             if let Some(dial) = pending.dial.take() {
                 dial.abort();
-                let _ = dial.await;
+                let _joined = dial.await;
+                #[cfg(test)]
+                tests::c240_actor_loop::dial_joined(match &_joined {
+                    Ok(()) => true,
+                    Err(error) => error.is_cancelled(),
+                });
             }
             if let Some(socket) = pending.socket.take() {
                 evidence = Some(
@@ -9435,7 +9460,12 @@ impl M2Actor {
         if let Some(mut pending) = self.pending_candidate.take() {
             if let Some(dial) = pending.dial.take() {
                 dial.abort();
-                let _ = dial.await;
+                let _joined = dial.await;
+                #[cfg(test)]
+                tests::c240_actor_loop::dial_joined(match &_joined {
+                    Ok(()) => true,
+                    Err(error) => error.is_cancelled(),
+                });
             }
             if let Some(socket) = pending.socket.take() {
                 let _ = close_unattached_socket(socket, pending.attempt.new_connection_id).await;
@@ -9520,8 +9550,14 @@ async fn join_carrier_task(mut task: JoinHandle<()>) -> bool {
 
 async fn join_carrier_task_with_timeout(task: &mut JoinHandle<()>, timeout: Duration) -> bool {
     match tokio::time::timeout(timeout, &mut *task).await {
-        Ok(_) => true,
+        Ok(_joined) => {
+            #[cfg(test)]
+            tests::c240_actor_loop::carrier_task_joined(_joined.is_ok());
+            true
+        }
         Err(_) => {
+            #[cfg(test)]
+            tests::c240_actor_loop::carrier_task_joined(false);
             // A timed-out task still owns the sink until it is explicitly
             // aborted and joined.  Dropping the handle here would detach the
             // task and invalidate the local-closure evidence.
@@ -9558,7 +9594,9 @@ async fn close_carrier(mut carrier: Carrier) -> ClosureEvidence {
                 tokio::select! {
                     biased;
                     reply = wait => reply.is_ok(),
-                    _ = writer => {
+                    _joined = writer => {
+                        #[cfg(test)]
+                        tests::c240_actor_loop::carrier_task_joined(_joined.is_ok());
                         writer_finished = true;
                         false
                     }
@@ -9586,6 +9624,8 @@ async fn close_carrier(mut carrier: Carrier) -> ClosureEvidence {
     } else {
         true
     };
+    #[cfg(test)]
+    tests::c240_actor_loop::carrier_closed(&connection_id, writer_joined && reader_joined);
     ClosureEvidence {
         connection_id,
         // Joining both carrier tasks proves that no local task still owns the
@@ -9599,6 +9639,7 @@ async fn close_carrier(mut carrier: Carrier) -> ClosureEvidence {
 #[cfg(test)]
 mod tests {
     use super::*;
+    pub(super) mod c240_actor_loop;
     mod c240_queue_boundary;
     use crate::test_hooks;
     use futures_util::{SinkExt, StreamExt};
