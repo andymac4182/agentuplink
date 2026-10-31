@@ -104,6 +104,77 @@ fn fingerprint(bytes: &[u8]) -> String {
     common::hex_encode(&Sha256::digest(bytes))
 }
 
+fn bounded_file(path: &Path, maximum: usize) -> GateResult<Vec<u8>> {
+    let mut bytes = Vec::new();
+    fs::File::open(path)
+        .map_err(|_| "open preapproval fence evidence")?
+        .take(maximum as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| "read preapproval fence evidence")?;
+    require(
+        bytes.len() <= maximum,
+        "preapproval fence evidence byte bound",
+    )?;
+    Ok(bytes)
+}
+
+#[derive(PartialEq, Eq)]
+struct PreapprovalEvidence {
+    authority: Vec<u8>,
+    recovery_fence: Vec<u8>,
+    relay_hashes: Vec<String>,
+    binding: [String; 2],
+}
+
+impl PreapprovalEvidence {
+    async fn read(
+        fixture: &Fixture,
+        admin: &mut redis::aio::MultiplexedConnection,
+        prefix: &str,
+        fence: &Path,
+    ) -> GateResult<Self> {
+        require(
+            fixture.relays.len() == 3,
+            "preapproval witness requires all three relays",
+        )?;
+        let mut relay_hashes = Vec::with_capacity(3);
+        for relay in &fixture.relays {
+            relay_hashes.push(fingerprint(&bounded_file(
+                &relay.version_state,
+                tunnel_relay::membership_version_state::MAX_MEMBERSHIP_VERSION_STATE_BYTES,
+            )?));
+        }
+        Ok(Self {
+            authority: bounded_file(&fixture.state, publication_observer::MAX_BYTES)?,
+            recovery_fence: fence_bytes(fence, None)?,
+            relay_hashes,
+            binding: [
+                bounded_redis(
+                    admin,
+                    redis::cmd("GET").arg(format!("{prefix}meta:active_incarnation")),
+                )
+                .await?,
+                bounded_redis(
+                    admin,
+                    redis::cmd("GET").arg(format!("{prefix}meta:redis_run_id")),
+                )
+                .await?,
+            ],
+        })
+    }
+}
+
+fn preapproval_startup_refused(output: &Capture, authority: bool) -> GateResult {
+    if authority {
+        refusal(
+            output,
+            "Redis run differs from independent durable approval; recovery required",
+        )
+    } else {
+        refusal(output, "stage=authority_identity class=run_changed")
+    }
+}
+
 struct Container {
     id: String,
     name: String,
@@ -1019,6 +1090,53 @@ async fn drill(
         fenced_at.elapsed().as_millis()
     );
 
+    // Before reconciliation, signing, recover, or inventory approval: the
+    // stale backup still binds the OLD incarnation/run. Starting old configs
+    // must not silently rebind that metadata to the newly observed process.
+    let preapproval = PreapprovalEvidence::read(fixture, &mut admin, &prefix, &fence).await?;
+    require(
+        preapproval.binding == [fixture.incarnation.clone(), fixture.redis_run.clone()]
+            && preapproval.binding[1] != new_run
+            && preapproval.recovery_fence == empty_fence
+            && preapproval.relay_hashes
+                == old_relay_states
+                    .iter()
+                    .map(|(_, hash)| hash.clone())
+                    .collect::<Vec<_>>(),
+        "preapproval witness did not begin at the old durable identity and fences",
+    )?;
+    let mut attempts = old_configs
+        .iter()
+        .map(|config| (&fixture.relay_binary, config, false))
+        .collect::<Vec<_>>();
+    attempts.push((&fixture.authority_binary, &fixture.config, true));
+    for (binary, config, authority) in attempts {
+        let output = capture(
+            binary,
+            &[
+                "serve".into(),
+                "--config".into(),
+                config.display().to_string(),
+            ],
+        )
+        .await?;
+        preapproval_startup_refused(&output, authority)?;
+        require(
+            PreapprovalEvidence::read(fixture, &mut admin, &prefix, &fence).await? == preapproval,
+            "old startup changed preapproval Redis identity or independent fences",
+        )?;
+        revocations
+            .raw_flags(fixture, &mut admin, namespace, true)
+            .await?;
+        require(
+            old.inspect().await? == (false, 0),
+            "old Redis restarted during startup refusal controls",
+        )?;
+    }
+    println!(
+        "c243 phase=preapproval-old-startups relay_run_changed=3 authority_run_changed=true bindings_and_fences_unchanged=true stale_revocations_unchanged=true"
+    );
+
     reconciled
         .restore(candidate.address, &prefix)
         .await
@@ -1356,4 +1474,35 @@ fn operator_tls_config_changes_only_the_independent_endpoint() {
         )
         .is_err()
     );
+}
+
+#[test]
+fn preapproval_startup_requires_changed_run_not_generic_unavailability() {
+    for (authority, marker) in [
+        (false, "stage=authority_identity class=run_changed"),
+        (
+            true,
+            "Redis run differs from independent durable approval; recovery required",
+        ),
+    ] {
+        let mut output = Capture {
+            success: false,
+            stdout: Vec::new(),
+            stderr: marker.as_bytes().to_vec(),
+        };
+        assert!(preapproval_startup_refused(&output, authority).is_ok());
+        output.success = true;
+        assert!(preapproval_startup_refused(&output, authority).is_err());
+        output.success = false;
+        for wrong in [
+            "stage=authority_identity class=catalog",
+            "stage=connection_establishment class=io",
+            "class=tls_certificate",
+            "timeout",
+            "profile unavailable",
+        ] {
+            output.stderr = wrong.as_bytes().to_vec();
+            assert!(preapproval_startup_refused(&output, authority).is_err());
+        }
+    }
 }

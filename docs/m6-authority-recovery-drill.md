@@ -62,7 +62,14 @@ launcher that mounts only the command's private input directory.
    records are active again in the old backup. Wait at least 65 seconds after
    the last successful process fence, covering the 60-second membership trust
    lifetime plus the shared five-second clock-skew bound.
-4. Apply the independent reconciled catalog. Run actual `recovery-observe` and
+4. Before reconciliation or any recovery/approval, start each old relay and
+   the old authority against the restored stale backup. Require exact
+   `stage=authority_identity class=run_changed` for all three relays and the
+   authority's independently pinned-run refusal. After every attempt require
+   byte-identical authority/recovery state, unchanged hashes of all three old
+   relay states, unchanged old Redis incarnation/run binding, still-stale
+   revocation flags and the original Redis still stopped. Then apply the
+   independent reconciled catalog. Run actual `recovery-observe` and
    offline `sign-recovery-approval`. Missing fencing acknowledgements and a
    wrong nonce must refuse with the expected cause and byte-identical fence.
    Restore the stale durable records after signing: actual `recover` must
@@ -245,3 +252,12 @@ remain in phases before relay startup or after all relays stop. The isolated
 lost-write and Redis-run fault scenarios never start relays. No direct HTTP
 coverage was dropped; only the concurrent continuity observation changed.
 Focused observation controls and the next corrected process run are pending.
+
+
+The preapproval old-startup witness was missing from both retained attempts:
+the earlier refusals occurred only after successful activation of the new
+incarnation. The new control runs before the first reconciliation, signing,
+recovery or inventory approval. Generic connection, TLS, timeout and later
+incarnation-mismatch failures cannot count as changed-run refusal. This is
+additional missing acceptance coverage, not a reproduced runtime defect.
+Its source and pure cause-selection control await compilation and live proof.
