@@ -133,6 +133,14 @@ class ContainerNoticesTests(unittest.TestCase):
         self.assertEqual(manifest["packages"][1]["notices"], ["crates/dep-2.0.0/dep-LICENSE"])
         self.assertEqual((self.output / "crates/dep-2.0.0/dep-LICENSE").read_bytes(), b"Pinned upstream MIT notice\n")
 
+    def test_unreviewed_authors_file_does_not_satisfy_missing_notice(self):
+        directory = self.supplements()
+        (directory / "supplements.json").write_text(json.dumps({"schema": 1, "packages": []}))
+        (self.dep / "AUTHORS").write_text("Ada Example and contributors\n")
+        with self.assertRaises(ValueError):
+            self.stage()
+        self.assertFalse(self.output.exists())
+
     def test_supplement_commit_checksum_and_content_substitutions_are_refused(self):
         directory = self.supplements()
         original = json.loads((directory / "supplements.json").read_text())
