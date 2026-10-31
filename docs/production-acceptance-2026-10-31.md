@@ -1,5 +1,25 @@
 # Combined production-candidate acceptance
 
+## Current successful candidate
+
+Integrated source `8c8c14fc9f6bb164daad224ad7300c04389a296f` now passes complete
+local Rust and all90 frozen M1/M2/M7 stages, all14 hosted CI jobs, all five
+optimized release builds/native archive verifiers, four original packaged
+Linux drills and the current actual authority-image lifecycle. Hosted merge
+`f2945e8196187bc7aec1d4415a58d3dde19b4e8b` has the identical tree
+`d6969b5a8e13cf09ade1cf6b410848f7ced2851f`. The
+[exact-candidate report](m6-final-candidate-2026-10-31.md) contains the results,
+identities, retained local image-build failure, cleanup evidence and scope.
+Production readiness remains open for the owner/external criteria in the
+[goal](production-readiness.md); no merge, publication or deployment occurred.
+
+## Earlier candidate history, preserved
+
+The entries below were recorded at their stated sources before the separate
+successful8c candidate. Pending statements describe that earlier observation;
+new successful evidence does not erase any failure or turn a mixed-artifact
+run into a valid one.
+
 Status at 2026-10-31T16:50:12+10:00: **not accepted for deployment**.
 
 This report records runtime `20b92455706baaacc1f2329c26afba41c48f906a`,
