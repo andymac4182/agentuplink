@@ -1,11 +1,12 @@
 # Three-relay operator recovery drill
 
 M6-C243 adds a bounded, test-only local acceptance drill for the existing
-M6-C22 recovery contract. **The live recovery drill is not yet verified.** Targeted compilation, four
-bounded snapshot controls and six pure wrapper guards pass at their narrow
-scope. No
+M6-C22 recovery contract. **The corrected local optimized-artifact recovery
+drill passes, along with a separate native authority lifecycle attempt.** The
+source, prior failures and exact evidence scopes are recorded below. No
 production service behavior changes, deployment or automatic reconciler are
-included. Keep M6-C22 open beyond this local drill.
+included. Keep M6-C22 open beyond this local drill; combined-candidate and
+hosted acceptance remain separate.
 
 The test uses the shipped `tunnel-authority` commands and service and the
 shipped `tunnel-relay` recovery commands and three serving relay processes.
@@ -255,8 +256,8 @@ restart freshness, recovered publication and inventory/client-revocation checks
 remain in phases before relay startup or after all relays stop. The isolated
 lost-write and Redis-run fault scenarios never start relays. No direct HTTP
 coverage was dropped; only the concurrent continuity observation changed.
-The corrected observation controls pass at the source and scope below. The
-next corrected process run is still pending.
+The corrected observation controls and the two serial process attempts pass
+at the sources and scopes recorded below.
 
 
 The preapproval old-startup witness was missing from both retained attempts:
@@ -265,8 +266,8 @@ incarnation. The new control runs before the first reconciliation, signing,
 recovery or inventory approval. Generic connection, TLS, timeout and later
 incarnation-mismatch failures cannot count as changed-run refusal. This is
 additional missing acceptance coverage, not a reproduced runtime defect.
-Its source and pure cause-selection control compile and pass in the focused
-validation below; the actual startup witnesses still await live proof.
+Its source and pure cause-selection control pass in the focused validation
+below; all four actual startup witnesses pass in the corrected recovery run.
 
 
 A reviewer initially inferred that startup clears persisted confirmation and
@@ -298,5 +299,63 @@ The adjacent `execution-inputs.json` pins the clean source, all five Rust
 fixture input hashes, validation logs and the unchanged C241 optimized
 executable copies, whose hashes were rechecked against the image report.
 The wrapper manifest now also records the passive observer and diagnostic
-module hashes. All earlier failed attempts remain retained. The corrected
-full recovery attempt and historical hosted lifecycle failure remain open.
+module hashes. All earlier failed attempts remain retained. The subsequent corrected
+recovery/lifecycle evidence follows; historical hosted attribution and the
+combined-candidate/hosted checks remain open.
+
+
+## Two serial optimized-artifact attempts
+
+On 2026-10-31, a declared quiet local build/fixture window ran exactly one
+corrected recovery attempt, then exactly one native lifecycle attempt. Both
+used frozen harness `f0d36173…59468c` from clean Rust source `7a522bea` and the
+unchanged image-extracted C241 authority `cc742006…36f2` and relay
+`2827f610…206c`. The recovery wrapper checkout was `a78e2be6`: its only changes
+from the harness source were evidence documentation and the source-hash input
+list. All five Rust fixture hashes matched before and after execution. No
+Cargo build, runtime modification, relaxed canary, or scenario retry occurred.
+
+| Attempt | Result | Test / wrapper duration | Exact cleanup |
+| --- | --- | --- | --- |
+| Three-relay recovery | PASS, one test | 116.23 s / 117.109 s | Both owned Redis container IDs proven absent |
+| Native authority lifecycle | PASS, one test | 118.31 s / 119.096 s | Its separate owned Redis container ID proven absent |
+
+Recovery retained an older physical backup, independently captured 93 later
+catalog records, fenced all old processes and waited 65,076 ms. Before any
+reconciliation or approval, all three old relays refused the changed Redis run
+and the old authority refused the run outside its durable approval; every
+attempt preserved the old bindings, full authority/fence bytes, relay-state
+hashes and visibly stale revocation flags. Missing-fence, wrong-nonce and
+stale-digest controls refused without consuming the fence. Actual CLI signing
+and recovery consumed version 1; replay refused. New membership approval
+preserved both allocators. All three new relays adopted verified checkpoint and
+node floors, a fresh device session carried exact non-owner traffic through two
+further confirmed publications, and both credential and consumer-grant
+revocations remained enforced.
+
+The separate lifecycle test preserved the exact owner/session/epoch/generation,
+data socket and three relay PIDs through two publications, authority stop and
+restart, and all-three persisted adoption. Direct nonce/signature and mTLS
+controls stayed outside the live relay phase. Failed publication responses
+retained their original expiry and became unavailable after 53,113 ms; startup
+freshness, revoked client pin, pending inventory and wrong-run checks all
+passed their existing predicates. This is native executable acceptance with a
+production-library device, not a new device-CLI, full-container, off-host or
+hosted-CI claim.
+
+Evidence is private under
+`/workspace/agentuplink-review-artifacts/c243-c248-quiet-a78e2be6/`:
+`inputs.json`, `recovery-first/result.json`,
+`recovery-first/012-actual-recovery-drill.log`, `lifecycle-predeclared.json`,
+`lifecycle-driver.py`, `lifecycle-first/result.json`,
+`lifecycle-first/007-actual-native-lifecycle.log` and
+`post-run-integrity.json`. The lifecycle driver reuses the reviewed bounded
+wrapper's ownership, immutable-ID/image/loopback/resource checks and process
+group cleanup for its separate disposable Redis. Shared port 16379 was never
+used. Its frozen driver SHA-256 is
+`7e26d3b77aa37c25d87c8fea1de07b07802c176ed9eb35ee4c12c6179c8521ca`.
+Post-run hashes prove all source/executable inputs unchanged. None of the nine
+retained serving-relay stderr captures contained the earlier authority-429
+warning. That observation and these local passes do not establish the cause of
+the historical hosted failure. Both failed earlier attempts remain retained;
+C22, combined-candidate acceptance and hosted validation remain open.
