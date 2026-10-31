@@ -31,7 +31,7 @@ import {
   validatePath,
   type PathBounds,
 } from './paths.ts';
-import { ConsumerSession, ROOT_FID, type Lifecycle } from './session.ts';
+import { ConsumerSession, ROOT_FID, type Lifecycle, type RequestSettlement } from './session.ts';
 import {
   runOperation, streamOperation, throwIfOperationCancelled, waitForCleanup, waitForSource,
   type OperationOptions,
@@ -243,12 +243,16 @@ export class RemoteFilesystem {
     const fid = this.session.allocateFid();
     let from = ROOT_FID;
     let bound = false;
+    let pendingSettlement: Promise<RequestSettlement> | undefined;
     try {
       if (components.length === 0) {
-        const reply = await this.session.request(
+        const request = this.session.requestTracked(
           { kind: 'Twalk', tag: 0, fid: ROOT_FID, newfid: fid, wnames: [] },
           { signal },
         );
+        pendingSettlement = request.settled;
+        const reply = await request.reply;
+        pendingSettlement = undefined;
         if (reply.kind !== 'Rwalk') {
           throw this.unexpected('walk', path);
         }
@@ -256,10 +260,13 @@ export class RemoteFilesystem {
       }
       for (let at = 0; at < components.length; at += C.MAXWELEM) {
         const names = components.slice(at, at + C.MAXWELEM);
-        const reply = await this.session.request(
+        const request = this.session.requestTracked(
           { kind: 'Twalk', tag: 0, fid: bound ? fid : from, newfid: fid, wnames: names },
           { signal },
         );
+        pendingSettlement = request.settled;
+        const reply = await request.reply;
+        pendingSettlement = undefined;
         if (reply.kind !== 'Rwalk') {
           throw this.unexpected('walk', path);
         }
@@ -279,7 +286,13 @@ export class RemoteFilesystem {
       }
       return fid;
     } catch (error) {
-      if (bound) {
+      if (pendingSettlement !== undefined && error instanceof FilesystemError && error.outcome !== 'not_started') {
+        // A dispatched walk can bind before its missing reply, including when
+        // this is the first step. Wait for a reply, Rflush or session end before
+        // clunking: clunking earlier could race a walk that binds afterwards.
+        // The caller need not wait, but the fid remains charged and reserved.
+        void pendingSettlement.then(() => this.clunkQuietly(fid)).catch(() => {});
+      } else if (bound) {
         await this.clunkQuietly(fid, signal);
       } else {
         this.session.releaseFid(fid);
@@ -293,11 +306,15 @@ export class RemoteFilesystem {
       this.session.releaseFid(fid);
       return;
     }
-    // Do not pass the expired application signal: cleanup still has to reach
-    // the device. The number stays owned until this bounded request settles.
-    const cleanup = this.session.request({ kind: 'Tclunk', tag: 0, fid })
-      .catch(() => {})
-      .finally(() => { this.session.releaseFid(fid); });
+    // Application expiry stops waiting, not cleanup. A Tclunk reply (including
+    // Rlerror, by 9P's rule) or session termination proves the fid is released.
+    // A deadline, refused dispatch or Rflush alone proves no such thing: keep
+    // that number quarantined against the quota instead of reusing it.
+    const request = this.session.requestTracked({ kind: 'Tclunk', tag: 0, fid });
+    void request.reply.catch(() => {});
+    const cleanup = request.settled.then((settlement) => {
+      if (settlement === 'reply' || settlement === 'closed') this.session.releaseFid(fid);
+    });
     await waitForCleanup(cleanup, signal);
   }
 

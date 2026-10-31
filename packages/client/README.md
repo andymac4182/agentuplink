@@ -70,7 +70,10 @@ iterators start on their first `next()`, including pauses after that point.
 A deadline stops new application requests and reports `DEADLINE_EXCEEDED` with
 the existing effect outcome and acknowledged-byte floor. A stalled upload source
 cannot resume writes after cancellation. Cleanup may finish in the background
-under its existing request deadline, retaining fid/tag ownership while it does.
+under its existing request deadline. An unanswered walk keeps its fid until
+protocol settlement permits cleanup; an unacknowledged clunk keeps that fid
+reserved against the session quota. A local timeout or flush alone cannot
+prove a clunk released the number.
 No mutation is replayed. Caller abort keeps its original-reply-before-`Rflush`
 semantics, and a known completed operation can return success while cleanup
 finishes. Synchronous caller code cannot be preempted; dispatch checks the

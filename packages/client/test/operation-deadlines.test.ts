@@ -304,3 +304,123 @@ it('an original mutation reply before Rflush still wins with an operation deadli
   assert.equal(provider.has('/directory'), true);
   assert.equal(remote.state, 'ready');
 });
+
+it('an unanswered walk keeps its fid until flush settlement and subsequent clunk', async (t) => {
+  let first = true;
+  let flush: Message | undefined;
+  const { remote, connection } = await connect(t, { file: 'hello' }, (request, reply) => {
+    if (request.kind === 'Twalk' && first) { first = false; return 'hold'; }
+    if (request.kind === 'Tflush') { flush = reply; return 'hold'; }
+    if (request.kind === 'Tclunk') return 300;
+    return 0;
+  });
+  await assert.rejects(remote.stat('/file', { timeoutMs: 150 }), failure('DEADLINE_EXCEEDED', 'failed'));
+  await until(() => flush !== undefined);
+  const original = connection.received.find((m) => m.kind === 'Twalk');
+  assert.ok(original?.kind === 'Twalk');
+  assert.equal(connection.received.filter((m) => m.kind === 'Tclunk').length, 0,
+    'clunk must not race a walk that can still bind its fid');
+  const second = remote.stat('/file', { timeoutMs: 1000 });
+  await until(() => connection.received.filter((m) => m.kind === 'Twalk').length === 2);
+  const next = connection.received.filter((m) => m.kind === 'Twalk')[1];
+  assert.ok(next?.kind === 'Twalk');
+  assert.notEqual(next.newfid, original.newfid, 'unacknowledged binding still owns its number');
+  connection.send(flush!);
+  await until(() => connection.received.some((m) => m.kind === 'Tclunk' && m.fid === original.newfid));
+  assert.equal((await second).size, 5n);
+  await delay(350);
+  assert.equal((await remote.stat('/file')).size, 5n);
+  const latest = connection.received.filter((m) => m.kind === 'Twalk').at(-1);
+  assert.ok(latest?.kind === 'Twalk');
+  assert.equal(latest.newfid, original.newfid, 'confirmed clunk makes the number reusable');
+  assert.equal(remote.state, 'ready');
+});
+
+it('an unacknowledged clunk cannot make its fid reusable merely by timing out and flushing', async (t) => {
+  let holdClunk = true;
+  const { remote, connection } = await connect(t, { file: 'hello' },
+    (request) => request.kind === 'Tclunk' && holdClunk ? 'hold' : 0);
+  // The stat itself is known complete. Only cleanup is unacknowledged.
+  assert.equal((await remote.stat('/file', { timeoutMs: 150 })).size, 5n);
+  await until(() => connection.received.some((m) => m.kind === 'Tflush'));
+  holdClunk = false;
+  assert.equal((await remote.stat('/file')).size, 5n);
+  const walks = connection.received.filter((m) => m.kind === 'Twalk');
+  assert.ok(walks[0]?.kind === 'Twalk' && walks[1]?.kind === 'Twalk');
+  assert.notEqual(walks[0].newfid, walks[1].newfid, 'flush is not proof Tclunk ran');
+  assert.equal(remote.state, 'ready');
+});
+
+it('a definitely refused walk releases its fid without unnecessary clunk', async (t) => {
+  const { remote, connection } = await connect(t, { file: 'hello' }, () => 0, { maxFids: 1 });
+  await assert.rejects(remote.stat('/missing'), failure('ENOENT', 'not_started'));
+  assert.equal(connection.received.filter((m) => m.kind === 'Tclunk').length, 0);
+  assert.equal((await remote.stat('/file')).size, 5n);
+  const walks = connection.received.filter((m) => m.kind === 'Twalk');
+  assert.ok(walks[0]?.kind === 'Twalk' && walks[1]?.kind === 'Twalk');
+  assert.equal(walks[0].newfid, walks[1].newfid);
+});
+
+it('a late original walk reply permits cleanup when the tag quota prevented flushing', async (t) => {
+  let originalReply: Message | undefined;
+  let first = true;
+  const { remote, connection } = await connect(t, { file: 'hello' }, (request, reply) => {
+    if (request.kind === 'Twalk' && first) { first = false; originalReply = reply; return 'hold'; }
+    return 0;
+  }, { maxInflightRequests: 1 });
+  await assert.rejects(remote.stat('/file', { timeoutMs: 150 }), failure('DEADLINE_EXCEEDED', 'failed'));
+  assert.equal(connection.received.filter((m) => m.kind === 'Tflush').length, 0);
+  assert.equal(connection.received.filter((m) => m.kind === 'Tclunk').length, 0);
+  assert.ok(originalReply !== undefined);
+  connection.send(originalReply);
+  await until(() => connection.received.some((m) => m.kind === 'Tclunk'));
+  // Receipt proves the peer processed the clunk; allow its reply across the socket.
+  await delay(10);
+  assert.equal((await remote.stat('/file')).size, 5n);
+  const walks = connection.received.filter((m) => m.kind === 'Twalk');
+  assert.ok(walks[0]?.kind === 'Twalk' && walks[1]?.kind === 'Twalk');
+  assert.equal(walks[0].newfid, walks[1].newfid);
+});
+
+it('caller-aborted walk waits for Rflush before cleanup and preserves a parallel operation', async (t) => {
+  let first = true;
+  const { remote, connection } = await connect(t, { file: 'hello' }, (request) => {
+    if (request.kind === 'Twalk' && first) { first = false; return 'hold'; }
+    return request.kind === 'Tflush' ? 200 : 0;
+  });
+  const controller = new AbortController();
+  const checked = assert.rejects(remote.stat('/file', { signal: controller.signal, timeoutMs: 1000 }),
+    failure('ABORTED', 'failed'));
+  await until(() => connection.received.some((m) => m.kind === 'Twalk'));
+  controller.abort();
+  assert.equal((await remote.stat('/file')).size, 5n);
+  const walks = connection.received.filter((m) => m.kind === 'Twalk');
+  assert.ok(walks[0]?.kind === 'Twalk' && walks[1]?.kind === 'Twalk');
+  assert.notEqual(walks[0].newfid, walks[1].newfid);
+  assert.equal(connection.received.filter((m) => m.kind === 'Tclunk' && m.fid === walks[0]!.newfid).length, 0);
+  await checked;
+  await until(() => connection.received.some((m) => m.kind === 'Tclunk' && m.fid === walks[0]!.newfid));
+  assert.equal(remote.state, 'ready');
+});
+
+it('an already-aborted walk consumes no fid or tag quota', async (t) => {
+  const { remote, connection } = await connect(t, { file: 'hello' }, () => 0, { maxFids: 1, maxInflightRequests: 1 });
+  const controller = new AbortController();
+  controller.abort();
+  const before = connection.received.length;
+  await assert.rejects(remote.stat('/file', { signal: controller.signal }), failure('ABORTED', 'not_started'));
+  assert.equal(connection.received.length, before);
+  assert.equal((await remote.stat('/file')).size, 5n);
+});
+
+it('a mismatched late reply cannot certify that an unanswered walk settled', async (t) => {
+  const { remote, connection } = await connect(t, { file: 'hello' },
+    (request) => request.kind === 'Twalk' || request.kind === 'Tflush' ? 'hold' : 0);
+  await assert.rejects(remote.stat('/file', { timeoutMs: 150 }), failure('DEADLINE_EXCEEDED', 'failed'));
+  const walk = connection.received.find((m) => m.kind === 'Twalk');
+  assert.ok(walk?.kind === 'Twalk');
+  connection.send({ kind: 'Rclunk', tag: walk.tag });
+  await until(() => remote.state === 'closed');
+  assert.equal(connection.received.filter((m) => m.kind === 'Tclunk').length, 0);
+  await assert.rejects(remote.stat('/file'), failure('PROTOCOL_VIOLATION', 'not_started'));
+});

@@ -41,6 +41,9 @@ import { operationCancellation } from './operation-deadline.ts';
 
 export type Lifecycle = 'connecting' | 'ready' | 'closed';
 
+/** A local deadline is not evidence the peer stopped using request-owned state. */
+export type RequestSettlement = 'reply' | 'flushed' | 'not_dispatched' | 'closed';
+
 /** The fid a `Tattach` binds. Fid 0 is the root for the life of the session. */
 export const ROOT_FID = 0;
 
@@ -158,6 +161,11 @@ const REPLY_OF: Record<string, string> = {
 export class ConsumerSession {
   private lifecycle: Lifecycle = 'connecting';
   private readonly outstanding = new Map<number, Outstanding>();
+  /** Only fid-owning requests ask for settlement; entries remain bounded by held tags. */
+  private readonly settlements = new Map<number, {
+    request: Message;
+    resolve: (settlement: RequestSettlement) => void;
+  }>();
   /** Tags taken, including those held only until a flush is answered. */
   private readonly heldTags = new Set<number>();
   /** Flushes outstanding against a tag, by victim. The tag is held until empty. */
@@ -235,6 +243,13 @@ export class ConsumerSession {
     const record = this.outstanding.get(tag);
     if (record === undefined) {
       if (this.heldTags.has(tag)) {
+        const tracked = this.settlements.get(tag);
+        if (tracked !== undefined && message.kind !== 'Rlerror' &&
+            (REPLY_OF[tracked.request.kind] !== message.kind || this.checkReplyBounds(tracked.request, message) !== undefined)) {
+          this.failSession('PROTOCOL_VIOLATION', 1002, 'late-reply-mismatch');
+          return;
+        }
+        this.settle(tag, 'reply');
         // A tag held only until its flush is answered: the original reply beat
         // the `Rflush`, which 9P explicitly permits. Honour it by dropping it,
         // not by closing — "respect a normal reply arriving before `Rflush`".
@@ -265,6 +280,7 @@ export class ConsumerSession {
       }
     }
     this.retire(record);
+    this.settle(tag, 'reply');
     if (message.kind === 'Rlerror') {
       const code = ERRNO_TO_CODE.get(message.ecode);
       record.reject(
@@ -502,11 +518,37 @@ export class ConsumerSession {
     message: MessageOf<K>,
     options: { signal?: AbortSignal | undefined } = {},
   ): Promise<Message> {
+    return this.startRequest(message, options);
+  }
+
+  /** Internal resource owners need peer settlement separately from the caller's reply deadline. */
+  requestTracked<K extends Message['kind']>(
+    message: MessageOf<K>,
+    options: { signal?: AbortSignal | undefined } = {},
+  ): { reply: Promise<Message>; settled: Promise<RequestSettlement> } {
+    let finish!: (settlement: RequestSettlement) => void;
+    const settled = new Promise<RequestSettlement>((resolve) => { finish = resolve; });
+    return { reply: this.startRequest(message, options, finish), settled };
+  }
+
+  private settle(tag: number, settlement: RequestSettlement): void {
+    const tracked = this.settlements.get(tag);
+    this.settlements.delete(tag);
+    tracked?.resolve(settlement);
+  }
+
+  private startRequest<K extends Message['kind']>(
+    message: MessageOf<K>,
+    options: { signal?: AbortSignal | undefined },
+    onSettled?: (settlement: RequestSettlement) => void,
+  ): Promise<Message> {
     if (this.lifecycle === 'closed') {
+      onSettled?.('closed');
       return Promise.reject(this.endError(message.kind));
     }
     const cancellation = operationCancellation(options.signal);
     if (cancellation !== undefined) {
+      onSettled?.('not_dispatched');
       return Promise.reject(
         new FilesystemError({
           code: cancellation,
@@ -520,9 +562,12 @@ export class ConsumerSession {
     try {
       tag = this.allocateTag();
     } catch (error) {
+      onSettled?.('not_dispatched');
       return Promise.reject(error as FilesystemError);
     }
-    const sent = this.sendRaw({ ...message, tag } as Message, tag);
+    const tagged = { ...message, tag } as Message;
+    if (onSettled !== undefined) this.settlements.set(tag, { request: tagged, resolve: onSettled });
+    const sent = this.sendRaw(tagged, tag);
     const signal = options.signal;
     if (signal !== undefined) {
       const onAbort = (): void => {
@@ -569,6 +614,7 @@ export class ConsumerSession {
       } catch (error) {
         this.retire(record);
         this.heldTags.delete(tag);
+        this.settle(tag, 'not_dispatched');
         reject(
           new FilesystemError({
             code: error instanceof NinepError && error.reason === 'CountAboveMsize' ? 'EFBIG' : 'EINVAL',
@@ -584,6 +630,7 @@ export class ConsumerSession {
         this.transport.send(bytes);
       } catch {
         this.retire(record);
+        this.settle(tag, 'not_dispatched');
         reject(
           new FilesystemError({
             code: 'SESSION_LOST',
@@ -720,6 +767,7 @@ export class ConsumerSession {
       }
       this.retire(victimRecord);
       this.flushesAgainst.delete(victim);
+      this.settle(victim, 'flushed');
       victimRecord.reject(
         new FilesystemError({
           code: 'ABORTED',
@@ -737,6 +785,7 @@ export class ConsumerSession {
     if (flushes.size === 0) {
       this.flushesAgainst.delete(victim);
       this.heldTags.delete(victim);
+      this.settle(victim, 'flushed');
     }
   }
 
@@ -759,6 +808,7 @@ export class ConsumerSession {
     this.outstanding.clear();
     this.heldTags.clear();
     this.flushesAgainst.clear();
+    for (const tag of this.settlements.keys()) this.settle(tag, 'closed');
     for (const record of records) {
       if (record.timer !== undefined) {
         clearTimeout(record.timer);
