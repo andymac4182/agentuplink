@@ -1,6 +1,6 @@
 # Milestone task tracker
 
-Last updated: 2026-10-31T11:34:06+10:00
+Last updated: 2026-10-31T11:36:47+10:00
 
 This tracker follows the roadmap. It records implementation work, discovered defects, owners, exact acceptance scope, and the evidence needed to close each gate.
 
@@ -1737,3 +1737,4 @@ evidence for verified events; a baseline is an observed count, not a completion.
 | 2026-10-31T11:27:06+10:00 | M6-C224, M6-C227 | first completion (job scope) | Hosted candidate CI 41154229124 at d7c13572 passed the added TypeScript, RustSec, Python dependency and Fly Docker proof jobs. All three Rust platforms and five release build/archive verification platforms also pass. Entire M7/M0/M2 run still in progress; no candidate release or production-readiness declaration. |
 | 2026-10-31T11:27:06+10:00 | M6-C230, M6-C221 | new acceptance fixture defect | Full local M7 stopped at SPKI replacement and a separate continuation stopped at bootstrap faults. Both require WARN diagnostics hidden by inherited error-only RUST_LOG. Unchanged SPKI rerun reproduces; fix and full rerun assigned. Security predicates remain intact. |
 | 2026-10-31T11:34:06+10:00 | M7-C06 | reopened: current-source evidence mismatch | Historical completion and cluster.md claimed a post-replacement device/consumer canary. Current SPKI phase 5 explicitly omits it and proves only A readiness/new-pin adoption. Corrected the guide, retained historical evidence, reopened this clause and assigned investigation; no replacement-service pass is claimed from the green SPKI transport walk. |
+| 2026-10-31T11:36:47+10:00 | M6-C22 | rebased candidate revalidated locally; row stays open | Authority candidate `f754dba8` rebased onto hardening `d7c13572`, with deployment/release guidance corrections: fmt and strict workspace/all-target Clippy passed; locked workspace tests under the environment subreaper passed 2,838 / 0 failed / 101 ignored across 171 targets. The ignored authority recovery regression passed separately against dedicated Redis `127.0.0.1:16379`, preserving revoked grant/credential denial and refusing stale digest/run/nonce/replay. All 37 packaging/archive/docs/artifact CLI Python tests and docs inventory passed. Signing is documented as separate from catalog reconciliation; single-relay Fly integration remains incomplete. No new release-profile archive or hosted-platform evidence is claimed. Membership/checkpoint services, optimized/provenance-bound release validation and full operator execution remain owed. |

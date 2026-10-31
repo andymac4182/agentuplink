@@ -36,7 +36,7 @@ Fly profile is an intermediate step, not a reduction of that requirement.
 
 | Priority | Work | Evidence / existing tasks | Closure condition |
 | --- | --- | --- | --- |
-| P0 | Deliver the external cluster and recovery authority | M6-C22; no `tunnel-authority` workspace member | Shipped signing/publishing/checkpoint commands and executed recovery/cluster procedures |
+| P0 | Complete the external cluster and recovery authority | M6-C22; `tunnel-authority` offline key generation and recovery signing are implemented with local CLI and real-Redis recovery evidence. Membership publisher and checkpoint service remain absent | Release validation of the offline signer, shipped membership/checkpoint services and executed recovery/cluster procedures |
 | P0 | Verify the credential-rotation procedure before expiry | M6-C56; same-device renewal remains owner-deferred because the relay cannot register its new SPKI. Re-enrolment as a new device is the approved workaround | Execute re-enrolment, grant migration, old-device revocation and restart; deliver same-device renewal separately when taken up |
 | P0 | Prove durable recovery | M6-C82; the single-relay continuity witness is process-local | Simultaneous restart recovers with an independent witness; rollback remains refused; restore drill completed |
 | P0 | Preserve quiet forwarded sessions across peer idle expiry | M6-C229; compatible owner heartbeat fix and real positive/red controls pass; full acceptance pending | Real quiet-session proof beyond the production idle window, compatible heartbeat and vanished-device controls |
@@ -173,8 +173,12 @@ grants, lease cleanup and dedicated guest acceptance are complete.
 
 ## Next action
 
-Complete M7 real-cluster acceptance and the quiet-forwarded-session fix, then package the
-reviewed candidate. A focused vanished-device regression and the accepted
-M6-C22 offline recovery-signer slice are in progress; neither closes the broader
-cluster-authority and recovery goal on its own. Do not mark this goal complete while required
-gates or deployment inputs remain unresolved.
+Complete M7 real-cluster acceptance for the quiet-forwarded-session fix and
+validate the combined candidate and release artifacts. The M6-C22 offline
+recovery signer is implemented and has local CLI and real-Redis recovery
+evidence; optimized release builds, the full operator session and hosted
+platform checks remain owed. Implement and verify the membership publisher and
+checkpoint service next, including compatible checkpoint client authentication.
+The signer alone does not close the cluster-authority or durable-recovery goals.
+Keep the production goal open while required gates or deployment inputs remain
+unresolved.
