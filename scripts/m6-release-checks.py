@@ -525,6 +525,19 @@ SECRET_ALLOWLIST: tuple[Allow, ...] = (
             "Committed before the literal was split; reviewed 2026-09-28."
         ),
     ),
+    Allow(
+        pattern_name="url-inline-password",
+        digest="a65880494e50f266f7668a30c8a256a24e5cbc837350aac2d5656172d6a855ac",
+        path_regex=r"^docs/authority\.md$",
+        reason=(
+            "Historical authority-guide URL shape with the literal uppercase "
+            "username USER and password PASSWORD, not an issued credential. "
+            "Reviewed from the five blobs reported by hosted job124440639901 "
+            "(M6-C242); the current guide uses angle-bracket placeholders. "
+            "Only these exact matched bytes in this document are exempted; "
+            "the dedicated control rejects a different password or path."
+        ),
+    ),
 )
 
 
@@ -2319,6 +2332,33 @@ def control_digest_allowlist_cannot_hide_another_secret() -> tuple[bool, str]:
     )
 
 
+def control_authority_placeholder_exception_is_exact() -> tuple[bool, str]:
+    """One historical documentation placeholder is not a path exclusion."""
+    path = "docs/authority.md"
+    # Split the inert fixture so the scanner continues checking its own source.
+    placeholder = b"rediss://" + b"USER:" + b"PASSWORD" + b"@"
+    if hashlib.sha256(placeholder).hexdigest() != (
+        "a65880494e50f266f7668a30c8a256a24e5cbc837350aac2d5656172d6a855ac"
+    ):
+        return False, "historical placeholder fixture differs from the reviewed bytes"
+    if scan_bytes(placeholder, "history", path, "control"):
+        return False, "reviewed historical documentation placeholder is still reported"
+    different = b"rediss://" + b"USER:" + b"synthetic-changed-password-42" + b"@"
+    cases = (
+        (different, path),
+        (placeholder, "docs/authority-other.md"),
+        (placeholder, "examples/authority.toml"),
+    )
+    for data, candidate_path in cases:
+        findings = scan_bytes(data, "control", candidate_path, "control")
+        if len(findings) != 1 or findings[0].pattern_name != "url-inline-password":
+            return False, "placeholder exception hid a different value or path"
+    return True, (
+        "exact historical digest/path suppressed; different password in the same "
+        "document and the same bytes in two other paths remain findings"
+    )
+
+
 def control_packaging_matrix_divergence_is_caught() -> tuple[bool, str]:
     """A workflow matrix that disagrees with the declaration must go red.
 
@@ -2747,6 +2787,10 @@ CONTROLS: dict[str, list[tuple[str, object]]] = {
         (
             "a digest exception cannot hide a different secret in the same file",
             control_digest_allowlist_cannot_hide_another_secret,
+        ),
+        (
+            "the authority documentation placeholder exception is exact",
+            control_authority_placeholder_exception_is_exact,
         ),
     ],
     "packaging": [
