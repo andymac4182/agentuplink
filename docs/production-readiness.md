@@ -27,15 +27,30 @@ then [terminal retirement observer #276](https://github.com/andymac4182/agentupl
 and [client matcher correction #277](https://github.com/andymac4182/agentuplink/pull/277),
 then [real actor queue acceptance #278](https://github.com/andymac4182/agentuplink/pull/278).
 
-This follow-up, branch `codex/fs-completion-accounting`, retains completed
-filesystem provider reports at valid stream retirement (C254) and expands
-optimized-release PR checks to all Rust crates, vendored code and the toolchain
-pin (C255). Runtime source `f12c9d81` passes 41 focused executions, fresh strict
-client Clippy, full formatting and the unchanged actual C244 gate in 9.146 seconds.
-Three earlier failed attempts remain recorded. This publication adds documentation
-and workflow coverage to that frozen runtime source; full hosted workspace,
-M1/M2/M7/M4 and five-platform archive checks remain pending. No owner license
-exception, merge, release publication or deployment is included.
+Current published [draft #282](https://github.com/andymac4182/agentuplink/pull/282),
+`cb619ee1` / actual `bdb17f6d`, has a new hosted M4-68 connector cleanup
+failure after expected native rotation/revocation outcomes. The completed
+connector error was discarded, so the cause remains unknown. Final gate
+validation was not reached and the later C244 gate did not run. All three
+Rust platforms, M1/M2/M3, TypeScript, image smoke, M0 and packaging pass;
+full M7 with ten complete OG-02 rows also passes. CI finishes at
+2026-11-02T14:17:54+10:00 with 13 passes / 1 M4 failure. Five optimized builds and five native
+archive verifiers pass, closing C255's declared trigger/check scope. Attestation
+and publication are skipped. [Exact hosted evidence and C256 follow-up](m6-fs-cleanup-diagnostics-2026-11-02.md)
+retain the failure and artifact identities.
+
+Isolated follow-up branch `codex/fs-cleanup-publication` preserves only closed
+cleanup-stage/error-code/retryability fields and adds diagnostic controls.
+At frozen `e3842fc5`, full formatting and eight focused tests pass with a fresh
+executable. Local Clippy fails the unchanged memory floor and shutdown leaves
+three zombie children; the attempt remains failed and its local lease is
+quarantined. Required checks and real acceptance remain pending on separate
+hosted runners. This change does not alter connector
+shutdown behavior or establish the original failure's cause. The preceding
+C254 frozen runtime `f12c9d81` retains its 41 focused passes, strict scoped
+Clippy, formatting and unchanged local C244 pass in 9.146 seconds, with all
+three earlier failed attempts preserved. No owner license exception, merge,
+release publication or deployment is included.
 
 Preceding draft #278 is `a2a6a62a` / actual runner `cf344feb`, same tree
 `6c53ff20`. All three Rust platforms pass required checks and all ten C240
