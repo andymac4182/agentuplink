@@ -2,10 +2,12 @@
 """Render an explicit three-relay Fly profile without credentials or network I/O."""
 import argparse
 import base64
+import contextlib
 import datetime
 import hashlib
 import ipaddress
 import json
+import os
 from pathlib import Path
 import re
 import stat
@@ -18,6 +20,8 @@ from urllib.parse import urlsplit
 ROOT = Path(__file__).resolve().parent
 NODES = ('relay-a', 'relay-b', 'relay-c')
 MAX_INPUT = 128 * 1024
+MAX_RENDERED_FILE = 128 * 1024
+MAX_RENDERED_TOTAL = 512 * 1024
 RELAY_BASE = '/var/lib/agent-tunnel'
 AUTHORITY_BASE = '/var/lib/agentuplink-authority'
 
@@ -325,19 +329,147 @@ def render_to(data, output, example=False):
     return json.loads(files['manifest.json'])
 
 
+def safe_verification_available():
+    return (os.name == 'posix' and hasattr(os, 'O_NOFOLLOW')
+            and hasattr(os, 'O_DIRECTORY') and hasattr(os, 'O_NONBLOCK')
+            and os.open in os.supports_dir_fd and os.scandir in os.supports_fd
+            and os.stat in os.supports_dir_fd and os.stat in os.supports_follow_symlinks)
+
+
+@contextlib.contextmanager
+def open_output_directory(path):
+    """Anchor every path component without following a symlink."""
+    path = Path(path).absolute()
+    require(len(os.fsencode(path)) <= 4096 and len(path.parts) <= 64
+            and '..' not in path.parts, 'verification-path-refused')
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    descriptor = os.open(path.anchor, flags)
+    try:
+        for part in path.parts[1:]:
+            child = os.open(part, flags, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = child
+        yield descriptor
+    finally:
+        os.close(descriptor)
+
+
+def unchanged_file_identity(info):
+    return (info.st_dev, info.st_ino, info.st_mode, info.st_nlink,
+            info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+
+def exact_directory_entries(descriptor, expected):
+    seen = set()
+    with os.scandir(descriptor) as entries:
+        for entry in entries:
+            require(len(seen) < len(expected) and entry.name in expected
+                    and entry.name not in seen, 'rendered-tree-mismatch')
+            seen.add(entry.name)
+    require(seen == expected, 'rendered-tree-mismatch')
+
+
+def verify_rendered_file(directory, name, expected):
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+    descriptor = os.open(name, flags, dir_fd=directory)
+    try:
+        before = os.fstat(descriptor)
+        require(stat.S_ISREG(before.st_mode) and before.st_nlink == 1
+                and before.st_size == len(expected), 'rendered-file-refused')
+        # One extra byte detects growth. The expected file size is independently
+        # bounded before opening any output; no manifest path or size is trusted.
+        raw = bytearray()
+        while len(raw) <= len(expected):
+            chunk = os.read(descriptor, min(65536, len(expected) + 1 - len(raw)))
+            if not chunk:
+                break
+            raw.extend(chunk)
+        require(raw == expected, 'rendered-file-mismatch')
+        require(unchanged_file_identity(before) == unchanged_file_identity(os.fstat(descriptor)),
+                'rendered-file-changed-during-verification')
+        return unchanged_file_identity(before)
+    finally:
+        os.close(descriptor)
+
+
+def recheck_rendered_file(directory, name, observed):
+    require(unchanged_file_identity(os.stat(name, dir_fd=directory, follow_symlinks=False)) == observed,
+            'rendered-file-changed-before-completion')
+
+
+def verify_output(data, output, example=False):
+    """Read-only POSIX byte check, not an atomic snapshot or authorization."""
+    require(safe_verification_available(), 'safe-output-verification-unavailable')
+    expected = render(data, example)
+    require(len(expected) == 11 and all(len(raw) <= MAX_RENDERED_FILE for raw in expected.values())
+            and sum(map(len, expected.values())) <= MAX_RENDERED_TOTAL,
+            'rendered-output-bound')
+    roles = {*NODES, 'authority', 'redis'}
+    require(set(expected) == {'manifest.json'} | {
+        role + '/' + name for role in roles for name in
+        ({'fly.toml', 'relay.toml'} if role in NODES else
+         {'fly.toml', 'authority.toml', 'inventory.json'} if role == 'authority' else {'fly.toml'})
+    }, 'rendered-output-layout')
+    with open_output_directory(output) as directory:
+        before = os.fstat(directory)
+        exact_directory_entries(directory, roles | {'manifest.json'})
+        observed_files = {'manifest.json': verify_rendered_file(
+            directory, 'manifest.json', expected['manifest.json'])}
+        observed_directories = {}
+        for role in sorted(roles):
+            child = os.open(role, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory)
+            try:
+                child_before = os.fstat(child)
+                names = {name.split('/')[1] for name in expected if name.startswith(role + '/')}
+                exact_directory_entries(child, names)
+                for name in sorted(names):
+                    observed_files[role + '/' + name] = verify_rendered_file(
+                        child, name, expected[role + '/' + name])
+                require(unchanged_file_identity(child_before) == unchanged_file_identity(os.fstat(child)),
+                        'rendered-directory-changed-during-verification')
+                observed_directories[role] = unchanged_file_identity(child_before)
+            finally:
+                os.close(child)
+        # Catch an earlier file changed while later files were being read. This
+        # is a second fixed-size observation, not an atomic snapshot or a lock.
+        recheck_rendered_file(directory, 'manifest.json', observed_files['manifest.json'])
+        for role in sorted(roles):
+            child = os.open(role, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory)
+            try:
+                require(unchanged_file_identity(os.fstat(child)) == observed_directories[role],
+                        'rendered-directory-changed-before-completion')
+                for name in sorted(name.split('/')[1] for name in observed_files if name.startswith(role + '/')):
+                    recheck_rendered_file(child, name, observed_files[role + '/' + name])
+                require(unchanged_file_identity(os.fstat(child)) == observed_directories[role],
+                        'rendered-directory-changed-before-completion')
+            finally:
+                os.close(child)
+        require(unchanged_file_identity(before) == unchanged_file_identity(os.fstat(directory)),
+                'rendered-directory-changed-during-verification')
+        with open_output_directory(output) as current:
+            require(unchanged_file_identity(before) == unchanged_file_identity(os.fstat(current)),
+                    'rendered-output-path-changed')
+    return json.loads(expected['manifest.json'])
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--inventory', required=True, type=Path)
-    parser.add_argument('--output', required=True, type=Path)
+    action = parser.add_mutually_exclusive_group(required=True)
+    action.add_argument('--output', type=Path, help='create a new rendered directory')
+    action.add_argument('--verify-output', type=Path, help='read-only exact-output verification (POSIX)')
     parser.add_argument('--example', action='store_true', help='explicitly render synthetic example inputs')
     args = parser.parse_args(argv)
     try:
-        manifest = render_to(load_inventory(args.inventory), args.output, args.example)
+        data = load_inventory(args.inventory)
+        manifest = (verify_output(data, args.verify_output, args.example) if args.verify_output is not None
+                    else render_to(data, args.output, args.example))
     except (OSError, ValueError, TypeError, KeyError, OverflowError) as error:
         label = str(error) if isinstance(error, ProfileError) else 'profile-input-or-output-refused'
         print('fly-cluster: ' + label, file=sys.stderr)
         return 1
-    print('Rendered five ' + manifest['purpose'] + ' profiles; no deployment or readiness verified.')
+    verb = 'Verified rendered bytes for' if args.verify_output is not None else 'Rendered'
+    print(verb + ' five ' + manifest['purpose'] + ' profiles; no deployment or readiness verified.')
     return 0
 
 

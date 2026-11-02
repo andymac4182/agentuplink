@@ -102,6 +102,47 @@ PYTHONDONTWRITEBYTECODE=1 python3 deploy/fly/cluster/render.py \
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p test_fly_cluster.py -v
 ```
 
+Before handing a rendered directory to another operator or to Fly's validator,
+check it against the same reviewed inventory and the exact renderer/templates:
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 python3 deploy/fly/cluster/render.py \
+  --inventory deploy/fly/cluster/inventory.example.json \
+  --verify-output /tmp/agentuplink-fly-example --example
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p test_fly_cluster_preflight.py -v
+```
+
+For deployment inputs, use the private reviewed inventory and output paths and
+omit `--example`. `--output` creates a new directory; `--verify-output` reads an
+existing one and cannot be combined with it. Verification regenerates all eleven
+expected files from the supplied inventory, current renderer and templates. It
+requires the exact five-directory layout, exact file bytes including the
+manifest, and single-link regular files. Missing, extra, changed, hardlinked,
+symlinked or nonregular entries are refused. Updating a mutable manifest to
+match edited configuration does not make it pass. Files are capped at 128 KiB
+each and 512 KiB in total; enumeration and reads stop at their fixed bounds.
+The verifier writes nothing and never repairs or removes a refused output.
+
+**The new verification mode requires POSIX no-follow directory-descriptor
+operations.** On unsupported hosts, including Windows, it returns
+`safe-output-verification-unavailable` without opening the output. Existing
+rendering remains supported there; no Rust, archive or other platform gate is
+removed. Use a supported operator host for this additional check. The verifier
+anchors every path component without following symlinks and checks observed
+file/directory identities for observed changes during reading. It is a bounded
+check, not an atomic snapshot or a lock against another writer: retain the private, exclusively controlled
+output, recheck after transfer and immediately before platform validation/use.
+Independently verify filesystem ownership and private permissions; byte
+verification does not attest them.
+
+Use the same reviewed renderer revision for verification. An intentional input,
+template or renderer change needs a newly reviewed rendering, not an edited
+manifest or an override. A passing check binds the supplied artifacts to each
+other; it does not establish who approved them, current certificate validity,
+registry provenance, real app/machine/volume custody, platform acceptance or
+deployment authorization. Keep the supplied `evaluation_time` and actual
+deployment-time key/certificate checks distinct.
+
 For reviewed deployment inputs, omit `--example`. Output contains
 `relay-a/`, `relay-b/`, `relay-c/`, `authority/` and `redis/` Fly configurations,
 nonsecret application configurations, the authority's public inventory and
@@ -216,6 +257,42 @@ container; this is not a configured external scraper, alerting system or public
 health endpoint. The rehearsal reads only a bounded, closed readiness projection
 on failure. Real monitoring access, retention and ownership remain to be defined.
 
+## Private operator handoff before first start
+
+Maintain a private handoff record alongside the reviewed inventory and rendered
+manifest. For every row below record a named accountable operator, a backup
+contact, the observation/decision time, and the private evidence reference and
+digest. Record unresolved items explicitly. A missing owner, evidence or
+required decision blocks the affected start/recovery step; filling a record is
+not evidence that a live check ran. Do not put credentials, key material,
+tokens, catalog snapshots or account-specific inventory in this public repository.
+The renderer intentionally does not accept these handoff fields.
+
+| Boundary | Required evidence and decision | Refusal or incident action |
+| --- | --- | --- |
+| Account and resources | Approved organization/network/region/budget; exact five app, machine and volume identities; intended single writer/node; independent 6PN address observations and custody | Refuse unknown, duplicate or changed resources; stop and review replacement rather than selecting a same-name volume |
+| Release and configuration | Reviewed source/tree, required CI, registry manifest digests, executable/notices and compatible forward/rollback versions; exact inventory/rendered hashes; offline verification and authenticated Fly validation results | Refuse a mismatch or failed gate; preserve failed artifacts and do not substitute an older candidate's proof |
+| PKI and identity | Named issuer/secret custodians for consumer, device, peer, checkpoint and Redis identities; SAN/SPKI/trust verification; expiry inventory and approved renewal lead time; IdP/JWKS key-overlap and restart procedure | Keep admission stopped for missing/expired/unapproved trust; never bypass hostname, chain, pin or mTLS checks to start |
+| State and backup custody | Owner-private state layout and exact volume bindings; independent approval/allocator high-water and later-revocation custody; backup age/completeness/integrity and an authorized restore rehearsal | Fence serving writers before recovery; unknown custody or reconciliation keeps service unavailable; never treat image rollback as state rollback |
+| Monitoring and response | Named on-call and escalation owner; approved private scrape/access method for loopback metrics; alert delivery/acknowledgement test, retention, and workload-based thresholds for readiness, authority/owner failures, clock, queues, memory/AOF headroom and certificate expiry | Treat absent telemetry as unknown; use the incident owner and existing fencing/refusal contract rather than clearing counters or suppressing alerts |
+| Outage and recovery acceptance | Approved outage/data-loss/recovery budgets, rollback stop conditions, 100-device/24-hour off-host acceptance evidence, and a named operator empowered to halt rollout | Stop the rollout at the first unmet condition; no automatic Redis promotion, unknown-outcome retry or inferred approval |
+
+These are required handoff inputs, not selected production owners, thresholds,
+regions, domains or recovery budgets. The current loopback metrics listener is
+not an installed scraper or alert route. Public Fly health routing is not a
+substitute for private authority/readiness monitoring. Test delivery to the
+actual responsible operator before relying on an alert; do not expose the
+private metrics or checkpoint listener publicly to make collection convenient.
+
+The backup/reconciliation entry is particularly important: the synthetic
+older-backup rehearsal's retained latest-catalog fixture is not a production
+reconciliation tool or trusted external revocation ledger. Until the production
+procedure and its independent custody are available and verified, the handoff
+must mark that boundary unresolved. Image, configuration and PKI rollback must
+preserve newer membership/recovery fences, authority counters and revocations.
+The next sections retain the actual startup and recovery ordering; this record
+does not authorize an additional command or a live deployment.
+
 ## First start, after explicit deployment authorization
 
 Create new approved app names and an empty deployment namespace; do not silently
@@ -223,8 +300,9 @@ reuse the historical single-relay apps or their state. Each billable resource
 and public address allocation needs the approved inventory/budget. Inspect exact
 machine/volume IDs before commands that could attach, replace or start them.
 
-1. Bind the final source SHA/tree, complete CI and image digests. Validate every
-   Fly profile under the intended authenticated account. Provision the five
+1. Bind the final source SHA/tree, complete CI and image digests. Complete the
+   private handoff, verify the rendered bytes against the reviewed inputs, and
+   validate every Fly profile under the intended authenticated account. Provision the five
    volumes and their owner-private layouts while application services are stopped.
 2. Install real PKI/OIDC/JWKS and Redis credentials. Start only Redis and verify
    its TLS/persistence profile. Independently record its current 40-character

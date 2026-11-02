@@ -406,11 +406,127 @@ def readiness_diagnostic_code(error):
     return str(error) if isinstance(error, Refused) and str(error) in allowed else "diagnostic_unclassified"
 
 
+# Closed source-derived observations only; never infer which lifecycle failed.
+# Source equality controls bind these messages to the Rust Display implementations.
+RELAY_TERMINAL_LITERALS = {
+    "checkpoint authority deadline exceeded": "checkpoint_authority_deadline_exceeded",
+    "checkpoint authority request was cancelled": "checkpoint_authority_cancelled",
+    "checkpoint authority response exceeded the size bound": "checkpoint_authority_body_too_large",
+    "checkpoint authority response was invalid": "checkpoint_authority_invalid_response",
+    "checkpoint authority transport failed": "checkpoint_authority_transport",
+    "cluster membership contains no approved peer keys": "membership_no_approved_peer_keys",
+    "invalid checkpoint authority client identity": "checkpoint_authority_invalid_client_identity",
+    "invalid checkpoint authority endpoint": "checkpoint_authority_invalid_endpoint",
+    "invalid checkpoint authority request": "checkpoint_authority_invalid_request",
+    "invalid checkpoint authority trust bundle": "checkpoint_authority_invalid_trust_bundle",
+    "invalid membership runtime configuration": "membership_runtime_invalid_configuration",
+    "invalid membership state identity": "membership_state_invalid_identity",
+    "invalid membership state path": "membership_state_invalid_path",
+    "membership catalog read was cancelled": "membership_source_cancelled",
+    "membership catalog unavailable": "membership_source_catalog",
+    "membership checkpoint expired": "membership_runtime_checkpoint_expired",
+    "membership record count exceeded the bound": "membership_source_too_many_records",
+    "membership record envelope was invalid": "membership_source_invalid_record_envelope",
+    "membership runtime cancelled": "membership_runtime_cancelled",
+    "membership runtime is not ready": "membership_runtime_not_ready",
+    "membership state I/O failed": "membership_state_io",
+    "membership state already exists": "membership_state_already_exists",
+    "membership state durable sync failed": "membership_state_durable_sync",
+    "membership state identity mismatch": "membership_state_identity_mismatch",
+    "membership state is already open": "membership_state_busy",
+    "membership state is corrupt": "membership_state_corrupt",
+    "membership state is invalid": "membership_state_invalid_state",
+    "membership state is missing": "membership_state_missing",
+    "membership state is not a regular file": "membership_state_not_regular_file",
+    "membership state load task failed": "membership_state_load_task_failed",
+    "membership state parent directory is not private": "membership_state_parent_directory_not_private",
+    "membership state path changed during access": "membership_state_path_changed",
+    "membership state permissions are too broad": "membership_state_insecure_permissions",
+    "membership state serialization failed": "membership_state_serialization",
+    "membership state symlink is rejected": "membership_state_symlink_rejected",
+    "membership state would roll back a fence": "membership_state_state_rollback",
+    "membership task did not join cleanly": "membership_runtime_join",
+    "membership version state persistence timed out": "membership_runtime_persistence_timeout",
+    "peer membership is not currently trusted": "membership_runtime_peer_rejected",
+}
+RELAY_BOOTSTRAP_TUPLES = (
+    ("starting", "starting", "bootstrap"),
+    ("ready", "ready", "bootstrap"),
+    ("unready", "unknown_authority", "authority"),
+    ("unready", "checkpoint_expired", "checkpoint"),
+    ("unready", "catalog_unavailable", "catalog"),
+    ("unready", "membership_rejected", "membership"),
+    ("unready", "missing_local_membership", "membership"),
+    ("unready", "missing_local_key", "membership"),
+    ("unready", "persistence_unavailable", "persistence"),
+    ("unready", "cancelled", "lifecycle"),
+)
+RELAY_SHUTDOWN_REASONS = (
+    "invalid_configuration", "authority", "source", "membership", "persistence",
+    "persistence_timeout", "not_ready", "peer_rejected", "checkpoint_expired", "cancelled", "join",
+)
+
+
+def relay_terminal_observation(data):
+    """Observe complete closed-vocabulary lines, without lifecycle/cause attribution.
+
+    Docker logs can combine old and restarted processes. Counts describe only
+    this bounded captured input; unknown and unterminated relay lines remain
+    explicitly unclassified. No raw text, paths, numeric details or line order
+    enter the projection. An oversized input is not scanned.
+    """
+    value = {"scanned": False, "recognized_lines": None, "unrecognized_terminal_lines": None,
+             "incomplete_terminal_lines": None, "observations": [], "lifecycle_attribution": "none"}
+    if data is None or len(data) > MAX_OUTPUT:
+        return value
+    value.update(scanned=True, recognized_lines=0, unrecognized_terminal_lines=0,
+                 incomplete_terminal_lines=0)
+    lines = data.split(b"\n")
+    prefix = b"tunnel-relay: "
+    if lines[-1].startswith(prefix):
+        value["incomplete_terminal_lines"] = 1
+    observations = set()
+    for line in lines[:-1]:
+        if line.endswith(b"\r"):
+            line = line[:-1]
+        if not line.startswith(prefix):
+            continue
+        observation = None
+        try:
+            body = line[len(prefix):].decode("ascii")
+        except UnicodeError:
+            body = ""
+        code = RELAY_TERMINAL_LITERALS.get(body)
+        if code is not None:
+            observation = {"code": code}
+        else:
+            match = re.fullmatch(
+                r"cluster membership bootstrap did not reach ready: readiness=([a-z_]+) "
+                r"reason=([a-z_]+) category=([a-z_]+)"
+                r"(?:; cleanup=membership_shutdown_failed reason=([a-z_]+))?", body)
+            if match is not None:
+                state, reason, category, cleanup = match.groups()
+                if (state, reason, category) in RELAY_BOOTSTRAP_TUPLES and (
+                        cleanup is None or cleanup in RELAY_SHUTDOWN_REASONS):
+                    observation = {"code": "membership_bootstrap_not_ready", "readiness": state,
+                                   "reason": reason, "category": category}
+                    if cleanup is not None:
+                        observation["cleanup_reason"] = cleanup
+        if observation is None:
+            value["unrecognized_terminal_lines"] += 1
+        else:
+            value["recognized_lines"] += 1
+            observations.add(tuple(sorted(observation.items())))
+    value["observations"] = [dict(item) for item in sorted(observations)]
+    return value
+
+
 def safe_log_receipt(path, *, docker=False):
     size = path.stat().st_size
     if size > MAX_OUTPUT:
         return {"bytes": size, "sha256": None, "closed_codes": [], "raw_uploaded": False,
-                "output_bound_exceeded": True, "cause_classification": "unclassified"}
+                "output_bound_exceeded": True, "cause_classification": "unclassified",
+                "relay_terminal": relay_terminal_observation(None)}
     data = path.read_bytes()
     codes = []
     allowed = {"CREDENTIAL_ERROR", "SUPERVISOR_ABSENT", "CONFIG_ERROR", "INVALID_CONFIG", "INVALID_INVOCATION",
@@ -426,7 +542,8 @@ def safe_log_receipt(path, *, docker=False):
             if isinstance(code, str) and code in allowed and code not in codes:
                 codes.append(code)
     receipt = {"bytes": len(data), "sha256": digest(data), "closed_codes": codes, "raw_uploaded": False,
-               "cause_classification": "closed_code" if codes else "unclassified"}
+               "cause_classification": "closed_code" if codes else "unclassified",
+               "relay_terminal": relay_terminal_observation(data)}
     if docker:
         receipt["docker_error"] = closed_docker_error(data)
     return receipt
