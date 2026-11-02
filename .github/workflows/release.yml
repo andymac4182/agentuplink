@@ -12,6 +12,9 @@ on:
   pull_request:
     paths:
       - 'scripts/*release*.py'
+      - 'scripts/container_notices.py'
+      - 'scripts/test_container_notices.py'
+      - 'deploy/notices/rust/**'
       - '.github/workflows/release.yml'
       - 'docs/operator.md'
       - 'docs/join-relay.md'

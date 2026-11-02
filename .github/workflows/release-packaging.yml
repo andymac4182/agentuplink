@@ -7,9 +7,9 @@ name: Release packaging tests
 # GitHub's `*` does not match `/`.  `LICENSE` because `package()` copies it.
 on:
   push:
-    paths: ['scripts/*release*.py', 'scripts/test_docs_inventory.py', 'crates/tunnel-client/src/main.rs', '.github/workflows/release*.yml', 'docs/**', 'examples/**', 'Cargo.toml', 'LICENSE']
+    paths: ['scripts/*release*.py', 'scripts/container_notices.py', 'scripts/test_container_notices.py', 'deploy/notices/rust/**', 'scripts/test_docs_inventory.py', 'crates/tunnel-client/src/main.rs', '.github/workflows/release*.yml', 'docs/**', 'examples/**', 'Cargo.toml', 'LICENSE']
   pull_request:
-    paths: ['scripts/*release*.py', 'scripts/test_docs_inventory.py', 'crates/tunnel-client/src/main.rs', '.github/workflows/release*.yml', 'docs/**', 'examples/**', 'Cargo.toml', 'LICENSE']
+    paths: ['scripts/*release*.py', 'scripts/container_notices.py', 'scripts/test_container_notices.py', 'deploy/notices/rust/**', 'scripts/test_docs_inventory.py', 'crates/tunnel-client/src/main.rs', '.github/workflows/release*.yml', 'docs/**', 'examples/**', 'Cargo.toml', 'LICENSE']
 permissions:
   contents: read
 jobs:

@@ -27,6 +27,34 @@ then [terminal retirement observer #276](https://github.com/andymac4182/agentupl
 and [client matcher correction #277](https://github.com/andymac4182/agentuplink/pull/277),
 then [real actor queue acceptance #278](https://github.com/andymac4182/agentuplink/pull/278).
 
+## Current merge and Fly continuation
+
+The owner has authorized merging and selected Fly for the initial deployment.
+The separate `codex/production-merge-candidate` branch consolidates the complete
+stack ending at [#283](https://github.com/andymac4182/agentuplink/pull/283) and
+adds C257 coverage for notice-only release inputs. Main is still `c749a784` at
+this observation. Merge only the final checked candidate using a merge commit;
+keep its main/base/head/tree identities and post-merge results explicit.
+
+At #283 `8c531ad4` / actual same-tree `b3e011e0`, all three Rust platforms and
+full M4 pass. The actual 300-second framework gate has eight exchanges / 20,480
+bytes and joined cleanup; C244 reaches three exchanges / zero streams / zero
+replay with every original assertion. Thirteen CI jobs pass, with M7 still
+running at this observation. All five optimized builds/native archive verifiers
+and packaging pass. These results do not erase #282's unknown cleanup cause,
+#278's failure or the local C256 Clippy/quarantined-cleanup failure.
+[Consolidation evidence, release effects and open work](m6-merge-candidate-2026-11-02.md)
+bind the exact scope. The new consolidation requires its own hosted checks.
+
+Main's existing successful-CI workflow publishes an attested development
+prerelease. This merge consequence is explicit; it is not production approval
+or live deployment. License decisions and unresolved notice/provenance scope
+remain open. Fly is the selected target, but the existing single-relay profile
+is only intermediate: C258 retains the three-relay/authority/durable-Redis
+requirements. Fly account access and actual inventory are not available here.
+
+## Retained predecessor evidence
+
 Current published [draft #282](https://github.com/andymac4182/agentuplink/pull/282),
 `cb619ee1` / actual `bdb17f6d`, has a new hosted M4-68 connector cleanup
 failure after expected native rotation/revocation outcomes. The completed
@@ -292,7 +320,7 @@ these completion criteria are evidenced; scheduling is not verification.
 
 ## Verification ledger
 
-- **Current PR #277 candidate:** run 41202356267 attempt 1 passes all 14 jobs at `bd93cfbd` / same-tree `3615d7a2`, including full M7 with 10 complete OG-02 rows. C252 closes at its declared advisory/compatibility scope; local, hosted, image-build and live deployment remain separate evidence.
+- **Prior PR #277 candidate:** run 41202356267 attempt 1 passes all 14 jobs at `bd93cfbd` / same-tree `3615d7a2`, including full M7 with 10 complete OG-02 rows. C252 closes at its declared advisory/compatibility scope; local, hosted, image-build and live deployment remain separate evidence.
 
 - **Current authority image:** actual2f image52606609 has713tracked build inputs matchingbd93 and now passes lifecycle130.74s plus separate mounted default-UID42.200s proof. Exact image/binary/notice identities and owned cleanup are retained; both earlier failed controllers remain failed. The default-UID network-none proof does not claim publication, recovery or crash durability.
 
