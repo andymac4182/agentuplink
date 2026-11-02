@@ -17,6 +17,7 @@ struct Exchange {
     carrier: mpsc::Receiver<CarrierCommand>,
     requests: mpsc::Receiver<HttpActorRequest>,
     _control: mpsc::Receiver<crate::QueuedMessage>,
+    _status: watch::Receiver<ConnectionStatus>,
     owner: StreamState,
     records: tunnel_fs_provider::RecordDecoder,
     root: tempfile::TempDir,
@@ -29,6 +30,9 @@ impl Exchange {
             .expect("synthetic fixture file");
         let (mut actor, key, carrier, mut control) =
             test_actor_with_control_capacity(M2_CARRIER_QUEUE_FRAMES, 16);
+        // Keep a real subscriber before OPEN so every published snapshot is stored.
+        // watch::Sender::send discards updates when no receiver is alive.
+        let status = actor.status.subscribe();
         actor.config.exports.insert(
             "fs".to_owned(),
             crate::ExportConfig {
@@ -88,6 +92,7 @@ impl Exchange {
             carrier,
             requests,
             _control: control,
+            _status: status,
             owner: StreamState::new(STREAM, WINDOW).expect("owner sequence"),
             records: tunnel_fs_provider::RecordDecoder::new(),
             root,
