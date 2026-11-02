@@ -29,6 +29,44 @@ then [real actor queue acceptance #278](https://github.com/andymac4182/agentupli
 
 ## Current merge and Fly continuation
 
+The continuous Codex production goal remains active; the owner disabled the
+hourly automation. Main remains `626ba9365b5d3e1faf8265f0b6ff50cc9111b749`.
+Merge authorization covers a fully checked candidate and the normal configured
+development prerelease; live deployment and license exceptions remain unauthorized.
+
+[Draft #290](https://github.com/andymac4182/agentuplink/pull/290) is frozen at
+`43ff240cc3e9598936445251cd13353b53a3ebae`, actual hosted checkout
+`f599b3da14d8af08764d5a8b1ac41930f7522c2a`, shared tree
+`edd49363032ac79132ea7e68ef6bd832c76f20ec`. All 14 ordinary CI jobs, three-OS
+packaging and all five optimized build/native verifier pairs pass. M4-76 named
+tests pass 20 on Linux/macOS and 19 applicable cases on Windows; the original
+Unix-only provider case is preserved. The separate nine-mutant workflow proves
+20 initial GREEN, 9 compiled mutants/10 intended RED, 20 restored GREEN. These
+checks do not establish the separate original gate4 mutation or Fly recovery.
+
+The Fly image baseline reaches three-relay readiness, nine routes and a configured
+300-second rotation, then fails `authorization_negative_status` after revocation.
+Its actual unexpected status/body remain unknown; same-AOF recovery is skipped.
+Owned cleanup succeeds without erasing the failure. The [exact continuation
+report](m6-fly-revocation-and-backup-2026-11-02.md) retains identities and failures.
+
+The successor combines C266's separate exact 403 insufficient-scope and exact 404
+sole-grant revocation contracts, closed response diagnostics, physical older-AOF
+fixture/reconciliation source, and a focused original gate4 controller. All 345
+pure/mock/temp controls pass; its original composition RED remains preserved.
+New hosted baseline/same-AOF/physical-backup and focused mutation execution are
+required. Synthetic catalog custody does not supply production reconciliation
+or independently trusted operator revocation/counter/backup custody. No source,
+controller, platform or license acceptance is silently narrowed.
+
+C256's local native/cache quarantine, M4-47's security block, five C253 policy
+refusals, C259 advisory findings, actual Fly inventory/access/PKI, operational
+ownership, capacity/24-hour soak and deployment authorization remain open.
+No production completion criterion is waived. Historical checkpoints below
+remain dated evidence; their pending-status wording does not describe #290.
+
+### Retained #289 and earlier checkpoints
+
 [Draft #289](https://github.com/andymac4182/agentuplink/pull/289) is frozen at
 `f12de07646ded6438a6411c7ae2b49e0cc4764a3`, actual hosted checkout
 `de3cbe30a812e9f292c2a595a287c801135d7994`, tree
@@ -56,8 +94,9 @@ No required assertions or supported platforms are removed.
 all14 ordinary CI jobs pass, while its Fly readiness and metrics-identity failures
 remain preserved. #287 and earlier failed candidates remain closed with evidence.
 Actual Fly access/inventory/PKI/operations, owner license decisions, physical backup
-recovery and live deployment authorization remain explicit. The goal and hourly
-continuation stay active; no candidate with failed required checks is mergeable.
+recovery and live deployment authorization remain explicit. At that checkpoint the goal and hourly continuation were active; the current
+continuous goal above supersedes that scheduling state. No candidate with failed
+required checks is mergeable.
 
 Current main remains `626ba936`; the subsequent [draft #287](https://github.com/andymac4182/agentuplink/pull/287)
 is frozen at `753aeb5c`, actual same-tree checkout `e99f2c18`. Its three-OS
@@ -120,8 +159,8 @@ and verified two-text companion resolve the two notice-text gaps in an offline
 replay; all five policy failures remain. Eighty-five local controls pass and
 the CI selector includes them, with new hosted verification pending. This does
 not prove SDK/full-graph distribution or enforce the real policy gate. No license exception, platform
-omission or live deployment authorization has been inferred. The production goal
-and hourly continuation remain active.
+omission or live deployment authorization has been inferred. The production goal remains active; the current scheduling state is recorded
+above.
 
 A separate fresh public-feed audit returns no npm advisories for the complete
 client/MCP graphs. GitHub's 19-alert banner remains inaccessible behind a 403,

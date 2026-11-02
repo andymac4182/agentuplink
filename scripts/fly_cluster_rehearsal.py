@@ -508,6 +508,109 @@ def peer_ipv6_addresses(subnet):
             for index, node in enumerate(NODES)}
 
 
+# Closed diagnostic vocabulary from the public relay HTTP response mapping.
+# This projection never changes the route's acceptance predicates or exposes
+# arbitrary response values, messages, headers, paths or request payloads.
+ECHO_RESPONSE_CODES = frozenset({
+    "UNAUTHORIZED", "FORBIDDEN", "NOT_FOUND", "DEVICE_NOT_FOUND", "SERVICE_NOT_FOUND",
+    "SERVICE_AMBIGUOUS", "AUTHORIZATION_UNAVAILABLE", "CLUSTER_UNREADY", "PEER_UNTRUSTED",
+    "PEER_UNAVAILABLE", "OWNER_NOT_READY", "OWNER_CHANGED", "ROTATION_FREEZE",
+    "RESOURCE_EXHAUSTED", "DEVICE_OFFLINE", "DEADLINE_EXCEEDED", "BODY_LIMIT", "BODY_TIMEOUT",
+    "REVERSE_CHANNEL_UNAVAILABLE",
+})
+ECHO_EXECUTIONS = frozenset({"not_dispatched", "unknown"})
+MAX_ECHO_RESPONSE_OBSERVATION = 65536  # unchanged http_request response bound
+
+
+def echo_response_observation(status, body, expected_body, expected_status, expected_code):
+    def field(value, key, allowed):
+        if key not in value:
+            return {"classification": "missing", "value": None}
+        selected = value[key]
+        if type(selected) is not str:
+            return {"classification": "invalid_type", "value": None}
+        return {"classification": "known" if selected in allowed else "unknown",
+                "value": selected if selected in allowed else None}
+
+    observed = {"status": status if type(status) is int and 100 <= status <= 999 else None,
+                "status_valid": type(status) is int and 100 <= status <= 999,
+                "expected_status": expected_status, "body_bytes": len(body) if type(body) is bytes else None,
+                "body_sha256": None, "hash_scope": "unavailable", "raw_uploaded": False,
+                "body_format": "invalid_type", "code": {"classification": "unavailable", "value": None},
+                "execution": {"classification": "unavailable", "value": None},
+                "expected_echo_body_match": type(body) is bytes and body == expected_body,
+                "expected_denial_fields_match": None if expected_code is None else False}
+    if type(body) is not bytes:
+        return observed
+    if len(body) > MAX_ECHO_RESPONSE_OBSERVATION:
+        observed.update(body_format="body_bound_exceeded", hash_scope="omitted_body_bound")
+        return observed
+    observed.update(body_sha256=digest(body), hash_scope="complete")
+    if not body:
+        observed["body_format"] = "empty"
+        return observed
+    duplicate = False
+    def pairs(rows):
+        nonlocal duplicate
+        value = {}
+        for key, item in rows:
+            duplicate |= key in value
+            value[key] = item
+        return value
+    def invalid_constant(_value):
+        raise ValueError("nonfinite JSON constant")
+    try:
+        value = json.loads(body.decode("utf-8"), object_pairs_hook=pairs, parse_constant=invalid_constant)
+    except (ValueError, UnicodeError, RecursionError):
+        observed["body_format"] = "invalid_json"
+        return observed
+    if duplicate:
+        observed["body_format"] = "duplicate_json_keys"
+        return observed
+    observed["body_format"] = "json_object" if type(value) is dict else "json_non_object"
+    if type(value) is dict:
+        observed["code"] = field(value, "code", ECHO_RESPONSE_CODES)
+        observed["execution"] = field(value, "execution", ECHO_EXECUTIONS)
+        if expected_code is not None:
+            observed["expected_denial_fields_match"] = (observed["code"]["value"] == expected_code
+                                                        and observed["execution"]["value"] == "not_dispatched")
+    return observed
+
+
+def checked_grant_state(values):
+    require(type(values) is list and len(values) == 2
+            and type(values[0]) is str and values[0] in {"0", "1"}
+            and type(values[1]) is str and re.fullmatch(r"[1-9][0-9]{0,19}", values[1]) is not None
+            and int(values[1]) <= 2**64 - 1, "grant_state_schema")
+    return {"active": values[0] == "1", "revision": int(values[1])}
+
+
+def check_grant_revocation(before, after):
+    for state in (before, after):
+        require(type(state) is dict and set(state) == {"active", "revision"}
+                and type(state["active"]) is bool and u64(state["revision"]) and state["revision"] > 0,
+                "grant_revocation_schema")
+    require(before["active"] is True and after["active"] is False
+            and after["revision"] > before["revision"], "grant_revocation_not_advanced")
+
+
+def check_visible_echo_target(value, tenant, device, service):
+    require(type(value) is list and 1 <= len(value) <= 3
+            and all(type(row) is dict for row in value), "grant_discovery_shape")
+    matches = [row for row in value if row.get("device_id") == device]
+    require(len(matches) == 1, "grant_discovery_target")
+    target = matches[0]
+    require(target.get("tenant_id") == tenant and target.get("active") is True,
+            "grant_discovery_target")
+    services = target.get("services")
+    require(type(services) is list and len(services) == 1 and type(services[0]) is dict,
+            "grant_discovery_sole_service")
+    selected = services[0]
+    require(selected.get("tenant_id") == tenant and selected.get("device_id") == device
+            and selected.get("service_id") == service and selected.get("service_type") == "echo"
+            and selected.get("active") is True, "grant_discovery_sole_service")
+
+
 def checked_status(raw, device):
     body = json.loads(raw)
     require(body.get("ok") is True and body.get("command") == "status", "client_status_envelope")
@@ -713,6 +816,7 @@ class Runner:
         self.subcommand = "none"
         self.stop_requested = False
         self.readiness_diagnostic_failures = []
+        self.echo_response_diagnostic_failure = None
 
     @contextmanager
     def budget(self, seconds):
@@ -1237,9 +1341,20 @@ class PKI:
         jwks = {"keys": [{"kty": "RSA", "kid": "synthetic", "alg": "RS256", "use": "sig", "n": b64(n).decode(), "e": "AQAB"}]}
         now = int(time.time())
         payload = {"iss": issuer, "sub": subject, "aud": "agent-tunnel", "iat": now - 5, "exp": now + 3600, "scope": "echo:invoke"}
-        unsigned = b64(canonical({"alg": "RS256", "kid": "synthetic", "typ": "JWT"})) + b"." + b64(canonical(payload))
-        signature = self.openssl(["dgst", "-sha256", "-sign", str(key)], unsigned)
-        return canonical(jwks), (unsigned + b"." + b64(signature)).decode()
+        self.primary_claims = dict(payload)
+        return canonical(jwks), self.sign_claims(payload)
+
+    def sign_claims(self, claims):
+        # Signing only: every control uses the original trusted key/JWKS.
+        b64 = lambda value: base64.urlsafe_b64encode(value).rstrip(b"=")
+        unsigned = b64(canonical({"alg": "RS256", "kid": "synthetic", "typ": "JWT"})) + b"." + b64(canonical(claims))
+        signature = self.openssl(["dgst", "-sha256", "-sign", str(self.root / "oidc.key")], unsigned)
+        return (unsigned + b"." + b64(signature)).decode()
+
+    def scope_refusal_token(self):
+        claims = dict(self.primary_claims)
+        require(claims.pop("scope") == "echo:invoke", "scope_control_original_claim")
+        return self.sign_claims(claims)
 
 
 def load_python(path, name):
@@ -1295,6 +1410,7 @@ class Rehearsal:
             self.pki.ca(name)
         self.password, self.publisher_password = secrets.token_hex(32), secrets.token_hex(32)
         self.jwks, self.token = self.pki.jwt(inv["oidc"]["issuer"], "synthetic-user")
+        self.scope_token = self.pki.scope_refusal_token()
         subnet = str(ipaddress.IPv6Network("fd" + secrets.token_hex(1) + ":" + secrets.token_hex(2)
                                           + ":" + secrets.token_hex(2) + "::/64"))
         name = self.prefix + "-network"
@@ -1554,6 +1670,9 @@ overlap_seconds = 30
         with self.run.budget(30):
             wait_until(self.run, fresh, 30, "authority_restart_fresh_publication")
 
+    def after_catalog_provisioned(self):
+        """Optional fixture-only checkpoint before any serving writer starts."""
+
     def bootstrap(self):
         d = self.docker
         self.redis_container = d.create("redis", d.images["redis"], memory=512, env=self.env["redis"],
@@ -1586,6 +1705,7 @@ overlap_seconds = 30
         for i in (1, 2):
             for kind, command in (("device", "add-device"), ("service", "add-service"), ("grant", "set-grant")):
                 self.relay_command("relay-a", [command, "--records", f"{operator}/{kind}-{i}.toml"])
+        self.after_catalog_provisioned()
         self.authority_command(["initialize-membership", "--expected-redis-run-id", self.run_id])
         self.authority_command(["check-config"])
         self.start_authority()
@@ -1703,25 +1823,103 @@ overlap_seconds = 30
         require(value.get("session_id") == session["session_id"] and int(value.get("owner_epoch", "0")) == session["epoch"], "owner_session_join")
         return value
 
-    def echo(self, ingress, device, *, anonymous=False, denied=False):
+    def grant_state(self, principal):
+        self.run.guard()
+        self.run.operation, self.run.role = "redis_grant_observation", "redis"
+        key = f"tunnel-catalog:{self.inventory['redis_namespace']}:grant:{self.tenant}:{principal}:{self.devices[0]}:{self.services[0]}"
+        return checked_grant_state(self.redis.command("HMGET", key, "active", "revision"))
+
+    def visible_echo_target(self, token):
+        self.run.guard()
+        self.run.operation, self.run.role = "https_discovery", "relay-a"
+        status, body = http_request(self.consumer_ports[0], self.public_hosts[0], self.public_context,
+                                   "/v1/devices", headers={"Authorization": "Bearer " + token})
+        diagnostic_failed = False
+        try:
+            observed = echo_response_observation(status, body, None, 200, None)
+            self.event("grant_discovery_response", stage=self.run.stage, ingress="relay-a", **observed)
+        except Exception:
+            diagnostic_failed = True
+            self.run.echo_response_diagnostic_failure = {"code": "echo_response_observation_failed"}
+        require(status == 200, "grant_discovery_status")
+        check_visible_echo_target(observation_json(body, 65536), self.tenant, self.devices[0], self.services[0])
+        require(not diagnostic_failed, "echo_response_observation_failed")
+
+    def scope_refusal(self):
+        before = self.grant_state(self.user)
+        require(before["active"] is True, "scope_control_grant_inactive")
+        self.echo(0, 0)
+        self.visible_echo_target(self.scope_token)
+        saved = self.token
+        try:
+            self.token = self.scope_token
+            self.echo(0, 0, denied=True)
+        finally:
+            self.token = saved
+        self.echo(0, 0)
+        require(self.grant_state(self.user) == before, "scope_control_grant_changed")
+        self.event("consumer_scope_refusal", status=403, code="FORBIDDEN", execution="not_dispatched",
+                   target_discovered=True, active_grant_unchanged=True, exact_echo_before_after=True)
+
+    def revoke_target_grant(self, principal, token):
+        self.visible_echo_target(token)
+        before = self.grant_state(principal)
+        require(before["active"] is True, "grant_revocation_already_inactive")
+        self.relay_command("relay-a", ["revoke-grant", "--tenant", self.tenant, "--user", principal,
+                                      "--device", self.devices[0], "--service", self.services[0]])
+        after = self.grant_state(principal)
+        check_grant_revocation(before, after)
+        self.event("grant_revocation_observed", active=False, before_revision=before["revision"], revision=after["revision"])
+        return {"before": before, "after": after}
+
+    def assert_grant_revocation(self, principal, proof):
+        require(type(proof) is dict and set(proof) == {"before", "after"}, "grant_revocation_proof")
+        check_grant_revocation(proof["before"], proof["after"])
+        require(self.grant_state(principal) == proof["after"], "grant_revocation_not_preserved")
+
+    def echo(self, ingress, device, *, anonymous=False, denied=False, revoked=False):
+        require(all(type(flag) is bool for flag in (anonymous, denied, revoked))
+                and sum((anonymous, denied, revoked)) <= 1, "echo_expectation")
         self.run.guard()
         self.run.operation, self.run.role = "https_echo", f"relay-{chr(97+ingress)}"
         path = f"/v1/devices/{self.devices[device]}/services/{self.services[device]}/echo"
         payload = secrets.token_hex(16).encode()
         status, body = http_request(self.consumer_ports[ingress], self.public_hosts[ingress], self.public_context,
                          path, method="POST", data=payload, headers={} if anonymous else {"Authorization": "Bearer " + self.token})
-        if anonymous or denied:
-            require(status == (401 if anonymous else 403), "authorization_negative_status")
+        expected_body = self.canaries[device].encode() + payload
+        expected_status = 401 if anonymous else 403 if denied else 404 if revoked else 200
+        expected_code = "UNAUTHORIZED" if anonymous else "FORBIDDEN" if denied else "DEVICE_NOT_FOUND" if revoked else None
+        diagnostic_failed = False
+        # Record negative responses and unexpected positive responses only;
+        # successful rotation traffic does not add per-payload observations.
+        if anonymous or denied or revoked or status != 200 or body != expected_body:
+            try:
+                observed = echo_response_observation(status, body, expected_body, expected_status, expected_code)
+                self.event("echo_response", stage=self.run.stage, ingress=NODES[ingress], device_index=device,
+                           expectation="anonymous_refusal" if anonymous else "consumer_scope_refusal" if denied
+                                       else "revoked_sole_grant" if revoked else "exact_echo",
+                           **observed)
+            except Exception:
+                # Diagnostics must not replace the original status/body failure.
+                # If those original assertions pass, fail on missing evidence.
+                diagnostic_failed = True
+                self.run.echo_response_diagnostic_failure = {"code": "echo_response_observation_failed"}
+        if anonymous or denied or revoked:
+            require(status == expected_status, "authorization_negative_status")
             result = json.loads(body)
-            require(result.get("code") == ("UNAUTHORIZED" if anonymous else "FORBIDDEN") and result.get("execution") == "not_dispatched", "authorization_negative_cause")
+            require(result.get("code") == expected_code and result.get("execution") == "not_dispatched", "authorization_negative_cause")
+            require(body != expected_body, "authorization_negative_echo")
         else:
             require(status == 200 and body == self.canaries[device].encode() + payload, "echo_exact_body")
+        require(not diagnostic_failed, "echo_response_observation_failed")
 
     def all_routes(self):
+        if self.grant_revoked:
+            self.assert_grant_revocation(self.user, self.grant_revocation)
         for device in range(3):
             self.owner(device)
             for ingress in range(3):
-                self.echo(ingress, device, denied=self.grant_revoked and device == 0)
+                self.echo(ingress, device, revoked=self.grant_revoked and device == 0)
 
     def negatives(self):
         for context, host, cause in ((self.public_context, "wrong.invalid", "wrong_name"),
@@ -1734,6 +1932,7 @@ overlap_seconds = 30
                 raise Refused("tls_negative_accepted")
         self.echo(0, 0, anonymous=True)
         self.event("anonymous_refusal", status=401)
+        self.scope_refusal()
         for port, host, ca, role in ((self.authority_port, self.authority_host, self.pki.cas["authority"][0], "authority"),
                                     (self.device_ports[0], self.public_hosts[0], self.pki.cas["public"][0], "device")):
             context = tls_context(ca)
@@ -1784,7 +1983,7 @@ overlap_seconds = 30
                    rotations=[x["session"]["rotations_completed"] for x in after])
 
     def restarts(self):
-        self.relay_command("relay-a", ["revoke-grant", "--tenant", self.tenant, "--user", self.user, "--device", self.devices[0], "--service", self.services[0]])
+        self.grant_revocation = self.revoke_target_grant(self.user, self.token)
         self.grant_revoked = True
         self.all_routes()
         old_owner = self.owner(0)
@@ -1912,6 +2111,7 @@ def main(argv=None):
         result.update(first_failure=first_error, cleanup_errors=cleanup_errors, containers=docker.inventory,
                       process_groups=len(run.processes), resource_samples=run.samples,
                       readiness_diagnostic_failures=run.readiness_diagnostic_failures,
+                      echo_response_diagnostic_failure=run.echo_response_diagnostic_failure,
                       interruptions=interruptions,
                       elapsed_seconds=round(time.monotonic() - started, 3))
         if first_error is None and not cleanup_errors and not interruptions:

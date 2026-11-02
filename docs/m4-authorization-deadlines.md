@@ -1,10 +1,11 @@
 # Independent authorization deadlines for handed-off work
 
-Status: M4-76 source implementation and independent review complete. Production
-binaries build on five optimized platforms and in the #289 image, but three
-Rust jobs stop at formatting before Clippy/unit execution. The20 new regressions
-and behavioral witnesses remain unrun. This is a source-derived defect and
-correction, not an executed timing reproduction.
+Status: source implementation and independent review complete; #290 now passes
+all three Rust jobs and the nine-mutant workflow. All 20 named tests execute on
+Linux/macOS and 19 applicable tests on Windows with the original Unix-only case
+preserved. The focused original filesystem gate4 mutation and fresh successor
+acceptance remain pending. [Current exact evidence](m6-fly-revocation-and-backup-2026-11-02.md#authorization-mutation-evidence-and-original-gate4-scope).
+Earlier source-only and #289 formatting-failure checkpoints below are historical.
 
 An unanswered refresh previously replaced a stream's last accepted confirmation
 deadline. The HTTP read boundary checked expiry only while `confirmed` was true,
@@ -63,7 +64,8 @@ inputs are unchanged between the worker baseline and that candidate.
 Twenty new tests cover HTTP reads, independent clock bounds, immediate/deferred
 admission, late and timely renewal, shortened deadlines with no pending bytes,
 provider-first refusal, terminal causes, snapshot contention/exhaustion, stream
-isolation and writer-failure cleanup. They are **written but unrun**. The existing
+isolation and writer-failure cleanup. At that source checkpoint they were **written but unrun**; #290 execution is
+recorded above. The existing
 filesystem guard-deletion matcher is adapted to the new equivalent close
 expression with its original mutation and exact-match failure requirement intact;
 the actual deletion witness still needs execution.
@@ -83,3 +85,12 @@ execution binds to its compiled executable and unchanged before/after hash.
 Its42 fake/synthetic controls and independent source review pass, with earlier
 review findings and original-source REDs preserved. This does not substitute for
 actual hosted execution, real process supervision or full required platform gates.
+
+## Focused original gate4 continuation
+
+The successor binds the exact original mutation declaration and required witness
+to a provider-dispatcher GREEN/compiled-original-deletion RED/restored GREEN
+sequence. Its 64 fake controls do not establish native execution. The literal
+broad four-crate original CLI remains outside that focused claim. The dedicated
+workflow preserves a 48-minute controller step inside a 60-minute outer job,
+source/artifact bindings and closed receipt output.

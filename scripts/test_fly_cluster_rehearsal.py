@@ -1385,5 +1385,184 @@ class PeerIPv6Assignment(unittest.TestCase):
             rehearsal.check_container(changed, expected, "owner")
 
 
+class EchoResponseDiagnostics(unittest.TestCase):
+    def fixture(self):
+        obj = object.__new__(rehearsal.Rehearsal)
+        obj.run = mock.Mock(stage="restart_revocation")
+        obj.run.echo_response_diagnostic_failure = None
+        obj.devices, obj.services = ["device-0"], ["service-0"]
+        obj.consumer_ports, obj.public_hosts = [8443], ["relay.invalid"]
+        obj.public_context, obj.token, obj.canaries = object(), "secret-token", ["private-canary"]
+        obj.event = mock.Mock()
+        return obj
+
+    def test_unexpected_denial_is_observed_before_original_exact_status_failure(self):
+        obj = self.fixture()
+        body = b'{"code":"DEVICE_NOT_FOUND","execution":"not_dispatched","message":"private-message"}'
+        with mock.patch.object(rehearsal, "http_request", return_value=(404, body)) as request:
+            with self.assertRaisesRegex(rehearsal.Refused, "^authorization_negative_status$"):
+                obj.echo(0, 0, denied=True)
+        request.assert_called_once()
+        obj.event.assert_called_once()
+        kind, = obj.event.call_args.args
+        observed = obj.event.call_args.kwargs
+        self.assertEqual(kind, "echo_response")
+        self.assertEqual(observed["status"], 404)
+        self.assertEqual(observed["expected_status"], 403)
+        self.assertEqual(observed["body_bytes"], len(body))
+        self.assertEqual(observed["body_sha256"], hashlib.sha256(body).hexdigest())
+        self.assertEqual(observed["code"], {"classification": "known", "value": "DEVICE_NOT_FOUND"})
+        self.assertEqual(observed["execution"], {"classification": "known", "value": "not_dispatched"})
+        self.assertFalse(observed["expected_echo_body_match"])
+        self.assertFalse(observed["expected_denial_fields_match"])
+        self.assertNotIn("private-message", json.dumps(observed))
+        self.assertNotIn("secret-token", json.dumps(observed))
+        self.assertNotIn("private-canary", json.dumps(observed))
+
+    def test_exact_refusals_still_pass_without_retry_or_payload_disclosure(self):
+        for anonymous, status, code in ((True, 401, "UNAUTHORIZED"), (False, 403, "FORBIDDEN")):
+            obj = self.fixture()
+            body = json.dumps({"code": code, "execution": "not_dispatched", "message": "private-message"}).encode()
+            with self.subTest(anonymous=anonymous), mock.patch.object(rehearsal, "http_request", return_value=(status, body)) as request:
+                obj.echo(0, 0, anonymous=anonymous, denied=not anonymous)
+            request.assert_called_once()
+            obj.run.guard.assert_called_once()
+            observed = obj.event.call_args.kwargs
+            self.assertEqual(observed["expected_status"], status)
+            self.assertTrue(observed["expected_denial_fields_match"])
+            self.assertEqual(observed["hash_scope"], "complete")
+            self.assertFalse(observed["raw_uploaded"])
+            self.assertIsNone(obj.run.echo_response_diagnostic_failure)
+            self.assertNotIn("private-message", json.dumps(observed))
+
+    def test_unexpected_real_echo_after_revocation_remains_failure_and_is_identifiable(self):
+        obj = self.fixture()
+        payload = "a" * 32
+        body = obj.canaries[0].encode() + payload.encode()
+        with mock.patch.object(rehearsal.secrets, "token_hex", return_value=payload), \
+             mock.patch.object(rehearsal, "http_request", return_value=(200, body)):
+            with self.assertRaisesRegex(rehearsal.Refused, "^authorization_negative_status$"):
+                obj.echo(0, 0, denied=True)
+        observed = obj.event.call_args.kwargs
+        self.assertEqual(observed["status"], 200)
+        self.assertTrue(observed["expected_echo_body_match"])
+        self.assertFalse(observed["expected_denial_fields_match"])
+        self.assertNotIn(payload, json.dumps(observed))
+        self.assertNotIn(obj.canaries[0], json.dumps(observed))
+
+    def test_wrong_denial_fields_keep_original_cause_assertion(self):
+        obj = self.fixture()
+        body = b'{"code":"FORBIDDEN","execution":"unknown"}'
+        with mock.patch.object(rehearsal, "http_request", return_value=(403, body)):
+            with self.assertRaisesRegex(rehearsal.Refused, "^authorization_negative_cause$"):
+                obj.echo(0, 0, denied=True)
+        self.assertFalse(obj.event.call_args.kwargs["expected_denial_fields_match"])
+
+    def test_successful_positive_traffic_has_no_new_event_but_wrong_body_does(self):
+        obj = self.fixture()
+        payload = "a" * 32
+        with mock.patch.object(rehearsal.secrets, "token_hex", return_value=payload), \
+             mock.patch.object(rehearsal, "http_request", return_value=(200, obj.canaries[0].encode() + payload.encode())):
+            obj.echo(0, 0)
+        obj.event.assert_not_called()
+        with mock.patch.object(rehearsal, "http_request", return_value=(200, b"private-unexpected-body")):
+            with self.assertRaisesRegex(rehearsal.Refused, "^echo_exact_body$"):
+                obj.echo(0, 0)
+        observed = obj.event.call_args.kwargs
+        self.assertEqual(observed["expectation"], "exact_echo")
+        self.assertIsNone(observed["expected_denial_fields_match"])
+        self.assertFalse(observed["expected_echo_body_match"])
+        self.assertNotIn("private-unexpected-body", json.dumps(observed))
+
+    def test_diagnostic_parse_or_event_error_cannot_mask_original_failure(self):
+        for target in ("projection", "event"):
+            obj = self.fixture()
+            if target == "event":
+                obj.event.side_effect = OSError("private-path")
+            with self.subTest(target=target), \
+                 mock.patch.object(rehearsal, "http_request", return_value=(503, b"private-body")), \
+                 mock.patch.object(rehearsal, "echo_response_observation", side_effect=RuntimeError("private-error")) if target == "projection" else nullcontext():
+                with self.assertRaisesRegex(rehearsal.Refused, "^authorization_negative_status$"):
+                    obj.echo(0, 0, denied=True)
+            self.assertEqual(obj.run.echo_response_diagnostic_failure, {"code": "echo_response_observation_failed"})
+
+    def test_missing_event_is_failure_when_original_refusal_assertions_pass(self):
+        obj = self.fixture()
+        obj.event.side_effect = OSError("private-path")
+        with mock.patch.object(rehearsal, "http_request", return_value=(403, b'{"code":"FORBIDDEN","execution":"not_dispatched"}')):
+            with self.assertRaisesRegex(rehearsal.Refused, "^echo_response_observation_failed$"):
+                obj.echo(0, 0, denied=True)
+
+    def test_closed_projection_never_copies_unknown_values_messages_or_keys(self):
+        body = json.dumps({"code": "secret-token", "execution": "private-value", "message": "private-message",
+                           "private-key": {"code": "FORBIDDEN"}, "retryable": "private-value"}).encode()
+        observed = rehearsal.echo_response_observation(503, body, b"expected", 403, "FORBIDDEN")
+        self.assertEqual(observed["code"], {"classification": "unknown", "value": None})
+        self.assertEqual(observed["execution"], {"classification": "unknown", "value": None})
+        self.assertFalse(observed["expected_denial_fields_match"])
+        for private in ("secret-token", "private-value", "private-message", "private-key"):
+            self.assertNotIn(private, json.dumps(observed))
+        known = rehearsal.echo_response_observation(503, b'{"code":"CLUSTER_UNREADY","execution":"not_dispatched"}', b"expected", 403, "FORBIDDEN")
+        self.assertEqual(known["code"], {"classification": "known", "value": "CLUSTER_UNREADY"})
+
+    def test_malformed_deep_duplicate_and_nonfinite_json_keep_status_failure(self):
+        for body, shape in ((b'\xff', "invalid_json"), (b'{"code":', "invalid_json"),
+                            (b'{"code":"FORBIDDEN","code":"FORBIDDEN"}', "duplicate_json_keys"),
+                            (b'{"code":"FORBIDDEN","extra":NaN}', "invalid_json"),
+                            (b'{"code":"FORBIDDEN","extra":Infinity}', "invalid_json"),
+                            (b'[]', "json_non_object"), (b'', "empty")):
+            obj = self.fixture()
+            with self.subTest(shape=shape, size=len(body)), mock.patch.object(rehearsal, "http_request", return_value=(404, body)):
+                with self.assertRaisesRegex(rehearsal.Refused, "^authorization_negative_status$"):
+                    obj.echo(0, 0, denied=True)
+            observed = obj.event.call_args.kwargs
+            self.assertEqual(observed["body_format"], shape)
+            self.assertEqual(observed["body_sha256"], hashlib.sha256(body).hexdigest())
+            self.assertEqual(observed["code"]["classification"], "unavailable")
+            self.assertFalse(observed["expected_denial_fields_match"])
+
+    def test_parser_recursion_limit_keeps_original_failure_and_closed_observation(self):
+        obj = self.fixture()
+        body = b'[' * 2000 + b'0' + b']' * 2000
+        # Interpreter recursion limits vary; exercise the real decoder-error
+        # boundary deterministically rather than assume this depth is invalid.
+        with mock.patch.object(rehearsal, "http_request", return_value=(404, body)), \
+             mock.patch.object(rehearsal.json, "loads", side_effect=RecursionError("private-parser-detail")):
+            with self.assertRaisesRegex(rehearsal.Refused, "^authorization_negative_status$"):
+                obj.echo(0, 0, denied=True)
+        observed = obj.event.call_args.kwargs
+        self.assertEqual(observed["body_format"], "invalid_json")
+        self.assertEqual(observed["body_sha256"], hashlib.sha256(body).hexdigest())
+        self.assertNotIn("private-parser-detail", json.dumps(observed))
+        self.assertIsNone(obj.run.echo_response_diagnostic_failure)
+
+    def test_missing_wrong_type_and_unknown_code_are_not_expected_denial_evidence(self):
+        for data, classification in (({}, "missing"), ({"code": None}, "invalid_type"),
+                                     ({"code": []}, "invalid_type"), ({"code": True}, "invalid_type"),
+                                     ({"code": "FORBIDDEN-private"}, "unknown")):
+            data["execution"] = "not_dispatched"
+            with self.subTest(classification=classification):
+                observed = rehearsal.echo_response_observation(403, json.dumps(data).encode(), b"expected", 403, "FORBIDDEN")
+                self.assertEqual(observed["code"], {"classification": classification, "value": None})
+                self.assertFalse(observed["expected_denial_fields_match"])
+        for status in (True, 403.0, "403", None):
+            observed = rehearsal.echo_response_observation(status, b'{}', b"expected", 403, "FORBIDDEN")
+            self.assertFalse(observed["status_valid"])
+            self.assertIsNone(observed["status"])
+
+    def test_body_bound_precedes_parser_and_marks_hash_omitted_not_prefix(self):
+        limit = rehearsal.MAX_ECHO_RESPONSE_OBSERVATION
+        exact = b"x" * limit
+        observed = rehearsal.echo_response_observation(404, exact, b"expected", 403, "FORBIDDEN")
+        self.assertEqual(observed["body_bytes"], 65536)
+        self.assertEqual(observed["hash_scope"], "complete")
+        self.assertEqual(observed["body_sha256"], hashlib.sha256(exact).hexdigest())
+        with mock.patch.object(rehearsal.json, "loads", side_effect=AssertionError("must not parse beyond bound")):
+            observed = rehearsal.echo_response_observation(404, exact + b"x", b"expected", 403, "FORBIDDEN")
+        self.assertEqual(observed["body_format"], "body_bound_exceeded")
+        self.assertEqual(observed["hash_scope"], "omitted_body_bound")
+        self.assertIsNone(observed["body_sha256"])
+
+
 if __name__ == "__main__":
     unittest.main()

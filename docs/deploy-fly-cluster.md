@@ -356,6 +356,15 @@ controls and review pass; current-image execution is pending. This does not
 replace physical older-backup restoration, independent later-revocation custody
 or execution against actual Fly inventory.
 
+The separate `older-backup` fixture now captures a bounded multipart AOF while
+the owned primary is paused, restores it into a distinct volume after fencing,
+and reconciles later catalog state from independently retained synthetic custody.
+Its workflow job requires successful baseline and same-AOF acceptance first.
+Both recovery executions remain pending. The [source continuation and limits](m6-fly-revocation-and-backup-2026-11-02.md)
+do not provide production reconciliation tooling or trusted operator custody.
+Exact consumer-scope 403 and sole-grant-revocation 404 checks preserve separate API
+contracts; the historical #290 unexpected response remains unknown.
+
 ## Evidence still required
 
 Rendering and static controls do not settle account access, actual app/volume

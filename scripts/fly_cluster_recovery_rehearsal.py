@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""Actual-image, explicitly approved same-AOF cluster restart rehearsal.
+"""Actual-image, explicitly approved synthetic cluster recovery rehearsals.
 
-This is NOT physical older-backup restoration, automatic failover, a Fly deploy,
-or crash/fsync acceptance. Only source.json, images.json, events.jsonl and
+Select same-AOF restart or physical older-AOF restoration with private synthetic
+catalog reconstruction. Neither provides production backup custody, a shipped
+reconstruction tool, automatic failover, a Fly deploy or crash/fsync acceptance.
+Only source.json, images.json, events.jsonl and
 result.json are uploadable. Raw commands, generated keys and approvals remain
 in the separately owned private temporary directory. No build/pull/native fallback.
 """
@@ -10,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+from contextlib import contextmanager
 import copy
 import datetime as dt
 import importlib.util
@@ -28,6 +31,7 @@ import uuid
 _spec = importlib.util.spec_from_file_location("fly_recovery_base", Path(__file__).with_name("fly_cluster_rehearsal.py"))
 base = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(base)
+backup = base.load_python(Path(__file__).with_name("fly_cluster_backup.py"), "fly_private_backup")
 require, Refused, canonical, digest = base.require, base.Refused, base.canonical, base.digest
 FENCE_FILE = "recovery-approval-fence.json"
 FENCING_SECONDS = 65
@@ -39,6 +43,14 @@ LIMITATIONS = [
     "externally chosen synthetic incarnation and offline approval; no automatic recovery or rebind",
     "fresh sessions and exact echo only; no replay of interrupted operations or uninterrupted rotation claim",
     "physical older-backup restoration and independent later-revocation reconciliation remain required",
+]
+OLDER_BACKUP_LIMITATIONS = [
+    LIMITATIONS[0],
+    "orchestrated paused physical AOF copy and all-role stop; not crash/fsync acceptance",
+    LIMITATIONS[2],
+    LIMITATIONS[3],
+    "private synthetic latest-catalog reconstruction is not a shipped production reconciliation tool",
+    "production off-host backup/revocation/allocator custody and operator recovery procedure remain unverified",
 ]
 
 # A negative-only mutation on ONE known synthetic tenant. Decimal arithmetic
@@ -363,7 +375,7 @@ operations = ["echo:invoke"]
         try:
             self.token = self.denied_token
             for ingress in range(3):
-                self.echo(ingress, 0, denied=denied)
+                self.echo(ingress, 0, revoked=denied)
         finally:
             self.token = saved
 
@@ -401,7 +413,7 @@ operations = ["echo:invoke"]
         self.spare_probe(False)
         self.grant_probe(False)
         self.relay_command("relay-a", ["revoke-credential", "--tenant", self.tenant, "--device", self.spare_device, "--credential", self.spare_credential])
-        self.relay_command("relay-a", ["revoke-grant", "--tenant", self.tenant, "--user", self.denied_user, "--device", self.devices[0], "--service", self.services[0]])
+        self.denied_grant_revocation = self.revoke_target_grant(self.denied_user, self.denied_token)
         self.assert_revocations()
         self.event("baseline_revocations", positive_devices=3, positive_routes=9, revoked_spare_device=self.spare_device,
                    revoked_grant_principal=self.denied_user, credential_was_ready=True, grant_was_permitted=True)
@@ -409,6 +421,7 @@ operations = ["echo:invoke"]
     def assert_revocations(self):
         self.all_routes()
         self.revocation_flags("0")
+        self.assert_grant_revocation(self.denied_user, self.denied_grant_revocation)
         self.spare_probe(True)
         self.grant_probe(True)
 
@@ -731,9 +744,324 @@ operations = ["echo:invoke"]
         self.restart_serving()
 
 
+class PhysicalBackupDocker(RecoveryDocker):
+    """The only extra Docker operations are identity-checked pause/unpause."""
+    def __init__(self, *args):
+        super().__init__(*args)
+        self.pause_intents = {}
+
+    def set_paused(self, item, paused):
+        require(type(paused) is bool and item in self.containers and item["role"] == "redis", "backup_pause_owned_redis")
+        row = self.inspect(item)
+        require(row["State"].get("Running") is True, "backup_pause_running")
+        if paused:
+            require(row["State"].get("Paused") is False, "backup_already_paused")
+            self.pause_intents[item["id"]] = item  # intent precedes possibly ambiguous dispatch
+        else:
+            require(item["id"] in self.pause_intents and row["State"].get("Paused") is True, "backup_resume_intent")
+        operation = "pause" if paused else "unpause"
+        self.run.operation, self.run.role, self.run.subcommand = "docker_container_" + operation, "redis", "backup-physical"
+        self.run(base.DOCKER + ["container", operation, item["id"]])
+        actual = self.inspect(item)["State"]
+        require(actual.get("Running") is True and actual.get("Paused") is paused, "backup_pause_observation")
+        if not paused:
+            del self.pause_intents[item["id"]]
+        self.run.event("backup_pause_state", container_id=item["id"], paused=paused, pid=actual.get("Pid"))
+
+    def call(self, args, **kwargs):
+        # base.cleanup already owns its original180s deadline. Intercept only
+        # that exact owned Redis stop, so no second cleanup budget is started.
+        if self.run.cleanup and len(args) >= 3 and args[:2] == ["container", "stop"]:
+            item = self.pause_intents.get(args[-1])
+            if item is not None:
+                state = self.inspect(item, identity_only=True)["State"]
+                if state.get("Paused") is True:
+                    self.run.operation, self.run.role, self.run.subcommand = "docker_container_unpause", "redis", "cleanup"
+                    self.run(base.DOCKER + ["container", "unpause", item["id"]], timeout=10)
+                    require(self.inspect(item, identity_only=True)["State"].get("Paused") is False, "backup_cleanup_still_paused")
+                del self.pause_intents[item["id"]]
+        return super().call(args, **kwargs)
+
+
+class PhysicalBackupRehearsal(RecoveryRehearsal):
+    """Real stale AOF plus private synthetic latest-catalog reconstruction."""
+    def fixture_call(self, function, *args, **kwargs):
+        try:
+            return function(*args, **kwargs)
+        except backup.BackupRefused as exc:
+            raise Refused(str(exc)) from None
+
+    def aof_profile(self):
+        pairs = self.redis.command("CONFIG", "GET", "dir", "appendfilename", "appenddirname", "appendonly", "appendfsync",
+                                   "no-appendfsync-on-rewrite", "aof-load-truncated", "auto-aof-rewrite-min-size")
+        require(isinstance(pairs, list) and len(pairs) == 16 and all(type(x) is str for x in pairs), "backup_config_shape")
+        values = dict(zip(pairs[::2], pairs[1::2]))
+        expected = {"dir": "/data/redis", "appendfilename": "appendonly.aof", "appenddirname": "appendonlydir",
+                    "appendonly": "yes", "appendfsync": "always", "no-appendfsync-on-rewrite": "no", "aof-load-truncated": "no"}
+        require(set(values) == set(expected) | {"auto-aof-rewrite-min-size"}
+                and all(values[k] == v for k, v in expected.items())
+                and values["auto-aof-rewrite-min-size"].isdecimal()
+                and int(values["auto-aof-rewrite-min-size"]) > backup.MAX_TREE, "backup_aof_config")
+        return values
+
+    def persistence_ready(self):
+        raw = self.redis.command("INFO", "persistence")
+        require(type(raw) is str and len(raw) <= 64 * 1024, "backup_persistence_shape")
+        rows = [line.partition(":") for line in raw.splitlines() if line and not line.startswith("#")]
+        require(all(separator and key and value for key, separator, value in rows)
+                and len({key for key, _, _ in rows}) == len(rows), "backup_persistence_duplicate")
+        values = {key: value for key, _, value in rows}
+        required = {"aof_enabled": "1", "aof_rewrite_in_progress": "0", "aof_rewrite_scheduled": "0",
+                    "aof_last_bgrewrite_status": "ok", "aof_last_write_status": "ok", "aof_pending_bio_fsync": "0",
+                    "rdb_bgsave_in_progress": "0"}
+        require(all(values.get(k) == v for k, v in required.items()), "backup_persistence_not_quiescent")
+        require(re.fullmatch(r"[0-9]+", values.get("aof_current_size", "")) is not None
+                and int(values["aof_current_size"]) <= backup.MAX_TREE, "backup_aof_size")
+        return {**required, "aof_current_size": int(values["aof_current_size"])}
+
+    def physical_helper(self, operation):
+        require(operation in {"capture", "verify", "restore"}, "backup_helper_operation")
+        code = Path(backup.__file__).read_bytes()
+        require(digest(code) == self.backup_helper_sha256, "backup_helper_source_changed")
+        request = {"operation": operation}
+        mounts = [(self.backup_volume, "/backup", operation == "capture")]
+        if operation == "capture":
+            request.update(uid=self.redis_uid, gid=self.redis_gid)
+            mounts += [(self.states["redis"], "/source", False)]
+        else:
+            request["manifest_sha256"] = self.physical_snapshot["manifest_sha256"]
+            if operation == "restore":
+                mounts += [(self.states["redis"], "/target", True)]
+        raw = self.docker.one_shot("backup-physical-" + operation, self.docker.images["authority"], network=False, user="0:0",
+                 mounts=mounts, entrypoint="/usr/bin/python3", command=["-I", "-c", code.decode()], data=canonical(request))
+        value = base.observation_json(raw, 16 * 1024)
+        require(isinstance(value, dict) and set(value) == {"schema_version", "tree_sha256", "manifest_sha256", "files", "entries", "bytes", "uid", "gid"}
+                and type(value["schema_version"]) is int and value["schema_version"] == 1
+                and all(type(value[k]) is int and value[k] >= 0 for k in ("files", "entries", "bytes", "uid", "gid"))
+                and 0 < value["files"] <= value["entries"] <= backup.MAX_ENTRIES and 0 < value["bytes"] <= backup.MAX_TREE
+                and value["uid"] == self.redis_uid and value["gid"] == self.redis_gid
+                and all(type(value[k]) is str and re.fullmatch(r"[0-9a-f]{64}", value[k]) for k in ("tree_sha256", "manifest_sha256")),
+                "backup_helper_summary")
+        if operation != "capture":
+            require(value == self.physical_snapshot, "backup_custody_summary_changed")
+        self.event("physical_backup_" + operation, helper_sha256=self.backup_helper_sha256, **value)
+        return value
+
+    def after_catalog_provisioned(self):
+        require(not self.relays and not self.clients and not hasattr(self, "authority"), "backup_capture_has_serving_writers")
+        operator = base.ROLE_BASE["relay"] + "/operator/"
+        for command, name in (("add-device", "spare"), ("add-service", "spare-service"),
+                              ("add-user", "denied-user"), ("set-grant", "denied-grant")):
+            self.relay_command("relay-a", [command, "--records", operator + name + ".toml"])
+        self.revocation_flags("1")
+        self.physical_observation = self.observe()
+        self.physical_bindings = self.bindings()
+        self.physical_flag_hashes = self.flag_record_hashes()
+        self.aof_profile()
+        self.persistence_ready()
+        identity = json.loads(self.docker.one_shot("backup-redis-identity", self.docker.images["redis"], network=False,
+            mounts=[(self.states["redis"], "/data", False)], entrypoint="/usr/bin/python3",
+            command=["-I", "-c", "import json,os,pwd; p=pwd.getpwnam('redis'); assert (os.geteuid(),os.getegid())==(p.pw_uid,p.pw_gid); print(json.dumps([os.geteuid(),os.getegid()]))"]))
+        require(isinstance(identity, list) and len(identity) == 2 and all(type(x) is int and x >= 0 for x in identity)
+                and identity[0] > 0, "backup_redis_default_identity")
+        self.redis_uid, self.redis_gid = identity
+        self.backup_helper_sha256 = digest(Path(backup.__file__).read_bytes())
+        self.backup_volume = self.docker.volume("physical-old-aof")
+        self.docker.setup_volume(self.backup_volume, 0, 0)
+        old_pid = self.docker.inspect(self.redis_container)["State"]["Pid"]
+        self.docker.set_paused(self.redis_container, True)
+        self.physical_snapshot = self.physical_helper("capture")
+        require(self.docker.inspect(self.redis_container)["State"].get("Paused") is True, "backup_capture_lost_pause")
+        self.physical_helper("verify")
+        require(self.docker.inspect(self.redis_container)["State"].get("Paused") is True, "backup_verify_lost_pause")
+        self.docker.set_paused(self.redis_container, False)
+        require(self.docker.inspect(self.redis_container)["State"].get("Pid") == old_pid
+                and self.run_identity() == self.run_id, "backup_capture_restarted_primary")
+        require(self.observe() == self.physical_observation and self.bindings() == self.physical_bindings
+                and self.flag_record_hashes() == self.physical_flag_hashes, "backup_capture_catalog_changed")
+        self.revocation_flags("1")
+        self.event("physical_backup_custody", backup_volume=self.backup_volume, source_volume=self.states["redis"],
+                   source_run=self.run_id, catalog_digest=self.physical_observation["catalog_digest"],
+                   catalog_generation=self.physical_observation["catalog_generation"], **self.physical_snapshot)
+
+    def setup_revocations(self):
+        # Enrollment already occurred before the physical backup; these are the
+        # exact existing positive probes and real revocation commands afterwards.
+        self.revocation_flags("1")
+        self.spare_probe(False)
+        self.grant_probe(False)
+        self.relay_command("relay-a", ["revoke-credential", "--tenant", self.tenant, "--device", self.spare_device, "--credential", self.spare_credential])
+        self.denied_grant_revocation = self.revoke_target_grant(self.denied_user, self.denied_token)
+        self.assert_revocations()
+        self.event("baseline_revocations", positive_devices=3, positive_routes=9, revoked_spare_device=self.spare_device,
+                   revoked_grant_principal=self.denied_user, credential_was_ready=True, grant_was_permitted=True)
+
+    def flag_record_hashes(self):
+        result = []
+        for key in self.flag_keys():
+            fields = self.redis.command("HGETALL", key)
+            require(isinstance(fields, list) and 0 < len(fields) <= 128 and len(fields) % 2 == 0
+                    and all(type(x) is str and len(x.encode()) <= 4096 for x in fields), "backup_flag_record_shape")
+            record = dict(zip(fields[::2], fields[1::2]))
+            require(len(record) * 2 == len(fields), "backup_flag_record_duplicate")
+            result.append(digest(canonical(record)))
+        return result
+
+    @contextmanager
+    def binary_session(self):
+        # One exact owned loopback/TLS endpoint, no inherited Redis target.
+        require(self.redis.port not in (0, 16379) and self.docker.port(self.redis_container, 6379) == self.redis.port
+                and self.redis.host == self.redis_host, "backup_snapshot_owned_endpoint")
+        deadline = min(self.run.deadline, time.monotonic() + 20)
+        def guard():
+            self.run.guard()
+            backup.require(time.monotonic() < deadline, "snapshot_operation_deadline")
+        sock, raw_socket = None, None
+        try:
+            with backup.command_timer(deadline):
+                raw_socket = socket.create_connection((base.HOST_LOOPBACK, self.redis.port), timeout=2)
+                sock = self.redis.context.wrap_socket(raw_socket, server_hostname=self.redis_host)
+            with sock, sock.makefile("rb", buffering=0) as stream:
+                connection = backup.BinaryConnection(sock, stream, deadline, guard)
+                backup.require(connection.command(b"AUTH", b"default", self.password.encode()) == b"OK", "snapshot_auth")
+                yield connection, guard
+                guard()
+        except backup.BackupRefused as exc:
+            raise Refused(str(exc)) from None
+        finally:
+            if sock is not None:
+                sock.close()
+            if raw_socket is not None:
+                raw_socket.close()
+
+    def capture_latest(self):
+        before_run, before_bindings, before_observed = self.run_identity(), self.bindings(), self.observe()
+        before_flags = self.flag_record_hashes()
+        with self.binary_session() as (connection, guard):
+            snapshot = self.fixture_call(backup.capture_snapshot, connection, self.catalog_prefix.encode(), guard)
+        require(self.run_identity() == before_run and self.bindings() == before_bindings and self.observe() == before_observed
+                and self.flag_record_hashes() == before_flags, "backup_latest_capture_changed")
+        self.latest_path = self.private / "independent-latest-catalog.json"
+        self.latest_file_sha = self.fixture_call(snapshot.retain, self.latest_path)
+        self.latest_summary = snapshot.summary()
+        self.latest_flag_hashes = before_flags
+        require(all(old != new for old, new in zip(self.physical_flag_hashes, self.latest_flag_hashes))
+                and before_observed["catalog_digest"] != self.physical_observation["catalog_digest"], "backup_later_revocations_not_independent")
+        self.event("independent_latest_catalog", custody_file_sha256=self.latest_file_sha, source_run=before_run,
+                   catalog_digest=before_observed["catalog_digest"], catalog_generation=before_observed["catalog_generation"],
+                   revoked_record_hashes=before_flags, physical_record_hashes=self.physical_flag_hashes, **self.latest_summary)
+
+    def reconcile_latest(self):
+        snapshot = self.fixture_call(backup.Snapshot.load, self.latest_path, self.latest_file_sha, self.catalog_prefix.encode(), self.run.guard)
+        require(snapshot.summary() == self.latest_summary, "backup_latest_custody_changed")
+        before_bindings = self.bindings()
+        with self.binary_session() as (connection, guard):
+            self.fixture_call(snapshot.restore, connection, guard)
+        require(self.run_identity() == self.run_id and self.bindings()[:2] == before_bindings[:2], "backup_reconciliation_changed_binding")
+        observed = self.observe()
+        require(all(observed[k] == self.stopped_observation[k] for k in ("catalog_digest", "catalog_generation", "key_count", "byte_count"))
+                and self.epoch_values() == self.stopped_epochs and self.flag_record_hashes() == self.latest_flag_hashes,
+                "backup_reconciliation_not_latest")
+        self.revocation_flags("0")
+        self.event("synthetic_catalog_reconciliation", production_tool=False, independent_custody_sha256=self.latest_file_sha,
+                   catalog_digest=observed["catalog_digest"], catalog_generation=observed["catalog_generation"],
+                   restored_records=self.latest_summary["records"], active_binding_unchanged=True)
+
+    def stop_and_restart(self):
+        self.old_env, self.old_inventory = copy.deepcopy(self.env), copy.deepcopy(self.inventory)
+        self.old_membership_files = self.membership_files.copy()
+        self.old_owners, self.old_status = [self.owner(i) for i in range(3)], [self.status(i) for i in range(3)]
+        old_ports = [*self.consumer_ports, *self.device_ports, self.authority_port]
+        for item in self.clients:
+            self.disconnect(item)
+        for item in [*self.relays, self.authority]:
+            self.docker.stop(item)
+            self.docker.remove_finished(item)
+        self.clients, self.relays = [], []
+        for port in old_ports:
+            absent_listener(port)
+        self.stopped_state = self.private_state()
+        self.stopped_authority = json.loads(self.stopped_state["authority"]["authority.json"])
+        self.stopped_bindings, self.stopped_epochs, self.stopped_observation = self.bindings(), self.epoch_values(), self.observe()
+        self.revocation_flags("0")
+        self.capture_latest()
+        self.old_redis_id, old_port, old_run = self.redis_container["id"], self.redis.port, self.run_id
+        self.old_current_volume = self.states["redis"]
+        self.docker.stop(self.redis_container)
+        self.docker.remove_finished(self.redis_container)
+        absent_listener(old_port)
+        fenced_at = time.monotonic()
+        self.states["redis"] = self.docker.volume("restored-old-aof")
+        require(len({self.states["redis"], self.old_current_volume, self.backup_volume}) == 3, "backup_distinct_volumes")
+        self.docker.setup_volume(self.states["redis"], self.redis_uid, self.redis_gid)
+        self.physical_helper("restore")
+        self.redis_container = self.docker.create("redis", self.docker.images["redis"], memory=512, env=self.env["redis"],
+             mounts=[(self.states["redis"], "/data", True)], aliases=[self.redis_host], ports=[6379])
+        self.docker.start(self.redis_container)
+        self.redis = base.Redis(self.docker.port(self.redis_container, 6379), self.redis_host,
+                                base.tls_context(self.pki.cas["redis"][0]), self.password)
+        def ping():
+            try:
+                return self.redis.command("PING") == "PONG"
+            except (ConnectionError, OSError):
+                return False
+        base.wait_until(self.run, ping, 20, "backup_restored_redis_start")
+        self.run_id = self.run_identity()
+        require(self.run_id != old_run and self.redis_container["id"] != self.old_redis_id, "backup_restored_primary_not_fresh")
+        self.aof_profile()
+        self.persistence_ready()
+        self.revocation_flags("1")
+        restored = self.observe()
+        require(self.bindings() == self.physical_bindings
+                and self.flag_record_hashes() == self.physical_flag_hashes
+                and all(restored[k] == self.physical_observation[k] for k in ("catalog_digest", "catalog_generation", "key_count", "byte_count")),
+                "backup_physical_load_not_old_catalog")
+        self.old_startups(self.stopped_state, self.physical_bindings)
+        while time.monotonic() - fenced_at < FENCING_SECONDS:
+            self.run.guard()
+            time.sleep(min(0.5, FENCING_SECONDS - (time.monotonic() - fenced_at)))
+        require(self.run_identity() == self.run_id, "backup_restored_run_changed")
+        self.old_ephemeral_absent()
+        self.event("physical_old_catalog_loaded", old_redis_id=self.old_redis_id, new_redis_id=self.redis_container["id"],
+                   old_run_id=old_run, new_run_id=self.run_id, source_volume=self.old_current_volume,
+                   backup_volume=self.backup_volume, restored_volume=self.states["redis"],
+                   old_catalog_digest=restored["catalog_digest"], missing_revocations=2,
+                   fenced_seconds=round(time.monotonic() - fenced_at, 3))
+        self.reconcile_latest()
+        # The common approval negative controls require latest generation and
+        # old metadata binding. Reconciliation restored exactly those values.
+        require(self.bindings() == self.stopped_bindings, "backup_latest_metadata_differs")
+
+    def restart_serving(self):
+        super().restart_serving()
+        self.physical_helper("verify")
+        require(not self.docker.call(["container", "ls", "--all", "--quiet", "--no-trunc", "--filter", "id=" + self.old_redis_id]).strip(),
+                "backup_old_primary_returned")
+        require(not any(volume == self.old_current_volume and writable for item in self.docker.containers
+                        for volume, _, writable in item["mounts"]), "backup_old_current_volume_reused")
+        self.fixture_call(backup.Snapshot.load, self.latest_path, self.latest_file_sha, self.catalog_prefix.encode(), self.run.guard)
+
+    def execute(self):
+        for stage, method in (("prepare", self.prepare), ("bootstrap_physical_capture", self.bootstrap)):
+            self.run.stage = stage
+            method()
+        self.run.stage = "baseline_routes"
+        for i in range(3):
+            self.start_client(i)
+        self.all_routes()
+        self.run.stage = "baseline_revocations"
+        self.setup_revocations()
+        self.run.stage = "physical_older_backup_restore"
+        self.stop_and_restart()
+        self.run.stage = "explicit_recovery"
+        self.explicit_recovery()
+        self.run.stage = "recovered_adoption"
+        self.restart_serving()
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--scenario", required=True, choices=["durable-restart"])
+    parser.add_argument("--scenario", required=True, choices=["durable-restart", "older-backup"])
     for role in ("relay", "authority", "redis", "client"):
         parser.add_argument("--" + role + "-image", required=True)
     parser.add_argument("--output", required=True, type=Path)
@@ -742,8 +1070,9 @@ def main(argv=None):
     require(all(base.IMAGE_RE.fullmatch(value) for value in images.values()), "immutable_image_id_required")
     args.output.mkdir(mode=0o700)
     started = time.monotonic()
-    result = {"schema_version": 1, "status": "failed", "scope": "same-aof-three-relay-recovery", "scenario": args.scenario,
-              "limitations": LIMITATIONS, "main_bound_seconds": base.MAIN_SECONDS, "cleanup_bound_seconds": base.CLEANUP_SECONDS}
+    result = {"schema_version": 1, "status": "failed", "scope": "physical-older-aof-three-relay-recovery" if args.scenario == "older-backup" else "same-aof-three-relay-recovery", "scenario": args.scenario,
+              "limitations": (OLDER_BACKUP_LIMITATIONS if args.scenario == "older-backup" else LIMITATIONS),
+              "main_bound_seconds": base.MAIN_SECONDS, "cleanup_bound_seconds": base.CLEANUP_SECONDS}
     def event(kind, **fields):
         with (args.output / "events.jsonl").open("ab") as file:
             file.write(canonical({"event": kind, "elapsed_seconds": round(time.monotonic() - started, 3), **fields}))
@@ -751,7 +1080,8 @@ def main(argv=None):
         private = Path(tmp)
         run = RecoveryRunner(private, event)
         base.NETWORK_DEADLINE = run.deadline
-        docker = RecoveryDocker(run, "aur-" + secrets.token_hex(6), images)
+        docker_type = PhysicalBackupDocker if args.scenario == "older-backup" else RecoveryDocker
+        docker = docker_type(run, "aur-" + secrets.token_hex(6), images)
         first_error, source, receipts = None, None, {}
         interruptions = []
         def interrupted(signum, _frame):
@@ -777,12 +1107,15 @@ def main(argv=None):
             # floors remain enforced on every guarded command afterwards.
             reserve = (3 * sizes["relay"] + 4 * sizes["client"] + sizes["authority"] + sizes["redis"]
                        + max(sizes.values()) + base.MAX_PRIVATE + 64 * 1024**2 + 1536 * 1024**2)
+            if args.scenario == "older-backup":
+                reserve += backup.EXTRA_RESERVE
             require(shutil.disk_usage(run.docker_root).free >= reserve, "recovery_image_copy_reserve")
             result["image_copy_reserve"] = {"estimated_required_free": reserve, "image_sizes": sizes, "guaranteed_peak": False}
             for role in images:
                 receipts[role]["artifacts"] = docker.artifact_receipt(role)
             base.private_write(args.output / "images.json", canonical(receipts))
-            RecoveryRehearsal(run, docker, private, event).execute()
+            scenario_type = PhysicalBackupRehearsal if args.scenario == "older-backup" else RecoveryRehearsal
+            scenario_type(run, docker, private, event).execute()
         except BaseException as exc:
             first_error = base.error_code(exc)
         if run.stop_requested and first_error is None:
@@ -811,6 +1144,7 @@ def main(argv=None):
         result.update(first_failure=first_error, cleanup_errors=cleanup_errors, containers=docker.inventory,
                       process_groups=len(run.processes), resource_samples=run.samples, interruptions=interruptions,
                       readiness_diagnostic_failures=run.readiness_diagnostic_failures,
+                      echo_response_diagnostic_failure=run.echo_response_diagnostic_failure,
                       elapsed_seconds=round(time.monotonic() - started, 3))
         if first_error is None and not cleanup_errors and not interruptions:
             result["status"] = "passed"
@@ -818,7 +1152,7 @@ def main(argv=None):
         for sig, handler in previous_signals.items():
             signal.signal(sig, handler)
         base.NETWORK_DEADLINE = None
-    print("Fly same-AOF recovery rehearsal: " + result["status"] + "; sanitized receipt: " + str(args.output / "result.json"))
+    print("Fly " + args.scenario + " recovery rehearsal: " + result["status"] + "; sanitized receipt: " + str(args.output / "result.json"))
     return 0 if result["status"] == "passed" else 1
 
 

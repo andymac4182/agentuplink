@@ -1,0 +1,88 @@
+# Focused original case only; does not invoke the broad four-crate CLI.
+name: Original gate4 expired authorization witness
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/m4-original-gate4-witness.yml'
+      - 'scripts/m4_original_gate4_witness.py'
+      - 'scripts/test_m4_original_gate4_witness.py'
+      - 'scripts/m4_authorization_witnesses.py'
+      - 'scripts/test_m4_authorization_witnesses.py'
+      - 'scripts/fs-guard-deletion.py'
+      - 'scripts/guard_outcomes.py'
+      - 'scripts/guard_witness_debt.json'
+      - '.cargo/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - 'crates/**'
+      - 'vendor/**'
+      - 'examples/**'
+  pull_request:
+    paths:
+      - '.github/workflows/m4-original-gate4-witness.yml'
+      - 'scripts/m4_original_gate4_witness.py'
+      - 'scripts/test_m4_original_gate4_witness.py'
+      - 'scripts/m4_authorization_witnesses.py'
+      - 'scripts/test_m4_authorization_witnesses.py'
+      - 'scripts/fs-guard-deletion.py'
+      - 'scripts/guard_outcomes.py'
+      - 'scripts/guard_witness_debt.json'
+      - '.cargo/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - 'crates/**'
+      - 'vendor/**'
+      - 'examples/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Each proof owns private source and processes until cleanup completes.
+concurrency:
+  group: original-gate4-${{ github.event_name }}-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  original-gate4-witness:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - name: Dedicated immutable checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.sha }}
+          path: original-gate4-source
+          persist-credentials: false
+      - name: Install pinned Rust
+        timeout-minutes: 5
+        run: rustup toolchain install 1.95.0 --profile minimal
+      - name: Existing and focused synthetic controller controls
+        timeout-minutes: 2
+        working-directory: original-gate4-source
+        run: |
+          python3 -m unittest discover -s scripts -p test_m4_authorization_witnesses.py -v
+          python3 -m unittest discover -s scripts -p test_m4_original_gate4_witness.py -v
+      - name: Original named GREEN, compiled original deletion RED, restored GREEN
+        timeout-minutes: 48
+        working-directory: original-gate4-source
+        env:
+          WITNESS_EXPECTED_COMMIT: ${{ github.sha }}
+        run: |
+          python3 scripts/m4_original_gate4_witness.py \
+            --expected-commit "$WITNESS_EXPECTED_COMMIT" \
+            --output "$RUNNER_TEMP/original-gate4-witness-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+      - name: Upload the closed receipt only
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: original-gate4-witness-receipt-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/original-gate4-witness-${{ github.run_id }}-${{ github.run_attempt }}/public/receipt.json
+          if-no-files-found: error
+          retention-days: 7

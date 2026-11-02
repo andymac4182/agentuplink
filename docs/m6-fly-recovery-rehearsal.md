@@ -1,8 +1,10 @@
 # Fly image recovery rehearsal
 
 Status: same-AOF rehearsal implemented and reviewed; current-image execution is
-pending. Physical older-backup restoration is a separate required scenario and
-has not been implemented in this controller. Neither result establishes actual
+pending. Physical older-backup restoration is now a separately reviewed source scenario;
+its current-image execution also remains pending. [Physical fixture and custody
+limits](m6-fly-revocation-and-backup-2026-11-02.md#two-recovery-scenarios-and-physical-custody-limits)
+record the successor integration. Neither result establishes actual
 Fly deployment readiness.
 
 The controller uses the four images built from the exact checkout in the Fly

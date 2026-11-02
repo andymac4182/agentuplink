@@ -353,7 +353,8 @@ class Artifact:
                 "sha256": self.sha256}
 
 
-def fingerprint_artifact(path: Path, target: Path, clock, deadline, interrupted) -> Artifact:
+def fingerprint_artifact(path: Path, target: Path, clock, deadline, interrupted,
+                         *, executable_kind="client_library") -> Artifact:
     """Bounded regular-file read; no symlinks, binary copies, or full-file buffer."""
     def budget():
         require(not interrupted(), "interrupted")
@@ -363,13 +364,16 @@ def fingerprint_artifact(path: Path, target: Path, clock, deadline, interrupted)
         return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns
 
     budget()
+    require(executable_kind in ("client_library", "provider_dispatcher"), "artifact_kind_invalid")
     try:
         canonical = path.resolve(strict=True)
         require(target.is_absolute() and target.resolve() == target
                 and path.is_absolute() and canonical == path
                 and path.is_relative_to(target), "artifact_path_invalid")
         identifier = path.relative_to(target).as_posix()
-        require(ARTIFACT_IDENTIFIER.fullmatch(identifier) is not None, "artifact_identifier_invalid")
+        pattern = ARTIFACT_IDENTIFIER if executable_kind == "client_library" else re.compile(
+            r"debug/deps/dispatcher-[0-9a-f]{16}")
+        require(pattern.fullmatch(identifier) is not None, "artifact_identifier_invalid")
         before = path.lstat()
         require(stat.S_ISREG(before.st_mode), "artifact_not_regular")
         require(0 < before.st_size <= MAX_ARTIFACT_BYTES, "artifact_size_invalid")

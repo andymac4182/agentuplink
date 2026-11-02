@@ -272,8 +272,16 @@ class RuntimeBoundaryTests(unittest.TestCase):
         with self.assertRaisesRegex(m.Refused, "removed_container_present"): docker.remove_finished(item)
         self.assertEqual(docker.containers, [item])
 
-    def test_no_older_backup_cli_option(self):
-        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit): m.main(["--scenario", "older-backup"])
+    def test_unknown_backup_cli_option(self):
+        # older-backup is now an explicit separate fixture. Supplying every
+        # other required option ensures this refuses the unknown scenario,
+        # rather than passing accidentally because image arguments are absent.
+        arguments = ["--scenario", "unknown-backup", "--output", "/unused"]
+        for role in ("relay", "authority", "redis", "client"):
+            arguments += ["--" + role + "-image", "sha256:" + "a" * 64]
+        with contextlib.redirect_stderr(io.StringIO()) as errors, self.assertRaises(SystemExit):
+            m.main(arguments)
+        self.assertIn("invalid choice", errors.getvalue())
 
     def test_exact_stage_order(self):
         obj = object.__new__(m.RecoveryRehearsal)
