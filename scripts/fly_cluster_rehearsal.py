@@ -41,6 +41,11 @@ CLEANUP_SECONDS = 180
 COMMAND_SECONDS = 30
 MAX_OUTPUT = 8 * 1024 * 1024
 MAX_PRIVATE = 256 * 1024 * 1024
+MAX_DOCKER_ERROR = 16 * 1024
+MAX_AUTHORITY_OBSERVATION = 256 * 1024
+MAX_RELAY_OBSERVATION = 16 * 1024
+NODES = ("relay-a", "relay-b", "relay-c")
+LOG_CONFIG = {"Type": "local", "Config": {"max-size": "2m", "max-file": "1", "compress": "false"}}
 NETWORK_DEADLINE = None  # one sequential controller; all requests share its original budget
 ROLE_BASE = {"relay": "/var/lib/agent-tunnel", "authority": "/var/lib/agentuplink-authority"}
 LIMITATIONS = [
@@ -115,7 +120,93 @@ def check_resources(sample, initial, *, startup=False):
     require(all(sample[key] == initial[key] for key in ("pswpin", "pswpout", "oom_kill")), "swap_or_oom_delta")
 
 
-def safe_log_receipt(path):
+def closed_docker_error(data):
+    """Report only fixed engine vocabulary, never a matched substring/value.
+
+    These are observations of an error, not inferred container outcomes. An
+    unfamiliar error stays unclassified. Oversized inputs have an explicitly
+    prefix-scoped hash/classification; they are never emitted as raw text.
+    """
+    bounded = data[:MAX_DOCKER_ERROR]
+    lowered = bounded.lower()
+    vocabulary = (
+        ("local_compression_single_file", b"compression cannot be enabled when max file count is 1"),
+        ("logging_driver_initialization", b"failed to initialize logging driver"),
+        ("container_task_creation", b"failed to create task for container"),
+        ("oci_runtime_creation", b"oci runtime create failed"),
+        ("container_process_start", b"unable to start container process"),
+        ("executable_not_found", b"executable file not found"),
+        ("missing_file", b"no such file or directory"),
+        ("permission_denied", b"permission denied"),
+        ("operation_not_permitted", b"operation not permitted"),
+        ("disk_full", b"no space left on device"),
+        ("read_only_filesystem", b"read-only file system"),
+        ("memory_allocation", b"cannot allocate memory"),
+        ("daemon_unreachable", b"cannot connect to the docker daemon"),
+        ("logging_read_unsupported", b"configured logging driver does not support reading"),
+    )
+    codes = [name for name, phrase in vocabulary if phrase in lowered]
+    errno = [name for name in ("EACCES", "EPERM", "ENOENT", "ENOSPC", "EROFS", "ENOMEM")
+             if re.search(rb"\b" + name.encode() + rb"\b", bounded)]
+    return {"bytes": len(data), "sha256": digest(bounded), "hash_scope": "complete" if len(data) <= MAX_DOCKER_ERROR else "prefix",
+            "classified_bytes": len(bounded), "classification_complete": len(data) <= MAX_DOCKER_ERROR,
+            "codes": codes, "errno_terms": errno, "raw_uploaded": False,
+            "classification": "matched_engine_vocabulary" if codes or errno else ("empty" if not data else "unclassified")}
+
+
+def safe_container_state(state):
+    """A small diagnostic projection; do not change lifecycle predicates."""
+    result, invalid, missing = {}, [], []
+    for field, output in (("Status", "status"), ("StartedAt", "started_at"), ("Pid", "pid"),
+                          ("Running", "running"), ("ExitCode", "exit_code"), ("OOMKilled", "oom_killed")):
+        if field not in state:
+            result[output] = None
+            missing.append(field)
+            continue
+        value = state[field]
+        if field == "Status":
+            valid = isinstance(value, str) and value in {"created", "running", "paused", "restarting", "removing", "exited", "dead"}
+        elif field == "StartedAt":
+            valid = isinstance(value, str) and re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,9})?Z", value) is not None
+            if valid:
+                try:
+                    dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+                except ValueError:
+                    valid = False
+        elif field in {"Pid", "ExitCode"}:
+            valid = type(value) is int and 0 <= value <= (2**31 - 1 if field == "Pid" else 255)
+        else:
+            valid = type(value) is bool
+        result[output] = value if valid else None
+        if not valid:
+            invalid.append(field)
+    error = state.get("Error")
+    result["error"] = ({"present": True, "valid_type": True, **closed_docker_error(error.encode())}
+                       if isinstance(error, str) else {"present": "Error" in state, "valid_type": False})
+    result.update(missing_fields=missing, invalid_fields=invalid)
+    return result
+
+
+def safe_engine_projection(server, log_drivers):
+    """Accept the fixed version/API projection, not arbitrary docker info."""
+    require(isinstance(server, dict) and isinstance(log_drivers, list), "docker_engine_projection")
+    fields = {}
+    patterns = {"Version": r"[0-9]+\.[0-9]+(?:\.[0-9]+)?[0-9A-Za-z.+_~-]{0,48}",
+                "ApiVersion": r"[0-9]+\.[0-9]+", "MinAPIVersion": r"[0-9]+\.[0-9]+",
+                "Os": r"linux", "Arch": r"amd64|arm64"}
+    for key, pattern in patterns.items():
+        value = server.get(key)
+        require(isinstance(value, str) and re.fullmatch(pattern, value) is not None, "docker_engine_projection")
+        fields[key] = value
+    require(len(log_drivers) <= 64 and all(isinstance(item, str) for item in log_drivers), "docker_log_plugin_projection")
+    known = {"awslogs", "fluentd", "gcplogs", "gelf", "journald", "json-file", "local", "none", "splunk", "syslog", "etwlogs"}
+    fields["known_log_drivers"] = sorted(set(log_drivers) & known)
+    fields["unknown_log_driver_count"] = sum(item not in known for item in log_drivers)
+    require("local" in fields["known_log_drivers"], "docker_local_logging_unavailable")
+    return fields
+
+
+def safe_log_receipt(path, *, docker=False):
     size = path.stat().st_size
     if size > MAX_OUTPUT:
         return {"bytes": size, "sha256": None, "closed_codes": [], "raw_uploaded": False,
@@ -132,10 +223,13 @@ def safe_log_receipt(path):
             continue
         if isinstance(value, dict) and isinstance(value.get("error"), dict):
             code = value["error"].get("code")
-            if code in allowed and code not in codes:
+            if isinstance(code, str) and code in allowed and code not in codes:
                 codes.append(code)
-    return {"bytes": len(data), "sha256": digest(data), "closed_codes": codes, "raw_uploaded": False,
-            "cause_classification": "closed_code" if codes else "unclassified"}
+    receipt = {"bytes": len(data), "sha256": digest(data), "closed_codes": codes, "raw_uploaded": False,
+               "cause_classification": "closed_code" if codes else "unclassified"}
+    if docker:
+        receipt["docker_error"] = closed_docker_error(data)
+    return receipt
 
 
 def group_present(pgid):
@@ -178,6 +272,7 @@ def check_container(value, expected, owner):
     require(host.get("Memory") == expected["memory"] and host.get("MemorySwap") == expected["memory"]
             and host.get("PidsLimit") == 256, "container_resource_limits")
     require((host.get("RestartPolicy") or {}).get("Name") == "no", "container_restart_policy")
+    require(host.get("LogConfig") == LOG_CONFIG, "container_logging_configuration")
     return value.get("State", {})
 
 
@@ -246,6 +341,120 @@ def check_persisted_version(before, after):
             and all(b["node_versions"][key] >= value for key, value in a["node_versions"].items()), "membership_rollback")
 
 
+def observation_json(raw, maximum):
+    require(isinstance(raw, bytes) and len(raw) <= maximum, "observation_byte_bound")
+    def pairs(items):
+        result = {}
+        for key, value in items:
+            require(key not in result, "observation_duplicate_field")
+            result[key] = value
+        return result
+    def constant(_value):
+        raise Refused("observation_json")
+    try:
+        return json.loads(raw, object_pairs_hook=pairs, parse_constant=constant)
+    except (ValueError, UnicodeError, RecursionError):
+        raise Refused("observation_json") from None
+
+
+def u64(value):
+    return type(value) is int and 0 <= value <= 2**64 - 1
+
+
+def timestamp_ns(value):
+    # Preserve Rust DateTime's nanoseconds: truncation could hide an extension
+    # of a fixed confirmation. No floating-point timestamps enter comparisons.
+    require(isinstance(value, str), "observation_timestamp")
+    match = re.fullmatch(r"([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2})(?:\.([0-9]{1,9}))?(Z|[+-][0-9]{2}:[0-9]{2})", value)
+    require(match is not None, "observation_timestamp")
+    require(match[3] == "Z" or (int(match[3][1:3]) < 24 and int(match[3][4:]) < 60), "observation_timestamp")
+    try:
+        whole = dt.datetime.fromisoformat(match[1] + match[3].replace("Z", "+00:00"))
+        delta = whole - dt.datetime(1970, 1, 1, tzinfo=dt.timezone.utc)
+    except ValueError:
+        raise Refused("observation_timestamp") from None
+    return (delta.days * 86400 + delta.seconds) * 10**9 + int((match[2] or "0").ljust(9, "0"))
+
+
+def utc_ns():
+    return timestamp_ns(dt.datetime.now(dt.timezone.utc).isoformat())
+
+
+def publication_observation(raw, inventory, run_id, now, previous=None):
+    """Passive equivalent of the native authority_publication_observer.
+
+    The unsigned local state is evidence only. Real relays must verify their
+    own nonce-bound checkpoints and records before their durable fences count.
+    """
+    value = observation_json(raw, MAX_AUTHORITY_OBSERVATION)
+    required = {"schema_version", "inventory", "expected_redis_run_id", "membership_high_water",
+                "checkpoint_high_water", "known_node_ids", "confirmed"}
+    require(isinstance(value, dict) and set(value) == required, "publication_schema")
+    require(type(value["schema_version"]) is int and value["schema_version"] == 1
+            and canonical(value["inventory"]) == canonical(inventory)
+            and value["expected_redis_run_id"] == run_id, "publication_identity")
+    nodes = value["known_node_ids"]
+    require(isinstance(nodes, list) and len(nodes) == 3 and all(isinstance(n, str) for n in nodes)
+            and set(nodes) == set(NODES)
+            and {n["node_id"] for n in inventory["nodes"]} == set(NODES)
+            and len(inventory["nodes"]) == 3, "publication_nodes")
+    require(u64(value["membership_high_water"]) and u64(value["checkpoint_high_water"]), "publication_counter")
+    confirmed = value["confirmed"]
+    if confirmed is not None:
+        require(isinstance(confirmed, dict) and set(confirmed) == {"inventory_revision", "membership_version", "expires_at"}, "confirmation_schema")
+        require(u64(confirmed["inventory_revision"]) and confirmed["inventory_revision"] == inventory["revision"]
+                and u64(confirmed["membership_version"]) and 0 < confirmed["membership_version"] <= value["membership_high_water"], "confirmation_version")
+        expires = timestamp_ns(confirmed["expires_at"])
+        require(now < expires <= now + 60 * 10**9, "confirmation_window")
+    if previous is not None:
+        require(value["membership_high_water"] >= previous["membership_high_water"]
+                and value["checkpoint_high_water"] >= previous["checkpoint_high_water"], "publication_rollback")
+        old = previous["confirmed"]
+        if old is not None:
+            require(confirmed is not None and confirmed["membership_version"] >= old["membership_version"]
+                    and (confirmed["membership_version"] != old["membership_version"]
+                         or timestamp_ns(confirmed["expires_at"]) == timestamp_ns(old["expires_at"])), "confirmation_rollback_or_extension")
+    return value
+
+
+def relay_observation(raw, inventory, node):
+    value = observation_json(raw, MAX_RELAY_OBSERVATION)
+    require(isinstance(value, dict) and set(value) == {"schema_version", "deployment_id", "deployment_incarnation", "node_id", "state"}, "relay_observation_schema")
+    require(type(value["schema_version"]) is int and value["schema_version"] == 1
+            and value["deployment_id"] == inventory["deployment_id"]
+            and value["deployment_incarnation"] == inventory["deployment_incarnation"]
+            and node in NODES and value["node_id"] == node, "relay_observation_identity")
+    state = value["state"]
+    require(isinstance(state, dict) and set(state) == {"checkpoint_version", "node_versions"}
+            and (state["checkpoint_version"] is None or u64(state["checkpoint_version"]))
+            and isinstance(state["node_versions"], dict) and set(state["node_versions"]) <= set(NODES)
+            and all(u64(v) for v in state["node_versions"].values()), "relay_observation_state")
+    return state
+
+
+class PublicationWatch:
+    def __init__(self, stopped):
+        self.stopped, self.latest, self.target = stopped, stopped, None
+
+    def observe(self, current):
+        # Freeze H+1 once. A moving checkpoint allocator is not an adoption
+        # target, and a spent but unconfirmed membership round cannot pass.
+        self.latest = current
+        confirmed = current["confirmed"]
+        if self.target is None and confirmed is not None and confirmed["membership_version"] > self.stopped["membership_high_water"]:
+            require(current["checkpoint_high_water"] < 2**64 - 1, "adoption_floor_overflow")
+            self.target = {"checkpoint_version": current["checkpoint_high_water"] + 1,
+                           "membership_version": confirmed["membership_version"],
+                           "expires_ns": timestamp_ns(confirmed["expires_at"])}
+
+    def adopted(self, states, now):
+        require(self.target is not None and now < self.target["expires_ns"], "adoption_target_expired")
+        return set(states) == set(NODES) and all(
+            state["checkpoint_version"] is not None and state["checkpoint_version"] >= self.target["checkpoint_version"]
+            and all(state["node_versions"].get(node, -1) >= self.target["membership_version"] for node in NODES)
+            for state in states.values())
+
+
 class Runner:
     def __init__(self, private, event):
         self.private, self.event = private, event
@@ -260,6 +469,18 @@ class Runner:
         self.role = "controller"
         self.subcommand = "none"
         self.stop_requested = False
+
+    @contextmanager
+    def budget(self, seconds):
+        # All volume-read CLI calls and their owned-group cleanup consume the
+        # same absolute budget. Never reset it for a poll or an individual node.
+        original = self.deadline
+        self.deadline = min(original, time.monotonic() + seconds)
+        try:
+            yield
+            self.guard()
+        finally:
+            self.deadline = original
 
     def guard(self):
         require(not self.stop_requested, "controller_interrupted")
@@ -333,7 +554,7 @@ class Runner:
                        elapsed_seconds=round(time.monotonic() - start, 3),
                        process_group_absent=absent, cleanup_failures=cleanup_failures,
                        stage=self.stage, operation=self.operation, role=self.role, subcommand=self.subcommand, passed=error is None,
-                       stdout=safe_log_receipt(stdout_path), stderr=safe_log_receipt(stderr_path),
+                       stdout=safe_log_receipt(stdout_path), stderr=safe_log_receipt(stderr_path, docker=self.operation.startswith("docker_")),
                        failure=error_code(error) if error else None)
         if error:
             raise error
@@ -349,11 +570,23 @@ class Docker:
         self.inventory = []
 
     def call(self, args, **kw):
+        for command, operation in ((["version", "--format", "{{json .Server}}"], "docker_engine_version"),
+                                   (["info", "--format", "{{json .Plugins.Log}}"], "docker_log_plugins")):
+            if args == command:
+                self.run.operation, self.run.role, self.run.subcommand = operation, "controller", "engine-metadata"
+                return self.run(DOCKER + args, **kw)
         allowed = {"container", "network", "image", "volume"}
         require(len(args) >= 2 and args[0] in allowed and args[1] in {
             "create", "inspect", "start", "stop", "exec", "logs", "rm", "ls", "cp"}, "docker_command_shape")
         self.run.operation = "docker_" + args[0] + "_" + args[1]
         return self.run(DOCKER + args, **kw)
+
+    def engine_preflight(self):
+        server = json.loads(self.call(["version", "--format", "{{json .Server}}"]))
+        drivers = json.loads(self.call(["info", "--format", "{{json .Plugins.Log}}"]))
+        projection = safe_engine_projection(server, drivers)
+        self.run.event("docker_engine", **projection)
+        return projection
 
     def inspect(self, item, *, identity_only=False):
         self.run.role = item["role"]
@@ -387,7 +620,8 @@ class Docker:
         args = ["container", "create", "--pull=never", "--name", name, "--label", OWNER_LABEL + "=" + self.owner,
                 "--label", OWNER_LABEL + ".role=" + role, "--network", net, "--memory", str(item["memory"]),
                 "--memory-swap", str(item["memory"]), "--pids-limit", "256", "--restart=no", "--cap-drop=ALL",
-                "--security-opt=no-new-privileges", "--log-driver=local", "--log-opt=max-size=2m", "--log-opt=max-file=1"]
+                "--security-opt=no-new-privileges", "--log-driver=local", "--log-opt=max-size=2m", "--log-opt=max-file=1",
+                "--log-opt=compress=false"]
         if user == "0:0":
             # These three capabilities are only used by the explicit owned-volume
             # initializer/reader, never by an ordinary serving entrypoint.
@@ -450,13 +684,16 @@ class Docker:
                       mounts=[(name, "/volume", True)], entrypoint="/usr/bin/python3",
                       command=["-I", "-c", VOLUME_INITIALIZE], data=canonical(payload))
 
-    def read_volume(self, name, relative):
+    def read_volume(self, name, relative, *, max_bytes=1024 * 1024 - 1):
+        require(type(max_bytes) is int and 0 < max_bytes < 1024 * 1024, "volume_read_byte_limit")
         raw = self.one_shot("volume-read", self.images["authority"], network=False, user="0:0",
                             mounts=[(name, "/volume", False)], entrypoint="/usr/bin/python3",
-                            command=["-I", "-c", VOLUME_READ], data=canonical({"paths": relative}))
+                            command=["-I", "-c", VOLUME_READ], data=canonical({"paths": relative, "max_bytes": max_bytes}))
         values = json.loads(raw)
         require(set(values) == set(relative), "volume_read_paths")
-        return {key: base64.b64decode(value, validate=True) for key, value in values.items()}
+        decoded = {key: base64.b64decode(value, validate=True) for key, value in values.items()}
+        require(all(len(value) <= max_bytes for value in decoded.values()), "volume_read_byte_bound")
+        return decoded
 
     def artifact_receipt(self, role):
         """Verify shipped notices against the exact copied image executables."""
@@ -512,7 +749,7 @@ class Docker:
                     errors.append({"resource": item["role"], "code": "container_oom"})
                 self.inventory.append({"role": item["role"], "id": item["id"], "image": item["image"],
                                        "exit_code_before_cleanup": state.get("ExitCode"), "running_before_cleanup": state.get("Running"),
-                                       "oom_killed": state.get("OOMKilled")})
+                                       "oom_killed": state.get("OOMKilled"), "state_before_cleanup": safe_container_state(state)})
                 if state.get("Running"):
                     try:
                         self.call(["container", "stop", "--time=5", item["id"]], timeout=10)
@@ -572,12 +809,16 @@ for name,data in v['files'].items():
  os.chmod(target,0o600); os.chown(target,v['uid'],v['gid'])
 '''
 VOLUME_READ = r'''
-import base64,json,pathlib,stat,sys
-v=json.load(sys.stdin); out={}; root=pathlib.Path('/volume')
+import base64,json,os,pathlib,stat,sys
+v=json.load(sys.stdin); out={}; root=pathlib.Path('/volume'); limit=v['max_bytes']
+assert type(limit) is int and 0<limit<1048576
 for name in v['paths']:
  p=pathlib.PurePosixPath(name); assert not p.is_absolute() and '..' not in p.parts and p.parts
- target=root.joinpath(*p.parts); assert target.is_file() and not target.is_symlink() and target.stat().st_size<1048576
- out[name]=base64.b64encode(target.read_bytes()).decode()
+ target=root.joinpath(*p.parts)
+ with os.fdopen(os.open(target,os.O_RDONLY|os.O_NOFOLLOW),'rb') as f:
+  info=os.fstat(f.fileno()); assert stat.S_ISREG(info.st_mode) and info.st_size<=limit
+  data=f.read(limit+1); assert len(data)<=limit
+ out[name]=base64.b64encode(data).decode()
 print(json.dumps(out))
 '''
 
@@ -829,6 +1070,7 @@ class Rehearsal:
         require(manifest["image_identity_kind"] == {role: "docker-config" for role in ("relay", "redis", "authority")}, "rendered_image_kind")
         for path, sha in manifest["files"].items():
             require(digest((self.rendered / path).read_bytes()) == sha, "rendered_file_hash")
+        self.authority_inventory = observation_json((self.rendered / "authority/inventory.json").read_bytes(), MAX_AUTHORITY_OBSERVATION)
         self.event("rendered", manifest_sha256=digest(canonical(manifest)), config_hashes=manifest["files"])
         read = lambda path: Path(path).read_bytes()
         default_user = "default"
@@ -972,6 +1214,9 @@ overlap_seconds = 30
         self.authority_port = self.docker.port(self.authority, 8444)
 
     def checkpoint(self):
+        # The serving relay owns this identity's one authority permit. Apply
+        # the guard before nonce/request construction or any network operation.
+        require(not self.relays, "checkpoint_observer_with_serving_relays")
         self.run.guard()
         self.run.operation, self.run.role = "https_checkpoint", "authority"
         nonce = secrets.token_hex(16)
@@ -987,6 +1232,44 @@ overlap_seconds = 30
             return None
         require(status == 200, "checkpoint_http")
         return check_checkpoint(json.loads(body), self.inventory, nonce)
+
+    def publication(self, previous=None):
+        raw = self.docker.read_volume(self.states["authority"], ["authority.json"], max_bytes=MAX_AUTHORITY_OBSERVATION)["authority.json"]
+        self.run.guard()
+        return publication_observation(raw, self.authority_inventory, self.run_id, utc_ns(), previous)
+
+    def restart_authority(self):
+        self.docker.stop(self.authority)
+        # Read only after the process is stopped. A pre-stop observation can
+        # miss one last completed round and falsely attribute it to restart.
+        stopped = self.publication()
+        self.event("authority_stopped_publication", membership_high_water=stopped["membership_high_water"],
+                   checkpoint_high_water=stopped["checkpoint_high_water"],
+                   confirmed_version=None if stopped["confirmed"] is None else stopped["confirmed"]["membership_version"])
+        self.docker.start(self.authority)
+        self.authority_port = self.docker.port(self.authority, 8444)
+        watch = PublicationWatch(stopped)
+        def fresh():
+            current = self.publication(watch.latest)
+            watch.observe(current)
+            if watch.target is None:
+                return False
+            require(utc_ns() < watch.target["expires_ns"], "adoption_target_expired")
+            states = {}
+            for node in NODES:
+                raw = self.docker.read_volume(self.states[node], ["membership-version-state.json"], max_bytes=MAX_RELAY_OBSERVATION)["membership-version-state.json"]
+                self.run.guard()
+                states[node] = relay_observation(raw, self.authority_inventory, node)
+            # Recheck both absolute budget and validity after the last read.
+            self.run.guard()
+            if not watch.adopted(states, utc_ns()):
+                return False
+            self.event("authority_passive_adoption", membership_version=watch.target["membership_version"],
+                       fixed_checkpoint_floor=watch.target["checkpoint_version"], adopted_nodes=list(NODES),
+                       observed_states=states, unsigned_observation=True)
+            return True
+        with self.run.budget(30):
+            wait_until(self.run, fresh, 30, "authority_restart_fresh_publication")
 
     def bootstrap(self):
         d = self.docker
@@ -1185,15 +1468,7 @@ overlap_seconds = 30
         check_persisted_version(old_state, new_state)
         self.all_routes()
         self.event("relay_restart", stable_node="relay-a", new_boot=True, new_session=True, persisted_version_monotonic=True, revoked_grant_refused=True)
-        before = self.checkpoint()
-        require(before is not None, "authority_before_restart_unready")
-        self.docker.stop(self.authority)
-        self.docker.start(self.authority)
-        self.authority_port = self.docker.port(self.authority, 8444)
-        def fresh():
-            value = self.checkpoint()
-            return value is not None and value["checkpoint_version"] > before["checkpoint_version"] and all(value["minimum_versions"][n] > v for n, v in before["minimum_versions"].items())
-        wait_until(self.run, fresh, 30, "authority_restart_fresh_publication")
+        self.restart_authority()
         self.wait_ready()
         self.all_routes()
         require(re.findall(r"^run_id:([0-9a-f]{40})\r?$", self.redis.command("INFO", "server"), re.MULTILINE) == [self.run_id], "redis_unexpected_restart")
@@ -1257,6 +1532,7 @@ def main(argv=None):
             check_resources(initial, run.initial, startup=True)
             source = source_receipt(run)
             private_write(args.output / "source.json", canonical(source))
+            result["docker_engine"] = docker.engine_preflight()
             for role, identity in images.items():
                 rows = json.loads(docker.call(["image", "inspect", identity]))
                 require(len(rows) == 1, "image_inspection_cardinality")

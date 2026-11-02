@@ -35,15 +35,31 @@ The owner authorized merging and selected Fly for the initial deployment.
 2026-11-02T15:40:54+10:00. Its tree `1e985753` exactly matches candidate
 `46a19cce` and actual hosted checkout `5f2053f0`. All 14 PR CI jobs,
 three-OS packaging and five optimized build/native archive verification pairs
-pass. C257's notice-input trigger scope is verified. Post-merge CI and the
-normal development-prerelease pipeline remain separate pending observations.
+pass. C257's notice-input trigger scope is verified. Main's own CI run
+41395438209 also passes all 14 jobs, including full M7, completed
+2026-11-02T16:17:31+10:00; three-OS packaging passes. Automatic development
+release run 41398988746 passes five builds, five verifiers, attestation and
+publication. The [development prerelease](https://github.com/andymac4182/agentuplink/releases/tag/v0.1.0-main.41395438209.626ba9365b5d)
+publishes at 2026-11-02T16:30:47+10:00 with ten attestation subjects and eight
+assets; its four checksum sidecars match GitHub archive digests. It is not
+marked latest, and no local archive execution or Fly deployment is inferred.
 Historical #278/#282 failures and C256's local failed/quarantined cleanup remain
 retained; a successful merge does not diagnose them or establish production readiness.
 
 C258 now supplies a separate three-relay, durable-Redis and online-authority Fly
 profile, four source-bound image recipes and a bounded hosted cluster rehearsal.
-Its 20 renderer, 20 entrypoint and 33 rehearsal controls pass locally; actual new
-image builds and cluster runtime have not yet run. The [Fly guide](deploy-fly-cluster.md)
+Its 20 renderer, 20 entrypoint and 33 rehearsal controls pass locally. At #285
+`d343d21c` / actual same-tree `fe6fc25a`, all four new images build and their
+binary/notice checks pass, but the first runtime attempt fails before bootstrap:
+Docker's local log driver rejects default compression with one retained file.
+Both recorded error hashes exactly match fixed public Moby diagnostics.
+C260 supplies an explicit compression setting with the existing size/count
+bounds and closed Docker diagnostics. Its combined controller has 57 passing
+local controls, including passive authority publication/adoption observation;
+corrected hosted runtime verification remains pending. The failed attempt and
+five cleanup log errors remain failed. Owned
+resource removal succeeds. [Exact failure and correction](m6-fly-continuation-2026-11-02.md)
+keep application startup, rotation and recovery acceptance unclaimed. The [Fly guide](deploy-fly-cluster.md)
 and [exact preparation/merge report](m6-fly-cluster-preparation-2026-11-02.md)
 record source identities, review corrections, failed precommit scan and remaining
 runtime/operator scope. The historical single-relay image smoke does not replace
@@ -55,6 +71,18 @@ and two missing archived notices. Its 55 seeded controls pass; CI now runs these
 controls without claiming full policy enforcement. No license exception, platform
 omission or live deployment authorization has been inferred. The production goal
 and hourly continuation remain active.
+
+A separate fresh public-feed audit returns no npm advisories for the complete
+client/MCP graphs. GitHub's 19-alert banner remains inaccessible behind a 403,
+so that result does not reconcile its alerts. C259 identifies ten affected
+CUA guest/build dependency names and an upstream server/FastMCP constraint.
+The [complete-scope checker](m6-cua-dependency-audit.md) passes 76 offline
+controls; its source-bound replay preserves the actual graph's 97 active
+advisory records and failed result.
+CI exercises those controls; the real advisory gate is not yet enforced there.
+CUA remains disabled and no server-runtime exposure is inferred. Its
+[source-bound findings and remediation limits](m6-fly-continuation-2026-11-02.md#separate-advisory-review--c259)
+retain all supported fixture platforms and make no policy exception.
 
 ## Retained predecessor evidence
 

@@ -32,7 +32,8 @@ def owned():
                 "Config": {"Labels": {rehearsal.OWNER_LABEL: "owner", rehearsal.OWNER_LABEL + ".role": "relay-a"}},
                 "Mounts": [{"Name": "owned-volume", "Destination": "/state", "RW": True}],
                 "HostConfig": {"NetworkMode": "network", "Memory": 512 * 1024**2, "MemorySwap": 512 * 1024**2,
-                               "PidsLimit": 256, "RestartPolicy": {"Name": "no"}},
+                               "PidsLimit": 256, "RestartPolicy": {"Name": "no"},
+                               "LogConfig": {"Type": "local", "Config": {"max-size": "2m", "max-file": "1", "compress": "false"}}},
                 "State": {"Running": True, "ExitCode": 0, "OOMKilled": False}}
     return expected, observed
 
@@ -87,6 +88,118 @@ class Validation(unittest.TestCase):
             changed["HostConfig"][key] = value
             with self.subTest(key=key, value=value), self.assertRaises(rehearsal.Refused):
                 rehearsal.check_container(changed, expected, "owner")
+
+    def test_logging_configuration_requires_compression_off_and_original_budget(self):
+        expected, observed = owned()
+        rehearsal.check_container(observed, expected, "owner")
+        for config in ({"max-size": "2m", "max-file": "1"},
+                       {"max-size": "2m", "max-file": "1", "compress": "true"},
+                       {"max-size": "4m", "max-file": "1", "compress": "false"},
+                       {"max-size": "2m", "max-file": "2", "compress": "false"},
+                       {"max-size": "2m", "max-file": "1", "compress": "false", "unknown": "value"}):
+            changed = copy.deepcopy(observed)
+            changed["HostConfig"]["LogConfig"]["Config"] = config
+            with self.subTest(config=config), self.assertRaisesRegex(rehearsal.Refused, "container_logging_configuration"):
+                rehearsal.check_container(changed, expected, "owner")
+        changed = copy.deepcopy(observed)
+        changed["HostConfig"]["LogConfig"]["Type"] = "json-file"
+        with self.assertRaisesRegex(rehearsal.Refused, "container_logging_configuration"):
+            rehearsal.check_container(changed, expected, "owner")
+
+    def test_create_disables_compression_without_increasing_log_retention(self):
+        run = mock.Mock()
+        docker = rehearsal.Docker(run, "owner", {})
+        commands = []
+        docker.call = lambda args, **kw: commands.append(args) or ("a" * 64).encode()
+        docker.inspect = mock.Mock()
+        docker.create("inspect-relay", "sha256:" + "b" * 64, network=False, entrypoint="/bin/true")
+        options = [value for value in commands[0] if value.startswith("--log-")]
+        self.assertEqual(options, ["--log-driver=local", "--log-opt=max-size=2m", "--log-opt=max-file=1", "--log-opt=compress=false"])
+
+    def test_retained_start_and_logs_hashes_match_fixed_engine_vocabulary(self):
+        message = "compression cannot be enabled when max file count is 1"
+        logs = ("Error response from daemon: " + message + "\n").encode()
+        start = ("Error response from daemon: failed to create task for container: failed to initialize logging driver: " + message + "\n").encode()
+        self.assertEqual(len(logs), 83)
+        self.assertEqual(rehearsal.digest(logs), "73cd41bda8d98d78c6c4122d7b314135fc53d000c8fd060b86ccb721efb31ec6")
+        self.assertEqual(len(start), 157)
+        self.assertEqual(rehearsal.digest(start), "80a868096821299612792f8e0917bc2abf47d10457d368b829edc8e23bdf720e")
+        self.assertEqual(rehearsal.closed_docker_error(logs)["codes"], ["local_compression_single_file"])
+        result = rehearsal.closed_docker_error(start)
+        self.assertEqual(set(result["codes"]), {"local_compression_single_file", "logging_driver_initialization", "container_task_creation"})
+        self.assertEqual(result["hash_scope"], "complete")
+        self.assertTrue(result["classification_complete"])
+
+    def test_closed_docker_error_does_not_emit_arbitrary_values(self):
+        secret = "private-token-certificate-command-path"
+        raw = ("OCI runtime create failed: EACCES permission denied " + secret).encode()
+        value = rehearsal.closed_docker_error(raw)
+        self.assertEqual(value["errno_terms"], ["EACCES"])
+        self.assertEqual(set(value["codes"]), {"oci_runtime_creation", "permission_denied"})
+        self.assertNotIn(secret, json.dumps(value))
+        unknown = rehearsal.closed_docker_error(secret.encode())
+        self.assertEqual(unknown["classification"], "unclassified")
+        self.assertEqual(unknown["codes"], [])
+        self.assertNotIn(secret, json.dumps(unknown))
+
+    def test_docker_error_scan_and_hash_are_explicitly_prefix_bounded(self):
+        prefix = b"x" * rehearsal.MAX_DOCKER_ERROR
+        raw = prefix + b" permission denied ENOSPC"
+        value = rehearsal.closed_docker_error(raw)
+        self.assertEqual(value["bytes"], len(raw))
+        self.assertEqual(value["classified_bytes"], len(prefix))
+        self.assertEqual(value["sha256"], rehearsal.digest(prefix))
+        self.assertEqual(value["hash_scope"], "prefix")
+        self.assertFalse(value["classification_complete"])
+        self.assertEqual(value["codes"], [])
+        self.assertEqual(value["errno_terms"], [])
+
+    def test_container_state_projection_preserves_fields_and_error_hash_only(self):
+        error = "failed to initialize logging driver: compression cannot be enabled when max file count is 1"
+        state = {"Status": "exited", "StartedAt": "0001-01-01T00:00:00Z", "Pid": 0, "Running": False,
+                 "ExitCode": 128, "OOMKilled": False, "Error": error, "unrelated": "private-value"}
+        value = rehearsal.safe_container_state(state)
+        self.assertEqual((value["status"], value["started_at"], value["pid"], value["exit_code"]),
+                         ("exited", "0001-01-01T00:00:00Z", 0, 128))
+        self.assertEqual(value["error"]["sha256"], rehearsal.digest(error.encode()))
+        self.assertEqual(value["missing_fields"], [])
+        self.assertEqual(value["invalid_fields"], [])
+        self.assertNotIn(error, json.dumps(value))
+        self.assertNotIn("private-value", json.dumps(value))
+
+    def test_missing_invalid_state_does_not_invent_zero_or_echo_input(self):
+        missing = rehearsal.safe_container_state({})
+        self.assertIsNone(missing["pid"])
+        self.assertIsNone(missing["running"])
+        self.assertFalse(missing["error"]["present"])
+        secret = "private-value"
+        invalid = rehearsal.safe_container_state({"Status": secret, "StartedAt": secret, "Pid": True,
+                   "Running": "false", "ExitCode": -1, "OOMKilled": None, "Error": [secret]})
+        self.assertEqual(set(invalid["invalid_fields"]), {"Status", "StartedAt", "Pid", "Running", "ExitCode", "OOMKilled"})
+        self.assertFalse(invalid["error"]["valid_type"])
+        self.assertNotIn(secret, json.dumps(invalid))
+
+    def test_engine_projection_retains_only_checked_version_and_known_plugins(self):
+        server = {"Version": "28.5.1", "ApiVersion": "1.51", "MinAPIVersion": "1.24", "Os": "linux", "Arch": "amd64",
+                  "RegistryConfig": "private-credentials"}
+        value = rehearsal.safe_engine_projection(server, ["local", "json-file", "private-plugin"])
+        self.assertEqual(value["known_log_drivers"], ["json-file", "local"])
+        self.assertEqual(value["unknown_log_driver_count"], 1)
+        self.assertNotIn("private", json.dumps(value))
+        self.refused("docker_local_logging_unavailable", rehearsal.safe_engine_projection, server, ["json-file"])
+        for key in ("Version", "ApiVersion", "MinAPIVersion", "Os", "Arch"):
+            with self.subTest(key=key):
+                self.refused("docker_engine_projection", rehearsal.safe_engine_projection, {**server, key: "private-value"}, ["local"])
+
+    def test_preflight_rejects_full_docker_info_or_caller_format_override(self):
+        run = mock.Mock()
+        docker = rehearsal.Docker(run, "owner", {})
+        for args in (["info"], ["info", "--format", "{{json .}}"], ["version", "--format", "{{json .Client}}"]):
+            with self.subTest(args=args), self.assertRaisesRegex(rehearsal.Refused, "docker_command_shape"):
+                docker.call(args)
+        run.assert_not_called()
+        docker.call(["info", "--format", "{{json .Plugins.Log}}"])
+        run.assert_called_once_with(rehearsal.DOCKER + ["info", "--format", "{{json .Plugins.Log}}"])
 
     def test_resource_floors_and_all_swap_oom_deltas(self):
         initial = {"memory_available": 5 * 1024**3, "temporary_free": 2 * 1024**3, "workspace_free": 2 * 1024**3,
@@ -293,6 +406,25 @@ class Cleanup(unittest.TestCase):
         self.assertEqual(errors[0]["code"], "log_capture_failed")
         self.assertIn(["container", "rm", "--force", "a" * 64], calls)
 
+    def test_created_inspection_container_still_records_real_logs_failure(self):
+        docker, calls = self.fixture(fail_logs=True)
+        # A created inspection intent is not grounds to erase a daemon failure:
+        # the original83-byte error was invalid logging config, not absent logs.
+        original = docker.call
+        def call(args, **kwargs):
+            output = original(args, **kwargs)
+            if args[:2] == ["container", "inspect"]:
+                value = json.loads(output)[0]
+                value["State"].update(Status="created", StartedAt="0001-01-01T00:00:00Z", Pid=0, Running=False, Error="")
+                return rehearsal.canonical([value])
+            return output
+        docker.call = call
+        errors = docker.cleanup()
+        self.assertEqual(errors[0]["code"], "log_capture_failed")
+        self.assertTrue(any(args[:2] == ["container", "logs"] for args in calls))
+        self.assertIn(["container", "rm", "--force", "a" * 64], calls)
+        self.assertEqual(docker.inventory[0]["state_before_cleanup"]["status"], "created")
+
     def test_stop_failure_does_not_skip_exact_owned_force_remove(self):
         docker, calls = self.fixture(fail_stop=True)
         self.assertEqual(docker.cleanup()[0]["code"], "stop_failed")
@@ -323,6 +455,8 @@ class Cleanup(unittest.TestCase):
                 self.containers = [item]
             def artifact_receipt(self, _role):
                 return {}
+            def engine_preflight(self):
+                return {"Version": "28.5.1", "ApiVersion": "1.51", "MinAPIVersion": "1.24", "Os": "linux", "Arch": "amd64", "known_log_drivers": ["local"]}
             def call(self, args, **kwargs):
                 if args[:2] == ["image", "inspect"]:
                     return rehearsal.canonical([{"Id": args[2], "Config": {"User": "fixture", "Labels": {"org.opencontainers.image.revision": source["commit"]}}}])
@@ -449,6 +583,287 @@ class SourceContract(unittest.TestCase):
         self.assertLess(names.index("initialize-membership"), names.index("serve-authority"))
         self.assertEqual([x for x in calls if x[0] == "start"][-3:], [("start", "relay-a"), ("start", "relay-b"), ("start", "relay-c")])
         self.assertEqual(calls[-1], ("wait-ready", "all"))
+
+
+class PassivePublication(unittest.TestCase):
+    def setUp(self):
+        self.inventory = {"schema_version": 1, "deployment_id": "deployment", "deployment_incarnation": "incarnation",
+                          "revision": 1, "nodes": [{"node_id": n} for n in rehearsal.NODES]}
+        self.run_id = "a" * 40
+        self.now = rehearsal.timestamp_ns("2026-11-02T00:00:00Z")
+        self.stopped = {"schema_version": 1, "inventory": self.inventory, "expected_redis_run_id": self.run_id,
+                        "membership_high_water": 7, "checkpoint_high_water": 10, "known_node_ids": list(rehearsal.NODES),
+                        "confirmed": {"inventory_revision": 1, "membership_version": 6, "expires_at": "2026-11-02T00:00:40Z"}}
+
+    def observe(self, value, previous=None):
+        return rehearsal.publication_observation(rehearsal.canonical(value), self.inventory, self.run_id, self.now, previous)
+
+    def fresh(self):
+        value = copy.deepcopy(self.stopped)
+        value.update(membership_high_water=8, checkpoint_high_water=12)
+        value["confirmed"].update(membership_version=8)
+        return value
+
+    def relay(self, node, checkpoint=13, membership=8):
+        return {"schema_version": 1, "deployment_id": "deployment", "deployment_incarnation": "incarnation", "node_id": node,
+                "state": {"checkpoint_version": checkpoint, "node_versions": {n: membership for n in rehearsal.NODES}}}
+
+    def test_bootstrap_http_refused_before_nonce_or_network_with_any_serving_relay(self):
+        fixture = rehearsal.Rehearsal.__new__(rehearsal.Rehearsal)
+        fixture.relays, fixture.run = [{}], mock.Mock()
+        fixture.inventory, fixture.authority_port, fixture.authority_host, fixture.checkpoint_context = self.inventory, 1, "authority.invalid", object()
+        with mock.patch.object(rehearsal.secrets, "token_hex", return_value="nonce") as nonce, \
+                mock.patch.object(rehearsal, "http_request", return_value=(503, b'{"status":"unavailable"}')) as network:
+            with self.assertRaisesRegex(rehearsal.Refused, "checkpoint_observer_with_serving_relays"):
+                fixture.checkpoint()
+            nonce.assert_not_called()
+            network.assert_not_called()
+            fixture.relays = []
+            self.assertIsNone(fixture.checkpoint())
+            network.assert_called_once()
+
+    def test_publication_schema_identity_nodes_and_u64_fail_closed(self):
+        self.assertEqual(self.observe(self.stopped), self.stopped)
+        changes = [lambda x: x.pop("confirmed"), lambda x: x.update(unexpected=True),
+                   lambda x: x.update(schema_version=True), lambda x: x.update(expected_redis_run_id="b" * 40),
+                   lambda x: x["inventory"].update(revision=True), lambda x: x["inventory"].update(deployment_incarnation="other"),
+                   lambda x: x.update(known_node_ids=["relay-a", "relay-a", "relay-c"]),
+                   lambda x: x.update(known_node_ids=["relay-a", "relay-b"]), lambda x: x.update(known_node_ids=[{}, {}, {}])]
+        for field in ("membership_high_water", "checkpoint_high_water"):
+            for invalid in (True, -1, 2**64, 1.0, "1", None):
+                changes.append(lambda x, k=field, v=invalid: x.update({k: v}))
+        for index, change in enumerate(changes):
+            changed = copy.deepcopy(self.stopped)
+            change(changed)
+            with self.subTest(index=index), self.assertRaises(rehearsal.Refused):
+                self.observe(changed)
+
+    def test_observation_rejects_duplicate_fields_oversize_nonfinite_and_bad_json(self):
+        for raw in (b'{"a":1,"a":2}', b'{"a":NaN}', b'\xff', b'{', b' ' * (256 * 1024 + 1)):
+            with self.subTest(size=len(raw)), self.assertRaises(rehearsal.Refused):
+                rehearsal.publication_observation(raw, self.inventory, self.run_id, self.now)
+        with self.assertRaisesRegex(rehearsal.Refused, "observation_byte_bound"):
+            rehearsal.relay_observation(b' ' * (16 * 1024 + 1), self.inventory, "relay-a")
+
+    def test_confirmation_requires_exact_revision_version_and_current_bounded_window(self):
+        changes = [lambda c: c.pop("expires_at"), lambda c: c.update(extra=1), lambda c: c.update(inventory_revision=2),
+                   lambda c: c.update(inventory_revision=True), lambda c: c.update(membership_version=True),
+                   lambda c: c.update(membership_version=0), lambda c: c.update(membership_version=8),
+                   lambda c: c.update(expires_at="2026-11-02T00:00:00Z"),
+                   lambda c: c.update(expires_at="2026-11-02T00:01:00.000000001Z"),
+                   lambda c: c.update(expires_at="2026-11-02T01:39:40+00:99"),
+                   lambda c: c.update(expires_at="2026-11-02T00:00:40"), lambda c: c.update(expires_at=42)]
+        for index, change in enumerate(changes):
+            changed = copy.deepcopy(self.stopped)
+            change(changed["confirmed"])
+            with self.subTest(index=index), self.assertRaises(rehearsal.Refused):
+                self.observe(changed)
+        boundary = copy.deepcopy(self.stopped)
+        boundary["confirmed"]["expires_at"] = "2026-11-02T00:01:00Z"
+        self.observe(boundary)
+
+    def test_highwaters_and_confirmation_never_roll_back_or_extend_same_version(self):
+        previous = self.observe(self.stopped)
+        for change in (lambda x: x.update(membership_high_water=6), lambda x: x.update(checkpoint_high_water=9),
+                       lambda x: x.update(confirmed=None), lambda x: x["confirmed"].update(membership_version=5),
+                       lambda x: x["confirmed"].update(expires_at="2026-11-02T00:00:40.000000001Z")):
+            changed = copy.deepcopy(self.stopped)
+            change(changed)
+            with self.assertRaises(rehearsal.Refused):
+                self.observe(changed, previous)
+        same_instant = copy.deepcopy(self.stopped)
+        same_instant["confirmed"]["expires_at"] = "2026-11-02T01:00:40+01:00"
+        self.observe(same_instant, previous)
+
+    def test_restart_old_confirmation_or_spent_round_cannot_supply_target(self):
+        watch = rehearsal.PublicationWatch(self.observe(self.stopped))
+        for high_water, confirmed in ((7, 6), (8, 6), (8, 7)):
+            current = copy.deepcopy(self.stopped)
+            current["membership_high_water"] = high_water
+            current["confirmed"]["membership_version"] = confirmed
+            watch.observe(self.observe(current, watch.latest))
+            self.assertIsNone(watch.target)
+        watch.observe(self.observe(self.fresh(), watch.latest))
+        self.assertEqual(watch.target["membership_version"], 8)
+
+    def test_fixed_checkpoint_floor_does_not_chase_live_allocator(self):
+        watch = rehearsal.PublicationWatch(self.observe(self.stopped))
+        watch.observe(self.observe(self.fresh(), watch.latest))
+        fixed = copy.deepcopy(watch.target)
+        moved = self.fresh()
+        moved["checkpoint_high_water"] = 99
+        moved["membership_high_water"] = 9
+        moved["confirmed"]["membership_version"] = 9
+        watch.observe(self.observe(moved, watch.latest))
+        self.assertEqual(watch.target, fixed)
+        states = {node: self.relay(node)["state"] for node in rehearsal.NODES}
+        self.assertTrue(watch.adopted(states, self.now))
+        overflow = self.fresh()
+        overflow["checkpoint_high_water"] = 2**64 - 1
+        with self.assertRaisesRegex(rehearsal.Refused, "adoption_floor_overflow"):
+            rehearsal.PublicationWatch(self.observe(self.stopped)).observe(self.observe(overflow))
+
+    def test_adoption_requires_all_three_checkpoint_and_all_three_node_fences(self):
+        watch = rehearsal.PublicationWatch(self.observe(self.stopped))
+        watch.observe(self.observe(self.fresh()))
+        states = {node: self.relay(node)["state"] for node in rehearsal.NODES}
+        self.assertTrue(watch.adopted(states, self.now))
+        for relay in rehearsal.NODES:
+            absent = copy.deepcopy(states)
+            absent.pop(relay)
+            self.assertFalse(watch.adopted(absent, self.now))
+            for checkpoint in (None, 12):
+                pending = copy.deepcopy(states)
+                pending[relay]["checkpoint_version"] = checkpoint
+                self.assertFalse(watch.adopted(pending, self.now))
+            for node in rehearsal.NODES:
+                for missing in (False, True):
+                    pending = copy.deepcopy(states)
+                    if missing:
+                        pending[relay]["node_versions"].pop(node)
+                    else:
+                        pending[relay]["node_versions"][node] = 7
+                    self.assertFalse(watch.adopted(pending, self.now))
+        with self.assertRaisesRegex(rehearsal.Refused, "adoption_target_expired"):
+            watch.adopted(states, self.now + 40 * 10**9)
+
+    def test_relay_envelopes_bind_each_identity_and_exact_typed_schema(self):
+        original = self.relay("relay-a")
+        self.assertEqual(rehearsal.relay_observation(rehearsal.canonical(original), self.inventory, "relay-a"), original["state"])
+        changes = [lambda x: x.update(node_id="relay-b"), lambda x: x.update(deployment_id="other"),
+                   lambda x: x.update(deployment_incarnation="other"), lambda x: x.update(schema_version=True),
+                   lambda x: x.update(extra=1), lambda x: x.pop("state"),
+                   lambda x: x["state"].pop("checkpoint_version"), lambda x: x["state"].update(extra=1),
+                   lambda x: x["state"].update(checkpoint_version=True), lambda x: x["state"].update(checkpoint_version=2**64),
+                   lambda x: x["state"]["node_versions"].update({"relay-a": True}),
+                   lambda x: x["state"]["node_versions"].update({"relay-a": -1}),
+                   lambda x: x["state"]["node_versions"].update({"relay-d": 8})]
+        for index, change in enumerate(changes):
+            changed = copy.deepcopy(original)
+            change(changed)
+            with self.subTest(index=index), self.assertRaises(rehearsal.Refused):
+                rehearsal.relay_observation(rehearsal.canonical(changed), self.inventory, "relay-a")
+
+    def test_read_volume_enforces_requested_bound_at_both_helper_and_reader(self):
+        docker = rehearsal.Docker(mock.Mock(), "owner", {"authority": "image"})
+        docker.one_shot = mock.Mock(return_value=rehearsal.canonical({"authority.json": rehearsal.b64(b"{}\n")}))
+        self.assertEqual(docker.read_volume("state", ["authority.json"], max_bytes=3), {"authority.json": b"{}\n"})
+        command = docker.one_shot.call_args.kwargs
+        self.assertFalse(command["network"])
+        self.assertEqual(command["mounts"], [("state", "/volume", False)])
+        self.assertEqual(json.loads(command["data"])["max_bytes"], 3)
+        with self.assertRaisesRegex(rehearsal.Refused, "volume_read_byte_bound"):
+            docker.read_volume("state", ["authority.json"], max_bytes=2)
+        # Execute only the helper's file reader with an in-memory stdin and a
+        # private temporary directory; no subprocess or container is involved.
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "authority.json"
+            path.write_bytes(b"1234")
+            helper = rehearsal.VOLUME_READ.replace("pathlib.Path('/volume')", "pathlib.Path(" + repr(root) + ")")
+            with mock.patch("sys.stdin", io.StringIO('{"paths":["authority.json"],"max_bytes":3}')), self.assertRaises(AssertionError):
+                exec(helper, {})
+            # Even an observed small size cannot bypass the bounded read if
+            # a file grows between metadata sampling and the actual read.
+            observed = path.stat()
+            smaller = mock.Mock(st_mode=observed.st_mode, st_size=3)
+            with mock.patch("sys.stdin", io.StringIO('{"paths":["authority.json"],"max_bytes":3}')), \
+                    mock.patch.object(os, "fstat", return_value=smaller), self.assertRaises(AssertionError):
+                exec(helper, {})
+            path.unlink()
+            other = Path(root) / "other"
+            other.write_bytes(b"1")
+            path.symlink_to(other)
+            with mock.patch("sys.stdin", io.StringIO('{"paths":["authority.json"],"max_bytes":3}')), self.assertRaises(OSError):
+                exec(helper, {})
+
+    def make_restart_fixture(self, *, expire_during_reads=False, cross_deadline=False):
+        fixture = rehearsal.Rehearsal.__new__(rehearsal.Rehearsal)
+        fixture.authority, fixture.relays = {"id": "authority"}, [{}, {}, {}]
+        fixture.authority_inventory, fixture.run_id = self.inventory, self.run_id
+        fixture.states = {node: node for node in (*rehearsal.NODES, "authority")}
+        fixture.checkpoint = mock.Mock(side_effect=AssertionError("active HTTP observer"))
+        fixture.event = mock.Mock()
+        clock, events = [100.0], []
+        fixture.run = rehearsal.Runner(Path("unused"), mock.Mock())
+        fixture.run.deadline = 500
+        def guard():
+            rehearsal.require(rehearsal.time.monotonic() < fixture.run.deadline, "controller_deadline")
+        fixture.run.guard = guard
+        fixture.docker = mock.Mock()
+        fixture.docker.stop.side_effect = lambda item: events.append("stop")
+        fixture.docker.start.side_effect = lambda item: events.append("start")
+        fixture.docker.port.return_value = 8444
+        publications = iter([self.stopped, self.stopped, self.fresh()])
+        def read(volume, paths, *, max_bytes):
+            events.append(("read", volume, max_bytes, fixture.run.deadline))
+            if volume == "authority":
+                return {paths[0]: rehearsal.canonical(next(publications))}
+            if volume == "relay-c":
+                if expire_during_reads:
+                    clock[0] = 140
+                elif cross_deadline:
+                    clock[0] = 130
+            return {paths[0]: rehearsal.canonical(self.relay(volume))}
+        fixture.docker.read_volume.side_effect = read
+        return fixture, clock, events
+
+    def test_restart_observes_after_stop_without_http_then_all_three_fences(self):
+        fixture, clock, events = self.make_restart_fixture()
+        with mock.patch.object(rehearsal.time, "monotonic", side_effect=lambda: clock[0]), \
+                mock.patch.object(rehearsal.time, "sleep", side_effect=lambda delay: clock.__setitem__(0, clock[0] + delay)), \
+                mock.patch.object(rehearsal, "utc_ns", return_value=self.now):
+            fixture.restart_authority()
+        self.assertEqual(events[:3], ["stop", ("read", "authority", 256 * 1024, 500), "start"])
+        self.assertEqual([event[1] for event in events[3:]], ["authority", "authority", *rehearsal.NODES])
+        self.assertTrue(all(event[3] == 130 for event in events[3:]))
+        self.assertEqual(fixture.run.deadline, 500)
+        fixture.checkpoint.assert_not_called()
+        adoption = fixture.event.call_args_list[-1]
+        self.assertEqual(adoption.args, ("authority_passive_adoption",))
+        self.assertEqual(adoption.kwargs["fixed_checkpoint_floor"], 13)
+
+    def test_adoption_after_last_read_rechecks_expiry_and_original_deadline(self):
+        for expired in (True, False):
+            fixture, clock, events = self.make_restart_fixture(expire_during_reads=expired, cross_deadline=not expired)
+            # Expiry has its own clock; preserve the30s monotonic budget when
+            # advancing wall time to the fixed target's expiry.
+            def monotonic():
+                return 101 if expired and clock[0] == 140 else clock[0]
+            with mock.patch.object(rehearsal.time, "monotonic", side_effect=monotonic), \
+                    mock.patch.object(rehearsal.time, "sleep", side_effect=lambda delay: clock.__setitem__(0, clock[0] + delay)), \
+                    mock.patch.object(rehearsal, "utc_ns", side_effect=lambda: self.now + (40 * 10**9 if expired and clock[0] == 140 else 0)), \
+                    self.assertRaisesRegex(rehearsal.Refused, "adoption_target_expired" if expired else "controller_deadline"):
+                fixture.restart_authority()
+            self.assertEqual(fixture.run.deadline, 500)
+            self.assertFalse(any(call.args == ("authority_passive_adoption",) for call in fixture.event.call_args_list))
+
+    def test_scoped_budget_never_extends_parent_and_restores_on_failure(self):
+        run = rehearsal.Runner(Path("unused"), mock.Mock())
+        run.deadline, run.guard = 105, mock.Mock()
+        with mock.patch.object(rehearsal.time, "monotonic", return_value=100):
+            with self.assertRaisesRegex(rehearsal.Refused, "retained_failure"):
+                with run.budget(30):
+                    self.assertEqual(run.deadline, 105)
+                    raise rehearsal.Refused("retained_failure")
+        self.assertEqual(run.deadline, 105)
+
+    def test_pending_publication_uses_one_original_thirty_second_budget(self):
+        fixture, clock, events = self.make_restart_fixture()
+        deadlines = []
+        def pending(previous=None):
+            deadlines.append(fixture.run.deadline)
+            return self.observe(self.stopped, previous)
+        fixture.publication = pending
+        with mock.patch.object(rehearsal.time, "monotonic", side_effect=lambda: clock[0]), \
+                mock.patch.object(rehearsal.time, "sleep", side_effect=lambda delay: clock.__setitem__(0, clock[0] + delay)), \
+                self.assertRaisesRegex(rehearsal.Refused, "controller_deadline"):
+            fixture.restart_authority()
+        self.assertEqual(clock[0], 130)
+        self.assertEqual(deadlines[0], 500)
+        self.assertGreater(len(deadlines), 2)
+        self.assertTrue(all(deadline == 130 for deadline in deadlines[1:]))
+        self.assertEqual(fixture.run.deadline, 500)
+        fixture.checkpoint.assert_not_called()
 
 
 if __name__ == "__main__":
