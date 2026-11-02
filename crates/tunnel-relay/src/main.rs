@@ -432,6 +432,14 @@ async fn run() -> Result<(), Box<dyn Error>> {
             .await?;
             println!("{line}");
         }
+        [command, rest @ ..] if command == OsStr::new("catalog-bundle-check") => {
+            let line = tunnel_relay::catalog_reconciliation::bundle_check(rest)?;
+            println!("{line}");
+        }
+        [command, rest @ ..] if command == OsStr::new("catalog-reconcile-plan") => {
+            let line = tunnel_relay::catalog_reconciliation::reconcile_plan(rest)?;
+            println!("{line}");
+        }
         [command, rest @ ..] if command == OsStr::new("recovery-initialize") => {
             run_to_completion("recovery-initialize", recovery_initialize(rest)).await?;
         }
@@ -443,7 +451,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
         }
         _ => {
             return Err(
-                "usage: tunnel-relay [--help | check-config [PATH] | check-serve-config --config PATH | initialize --config PATH | recovery-initialize --config PATH | recovery-observe --config PATH | recover --config PATH --approval PATH --expected-nonce NONCE --acknowledgement-id ID --old-primary-fenced --old-relays-fenced | activate-first-incarnation --config PATH | rebind-redis-run --config PATH --redis-restarted-in-place | provision-catalog --config PATH --records PATH [--dry-run] | add-user|add-device|add-service|set-grant --config PATH --records PATH [--dry-run] | revoke-grant|revoke-device|revoke-credential --config PATH --tenant UUID ... [--dry-run] | serve --config PATH]".into(),
+                "usage: tunnel-relay [--help | check-config [PATH] | check-serve-config --config PATH | initialize --config PATH | catalog-bundle-check --config PATH --bundle PATH --expected-bundle-sha256 SHA256 | catalog-reconcile-plan --config PATH --baseline PATH --expected-baseline-sha256 SHA256 --target PATH --expected-target-sha256 SHA256 --output NEW_PATH | recovery-initialize --config PATH | recovery-observe --config PATH | recover --config PATH --approval PATH --expected-nonce NONCE --acknowledgement-id ID --old-primary-fenced --old-relays-fenced | activate-first-incarnation --config PATH | rebind-redis-run --config PATH --redis-restarted-in-place | provision-catalog --config PATH --records PATH [--dry-run] | add-user|add-device|add-service|set-grant --config PATH --records PATH [--dry-run] | revoke-grant|revoke-device|revoke-credential --config PATH --tenant UUID ... [--dry-run] | serve --config PATH]".into(),
             );
         }
     }
@@ -1713,7 +1721,7 @@ fn parse_jwks(bytes: &[u8]) -> Result<Vec<ApprovedJwk>, Box<dyn Error>> {
 }
 
 /// Every subcommand `run` dispatches, for the subcommand `--help` arm.
-const RELAY_SUBCOMMANDS: [&str; 17] = [
+const RELAY_SUBCOMMANDS: [&str; 19] = [
     "check-config",
     "check-serve-config",
     "serve",
@@ -1728,6 +1736,8 @@ const RELAY_SUBCOMMANDS: [&str; 17] = [
     "revoke-grant",
     "revoke-device",
     "revoke-credential",
+    "catalog-bundle-check",
+    "catalog-reconcile-plan",
     "recovery-initialize",
     "recovery-observe",
     "recover",
@@ -1736,13 +1746,18 @@ const RELAY_SUBCOMMANDS: [&str; 17] = [
 fn print_help() {
     println!(
         "tunnel-relay — authenticated multi-user Agent Tunnel relay\n\n\
-         Usage: tunnel-relay [--help | check-config [PATH] | check-serve-config --config PATH | initialize --config PATH | recovery-initialize --config PATH | recovery-observe --config PATH | recover --config PATH --approval PATH --expected-nonce NONCE --acknowledgement-id ID --old-primary-fenced --old-relays-fenced | activate-first-incarnation --config PATH | rebind-redis-run --config PATH --redis-restarted-in-place | provision-catalog --config PATH --records PATH [--dry-run] | add-user|add-device|add-service|set-grant --config PATH --records PATH [--dry-run] | revoke-grant|revoke-device|revoke-credential --config PATH --tenant UUID ... [--dry-run] | serve --config PATH]\n\n\
+         Usage: tunnel-relay [--help | check-config [PATH] | check-serve-config --config PATH | initialize --config PATH | catalog-bundle-check --config PATH --bundle PATH --expected-bundle-sha256 SHA256 | catalog-reconcile-plan --config PATH --baseline PATH --expected-baseline-sha256 SHA256 --target PATH --expected-target-sha256 SHA256 --output NEW_PATH | recovery-initialize --config PATH | recovery-observe --config PATH | recover --config PATH --approval PATH --expected-nonce NONCE --acknowledgement-id ID --old-primary-fenced --old-relays-fenced | activate-first-incarnation --config PATH | rebind-redis-run --config PATH --redis-restarted-in-place | provision-catalog --config PATH --records PATH [--dry-run] | add-user|add-device|add-service|set-grant --config PATH --records PATH [--dry-run] | revoke-grant|revoke-device|revoke-credential --config PATH --tenant UUID ... [--dry-run] | serve --config PATH]\n\n\
          check-config [PATH]       Validate legacy relay TOML without opening listeners.\n\
          check-serve-config --config PATH\n\
                                   Dry-run the configuration serve uses: full validation,\n\
                                   no socket, no Redis connection, no credential read.\n\
                                   Exits 0 when valid and 1 with a field-level reason.\n\
          initialize --config PATH Create the empty cluster membership fence explicitly.\n\
+         catalog-bundle-check --config PATH --bundle PATH --expected-bundle-sha256 SHA256\n\
+                                  Offline schema/identity check; custody unproven.\n\
+         catalog-reconcile-plan --config PATH --baseline PATH --expected-baseline-sha256 SHA256\n\
+           --target PATH --expected-target-sha256 SHA256 --output NEW_PATH\n\
+                                  Private offline draft only; no export, apply or Redis.\n\
          recovery-initialize --config PATH\n\
                                   Create the empty recovery approval fence explicitly.\n\
          recovery-observe --config PATH\n\

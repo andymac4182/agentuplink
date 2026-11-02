@@ -34,6 +34,35 @@ hourly automation. Main remains `626ba9365b5d3e1faf8265f0b6ff50cc9111b749`.
 Merge authorization covers a fully checked candidate and the normal configured
 development prerelease; live deployment and license exceptions remain unauthorized.
 
+[Draft #293](https://github.com/andymac4182/agentuplink/pull/293) is frozen at
+`867fd212f814c334c626f57ff8da837fc2a2b9ce`, actual hosted checkout
+`b71a13e228ae46b30e0f3738cbb1da19029f3dba`, shared tree
+`db414265ca5ff657c1d52ad17c56b377d0447728`. At the retained
+2026-11-02T13:28:17.372389Z snapshot, ordinary CI has 13 of 14 jobs passing;
+M7 remains active. M0 passes 21 gates/21 declared witnesses and M2 passes three
+default rotations. Three-OS packaging, five optimized build/native
+archive verifier pairs and both independently reviewed authorization mutation
+workflows pass on this exact source.
+
+The actual Fly helper disconnect passes, but relay-a restart fails with exit 1.
+Combined logs contain a closed membership-bootstrap rejection tuple with
+`membership_rejected`; lifecycle attribution is `none` and the underlying
+variant remains unknown. Both recovery scenarios are skipped. The
+[exact #293 report](m6-offline-catalog-reconciliation-2026-11-02.md) preserves
+source/image bindings, refusal/positive controls and cleanup without attributing
+an older failure or claiming repair.
+
+The separate successor adds independently reviewed offline catalog validation
+and a conservative reconciliation draft. It performs no Redis/export/apply or
+activation operation and supplies no production custody or interlock. All 23
+prepared Rust tests, formatting, Clippy and native CLI execution remain unrun.
+Existing 338 pure/temp controls pass against the integrated source bindings;
+they are not native proof. Optimized archive semantic witnesses remain separate
+work pending review and hosted execution. All production restrictions and
+completion criteria below remain open.
+
+### Retained #292 checkpoint
+
 [Draft #292](https://github.com/andymac4182/agentuplink/pull/292) is frozen at
 `9b0820974038685e7a4c6a9195c3a75a018dfcec`, actual hosted checkout
 `990d5627da890715fcfce453632fa75016673d57`, shared tree

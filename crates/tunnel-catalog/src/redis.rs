@@ -26,6 +26,7 @@ use std::{
 };
 use uuid::Uuid;
 
+mod catalog_bundle;
 mod lane;
 mod recovery;
 mod recovery_scanner;
@@ -33,6 +34,10 @@ mod recovery_schema;
 use lane::{AuthorityLane, LaneGroup, RebindScope};
 pub(crate) use lane::{
     CONTINUITY_MISMATCH, NAMESPACE_UNBOUND, PERSISTENCE_UNSOUND, RUN_BINDING_CHANGED,
+};
+pub use catalog_bundle::{
+    CatalogBundle, CatalogBundleError, CatalogBundleIdentity, CatalogBundleSummary,
+    CatalogReconciliationPlan, MAX_CATALOG_BUNDLE_BYTES, plan_catalog_reconciliation,
 };
 pub use recovery::DurableCatalogObservation;
 
