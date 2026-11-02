@@ -5,7 +5,7 @@ on:
     workflows: [CI]
     types: [completed]
     branches: [main]
-  # A pull request that changes the release path builds and verifies the
+  # A pull request that changes release inputs builds and verifies the
   # complete matrix exactly as main does, and never attests or publishes:
   # `attest` and `publish` run only for `workflow_run` (docs/tasks.md M6-C13,
   # M6-C114).  Fork pull requests are skipped.
@@ -19,10 +19,9 @@ on:
       - '.cargo/config.toml'
       - 'Cargo.lock'
       - 'Cargo.toml'
-      - 'crates/tunnel-authority/**'
-      - 'crates/tunnel-client/src/main.rs'
-      - 'crates/tunnel-relay/src/main.rs'
-      - 'crates/tunnel-deadman/src/**'
+      - 'rust-toolchain.toml'
+      - 'crates/**'
+      - 'vendor/**'
 
 permissions:
   contents: read
