@@ -1,0 +1,1053 @@
+{
+  "commit": "a56c91381343ee017becf70c46b66c72cf9c1b09",
+  "evidence": {
+    "empty_source_maps": [
+      {
+        "map": "package/dist/chunk-5wgwscd0.js.map",
+        "sources": []
+      },
+      {
+        "map": "package/dist/chunk-ecyg08gn.js.map",
+        "sources": []
+      },
+      {
+        "map": "package/dist/index.js.map",
+        "sources": []
+      },
+      {
+        "map": "package/dist/onedrive/index.js.map",
+        "sources": []
+      },
+      {
+        "map": "package/dist/openai/index.js.map",
+        "sources": []
+      },
+      {
+        "map": "package/dist/providers/index.js.map",
+        "sources": []
+      },
+      {
+        "map": "package/dist/s3/index.js.map",
+        "sources": []
+      }
+    ],
+    "package_metadata": {
+      "archive_blob_sha1": "c258fa371e1356a3e7511698fcfae8ee2b0ec4c6",
+      "archive_sha256": "bf26487f786b3435d9f8635499b3bb471ff5df06c810bd3c32452ccf301835e7",
+      "byte_equal": true,
+      "package_metadata_sha256": "8f40cfa237851de5817c74b78a32bbfc2690c0c7093fc03de0abfa49b662cc6e",
+      "upstream_listed_blob": "c258fa371e1356a3e7511698fcfae8ee2b0ec4c6",
+      "upstream_metadata_sha256": "8f40cfa237851de5817c74b78a32bbfc2690c0c7093fc03de0abfa49b662cc6e"
+    },
+    "root_package": {
+      "license": "ISC",
+      "name": "files-sdk-monorepo",
+      "private": true,
+      "version": "0.0.0"
+    },
+    "source_bindings": [
+      {
+        "content_git_blob_sha1": "f714fcc0f32189b218ff7ea23105449616513a40",
+        "content_sha256": "8f9c48733bed900b7e855a8b48649e84ca8f773f25c8d8ad2213bf76e0ffa287",
+        "match": true,
+        "source_path": "packages/files-sdk/src/cli/io.ts",
+        "upstream_git_blob_sha1": "f714fcc0f32189b218ff7ea23105449616513a40"
+      },
+      {
+        "content_git_blob_sha1": "bee633d6a26a86af38e6a3fa02f7b91ab01218a1",
+        "content_sha256": "66b48b5068d7a6b2df8ac29bc7651439e07f3ea5225dd3c2b6c04717ea5b2f1b",
+        "match": true,
+        "source_path": "packages/files-sdk/src/internal/gcs-resumable.ts",
+        "upstream_git_blob_sha1": "bee633d6a26a86af38e6a3fa02f7b91ab01218a1"
+      },
+      {
+        "content_git_blob_sha1": "8e33e97dda1a4e1f302336c6f92e32673604fb65",
+        "content_sha256": "2d0ab3f35d6260476d10f6f66a2e061383b5c955a1e89b0482db384246e63fb3",
+        "match": true,
+        "source_path": "packages/files-sdk/src/internal/ai-tools/approval.ts",
+        "upstream_git_blob_sha1": "8e33e97dda1a4e1f302336c6f92e32673604fb65"
+      },
+      {
+        "content_git_blob_sha1": "150eae353bfc9f9b2732407292725e09d89885bc",
+        "content_sha256": "dc6b525bacd05b854db013873555a195943e649d167e1ad5826a083d46256703",
+        "match": true,
+        "source_path": "packages/files-sdk/src/internal/ai-tools/schemas.ts",
+        "upstream_git_blob_sha1": "150eae353bfc9f9b2732407292725e09d89885bc"
+      },
+      {
+        "content_git_blob_sha1": "b346be8504775da62577289a4e700f45bccedf6c",
+        "content_sha256": "ff93f2a7997e001e2ed026a6f47289b50dd3e52b7b54200f5ddf4af627d732fc",
+        "match": true,
+        "source_path": "packages/files-sdk/src/internal/ai-tools/executors.ts",
+        "upstream_git_blob_sha1": "b346be8504775da62577289a4e700f45bccedf6c"
+      },
+      {
+        "content_git_blob_sha1": "b9268402e32ccec442f15f8b1951df5cc4a3b6dd",
+        "content_sha256": "ea3632a3491538e55530b226314f6731897cbede33d8122d1cc281e6f7c3ef8d",
+        "match": true,
+        "source_path": "packages/files-sdk/src/internal/s3-engine.ts",
+        "upstream_git_blob_sha1": "b9268402e32ccec442f15f8b1951df5cc4a3b6dd"
+      },
+      {
+        "content_git_blob_sha1": "14b7c6a21e69b6672e31c658d261b6d0c063145d",
+        "content_sha256": "e31fcaf45ca00786b178c28059ef5ff729a5c8e591227be4ed2080e87611356f",
+        "match": true,
+        "source_path": "packages/files-sdk/src/internal/core.ts",
+        "upstream_git_blob_sha1": "14b7c6a21e69b6672e31c658d261b6d0c063145d"
+      },
+      {
+        "content_git_blob_sha1": "e7c086e9ca9731f507918fb78d8755d451248c0a",
+        "content_sha256": "034da782a9c69190e8a23fd1af27829f12dce4d95da7207c9873302258f91955",
+        "match": true,
+        "source_path": "packages/files-sdk/src/internal/stored-file.ts",
+        "upstream_git_blob_sha1": "e7c086e9ca9731f507918fb78d8755d451248c0a"
+      },
+      {
+        "content_git_blob_sha1": "b43f475d3695d4a5395dd4f75b2e59f12cecdf59",
+        "content_sha256": "33d86cbb8edc100a0e47c0dfbef551d9af86da81a95bf5b1c10c259ecd0f5a4a",
+        "match": true,
+        "source_path": "packages/files-sdk/src/internal/content-disposition.ts",
+        "upstream_git_blob_sha1": "b43f475d3695d4a5395dd4f75b2e59f12cecdf59"
+      },
+      {
+        "content_git_blob_sha1": "5dad313298d595d707eeef8baa45a38ba6bed1ae",
+        "content_sha256": "e7d91ba3e2203e4bb8e0d7a6ffb4e73526ca004925c085fe325976b8b1dfd32e",
+        "match": true,
+        "source_path": "packages/files-sdk/src/internal/resumable-session-url.ts",
+        "upstream_git_blob_sha1": "5dad313298d595d707eeef8baa45a38ba6bed1ae"
+      },
+      {
+        "content_git_blob_sha1": "3d29273a98bb6e1ceea897436df857771e90ae46",
+        "content_sha256": "d2e4a2b422c19e69bab2be7ce5537ed805b8f26f79fc314076818c54a9298fc4",
+        "match": true,
+        "source_path": "packages/files-sdk/src/internal/resumable-offset-http.ts",
+        "upstream_git_blob_sha1": "3d29273a98bb6e1ceea897436df857771e90ae46"
+      },
+      {
+        "content_git_blob_sha1": "1f223d8f1d8050c6309520cb02881050e6886f02",
+        "content_sha256": "c86581fc34778bdd3bc427aded875f93dbd05b700ace2e3cb6757ee5a962eaed",
+        "match": true,
+        "source_path": "packages/files-sdk/src/cli/registry.ts",
+        "upstream_git_blob_sha1": "1f223d8f1d8050c6309520cb02881050e6886f02"
+      },
+      {
+        "content_git_blob_sha1": "4b621d57f968db21676dee8b2a717f125cdc1fae",
+        "content_sha256": "ea7e967ecf8136fa66b825cf9ce92de8a6e93adbab215854a6b4aa3d454f9135",
+        "match": true,
+        "source_path": "packages/files-sdk/src/cli/loader.ts",
+        "upstream_git_blob_sha1": "4b621d57f968db21676dee8b2a717f125cdc1fae"
+      },
+      {
+        "content_git_blob_sha1": "cbe253d198b1eca72dff5b575ff6fd08a2858d90",
+        "content_sha256": "e21d9bc76c289e62e8ac7660eede9d74b784e3605ec035c1406de2ca31e2b1ee",
+        "match": true,
+        "source_path": "packages/files-sdk/src/s3/index.ts",
+        "upstream_git_blob_sha1": "cbe253d198b1eca72dff5b575ff6fd08a2858d90"
+      },
+      {
+        "content_git_blob_sha1": "a05482965915570f9d9c4ade1077e2400eea8f0a",
+        "content_sha256": "d489abeb5d4fcf060fdee859ca53cad6fd46d9dd6b81c5948b94814e8bc9f3d7",
+        "match": true,
+        "source_path": "packages/files-sdk/src/internal/s3-fetch.ts",
+        "upstream_git_blob_sha1": "a05482965915570f9d9c4ade1077e2400eea8f0a"
+      },
+      {
+        "content_git_blob_sha1": "2f662736797db02e93df46d182477b2c62b3ae33",
+        "content_sha256": "5a2252f5c23149393e3664e18434034738fcbeff0866a20eb431db331f0ef61f",
+        "match": true,
+        "source_path": "packages/files-sdk/src/internal/mime.ts",
+        "upstream_git_blob_sha1": "2f662736797db02e93df46d182477b2c62b3ae33"
+      },
+      {
+        "content_git_blob_sha1": "ff02362a783bc252658200c4cd93b8553b4b3a26",
+        "content_sha256": "d174dea9ae24d374a59c6c807b0c62b674fdeade26a31dee909873c078a0489b",
+        "match": true,
+        "source_path": "packages/files-sdk/src/onedrive/index.ts",
+        "upstream_git_blob_sha1": "ff02362a783bc252658200c4cd93b8553b4b3a26"
+      },
+      {
+        "content_git_blob_sha1": "dc85dbec7d20404d81247c5de3dc2036763b898b",
+        "content_sha256": "01e11165ac46e01b2af0874862b8fc8e1a7d0d26c30e670b3be475e0383307c8",
+        "match": true,
+        "source_path": "packages/files-sdk/src/internal/walk-paginate.ts",
+        "upstream_git_blob_sha1": "dc85dbec7d20404d81247c5de3dc2036763b898b"
+      },
+      {
+        "content_git_blob_sha1": "d82dcf752282e4424a25a8a86013d68e61b56106",
+        "content_sha256": "65440f84abf7a775138ca641371f01b28b5c9d5b4d0346c652127b97d8f5c0bf",
+        "match": true,
+        "source_path": "packages/files-sdk/src/internal/node-stream.ts",
+        "upstream_git_blob_sha1": "d82dcf752282e4424a25a8a86013d68e61b56106"
+      },
+      {
+        "content_git_blob_sha1": "aafc552aa07f9635e8b2b3a6b204f28a7c8b538c",
+        "content_sha256": "8f80426b5d69e8f43d49f7c9763bb6795c32c4afb25775f4f446d28adfb708d5",
+        "match": true,
+        "source_path": "packages/files-sdk/src/internal/glob.ts",
+        "upstream_git_blob_sha1": "aafc552aa07f9635e8b2b3a6b204f28a7c8b538c"
+      },
+      {
+        "content_git_blob_sha1": "64f98c6cc0885997d82f5fd79d3f8d0a82054d0b",
+        "content_sha256": "bae155517b05f6d013315e9046475b604f1732fd5f7b50e6b67ade889c1d6fb9",
+        "match": true,
+        "source_path": "packages/files-sdk/src/internal/search-regex.ts",
+        "upstream_git_blob_sha1": "64f98c6cc0885997d82f5fd79d3f8d0a82054d0b"
+      },
+      {
+        "content_git_blob_sha1": "efe7b331353fda3bb2488214d2b19ec54815cff8",
+        "content_sha256": "7c442f2683b5f64538e8c4c3f67d324efd074e4ed6ee309412069b2f2b92545f",
+        "match": true,
+        "source_path": "packages/files-sdk/src/internal/search-matcher.ts",
+        "upstream_git_blob_sha1": "efe7b331353fda3bb2488214d2b19ec54815cff8"
+      },
+      {
+        "content_git_blob_sha1": "326133c8fa3766f4fedd32864b0b835cc3f797a9",
+        "content_sha256": "b69dee44549fe7666bf8993b3b8c1be4269dff1cc18f581bfda3c2d4a997ee03",
+        "match": true,
+        "source_path": "packages/files-sdk/src/internal/retry.ts",
+        "upstream_git_blob_sha1": "326133c8fa3766f4fedd32864b0b835cc3f797a9"
+      },
+      {
+        "content_git_blob_sha1": "63e7e14acaaea35763e0227c292699571634d63b",
+        "content_sha256": "d1b628bd5ca5b9cdc302231818910112898d0eb1a84dde0bbfa01928328179f3",
+        "match": true,
+        "source_path": "packages/files-sdk/src/internal/resumable.ts",
+        "upstream_git_blob_sha1": "63e7e14acaaea35763e0227c292699571634d63b"
+      },
+      {
+        "content_git_blob_sha1": "f0eaaae22df0b73880bde597e0d800d503a2316e",
+        "content_sha256": "68b74dab389b9407015c269db2dcd5578e367b95a73d3ada99b400027bbecfe7",
+        "match": true,
+        "source_path": "packages/files-sdk/src/internal/is.ts",
+        "upstream_git_blob_sha1": "f0eaaae22df0b73880bde597e0d800d503a2316e"
+      },
+      {
+        "content_git_blob_sha1": "9738b1a0cf3527f39fe075e68ab98e0b5ec50873",
+        "content_sha256": "69bc9f1d742e2c7615e8150986cbd70538634d93cb1c184b948a0de0b8d7b271",
+        "match": true,
+        "source_path": "packages/files-sdk/src/internal/errors.ts",
+        "upstream_git_blob_sha1": "9738b1a0cf3527f39fe075e68ab98e0b5ec50873"
+      },
+      {
+        "content_git_blob_sha1": "8fc503df28ff17fbc60027c987bc6e166477e989",
+        "content_sha256": "0b4e7ffd38744e97731280917dab3025007b4ae492aae42d0522009d0f4d3c18",
+        "match": true,
+        "source_path": "packages/files-sdk/src/internal/env.ts",
+        "upstream_git_blob_sha1": "8fc503df28ff17fbc60027c987bc6e166477e989"
+      },
+      {
+        "content_git_blob_sha1": "0dfefc6c0edb3dc072a5c83281adaa18faaee77e",
+        "content_sha256": "35f406912cdb4e2120a7ece9b1b1078839d5761fdd3c29ca0871580affb17967",
+        "match": true,
+        "source_path": "packages/files-sdk/src/cli/mcp.ts",
+        "upstream_git_blob_sha1": "0dfefc6c0edb3dc072a5c83281adaa18faaee77e"
+      },
+      {
+        "content_git_blob_sha1": "be3c92c3397f20447b7dc92095867ad3f0c16b69",
+        "content_sha256": "e16ecedb99103ddd2c4e6e9ddb88264238ea5712f2b04a95e79df64fdf6d0319",
+        "match": true,
+        "source_path": "packages/files-sdk/src/internal/json.ts",
+        "upstream_git_blob_sha1": "be3c92c3397f20447b7dc92095867ad3f0c16b69"
+      },
+      {
+        "content_git_blob_sha1": "787c6bdd69504b2f00673ebed8aa4bb45bce743a",
+        "content_sha256": "655db5d81fddd87bff1bd78dd0b5e85f3f84d5a7ac121f161e3feb97b2fe1c5b",
+        "match": true,
+        "source_path": "packages/files-sdk/src/internal/receipts.ts",
+        "upstream_git_blob_sha1": "787c6bdd69504b2f00673ebed8aa4bb45bce743a"
+      },
+      {
+        "content_git_blob_sha1": "c5649b4849d1a0496f0025cd2bd411d350d81984",
+        "content_sha256": "f964903582f2a314cb78c981079a2c97f18969b5f584cbbf1b50eb13678fc47e",
+        "match": true,
+        "source_path": "packages/files-sdk/src/internal/conditional.ts",
+        "upstream_git_blob_sha1": "c5649b4849d1a0496f0025cd2bd411d350d81984"
+      },
+      {
+        "content_git_blob_sha1": "8fe0d8b3ba05edf22ca47c83939092430bc8b2d6",
+        "content_sha256": "4cc78166ec9e0f097dd871967ba2786c5c09c6dc26759fdea8e530a465e16671",
+        "match": true,
+        "source_path": "packages/files-sdk/src/internal/sync.ts",
+        "upstream_git_blob_sha1": "8fe0d8b3ba05edf22ca47c83939092430bc8b2d6"
+      },
+      {
+        "content_git_blob_sha1": "fb95c104ebd2730752620871ea19887732ba7700",
+        "content_sha256": "a57cc9ad0c9f72c7ada293056baf92ce100761d7213d9f4cd77945c3979f7337",
+        "match": true,
+        "source_path": "packages/files-sdk/src/internal/transfer.ts",
+        "upstream_git_blob_sha1": "fb95c104ebd2730752620871ea19887732ba7700"
+      },
+      {
+        "content_git_blob_sha1": "942c6596499201b386b2121fdd4d346aa98f6ee7",
+        "content_sha256": "e0ee33310f6c3a4b40677079c872d3f43de5e9b16e1905eb3f0b441ba8c8ef88",
+        "match": true,
+        "source_path": "packages/files-sdk/src/index.ts",
+        "upstream_git_blob_sha1": "942c6596499201b386b2121fdd4d346aa98f6ee7"
+      },
+      {
+        "content_git_blob_sha1": "3d606e19ae35e01c47ef6d7a86bd19bc6a957802",
+        "content_sha256": "8a477838ed02b2f6cf2863cb063bcf94931e41a74650a025bd2ddcd6b140be5e",
+        "match": true,
+        "source_path": "packages/files-sdk/src/internal/remote-path.ts",
+        "upstream_git_blob_sha1": "3d606e19ae35e01c47ef6d7a86bd19bc6a957802"
+      },
+      {
+        "content_git_blob_sha1": "2a02aa65c93a5a284d7d4e61a7a423b22b126743",
+        "content_sha256": "699d55709f74b8f0d291252fa587fab3586d47e5549bb1bfc5f13a3b25d2ae4d",
+        "match": true,
+        "source_path": "packages/files-sdk/src/s3/core.ts",
+        "upstream_git_blob_sha1": "2a02aa65c93a5a284d7d4e61a7a423b22b126743"
+      },
+      {
+        "content_git_blob_sha1": "2521361f2fc7e8983fb3627a9e411f226c9f3382",
+        "content_sha256": "6b0e804f96d6cf76a2d605d9c8f9a15a841c4c785b97feacfa99c0a4704d61f9",
+        "match": true,
+        "source_path": "packages/files-sdk/src/providers/index.ts",
+        "upstream_git_blob_sha1": "2521361f2fc7e8983fb3627a9e411f226c9f3382"
+      },
+      {
+        "content_git_blob_sha1": "6eed65f98c47e4fc4ca6dc142dc93782fcd1d474",
+        "content_sha256": "b20598a38e4067c9408aa67e9d3adb0ac91104d6252716cc7cad8a0860f7b23e",
+        "match": true,
+        "source_path": "packages/files-sdk/src/internal/node-http.ts",
+        "upstream_git_blob_sha1": "6eed65f98c47e4fc4ca6dc142dc93782fcd1d474"
+      },
+      {
+        "content_git_blob_sha1": "b33d4af2ba29a35325256ef2c5dda0b80d6ef9bd",
+        "content_sha256": "2509b67874989ce19b473e0c8b5b8e11cf4c0db6ae0f4cd42955f38d939bb29d",
+        "match": true,
+        "source_path": "packages/files-sdk/src/ai-sdk/tools.ts",
+        "upstream_git_blob_sha1": "b33d4af2ba29a35325256ef2c5dda0b80d6ef9bd"
+      },
+      {
+        "content_git_blob_sha1": "77b04c3e9121034c29f903b69dcc285507d5f85b",
+        "content_sha256": "5111b56c092351773444064cd28c0f51721cd01f00a7512197072e6466d7e3c7",
+        "match": true,
+        "source_path": "packages/files-sdk/src/ai-sdk/index.ts",
+        "upstream_git_blob_sha1": "77b04c3e9121034c29f903b69dcc285507d5f85b"
+      },
+      {
+        "content_git_blob_sha1": "81772ce4fc2f4e86e916bc56eae8be50f23cade7",
+        "content_sha256": "3f36e09e25ae2073da7ea4edc775c8cf42f1adbf265a231d89e2fa5b820a5198",
+        "match": true,
+        "source_path": "packages/files-sdk/src/akamai/index.ts",
+        "upstream_git_blob_sha1": "81772ce4fc2f4e86e916bc56eae8be50f23cade7"
+      },
+      {
+        "content_git_blob_sha1": "d225644dd4af2be137c45dcc5e65ae5e7618b20e",
+        "content_sha256": "ae20d70ae9f09be4344a83ac6fb71c81cdaf02efedd33562254d08206eb17c66",
+        "match": true,
+        "source_path": "packages/files-sdk/src/alibaba/index.ts",
+        "upstream_git_blob_sha1": "d225644dd4af2be137c45dcc5e65ae5e7618b20e"
+      },
+      {
+        "content_git_blob_sha1": "193354878b082418f3ae31386f88922d889cd873",
+        "content_sha256": "f02862e92b1a0353cee9c9192e1d76b0579f69c0797c8634040af3133e5c7df3",
+        "match": true,
+        "source_path": "packages/files-sdk/src/internal/router-core/envelope.ts",
+        "upstream_git_blob_sha1": "193354878b082418f3ae31386f88922d889cd873"
+      },
+      {
+        "content_git_blob_sha1": "8df48b6e42078daf200fcb754524f5e2581b8999",
+        "content_sha256": "4fd818078a41d4d9513d0e2f9d1219654d0fff7037b09dc56eb5933cd520a33e",
+        "match": true,
+        "source_path": "packages/files-sdk/src/internal/router-core/origin.ts",
+        "upstream_git_blob_sha1": "8df48b6e42078daf200fcb754524f5e2581b8999"
+      },
+      {
+        "content_git_blob_sha1": "1e5aaaf81126069b019849924a6384e85437fe2c",
+        "content_sha256": "78efa7fe39ec15dbaf2af52f8eb57a88592c0cd31c0d94af1ba52b5d7f15bdaa",
+        "match": true,
+        "source_path": "packages/files-sdk/src/internal/files-router/keys.ts",
+        "upstream_git_blob_sha1": "1e5aaaf81126069b019849924a6384e85437fe2c"
+      },
+      {
+        "content_git_blob_sha1": "0c240a86415b8052250268a2e5c299b321e68d77",
+        "content_sha256": "6c348487fcce07dd7b433330f1f754f9fd2940137f5b58b0aa32e5a333fc9f78",
+        "match": true,
+        "source_path": "packages/files-sdk/src/internal/files-router/authorize.ts",
+        "upstream_git_blob_sha1": "0c240a86415b8052250268a2e5c299b321e68d77"
+      },
+      {
+        "content_git_blob_sha1": "4f22ea9a5d6b6c5c9ad9e4f03a36352b5f97f926",
+        "content_sha256": "56d50f1b2c87409a61b106b83d34a933432098cbf74cabcf57e4805bf9d42a36",
+        "match": true,
+        "source_path": "packages/files-sdk/src/internal/files-router/download.ts",
+        "upstream_git_blob_sha1": "4f22ea9a5d6b6c5c9ad9e4f03a36352b5f97f926"
+      },
+      {
+        "content_git_blob_sha1": "a97878ef1cf82004f0a4eb754cd8591dca9cfb4b",
+        "content_sha256": "b52c9849b0afb2ec952980c1eef5b26000b86574c3d324b063d3bc1c5b7fa52f",
+        "match": true,
+        "source_path": "packages/files-sdk/src/internal/files-router/serialize.ts",
+        "upstream_git_blob_sha1": "a97878ef1cf82004f0a4eb754cd8591dca9cfb4b"
+      },
+      {
+        "content_git_blob_sha1": "7f0a74c1ee9c8f2b765056e1e107e7bb8fb9e8fc",
+        "content_sha256": "3cf2a0fe9fc727e7c3ed19a72ba56ce75b65816a5aa9966b270e0d8e05919491",
+        "match": true,
+        "source_path": "packages/files-sdk/src/internal/router-core/sign-token.ts",
+        "upstream_git_blob_sha1": "7f0a74c1ee9c8f2b765056e1e107e7bb8fb9e8fc"
+      },
+      {
+        "content_git_blob_sha1": "15d41451940b83cf24d759683cfc04035cc4fd76",
+        "content_sha256": "a2b760b5c8e3503531075c0824d5520ad3c3748df3d19d46fa99e6d4e908f522",
+        "match": true,
+        "source_path": "packages/files-sdk/src/internal/files-router/upload.ts",
+        "upstream_git_blob_sha1": "15d41451940b83cf24d759683cfc04035cc4fd76"
+      },
+      {
+        "content_git_blob_sha1": "4a0db51a1870b322ab09f47ea9653a528182591d",
+        "content_sha256": "a22e57d5798dd005f24b5e2904e8e77f6ec56f2b3d033bc5cd59ea718fd9eaf9",
+        "match": true,
+        "source_path": "packages/files-sdk/src/internal/files-router/handler.ts",
+        "upstream_git_blob_sha1": "4a0db51a1870b322ab09f47ea9653a528182591d"
+      },
+      {
+        "content_git_blob_sha1": "239b3f15cb5b75c7652b26be214a4a0f6f29edc0",
+        "content_sha256": "66c7fdc4a15f69a1b2a48f6c039513b3a5140036fef409a4ab843ad0559cbcbf",
+        "match": true,
+        "source_path": "packages/files-sdk/src/internal/router-core/web.ts",
+        "upstream_git_blob_sha1": "239b3f15cb5b75c7652b26be214a4a0f6f29edc0"
+      },
+      {
+        "content_git_blob_sha1": "6f0a51c8034b5370e26ca669037a0b438f740a31",
+        "content_sha256": "4e7338611538f9b3886c65b6ea56dcba155f7140ac86f3578fb2874ad12081e2",
+        "match": true,
+        "source_path": "packages/files-sdk/src/api/index.ts",
+        "upstream_git_blob_sha1": "6f0a51c8034b5370e26ca669037a0b438f740a31"
+      },
+      {
+        "content_git_blob_sha1": "2986733e99f6d9b294b0c34ccf0526425dfbd758",
+        "content_sha256": "cc0765139c08c200cd79d0b5ed573c85d0c63c270d8f503afca14a74a8407f5f",
+        "match": true,
+        "source_path": "packages/files-sdk/src/appwrite/index.ts",
+        "upstream_git_blob_sha1": "2986733e99f6d9b294b0c34ccf0526425dfbd758"
+      },
+      {
+        "content_git_blob_sha1": "b88e286434be926b155aaefc820c822e28d03935",
+        "content_sha256": "e02a5b2bb4b6b8adfd6edd17886107265215e5090dfa15a16e98cf21d722d853",
+        "match": true,
+        "source_path": "packages/files-sdk/src/archil/index.ts",
+        "upstream_git_blob_sha1": "b88e286434be926b155aaefc820c822e28d03935"
+      },
+      {
+        "content_git_blob_sha1": "1a1b8e7b0abcb734c146c363c48e5e3e8fa446a2",
+        "content_sha256": "42ca8a409a1c9f88376f199475e1b8e9cf37de2fb4204972291dadc70484b15d",
+        "match": true,
+        "source_path": "packages/files-sdk/src/astro/index.ts",
+        "upstream_git_blob_sha1": "1a1b8e7b0abcb734c146c363c48e5e3e8fa446a2"
+      },
+      {
+        "content_git_blob_sha1": "d3cd410ab5d71f52a13ed1f6002714d1dbf7ecdc",
+        "content_sha256": "6305afd556c827b03f0cc0ff2065b06c46295586e3c3b03b072b90bb3af4b691",
+        "match": true,
+        "source_path": "packages/files-sdk/src/audit/index.ts",
+        "upstream_git_blob_sha1": "d3cd410ab5d71f52a13ed1f6002714d1dbf7ecdc"
+      },
+      {
+        "content_git_blob_sha1": "bd0b9b1d7df0f06c1cd69c1c6c6b5719cf283722",
+        "content_sha256": "aec8ab97f1c2906763e067f363a6987166b98a033ce59d6f9722624cff8b5f01",
+        "match": true,
+        "source_path": "packages/files-sdk/src/azure/index.ts",
+        "upstream_git_blob_sha1": "bd0b9b1d7df0f06c1cd69c1c6c6b5719cf283722"
+      },
+      {
+        "content_git_blob_sha1": "621a49b2aaab4565e43b3968cea902e2f8a394d3",
+        "content_sha256": "4ed3a1837b878d3148c5a6001984c50570d8cb03e0eff1b77438cdee18cf4c73",
+        "match": true,
+        "source_path": "packages/files-sdk/src/backblaze-b2/index.ts",
+        "upstream_git_blob_sha1": "621a49b2aaab4565e43b3968cea902e2f8a394d3"
+      },
+      {
+        "content_git_blob_sha1": "93f9e4542148df71282481e6c24d06564a2e87a4",
+        "content_sha256": "d0a80bc8cd9731d321911add0e02f5daa90b89294e0a4e09bf30aaae58fc0570",
+        "match": true,
+        "source_path": "packages/files-sdk/src/box/index.ts",
+        "upstream_git_blob_sha1": "93f9e4542148df71282481e6c24d06564a2e87a4"
+      },
+      {
+        "content_git_blob_sha1": "78fd29ba1da08df441a2e44556ba1dc4a02347d3",
+        "content_sha256": "68cf9deb6ee25657700c760b359877ca7e6d021d3fcc37998602b54522c2c658",
+        "match": true,
+        "source_path": "packages/files-sdk/src/bun-s3/index.ts",
+        "upstream_git_blob_sha1": "78fd29ba1da08df441a2e44556ba1dc4a02347d3"
+      },
+      {
+        "content_git_blob_sha1": "30b7fc6c3ac9dc929bedbac0ffdab7fe15744769",
+        "content_sha256": "a086a17c43312dabf822f0033d5a11cc6338577b93111b1b47bbbb4f171cd607",
+        "match": true,
+        "source_path": "packages/files-sdk/src/bunny-storage/index.ts",
+        "upstream_git_blob_sha1": "30b7fc6c3ac9dc929bedbac0ffdab7fe15744769"
+      },
+      {
+        "content_git_blob_sha1": "ade3392567c483666cd0e58c55a2713461f9d08c",
+        "content_sha256": "4441794826de60be34bdb26f42424294d3cffc40b2b7e4885b99ffb175fecc24",
+        "match": true,
+        "source_path": "packages/files-sdk/src/cache/index.ts",
+        "upstream_git_blob_sha1": "ade3392567c483666cd0e58c55a2713461f9d08c"
+      },
+      {
+        "content_git_blob_sha1": "5603c114f90d7fa40dd39d172fb01ecf220e8291",
+        "content_sha256": "ebead5bcd9d602639d47350e743810afba12e9cdddd2d06cdba0cd247e19da33",
+        "match": true,
+        "source_path": "packages/files-sdk/src/claude/index.ts",
+        "upstream_git_blob_sha1": "5603c114f90d7fa40dd39d172fb01ecf220e8291"
+      },
+      {
+        "content_git_blob_sha1": "67c0ebb0377e6559f0a8ddbf49c0e65f716192e4",
+        "content_sha256": "ea0a846359fd1c9f7dc3779a7bf771e5dbcaff9b28a320bbe5cb960c39d90f81",
+        "match": true,
+        "source_path": "packages/files-sdk/src/claude/tools.ts",
+        "upstream_git_blob_sha1": "67c0ebb0377e6559f0a8ddbf49c0e65f716192e4"
+      },
+      {
+        "content_git_blob_sha1": "25a14e6e1d1e9f0439922e2a953c2763e1e3649e",
+        "content_sha256": "b297c751665fbc233ac6415b0b4db10763635294db587787c2511bddcbd2613f",
+        "match": true,
+        "source_path": "packages/files-sdk/src/cli/program.ts",
+        "upstream_git_blob_sha1": "25a14e6e1d1e9f0439922e2a953c2763e1e3649e"
+      },
+      {
+        "content_git_blob_sha1": "6d18bf91b065c06d9f7655133bbab843a03db8a7",
+        "content_sha256": "f208e9f6fff719e4adfa879d9cdb3fa8980b3c762d53d1ecd06cbb456dafda02",
+        "match": true,
+        "source_path": "packages/files-sdk/src/cli/commands.ts",
+        "upstream_git_blob_sha1": "6d18bf91b065c06d9f7655133bbab843a03db8a7"
+      },
+      {
+        "content_git_blob_sha1": "ed0f313e01f1d516a83cd6e86bbd02b5b3fb6912",
+        "content_sha256": "d4fb34b25fb2d056257579a7d4c31e2a48289543cd79f4edd8edecd96f7bac29",
+        "match": true,
+        "source_path": "packages/files-sdk/src/cli/index.ts",
+        "upstream_git_blob_sha1": "ed0f313e01f1d516a83cd6e86bbd02b5b3fb6912"
+      },
+      {
+        "content_git_blob_sha1": "6b14ae27f818022e7d86ffbbf0e707f5e2775e56",
+        "content_sha256": "e4f4e75f387487df80cfc492461e9c50b9c97437811c8e2b8ac01405403c6acd",
+        "match": true,
+        "source_path": "packages/files-sdk/src/client/files-client.ts",
+        "upstream_git_blob_sha1": "6b14ae27f818022e7d86ffbbf0e707f5e2775e56"
+      },
+      {
+        "content_git_blob_sha1": "b696360157766568031efb54fcb7651b5bb85290",
+        "content_sha256": "e7c51232dd2fbc4b170fa7074f5e4120521c07483c8a3dde8001a6c752a54837",
+        "match": true,
+        "source_path": "packages/files-sdk/src/client/download-decode.ts",
+        "upstream_git_blob_sha1": "b696360157766568031efb54fcb7651b5bb85290"
+      },
+      {
+        "content_git_blob_sha1": "8d43a1b05ea690331e5ecbb7f40388c616f906be",
+        "content_sha256": "c61903cecbd3abc8d8fadd18b5eb168ae135da050bf61550761edf06a3448675",
+        "match": true,
+        "source_path": "packages/files-sdk/src/client/types.ts",
+        "upstream_git_blob_sha1": "8d43a1b05ea690331e5ecbb7f40388c616f906be"
+      },
+      {
+        "content_git_blob_sha1": "4a0ba92758d8f813da3fd0c502b02c16244aa222",
+        "content_sha256": "2b070d13d0b95352075affa4f8ca9d4c9e4300b3af2e1564401ec98944a36928",
+        "match": true,
+        "source_path": "packages/files-sdk/src/client/progress.ts",
+        "upstream_git_blob_sha1": "4a0ba92758d8f813da3fd0c502b02c16244aa222"
+      },
+      {
+        "content_git_blob_sha1": "82e8a3c90f58aa67c459c18db7b96ff06cfe3d59",
+        "content_sha256": "d15223e0df55466c3caa81fdd0a34f3c95cbd272e8d3eb7db5482f8f3683dc60",
+        "match": true,
+        "source_path": "packages/files-sdk/src/client/transport.ts",
+        "upstream_git_blob_sha1": "82e8a3c90f58aa67c459c18db7b96ff06cfe3d59"
+      },
+      {
+        "content_git_blob_sha1": "30a45414ed4c6224024c17575b2d402260f517e2",
+        "content_sha256": "5b8a207bc045a91017284e8f9509f8eec4218a9fabb14bde732d214328c4a51b",
+        "match": true,
+        "source_path": "packages/files-sdk/src/cloudinary/index.ts",
+        "upstream_git_blob_sha1": "30a45414ed4c6224024c17575b2d402260f517e2"
+      },
+      {
+        "content_git_blob_sha1": "f86da3219500ac75e34d3165ae9d3f1305227276",
+        "content_sha256": "f7c9bfdf1b050bf82d7e51c4ee318c56b47b84e7211bc04f0829dcb16b4ddd46",
+        "match": true,
+        "source_path": "packages/files-sdk/src/compression/index.ts",
+        "upstream_git_blob_sha1": "f86da3219500ac75e34d3165ae9d3f1305227276"
+      },
+      {
+        "content_git_blob_sha1": "0285b939a0304962ef0cbce3ad736cc84f2b159e",
+        "content_sha256": "f12edbf9d3f8010df941745df6bc14811253f0347aa7455d86bffc966bc6d831",
+        "match": true,
+        "source_path": "packages/files-sdk/src/content-type/index.ts",
+        "upstream_git_blob_sha1": "0285b939a0304962ef0cbce3ad736cc84f2b159e"
+      },
+      {
+        "content_git_blob_sha1": "8ffd8fc6800cd0b7b56971e2de4b392256ef08ca",
+        "content_sha256": "b9063cf7775731ee1c3c9bcbdd30c3a33eb09f918c32c5b35de53b0201145a3e",
+        "match": true,
+        "source_path": "packages/files-sdk/src/convex/index.ts",
+        "upstream_git_blob_sha1": "8ffd8fc6800cd0b7b56971e2de4b392256ef08ca"
+      },
+      {
+        "content_git_blob_sha1": "3c083b7eb850959612b80e7e41d962de10cda02e",
+        "content_sha256": "7e0ae306e8ba7eff270f6dfc73dec927094e548f7a6d973725d91ffef0939510",
+        "match": true,
+        "source_path": "packages/files-sdk/src/dedup/index.ts",
+        "upstream_git_blob_sha1": "3c083b7eb850959612b80e7e41d962de10cda02e"
+      },
+      {
+        "content_git_blob_sha1": "27b650de933294ec852394525c32730e6210a0b1",
+        "content_sha256": "ccea64ba1e8fa45d8811cfe08b9d6972e6245db5a95d6b2135dc01dafbaa9553",
+        "match": true,
+        "source_path": "packages/files-sdk/src/digitalocean-spaces/index.ts",
+        "upstream_git_blob_sha1": "27b650de933294ec852394525c32730e6210a0b1"
+      },
+      {
+        "content_git_blob_sha1": "690065796c2ec391495fd569193a1e3dee7286f9",
+        "content_sha256": "ea79af08fea6933fab06eda0e01ec636dfe08b0f7a0767a8662933b822b225e4",
+        "match": true,
+        "source_path": "packages/files-sdk/src/dropbox/index.ts",
+        "upstream_git_blob_sha1": "690065796c2ec391495fd569193a1e3dee7286f9"
+      },
+      {
+        "content_git_blob_sha1": "a7213f645b145d4e30af37920b9c3ac5acaf2458",
+        "content_sha256": "5d87be6594bc82e8573350ea85dcd39397fd2961ce630ad8d5dc2bf96361c682",
+        "match": true,
+        "source_path": "packages/files-sdk/src/encryption/index.ts",
+        "upstream_git_blob_sha1": "a7213f645b145d4e30af37920b9c3ac5acaf2458"
+      },
+      {
+        "content_git_blob_sha1": "3102c473c76a61e36c7f9445e7e927e04a4ea270",
+        "content_sha256": "788ff310eec65d86c92c4e96a71367d8aea44d32f822da3c192005407e73907e",
+        "match": true,
+        "source_path": "packages/files-sdk/src/exoscale/index.ts",
+        "upstream_git_blob_sha1": "3102c473c76a61e36c7f9445e7e927e04a4ea270"
+      },
+      {
+        "content_git_blob_sha1": "cadd81a8de7723a7a338146c4c9a25a133eef9ce",
+        "content_sha256": "7c7eac4341f7dafc6b27fa0995326a713154d10d939903fe29c16343b787d63e",
+        "match": true,
+        "source_path": "packages/files-sdk/src/express/index.ts",
+        "upstream_git_blob_sha1": "cadd81a8de7723a7a338146c4c9a25a133eef9ce"
+      },
+      {
+        "content_git_blob_sha1": "211a8842bbc71d2f7dea4b728c718b889b53511f",
+        "content_sha256": "2b45cc07b8c50f884b8d1ee535c49086cc5da4cbce727ee79af4fdba41686b17",
+        "match": true,
+        "source_path": "packages/files-sdk/src/failover/index.ts",
+        "upstream_git_blob_sha1": "211a8842bbc71d2f7dea4b728c718b889b53511f"
+      },
+      {
+        "content_git_blob_sha1": "4eaff049696985da8c160997636099a200dcf378",
+        "content_sha256": "0cb42c008401df2452b2320cea38ae3aa7c6a4cf4b127312eeaf45a0bc8efbcc",
+        "match": true,
+        "source_path": "packages/files-sdk/src/fastify/index.ts",
+        "upstream_git_blob_sha1": "4eaff049696985da8c160997636099a200dcf378"
+      },
+      {
+        "content_git_blob_sha1": "06fb9af259a5e500fd72d56abd4615e473568b4c",
+        "content_sha256": "b2fbdda55c7ca92b39dcb106861692d2190729c175a2a27ccb1d67f5c2065644",
+        "match": true,
+        "source_path": "packages/files-sdk/src/filebase/index.ts",
+        "upstream_git_blob_sha1": "06fb9af259a5e500fd72d56abd4615e473568b4c"
+      },
+      {
+        "content_git_blob_sha1": "8835b02fbb413d063170b848881418e8855bdb67",
+        "content_sha256": "720527dd9f50dc5398951a79488e3459c97c3cb05af83f4dd7d0473564be80bb",
+        "match": true,
+        "source_path": "packages/files-sdk/src/firebase-storage/index.ts",
+        "upstream_git_blob_sha1": "8835b02fbb413d063170b848881418e8855bdb67"
+      },
+      {
+        "content_git_blob_sha1": "135d6f7d4604b6b38d374fcd64e60d205ab163a1",
+        "content_sha256": "a3e18dbacd6d970f8a666d12fe996f8671e44eb6b347039e7a165f05d3f096c3",
+        "match": true,
+        "source_path": "packages/files-sdk/src/firebase-storage/firebase-admin-loader.ts",
+        "upstream_git_blob_sha1": "135d6f7d4604b6b38d374fcd64e60d205ab163a1"
+      },
+      {
+        "content_git_blob_sha1": "44c98dc2c2d9ab39339c89f105a7ea8a77c91614",
+        "content_sha256": "da47ca9f24a786baddf24fe8ecc036fee5a88deea8bdd6e72064394ad434eba8",
+        "match": true,
+        "source_path": "packages/files-sdk/src/fs/index.ts",
+        "upstream_git_blob_sha1": "44c98dc2c2d9ab39339c89f105a7ea8a77c91614"
+      },
+      {
+        "content_git_blob_sha1": "3be2df7b44430941305de8e37624cc42ad49e185",
+        "content_sha256": "0bdf9ec9104753be4190cd8b345a8c8f18452c7ccb2f6d1b3f86d549f2bc8fad",
+        "match": true,
+        "source_path": "packages/files-sdk/src/ftp/index.ts",
+        "upstream_git_blob_sha1": "3be2df7b44430941305de8e37624cc42ad49e185"
+      },
+      {
+        "content_git_blob_sha1": "3c35192b9680593a8ef03d5973a3e11618b815d7",
+        "content_sha256": "2f35c0d109269eb1c3230d34d99afdd8ddc6291adbed373206ab8304ea12c229",
+        "match": true,
+        "source_path": "packages/files-sdk/src/gcs/index.ts",
+        "upstream_git_blob_sha1": "3c35192b9680593a8ef03d5973a3e11618b815d7"
+      },
+      {
+        "content_git_blob_sha1": "ecac38a293674b2fd5a2758b3f0d8801e9430501",
+        "content_sha256": "7cb0c6d1cd563d13e9deb7220a5fadb6cb7971d69fd63993d7a1624d71576ea7",
+        "match": true,
+        "source_path": "packages/files-sdk/src/google-drive/index.ts",
+        "upstream_git_blob_sha1": "ecac38a293674b2fd5a2758b3f0d8801e9430501"
+      },
+      {
+        "content_git_blob_sha1": "2d960d021f5dfad543fce6359e73f4db2c2220ab",
+        "content_sha256": "3a5f4a7e56a0d239afa853d39f5e68bf4b2be11fc272e4eb46d557ea3a6f4e1d",
+        "match": true,
+        "source_path": "packages/files-sdk/src/hetzner/index.ts",
+        "upstream_git_blob_sha1": "2d960d021f5dfad543fce6359e73f4db2c2220ab"
+      },
+      {
+        "content_git_blob_sha1": "27ccff63358c94a141dd51c088e6b8a508a046a6",
+        "content_sha256": "a34d1462e7d45de8eb8fe3b1311c28379410211e666f7fbd9908f881a2e62ad0",
+        "match": true,
+        "source_path": "packages/files-sdk/src/hono/index.ts",
+        "upstream_git_blob_sha1": "27ccff63358c94a141dd51c088e6b8a508a046a6"
+      },
+      {
+        "content_git_blob_sha1": "145ee615483c9689c5998cd8e849bb5743c345d2",
+        "content_sha256": "4bffb3ea45b3f1b709f95e5abb9aa28c260929a8761e6500e966c2b4397976a0",
+        "match": true,
+        "source_path": "packages/files-sdk/src/ibm-cos/index.ts",
+        "upstream_git_blob_sha1": "145ee615483c9689c5998cd8e849bb5743c345d2"
+      },
+      {
+        "content_git_blob_sha1": "3f15fa3ca46f5c6c772d44ab828ba500e5a5753a",
+        "content_sha256": "cb6c0c4286bcd159d7a0d81075205f196a95b955db347f78e8f71f487ebfd185",
+        "match": true,
+        "source_path": "packages/files-sdk/src/idrive-e2/index.ts",
+        "upstream_git_blob_sha1": "3f15fa3ca46f5c6c772d44ab828ba500e5a5753a"
+      },
+      {
+        "content_git_blob_sha1": "de5b4e0639b655bc285b3942f85c4f395c6269ce",
+        "content_sha256": "64a43ae8da5d2c5288a916c8ee8e52b4c9b9ac466eeb64284bc7c057f8792aeb",
+        "match": true,
+        "source_path": "packages/files-sdk/src/koa/index.ts",
+        "upstream_git_blob_sha1": "de5b4e0639b655bc285b3942f85c4f395c6269ce"
+      },
+      {
+        "content_git_blob_sha1": "0ceedc6c7577c2e130d26ce3da5bf04d56404d7a",
+        "content_sha256": "b2381c5d3da009037ccf2cacb16da4bcedb37d5e9df1a09217c2d6e27aeacddf",
+        "match": true,
+        "source_path": "packages/files-sdk/src/loader/index.ts",
+        "upstream_git_blob_sha1": "0ceedc6c7577c2e130d26ce3da5bf04d56404d7a"
+      },
+      {
+        "content_git_blob_sha1": "81acced129236dd3dfe9f3461704be70c2967697",
+        "content_sha256": "1b30242be8b5a95a31a4b5a9e13e4c4529d85eae1f9dd953069020a413b9778a",
+        "match": true,
+        "source_path": "packages/files-sdk/src/memory/index.ts",
+        "upstream_git_blob_sha1": "81acced129236dd3dfe9f3461704be70c2967697"
+      },
+      {
+        "content_git_blob_sha1": "2a088d974fd5c96777ee4fad17a516a1a988a65b",
+        "content_sha256": "2733cc971763c7bbec6c06b7ae2681356b7ece23176d1bfc548c63bfa82db42a",
+        "match": true,
+        "source_path": "packages/files-sdk/src/minio/index.ts",
+        "upstream_git_blob_sha1": "2a088d974fd5c96777ee4fad17a516a1a988a65b"
+      },
+      {
+        "content_git_blob_sha1": "2c8d33014e384486b4e8e34907cde8e7206f66c0",
+        "content_sha256": "1f5048575bb702faf70adb11315e52194e6eb5d55a643d3330eb584231b5204c",
+        "match": true,
+        "source_path": "packages/files-sdk/src/neon/index.ts",
+        "upstream_git_blob_sha1": "2c8d33014e384486b4e8e34907cde8e7206f66c0"
+      },
+      {
+        "content_git_blob_sha1": "2b209d1253cc2059c2e340894b2336a31047afb8",
+        "content_sha256": "710a30a768d81ce6492d0370202c025074e78e956e5f55c1869cbb027b25366e",
+        "match": true,
+        "source_path": "packages/files-sdk/src/nestjs/index.ts",
+        "upstream_git_blob_sha1": "2b209d1253cc2059c2e340894b2336a31047afb8"
+      },
+      {
+        "content_git_blob_sha1": "bdaf51bd3540f9f6e29cfc69d6b0ad9dd110de3f",
+        "content_sha256": "5d435da6a0351b97a3aafb9bde5e127cad2c82090e02b26d8a1d5dabf48f5675",
+        "match": true,
+        "source_path": "packages/files-sdk/src/netlify-blobs/index.ts",
+        "upstream_git_blob_sha1": "bdaf51bd3540f9f6e29cfc69d6b0ad9dd110de3f"
+      },
+      {
+        "content_git_blob_sha1": "e0ed89caff5303bc97190604a32e1ee052fca9d6",
+        "content_sha256": "bfda9d3072f86fdf597af42b7a731acb5f1d1a08658d606762b216fa3e54c219",
+        "match": true,
+        "source_path": "packages/files-sdk/src/next/index.ts",
+        "upstream_git_blob_sha1": "e0ed89caff5303bc97190604a32e1ee052fca9d6"
+      },
+      {
+        "content_git_blob_sha1": "f74fb0b38129289405b7325463c61f233645ec55",
+        "content_sha256": "09e55a45c39a59a6013a79062a9be7f1eb77a61b34ca7d36976341a75cccb78e",
+        "match": true,
+        "source_path": "packages/files-sdk/src/nitro/index.ts",
+        "upstream_git_blob_sha1": "f74fb0b38129289405b7325463c61f233645ec55"
+      },
+      {
+        "content_git_blob_sha1": "f20902d2e6053497e69e6690c6616d98dfdfc0f9",
+        "content_sha256": "04dc5299acd07b6a13837d54d62f66be7b92a48b30f2f0d12718072b0e18d269",
+        "match": true,
+        "source_path": "packages/files-sdk/src/oracle-cloud/index.ts",
+        "upstream_git_blob_sha1": "f20902d2e6053497e69e6690c6616d98dfdfc0f9"
+      },
+      {
+        "content_git_blob_sha1": "496309cb0ee51180ce5e8b2cc0ae16633b494a7c",
+        "content_sha256": "6daad251edcf9329554e663946b2b0e8606e24da6a07d78f8ba2749594f4fe65",
+        "match": true,
+        "source_path": "packages/files-sdk/src/ovhcloud/index.ts",
+        "upstream_git_blob_sha1": "496309cb0ee51180ce5e8b2cc0ae16633b494a7c"
+      },
+      {
+        "content_git_blob_sha1": "9c489b0a1ae8c590bf7368ec4ca8107710aa29e9",
+        "content_sha256": "6d2c7df51af2c3d3521d2b6be1719f3e202f24d979c71d0207a90c408196bb35",
+        "match": true,
+        "source_path": "packages/files-sdk/src/pocketbase/index.ts",
+        "upstream_git_blob_sha1": "9c489b0a1ae8c590bf7368ec4ca8107710aa29e9"
+      },
+      {
+        "content_git_blob_sha1": "5f3e56456bfe6b01b9b636fe933e896e2119f67f",
+        "content_sha256": "b2ecb27eb09c4d472c54c53dc3f9646f5b46e3ff5237e0b6ec0de515817de472",
+        "match": true,
+        "source_path": "packages/files-sdk/src/r2/index.ts",
+        "upstream_git_blob_sha1": "5f3e56456bfe6b01b9b636fe933e896e2119f67f"
+      },
+      {
+        "content_git_blob_sha1": "b99f6afd6be7ce8622301a2f782c69a69d998602",
+        "content_sha256": "244b6efb6deee0b04c349f2ab1b26696bb69247363939aa7f8a127fcc3c632ff",
+        "match": true,
+        "source_path": "packages/files-sdk/src/react/use-files.ts",
+        "upstream_git_blob_sha1": "b99f6afd6be7ce8622301a2f782c69a69d998602"
+      },
+      {
+        "content_git_blob_sha1": "11ea7f082ae9af970a79f93c86e4a649e71dfe3c",
+        "content_sha256": "522ba18e974f9b5d87c9500fd1871d366916c68ffd08bdf631d829aaffaf6ba0",
+        "match": true,
+        "source_path": "packages/files-sdk/src/react/store.ts",
+        "upstream_git_blob_sha1": "11ea7f082ae9af970a79f93c86e4a649e71dfe3c"
+      },
+      {
+        "content_git_blob_sha1": "f3be7302400273c4d0b91bc7603a5b4454aa7c4f",
+        "content_sha256": "5e747e71ae049360785092467f6ff112fc08fd2c5eb2ef594544af3583567188",
+        "match": true,
+        "source_path": "packages/files-sdk/src/react/use-files-query.ts",
+        "upstream_git_blob_sha1": "f3be7302400273c4d0b91bc7603a5b4454aa7c4f"
+      },
+      {
+        "content_git_blob_sha1": "6d32206e85ef2af7aa6ae3d2411fac7b62845382",
+        "content_sha256": "2842dd9710ec5499eae21ddb308184bc496f854be630b55eccfc2cb886541d57",
+        "match": true,
+        "source_path": "packages/files-sdk/src/s3-fetch/index.ts",
+        "upstream_git_blob_sha1": "6d32206e85ef2af7aa6ae3d2411fac7b62845382"
+      },
+      {
+        "content_git_blob_sha1": "96a2fccf961286d4ba61d128e9c350f708cb2c1a",
+        "content_sha256": "755a9e16f2563f1d8c0cd79322e6f929f6b61539c49d9e81f247fae023c08696",
+        "match": true,
+        "source_path": "packages/files-sdk/src/scaleway/index.ts",
+        "upstream_git_blob_sha1": "96a2fccf961286d4ba61d128e9c350f708cb2c1a"
+      },
+      {
+        "content_git_blob_sha1": "61c01357798e8e4c23b34f98a43a30a020bdf4a4",
+        "content_sha256": "955d139f2a5eeafe40765d7d492ea169a61ab381939229b9d7078ee83c6ac54f",
+        "match": true,
+        "source_path": "packages/files-sdk/src/sftp/index.ts",
+        "upstream_git_blob_sha1": "61c01357798e8e4c23b34f98a43a30a020bdf4a4"
+      },
+      {
+        "content_git_blob_sha1": "660e777e49768f6decdc711388078cc79a524484",
+        "content_sha256": "c9f1fe682b008a6785655997a83c27a442f92392f88f37f4470735b91c2aed4c",
+        "match": true,
+        "source_path": "packages/files-sdk/src/sharepoint/index.ts",
+        "upstream_git_blob_sha1": "660e777e49768f6decdc711388078cc79a524484"
+      },
+      {
+        "content_git_blob_sha1": "4bfb600a410bae158dac85c679ca96eaa4819c10",
+        "content_sha256": "469b14906652bc3cdbd681edbd754b5945f0b2bacfd18048ad227a83666f45a8",
+        "match": true,
+        "source_path": "packages/files-sdk/src/signed-url-policy/index.ts",
+        "upstream_git_blob_sha1": "4bfb600a410bae158dac85c679ca96eaa4819c10"
+      },
+      {
+        "content_git_blob_sha1": "904b8d8497cb5cb36835e4ea0a62322419173928",
+        "content_sha256": "41fe11edca0707a8405252a2b2a0f34f71ecebf79029a7eaa7fd1c63dc44d551",
+        "match": true,
+        "source_path": "packages/files-sdk/src/soft-delete/index.ts",
+        "upstream_git_blob_sha1": "904b8d8497cb5cb36835e4ea0a62322419173928"
+      },
+      {
+        "content_git_blob_sha1": "ab6fc493db5f4f7528520d52a0fc29a228bfa317",
+        "content_sha256": "99af32d2de6977c62f838930f5b43c696b69313eed741ea569fa6e9aed96b9cc",
+        "match": true,
+        "source_path": "packages/files-sdk/src/storj/index.ts",
+        "upstream_git_blob_sha1": "ab6fc493db5f4f7528520d52a0fc29a228bfa317"
+      },
+      {
+        "content_git_blob_sha1": "391c2a522a795760bbe276289a5a915db51c6d16",
+        "content_sha256": "2b9983ed9d1ba43e44b457484ae82ba18b2005336675f03c0af2f9dcf641cb40",
+        "match": true,
+        "source_path": "packages/files-sdk/src/supabase/index.ts",
+        "upstream_git_blob_sha1": "391c2a522a795760bbe276289a5a915db51c6d16"
+      },
+      {
+        "content_git_blob_sha1": "b3eb84d860d8375e2bd6870f3c44275dd95ce90d",
+        "content_sha256": "478d99993113c00f7befe590e426cf428ecbad095ff5014be95e54c5ed7f904c",
+        "match": true,
+        "source_path": "packages/files-sdk/src/svelte/store.ts",
+        "upstream_git_blob_sha1": "b3eb84d860d8375e2bd6870f3c44275dd95ce90d"
+      },
+      {
+        "content_git_blob_sha1": "9872dd1c56dd5238bac01d477494e8d9c8681527",
+        "content_sha256": "feca964b8b2d4b85283c814f71948b8d161e520fab7b9883c8ee8894ac416afc",
+        "match": true,
+        "source_path": "packages/files-sdk/src/svelte/use-files.ts",
+        "upstream_git_blob_sha1": "9872dd1c56dd5238bac01d477494e8d9c8681527"
+      },
+      {
+        "content_git_blob_sha1": "abafbb6f5d9b41a3b68d5e4ae63f1b4e911709ee",
+        "content_sha256": "585c87f5ed13083a43bed4eceeb0716da938fd9ed3d5cbab1a26494fd4a814b1",
+        "match": true,
+        "source_path": "packages/files-sdk/src/svelte/use-files-query.ts",
+        "upstream_git_blob_sha1": "abafbb6f5d9b41a3b68d5e4ae63f1b4e911709ee"
+      },
+      {
+        "content_git_blob_sha1": "f0b27d19366dab22a0e631be38ef9c9a9ef1f35f",
+        "content_sha256": "df7c09d629ea216fb5fe2348664f889892d3977f1dd2bf52acb9962e1ba80693",
+        "match": true,
+        "source_path": "packages/files-sdk/src/sveltekit/index.ts",
+        "upstream_git_blob_sha1": "f0b27d19366dab22a0e631be38ef9c9a9ef1f35f"
+      },
+      {
+        "content_git_blob_sha1": "39e91a5f4ed3b75e1ea5952a6a9f00c74c81a129",
+        "content_sha256": "b85e133694bc8f4eeea46f848bf2fb6288233d49b7c8a808f368113aa52696f7",
+        "match": true,
+        "source_path": "packages/files-sdk/src/tanstack-start/index.ts",
+        "upstream_git_blob_sha1": "39e91a5f4ed3b75e1ea5952a6a9f00c74c81a129"
+      },
+      {
+        "content_git_blob_sha1": "fb47c49d2bb82251dc326ad0c4b453eb932c51c4",
+        "content_sha256": "ef9a26eeb3ee3a7a6de27e2e111ae549daff267674e8140bb83cd5e147588300",
+        "match": true,
+        "source_path": "packages/files-sdk/src/tencent/index.ts",
+        "upstream_git_blob_sha1": "fb47c49d2bb82251dc326ad0c4b453eb932c51c4"
+      },
+      {
+        "content_git_blob_sha1": "5ce318303cd218547159e196f070501f7770c024",
+        "content_sha256": "226f077ed666a430a388517fdc2329abbf1572adaed4f79b0eb2f7bcfea4187a",
+        "match": true,
+        "source_path": "packages/files-sdk/src/tiering/index.ts",
+        "upstream_git_blob_sha1": "5ce318303cd218547159e196f070501f7770c024"
+      },
+      {
+        "content_git_blob_sha1": "66532ac4d9dc0a383c197d9d78b480989199cd60",
+        "content_sha256": "fe3c38017fe2a2f5040a6617f98c6f991b0f7ee4c200599333e96a28a90cb162",
+        "match": true,
+        "source_path": "packages/files-sdk/src/tigris/index.ts",
+        "upstream_git_blob_sha1": "66532ac4d9dc0a383c197d9d78b480989199cd60"
+      },
+      {
+        "content_git_blob_sha1": "694b90b41335bcfa8e4339cec8d410f87c7dfab2",
+        "content_sha256": "58e6c270aacf4701b05b9f7e1452086883bdbd1c280af3a1208e51ce55c6ad73",
+        "match": true,
+        "source_path": "packages/files-sdk/src/tracing/index.ts",
+        "upstream_git_blob_sha1": "694b90b41335bcfa8e4339cec8d410f87c7dfab2"
+      },
+      {
+        "content_git_blob_sha1": "817ed29c41ea44e58b2872fb5501c84445b2e137",
+        "content_sha256": "8e64f8a0f14ca5957782800da2078ba1a2bdf4596e3998e05efe7763a931e6d2",
+        "match": true,
+        "source_path": "packages/files-sdk/src/uploadthing/index.ts",
+        "upstream_git_blob_sha1": "817ed29c41ea44e58b2872fb5501c84445b2e137"
+      },
+      {
+        "content_git_blob_sha1": "d81514687d88270effb59516ec0d858b817de4d2",
+        "content_sha256": "56f160f4de0b63c41470cab9d3347b9656d6654deb1e6e648d238d457c7c2213",
+        "match": true,
+        "source_path": "packages/files-sdk/src/usage/index.ts",
+        "upstream_git_blob_sha1": "d81514687d88270effb59516ec0d858b817de4d2"
+      },
+      {
+        "content_git_blob_sha1": "a1f54f407fe5b2bc70d4e18d33fb1a3d75a9a0ae",
+        "content_sha256": "c1e007bd9525c7247701ddef7678dd5905058ba801c3bf0959b93f8f96e0a7ad",
+        "match": true,
+        "source_path": "packages/files-sdk/src/validation/index.ts",
+        "upstream_git_blob_sha1": "a1f54f407fe5b2bc70d4e18d33fb1a3d75a9a0ae"
+      },
+      {
+        "content_git_blob_sha1": "54b221cc79c519d7d095ccfebf5587925813701f",
+        "content_sha256": "12d49d46eb381883efb3cad029f301bcf7acee88df7f893c3fa869c7d3649cd1",
+        "match": true,
+        "source_path": "packages/files-sdk/src/vercel-blob/index.ts",
+        "upstream_git_blob_sha1": "54b221cc79c519d7d095ccfebf5587925813701f"
+      },
+      {
+        "content_git_blob_sha1": "b492d6d80d4b7d104d9fd220711d5a5168a222e9",
+        "content_sha256": "33681bebb7521e7e05c1b7640bcd1ea0a95050bbd7d99933803643203fd12ccd",
+        "match": true,
+        "source_path": "packages/files-sdk/src/versioning/index.ts",
+        "upstream_git_blob_sha1": "b492d6d80d4b7d104d9fd220711d5a5168a222e9"
+      },
+      {
+        "content_git_blob_sha1": "61f970429f353dd1212e999ab2e65531e1ef2a37",
+        "content_sha256": "cfe5174ab7782aeb5774714a2458ad2187d121b80ad8c489c2a51b589164cffb",
+        "match": true,
+        "source_path": "packages/files-sdk/src/vue/use-files.ts",
+        "upstream_git_blob_sha1": "61f970429f353dd1212e999ab2e65531e1ef2a37"
+      },
+      {
+        "content_git_blob_sha1": "e961722fc44893aa8697837d76826f8044b300cd",
+        "content_sha256": "a96f98961df50a6bfe257d986fb38996bf62c69b449c7185475582b994c9ee2e",
+        "match": true,
+        "source_path": "packages/files-sdk/src/vue/use-files-query.ts",
+        "upstream_git_blob_sha1": "e961722fc44893aa8697837d76826f8044b300cd"
+      },
+      {
+        "content_git_blob_sha1": "8ab54299aadd90afb32012bf0893e5535364456f",
+        "content_sha256": "cb5a05ec55d2c14a23fb9db9d76a7c1b5b39f5ca6d0a20500ffb319cc28ee857",
+        "match": true,
+        "source_path": "packages/files-sdk/src/vultr/index.ts",
+        "upstream_git_blob_sha1": "8ab54299aadd90afb32012bf0893e5535364456f"
+      },
+      {
+        "content_git_blob_sha1": "db1d1e3a1f92632db1d5e6df3f9bcb86fbbaa472",
+        "content_sha256": "599203067522272c740af6c2ffd28308804a8cbc0f3da25880b7e3154310b963",
+        "match": true,
+        "source_path": "packages/files-sdk/src/wasabi/index.ts",
+        "upstream_git_blob_sha1": "db1d1e3a1f92632db1d5e6df3f9bcb86fbbaa472"
+      },
+      {
+        "content_git_blob_sha1": "07db972ed4afe0e12c93502d73bb4d71deede6cb",
+        "content_sha256": "ed407705ba8cb509b4cc7914ec3863a63de527764a240cb808a058e64907a413",
+        "match": true,
+        "source_path": "packages/files-sdk/src/webdav/index.ts",
+        "upstream_git_blob_sha1": "07db972ed4afe0e12c93502d73bb4d71deede6cb"
+      },
+      {
+        "content_git_blob_sha1": "7aab4ae9a11509e0955b52764188f31a1b15998b",
+        "content_sha256": "8f586f191ea02e77261e20b7f990b6f4327f14fe30c8aeb69410dfd4c7f671a1",
+        "match": true,
+        "source_path": "packages/files-sdk/src/yandex/index.ts",
+        "upstream_git_blob_sha1": "7aab4ae9a11509e0955b52764188f31a1b15998b"
+      },
+      {
+        "content_git_blob_sha1": "f3db227e0106e986463fee00c8b043f89ef28e6c",
+        "content_sha256": "ccc6de143dc40c435c86b35f9bc9ec7d8fe2f87189d10faba1f59033ee72265c",
+        "match": true,
+        "source_path": "packages/files-sdk/src/zip/index.ts",
+        "upstream_git_blob_sha1": "f3db227e0106e986463fee00c8b043f89ef28e6c"
+      }
+    ],
+    "source_instances": 192,
+    "unique_source_paths": 141
+  },
+  "limitations": [
+    "Root private files-sdk-monorepo0.0.0 metadata saysISC while root LICENSE/README and files-sdk2.4.0 metadata sayMIT.",
+    "Embedded source identity does not verify generated JS, empty source maps, SLSA provenance, reproducible builds or all bundled obligations."
+  ],
+  "name": "files-sdk",
+  "notice_path": "LICENSE",
+  "notice_sha256": "e76b3f525b681b119e7284939032d1fd66e41d0d41b9e24dbe0170683562335c",
+  "package_directory": "packages/files-sdk",
+  "reason": "The exact published package metadata declares MIT and author Hayden Bleasel, matching the root complete MIT notice and root README. All192 embedded source instances across141 source paths match the pinned package subtree. The separate private monorepo root package declaresISC; this supplement does not substitute that declaration for the published files-sdk package MIT declaration.",
+  "repository": "haydenbleasel/files-sdk",
+  "review_scope": "Source-bound MIT notice applicability only; no exception, rebuilt-output proof or bundled-component audit.",
+  "schema": 1,
+  "version": "2.4.0"
+}

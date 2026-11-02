@@ -507,3 +507,75 @@ async fn restart_restores_fences_and_rejects_a_lower_membership_version() {
         MembershipReadiness::Unready(MembershipUnreadyReason::MembershipRejected)
     );
 }
+
+#[tokio::test]
+async fn restart_keeps_equal_restored_bytes_fenced_until_strictly_newer_record() {
+    let directory = TestDirectory::new();
+    let store = open_store(&directory);
+    let (issuer, _trusted) = issuer_and_trusted_key();
+    let authority = Arc::new(TestCheckpointAuthority::new(Arc::clone(&issuer)));
+    let source = TestMembershipSource::new(directory.state_path());
+    // Preserve these exact signed bytes across restart. Even identical bytes
+    // cannot recover the verifier evidence deliberately absent from disk.
+    source.replace(vec![record(&issuer, 2)]).await;
+    let runtime = build_runtime(&source, &authority, &issuer, Arc::clone(&store), BOOT_ID);
+    let handle = runtime.start().await.expect("initial runtime starts");
+    assert_eq!(handle.initial_bootstrap_failure(), None);
+    assert_eq!(runtime.readiness(), MembershipReadiness::Ready);
+    handle.shutdown().await.expect("joined initial shutdown");
+    let initial = store.load().expect("final stopped state");
+    drop(runtime);
+    drop(store);
+
+    let identity =
+        MembershipVersionStateIdentity::new(DEPLOYMENT_ID, DEPLOYMENT_INCARNATION, NODE_ID)
+            .expect("state identity");
+    let reopened = Arc::new(
+        MembershipVersionStateStore::open(directory.state_path(), identity.clone())
+            .expect("reopen final stopped state"),
+    );
+    let restarted = build_runtime(
+        &source,
+        &authority,
+        &issuer,
+        Arc::clone(&reopened),
+        "boot-b",
+    );
+    let handle = restarted.start().await.expect("supervisor stays joinable");
+    let failure = handle.initial_bootstrap_failure().expect("initial failure");
+    assert_eq!(failure.code(), "membership_equal_version_conflict");
+    assert_eq!(
+        restarted.readiness(),
+        MembershipReadiness::Unready(MembershipUnreadyReason::MembershipRejected)
+    );
+    assert!(
+        restarted
+            .admit_peer(MembershipPeerIdentity::new(NODE_ID, "boot-b", SPKI_SHA256))
+            .is_err()
+    );
+    handle.shutdown().await.expect("joined refused startup");
+    let refused = reopened.load().expect("refused pass preserves fences");
+    assert!(refused.checkpoint_version > initial.checkpoint_version);
+    assert_eq!(refused.node_versions[NODE_ID], 2);
+    drop(restarted);
+    drop(reopened);
+
+    source.replace(vec![record(&issuer, 3)]).await;
+    let reopened = Arc::new(
+        MembershipVersionStateStore::open(directory.state_path(), identity)
+            .expect("reopen after joined refusal"),
+    );
+    let newer = build_runtime(&source, &authority, &issuer, Arc::clone(&reopened), "boot-c");
+    let handle = newer.start().await.expect("newer signed round starts");
+    assert_eq!(handle.initial_bootstrap_failure(), None);
+    assert_eq!(newer.readiness(), MembershipReadiness::Ready);
+    assert!(
+        newer
+            .admit_peer(MembershipPeerIdentity::new(NODE_ID, "boot-c", SPKI_SHA256))
+            .is_ok()
+    );
+    handle.shutdown().await.expect("joined newer shutdown");
+    let accepted = reopened.load().expect("newer fences persisted");
+    assert!(accepted.checkpoint_version > refused.checkpoint_version);
+    assert_eq!(accepted.node_versions[NODE_ID], 3);
+}

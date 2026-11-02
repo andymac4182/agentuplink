@@ -57,7 +57,7 @@ tunnel-fs-provider = { path = "../tunnel-fs-provider" }
 # `same-file`. See `src/file_identity.rs` and task row M6-C80.
 [target.'cfg(unix)'.dependencies]
 # M6-C155: read the soft open-file limit at startup; no unsafe code.
-rustix = { version = "1.1", default-features = false, features = ["process", "std"] }
+rustix = { version = "1.1", default-features = false, features = ["fs", "process", "std"] }
 
 [target.'cfg(windows)'.dependencies]
 winapi-util = "0.1.11"

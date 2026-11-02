@@ -73,7 +73,7 @@ mod provider;
 // relay is not required to be a host that can serve a filesystem export.
 pub mod record;
 
-pub use authority::{Authority, Authorization, ProviderStats};
+pub use authority::{Authority, Authorization, FreshnessFailure, ProviderStats};
 #[cfg(unix)]
 pub use provider::{Outbound, Provider};
 pub use record::{

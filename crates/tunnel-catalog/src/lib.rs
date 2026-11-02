@@ -28,8 +28,10 @@ pub use recovery::{
     RecoveryPolicy, SignedRecoveryApproval, TrustedRecoveryKey, VerifiedRecoveryApproval,
 };
 pub use redis::{
-    DurableCatalogObservation, MAX_REDIS_NAMESPACE_BYTES, REDIS_OPERATION_TIMEOUT, RedisCatalog,
-    RedisMembershipPublisher, RedisRunRebind, RedisTlsOptions, validate_device_addition,
+    CatalogBundle, CatalogBundleError, CatalogBundleIdentity, CatalogBundleSummary,
+    CatalogReconciliationPlan, DurableCatalogObservation, MAX_CATALOG_BUNDLE_BYTES,
+    MAX_REDIS_NAMESPACE_BYTES, REDIS_OPERATION_TIMEOUT, RedisCatalog, RedisMembershipPublisher,
+    RedisRunRebind, RedisTlsOptions, plan_catalog_reconciliation, validate_device_addition,
     validate_redis_namespace, validate_service_addition, validate_user_addition,
 };
 pub use types::{

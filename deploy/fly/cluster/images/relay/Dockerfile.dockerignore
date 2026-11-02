@@ -1,0 +1,21 @@
+# Build context allowlist for deploy/fly/relay/Dockerfile. Everything is
+# excluded except what `cargo build --locked -p tunnel-relay` and the runtime
+# stage read, so no local key, target directory or .git reaches a builder.
+*
+!Cargo.toml
+!Cargo.lock
+!rust-toolchain.toml
+!LICENSE
+!scripts/container_notices.py
+!deploy/notices/rust/
+!crates/
+!vendor/
+!examples/
+!deploy/fly/cluster/images/entrypoint.py
+!deploy/fly/cluster/images/PROVENANCE.md
+**/target
+**/*.pem
+**/*.key
+**/.env
+**/.env.*
+**/*.der

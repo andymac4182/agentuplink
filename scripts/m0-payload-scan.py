@@ -24,8 +24,9 @@ forms, each also JSON-escaped; lowercase hex; standard base64; and, for a long
 value, the same encodings of its leading 32-byte window, so a truncated leak
 still matches.  It also searches for fixed credential shapes that need no
 manifest (a PEM header, a JWT-shaped token, an `Authorization: Bearer`
-header).  Any hit fails the gate.  Only a category, a stream role and an offset
-are ever printed: never a value, and never a captured stream.
+header).  Any hit fails the gate.  A hit reports only its category, stream role
+and offset. A failed declared-witness child adds closed diagnostic labels,
+stderr byte count and digest; its captured stderr is always withheld.
 
 **What it cannot see**, so a green is read at its real size: an encoding not in
 that list (compression, encryption, another base64 alphabet, a re-ordered
@@ -75,6 +76,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import json
 import os
 import re
@@ -102,6 +104,7 @@ MAX_MANIFEST_BYTES = 4 * 1024 * 1024
 #: A child stream larger than this fails the gate rather than being truncated,
 #: because a truncated stream is an unscanned one.
 MAX_STREAM_BYTES = 256 * 1024 * 1024
+MAX_WITNESS_DIAGNOSTIC_BYTES = 16 * 1024
 
 #: Credential shapes that need no manifest.  A fixture that forgets to record a
 #: key or token is still caught if it prints one in a recognisable form.
@@ -726,6 +729,51 @@ def check_clean(run: GateRun) -> list[str]:
     return failures
 
 
+def witness_failure_diagnostics(run: GateRun) -> list[str]:
+    """Closed observations only; matching vocabulary does not identify cause.
+
+    Required sentinel categories being present is not proof that every secret
+    or payload was recorded. Never publish a stderr tail, even after redaction.
+    The digest covers the full bounded capture; only classification is tailed.
+    This helper changes neither scanner hits nor witness acceptance.
+    """
+    if run.exit_code == 0:
+        return []
+    data = run.streams.get("harness_stderr")
+    result = {
+        "stderr_bytes": None,
+        "stderr_sha256": None,
+        "raw_stderr_withheld": True,
+        "classification": "stderr_unavailable",
+        "classification_scope": "none",
+        "classified_bytes": 0,
+        "codes": [],
+    }
+    if isinstance(data, bytes):
+        result["stderr_bytes"] = len(data)
+        if len(data) > MAX_STREAM_BYTES:
+            result["classification"] = "stderr_over_bound"
+        else:
+            result["stderr_sha256"] = hashlib.sha256(data).hexdigest()
+            if run.error or any(not run.sentinels.get(kind) for kind in run.gate.requires):
+                result["classification"] = "capture_incomplete"
+            else:
+                tail = data[-MAX_WITNESS_DIAGNOSTIC_BYTES:].lower()
+                vocabulary = (
+                    ("assertion_failure", b"assertion failed"),
+                    ("rust_panic", b"panicked at"),
+                    ("deadline_exceeded", b"deadline exceeded"),
+                    ("timeout", b"timed out"),
+                    ("connection_refused", b"connection refused"),
+                    ("permission_denied", b"permission denied"),
+                )
+                result["codes"] = [code for code, phrase in vocabulary if phrase in tail]
+                result["classification"] = "matched_vocabulary" if result["codes"] else "unclassified"
+                result["classification_scope"] = "tail" if len(data) > len(tail) else "complete"
+                result["classified_bytes"] = len(tail)
+    return ["failed witness child: " + json.dumps(result, sort_keys=True)]
+
+
 def classify_witness(run: GateRun) -> str:
     """RED only when the scan went red with exactly the declared witness."""
     if run.error:
@@ -956,6 +1004,8 @@ def main() -> int:
                 f"hits={len(run.hits)} secs={run.seconds:.0f}",
                 flush=True,
             )
+            for detail in witness_failure_diagnostics(run):
+                print(f"m0-payload-scan:   {gate.command}: {detail}", flush=True)
             failed |= outcome != "RED"
     finally:
         if cleanup is not None:

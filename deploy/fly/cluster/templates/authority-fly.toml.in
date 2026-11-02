@@ -1,0 +1,37 @@
+app = $app
+primary_region = $region
+kill_signal = "SIGTERM"
+kill_timeout = 60
+
+[build]
+image = $image
+
+[env]
+AT_CLUSTER_CONFIG_B64 = $config_b64
+AT_CLUSTER_INVENTORY_B64 = $inventory_b64
+AT_CLUSTER_REDIS_HOST = $redis_host
+AT_CLUSTER_PUBLISHER_USER = $publisher_user
+
+[deploy]
+strategy = "immediate"
+
+[[restart]]
+policy = "on-failure"
+retries = 10
+
+[[vm]]
+cpu_kind = "shared"
+cpus = 1
+memory = $memory_mb
+
+[mounts]
+source = $volume
+destination = $state_dir
+
+# Liveness only. Actual readiness requires an approved mTLS identity.
+[checks.authority_tcp]
+type = "tcp"
+port = 8444
+interval = "15s"
+timeout = "5s"
+grace_period = "30s"

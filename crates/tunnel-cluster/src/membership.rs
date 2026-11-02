@@ -1014,6 +1014,25 @@ impl MembershipVerifier {
         }
     }
 
+    /// Whether an equal-version refusal matches a retained numeric-only floor.
+    ///
+    /// Call this on the error returned by this verifier before changing its
+    /// state. Both retained evidence fields must be absent, as they are after
+    /// restoring a version fence. A conflict against bytes verified in this
+    /// process is not a restored floor. This read-only classification neither
+    /// verifies the supplied error nor accepts a record or authorizes a retry.
+    #[must_use]
+    pub fn is_restored_membership_floor(&self, error: &MembershipError) -> bool {
+        let MembershipError::EqualVersionConflict { node_id, version } = error else {
+            return false;
+        };
+        self.highest_memberships.get(node_id).is_some_and(|retained| {
+            retained.version == *version
+                && retained.signed_bytes.is_none()
+                && retained.verified.is_none()
+        })
+    }
+
     /// Restore version fences after a process restart, without accepting any
     /// record bytes.  Equal versions remain fenced until superseded.
     pub fn restore_version_state(
@@ -1964,6 +1983,253 @@ mod tests {
             verifier.verify_membership(&lower, now),
             Err(MembershipError::VersionRollback { .. })
         ));
+    }
+
+    #[test]
+    fn restored_membership_floor_is_classified_without_accepting_equal_bytes() {
+        let (issuer, _) = MembershipIssuer::generate("publisher-a").expect("issuer");
+        let now = now();
+        let mut original = verifier(&issuer);
+        verify_test_checkpoint(&issuer, &mut original, now);
+        let bytes = issuer
+            .sign_membership(record(now, "node-a", 2))
+            .expect("record")
+            .encode()
+            .expect("record bytes");
+        original.verify_membership(&bytes, now).expect("original");
+        let mut restored = verifier(&issuer);
+        restored
+            .restore_version_state(original.version_state())
+            .expect("restore numeric floors");
+        let nonce = "fedcba9876543210";
+        let fresh_checkpoint = issuer
+            .sign_checkpoint(checkpoint(now, 2, nonce))
+            .expect("fresh checkpoint")
+            .encode()
+            .expect("checkpoint bytes");
+        restored
+            .verify_checkpoint(&fresh_checkpoint, nonce, now)
+            .expect("fresh nonce-bound checkpoint");
+        let before = restored.version_state();
+        let error = restored
+            .verify_membership(&bytes, now)
+            .expect_err("equal restored version remains refused");
+        assert_eq!(
+            error,
+            MembershipError::EqualVersionConflict {
+                node_id: "node-a".into(),
+                version: 2,
+            }
+        );
+        assert!(restored.is_restored_membership_floor(&error));
+        assert_eq!(restored.version_state(), before);
+        assert!(restored.retained_memberships().is_empty());
+        assert!(restored.highest_memberships["node-a"].signed_bytes.is_none());
+        assert!(restored.highest_memberships["node-a"].verified.is_none());
+        assert_eq!(restored.verify_membership(&bytes, now), Err(error.clone()));
+
+        let higher = issuer
+            .sign_membership(record(now, "node-a", 3))
+            .expect("higher record")
+            .encode()
+            .expect("higher bytes");
+        restored
+            .verify_membership(&higher, now)
+            .expect("strictly higher version verifies normally");
+        assert!(!restored.is_restored_membership_floor(&error));
+        assert_eq!(restored.version_state().node_versions["node-a"], 3);
+        assert_eq!(
+            restored.retained_memberships()[0].signed_bytes(),
+            higher.as_slice()
+        );
+    }
+
+    #[test]
+    fn verified_equal_version_conflict_is_not_restored_floor_provenance() {
+        let (issuer, _) = MembershipIssuer::generate("publisher-a").expect("issuer");
+        let now = now();
+        let mut verifier = verifier(&issuer);
+        verify_test_checkpoint(&issuer, &mut verifier, now);
+        let bytes = issuer
+            .sign_membership(record(now, "node-a", 2))
+            .expect("record")
+            .encode()
+            .expect("record bytes");
+        verifier.verify_membership(&bytes, now).expect("original");
+        let before = verifier.version_state();
+        let mut changed = record(now, "node-a", 2);
+        changed.peer_endpoint = "10.0.0.2:8443".into();
+        changed.server_name = "10.0.0.2".into();
+        let conflicting = issuer
+            .sign_membership(changed)
+            .expect("signed conflicting record")
+            .encode()
+            .expect("conflicting bytes");
+        let error = verifier
+            .verify_membership(&conflicting, now)
+            .expect_err("in-process conflict");
+        assert!(matches!(error, MembershipError::EqualVersionConflict { .. }));
+        assert!(!verifier.is_restored_membership_floor(&error));
+        verifier
+            .restore_version_state(before.clone())
+            .expect("equal numeric restore preserves verified evidence");
+        assert!(!verifier.is_restored_membership_floor(&error));
+        assert_eq!(verifier.version_state(), before);
+        assert_eq!(
+            verifier.retained_memberships()[0].signed_bytes(),
+            bytes.as_slice()
+        );
+        assert!(verifier.verify_membership(&bytes, now).is_ok());
+        assert_eq!(verifier.verify_membership(&conflicting, now), Err(error));
+    }
+
+    #[test]
+    fn restored_floor_classification_requires_exact_node_version_and_error_variant() {
+        let (issuer, _) = MembershipIssuer::generate("publisher-a").expect("issuer");
+        let mut verifier = verifier(&issuer);
+        let exact = MembershipError::EqualVersionConflict {
+            node_id: "node-a".into(),
+            version: 2,
+        };
+        assert!(!verifier.is_restored_membership_floor(&exact));
+        verifier
+            .restore_version_state(MembershipVersionState {
+                checkpoint_version: Some(2),
+                node_versions: BTreeMap::from([("node-a".into(), 2)]),
+            })
+            .expect("numeric floors");
+        assert!(verifier.is_restored_membership_floor(&exact));
+        let before = verifier.version_state();
+        for error in [
+            MembershipError::EqualVersionConflict {
+                node_id: "node-b".into(),
+                version: 2,
+            },
+            MembershipError::EqualVersionConflict {
+                node_id: "node-a".into(),
+                version: 1,
+            },
+            MembershipError::EqualVersionConflict {
+                node_id: "node-a".into(),
+                version: 3,
+            },
+            MembershipError::CheckpointEqualVersionConflict { version: 2 },
+            MembershipError::VersionRollback {
+                node_id: "node-a".into(),
+                highest: 2,
+                received: 1,
+            },
+            MembershipError::SignatureInvalid,
+            MembershipError::NonCanonicalEncoding,
+            MembershipError::CheckpointNonceMismatch,
+            MembershipError::Expired,
+            MembershipError::RoleNotAllowed,
+        ] {
+            assert!(!verifier.is_restored_membership_floor(&error), "{error:?}");
+        }
+        assert_eq!(verifier.version_state(), before);
+        assert!(verifier.retained_memberships().is_empty());
+    }
+
+    #[test]
+    fn restored_floor_requires_both_retained_evidence_fields_to_be_absent() {
+        let (issuer, _) = MembershipIssuer::generate("publisher-a").expect("issuer");
+        let now = now();
+        let mut original = verifier(&issuer);
+        verify_test_checkpoint(&issuer, &mut original, now);
+        let bytes = issuer
+            .sign_membership(record(now, "node-a", 2))
+            .expect("record")
+            .encode()
+            .expect("record bytes");
+        original.verify_membership(&bytes, now).expect("original");
+        let error = MembershipError::EqualVersionConflict {
+            node_id: "node-a".into(),
+            version: 2,
+        };
+        // Defensive internal-state controls: production restore creates neither
+        // evidence field, while successful verification creates both.
+        let mut bytes_only = original.clone();
+        bytes_only
+            .highest_memberships
+            .get_mut("node-a")
+            .unwrap()
+            .verified = None;
+        assert!(!bytes_only.is_restored_membership_floor(&error));
+        let mut verified_only = original.clone();
+        verified_only
+            .highest_memberships
+            .get_mut("node-a")
+            .unwrap()
+            .signed_bytes = None;
+        assert!(!verified_only.is_restored_membership_floor(&error));
+        assert!(!original.is_restored_membership_floor(&error));
+        let mut restored = verifier(&issuer);
+        restored
+            .restore_version_state(original.version_state())
+            .expect("real numeric restore");
+        assert!(restored.is_restored_membership_floor(&error));
+    }
+
+    #[test]
+    fn invalid_records_at_restored_floor_preserve_original_verifier_refusals() {
+        let (issuer, _) = MembershipIssuer::generate("publisher-a").expect("issuer");
+        let now = now();
+        let mut verifier = verifier(&issuer);
+        verifier
+            .restore_version_state(MembershipVersionState {
+                checkpoint_version: None,
+                node_versions: BTreeMap::from([("node-a".into(), 2)]),
+            })
+            .expect("numeric floor");
+        verify_test_checkpoint(&issuer, &mut verifier, now);
+        let before = verifier.version_state();
+        let signed = issuer
+            .sign_membership(record(now, "node-a", 2))
+            .expect("record");
+        let canonical = signed.encode().expect("canonical bytes");
+        let mut forged = signed;
+        forged.peer_endpoint = "10.0.0.2:8443".into();
+        forged.server_name = "10.0.0.2".into();
+        let lower = issuer
+            .sign_membership(record(now, "node-a", 1))
+            .expect("lower record")
+            .encode()
+            .expect("lower bytes");
+        let mut disallowed = record(now, "node-a", 2);
+        disallowed.roles = vec!["consumer".into()];
+        let disallowed = issuer
+            .sign_membership(disallowed)
+            .expect("disallowed-role record")
+            .encode()
+            .expect("disallowed-role bytes");
+        for (bytes, expected) in [
+            (
+                forged.encode().expect("forged bytes"),
+                MembershipError::SignatureInvalid,
+            ),
+            (
+                [b" ".as_slice(), canonical.as_slice()].concat(),
+                MembershipError::NonCanonicalEncoding,
+            ),
+            (
+                lower,
+                MembershipError::VersionRollback {
+                    node_id: "node-a".into(),
+                    highest: 2,
+                    received: 1,
+                },
+            ),
+            (disallowed, MembershipError::RoleNotAllowed),
+        ] {
+            let error = verifier
+                .verify_membership(&bytes, now)
+                .expect_err("trust failure remains fatal to verification");
+            assert_eq!(error, expected);
+            assert!(!verifier.is_restored_membership_floor(&error));
+            assert_eq!(verifier.version_state(), before);
+            assert!(verifier.retained_memberships().is_empty());
+        }
     }
 
     #[test]

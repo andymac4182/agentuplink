@@ -12,6 +12,7 @@
 mod actor;
 mod authority_readiness;
 pub mod catalog_changes;
+pub mod catalog_reconciliation;
 mod clock_offset;
 mod config;
 mod consumer_framing;
@@ -62,10 +63,11 @@ pub use http::{
 pub use membership_runtime::{
     AdmissionDeadline, CheckpointAuthority, CheckpointAuthorityError, CheckpointRequest,
     CheckpointResponse, HttpsCheckpointAuthority, LocalKeyApproval, LocalServingSwitchError,
-    MAX_MEMBERSHIP_PERSISTENCE_TIMEOUT, MembershipReadiness, MembershipRecordSource,
-    MembershipRuntime, MembershipRuntimeConfig, MembershipRuntimeError, MembershipRuntimeHandle,
-    MembershipSnapshot, MembershipUnreadyReason, OWN_KEY_SURRENDER_CONFIRMATIONS, PeerAdmission,
-    PeerIdentity as MembershipPeerIdentity, PeerInvalidationReason,
+    MAX_MEMBERSHIP_PERSISTENCE_TIMEOUT, MembershipBootstrapFailure, MembershipReadiness,
+    MembershipRecordSource, MembershipRuntime, MembershipRuntimeConfig, MembershipRuntimeError,
+    MembershipRuntimeHandle, MembershipSnapshot, MembershipUnreadyReason,
+    OWN_KEY_SURRENDER_CONFIRMATIONS, PeerAdmission, PeerIdentity as MembershipPeerIdentity,
+    PeerInvalidationReason,
 };
 pub use membership_version_state::{
     MembershipVersionStateIdentity, MembershipVersionStateStore, MembershipVersionStateStoreError,

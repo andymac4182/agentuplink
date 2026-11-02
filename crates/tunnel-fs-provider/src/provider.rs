@@ -311,7 +311,7 @@ impl<A: Authority> Provider<A> {
         if !live.fresh {
             self.stats.freshness_closures += 1;
             self.close();
-            return vec![Outbound::Close(SessionErrorCode::AuthExpired)];
+            return vec![Outbound::Close(live.freshness_failure.close_code())];
         }
         for primitive in queued.accepted.primitives.iter() {
             if !primitive.is_permitted(live.grant, self.features) {
