@@ -758,12 +758,9 @@ impl M2Actor {
             let _ = reply.send(DeviceRead::Closed);
             return Ok(());
         };
-        let expired = stream.auth.confirmed
-            && stream
-                .auth
-                .deadline
-                .min(stream.auth.operation_deadline)
-                .expired();
+        // Already handed-off bytes remain subject to the last accepted
+        // confirmation while an unanswered refresh is in flight (M4-76).
+        let expired = stream.authorization_expired_at(Instant::now(), SystemTime::now());
         let invalidated = stream.auth.invalidated;
         let input_reset = stream.input_reset;
         let Some(http) = stream.http.as_mut() else {
@@ -1336,6 +1333,7 @@ mod tests {
                 refresh_in_flight: false,
                 invalidated: false,
             },
+            last_confirmed_deadline: None,
             sequence: StreamState::new(1, 1024).expect("test sequence"),
             pending: VecDeque::new(),
             pending_bytes: 0,

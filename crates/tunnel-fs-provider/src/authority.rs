@@ -9,7 +9,25 @@
 //! dispatcher, `tunnel-client` did not compile for `x86_64-pc-windows-msvc`,
 //! one of the four release targets.
 
-use tunnel_fs_core::CapabilitySet;
+use tunnel_fs_core::{CapabilitySet, SessionErrorCode};
+
+/// Why one immutable authorization observation refuses dispatch.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FreshnessFailure {
+    Invalidated,
+    DeadlineElapsed,
+    SnapshotUnavailable,
+}
+
+impl FreshnessFailure {
+    #[must_use]
+    pub const fn close_code(self) -> SessionErrorCode {
+        match self {
+            Self::Invalidated => SessionErrorCode::AuthExpired,
+            Self::DeadlineElapsed | Self::SnapshotUnavailable => SessionErrorCode::SessionLost,
+        }
+    }
+}
 
 /// What the connector knows about this session's authorization right now.
 ///
@@ -34,6 +52,9 @@ pub struct Authorization {
     /// await/queue wait". This provider asks at exactly those two moments; the
     /// *deadline arithmetic* belongs to the connector, which has the clock.
     pub fresh: bool,
+    /// Used only when `fresh` is false, from this same observation. A later
+    /// mutable authority read must not reclassify a provider's refusal.
+    pub freshness_failure: FreshnessFailure,
 }
 
 /// Where a provider asks what it is allowed to do at this instant.
@@ -70,7 +91,7 @@ pub struct ProviderStats {
     pub grant_refusals: u64,
     /// Sessions closed because the grant revision moved under them.
     pub revision_closures: u64,
-    /// Sessions closed because the authorization snapshot had expired.
+    /// Sessions closed because authorization freshness was lost or unavailable.
     pub freshness_closures: u64,
     /// `Tlopen`s the resolver's kind classified differently from the flags.
     ///

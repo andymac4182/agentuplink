@@ -26,10 +26,10 @@ use tunnel_catalog::{
 use tunnel_cluster::membership::TrustedPublisherKey;
 use tunnel_core::RelayConfig;
 use tunnel_relay::{
-    MembershipReadiness, MembershipRuntime, MembershipRuntimeConfig, MembershipRuntimeError,
-    MembershipUnreadyReason, MembershipVersionStateIdentity, MembershipVersionStateStore,
-    PeerListenerConfig, PeerListenerState, PeerReadiness, PeerRouteTarget, PeerRuntime,
-    RelayOptions, ServeConfig,
+    MembershipBootstrapFailure, MembershipReadiness, MembershipRuntime, MembershipRuntimeConfig,
+    MembershipRuntimeError, MembershipUnreadyReason, MembershipVersionStateIdentity,
+    MembershipVersionStateStore, PeerListenerConfig, PeerListenerState, PeerReadiness,
+    PeerRouteTarget, PeerRuntime, RelayOptions, ServeConfig,
     peer_rekey::{PeerRekey, PeerRekeyConfig},
     recovery::{
         QuiescenceAcknowledgement, RecoverRequest, RecoveryApprovalVersionStore,
@@ -432,6 +432,14 @@ async fn run() -> Result<(), Box<dyn Error>> {
             .await?;
             println!("{line}");
         }
+        [command, rest @ ..] if command == OsStr::new("catalog-bundle-check") => {
+            let line = tunnel_relay::catalog_reconciliation::bundle_check(rest)?;
+            println!("{line}");
+        }
+        [command, rest @ ..] if command == OsStr::new("catalog-reconcile-plan") => {
+            let line = tunnel_relay::catalog_reconciliation::reconcile_plan(rest)?;
+            println!("{line}");
+        }
         [command, rest @ ..] if command == OsStr::new("recovery-initialize") => {
             run_to_completion("recovery-initialize", recovery_initialize(rest)).await?;
         }
@@ -443,7 +451,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
         }
         _ => {
             return Err(
-                "usage: tunnel-relay [--help | check-config [PATH] | check-serve-config --config PATH | initialize --config PATH | recovery-initialize --config PATH | recovery-observe --config PATH | recover --config PATH --approval PATH --expected-nonce NONCE --acknowledgement-id ID --old-primary-fenced --old-relays-fenced | activate-first-incarnation --config PATH | rebind-redis-run --config PATH --redis-restarted-in-place | provision-catalog --config PATH --records PATH [--dry-run] | add-user|add-device|add-service|set-grant --config PATH --records PATH [--dry-run] | revoke-grant|revoke-device|revoke-credential --config PATH --tenant UUID ... [--dry-run] | serve --config PATH]".into(),
+                "usage: tunnel-relay [--help | check-config [PATH] | check-serve-config --config PATH | initialize --config PATH | catalog-bundle-check --config PATH --bundle PATH --expected-bundle-sha256 SHA256 | catalog-reconcile-plan --config PATH --baseline PATH --expected-baseline-sha256 SHA256 --target PATH --expected-target-sha256 SHA256 --output NEW_PATH | recovery-initialize --config PATH | recovery-observe --config PATH | recover --config PATH --approval PATH --expected-nonce NONCE --acknowledgement-id ID --old-primary-fenced --old-relays-fenced | activate-first-incarnation --config PATH | rebind-redis-run --config PATH --redis-restarted-in-place | provision-catalog --config PATH --records PATH [--dry-run] | add-user|add-device|add-service|set-grant --config PATH --records PATH [--dry-run] | revoke-grant|revoke-device|revoke-credential --config PATH --tenant UUID ... [--dry-run] | serve --config PATH]".into(),
             );
         }
     }
@@ -1153,12 +1161,14 @@ async fn start_cluster(
     // pass reached Ready; an unready supervisor is useful for an explicit
     // operator restart but is unsafe for a serving process.
     let membership_handle = membership.start().await?;
+    let initial_bootstrap_failure = membership_handle.initial_bootstrap_failure();
     let membership_readiness = membership.readiness();
     if !matches!(&membership_readiness, MembershipReadiness::Ready) {
         membership_handle.cancel();
         let shutdown_result = membership_handle.shutdown().await;
         return Err(membership_bootstrap_error(
             &membership_readiness,
+            initial_bootstrap_failure,
             shutdown_result.as_ref().err(),
         )
         .into());
@@ -1414,12 +1424,15 @@ impl ClusterServing {
 
 fn membership_bootstrap_error(
     readiness: &MembershipReadiness,
+    bootstrap_failure: Option<MembershipBootstrapFailure>,
     shutdown_error: Option<&MembershipRuntimeError>,
 ) -> String {
     let (readiness_state, reason, category) = membership_readiness_code(readiness);
     let mut message = format!(
         "cluster membership bootstrap did not reach ready: readiness={readiness_state} reason={reason} category={category}"
     );
+    message.push_str(" bootstrap_cause=");
+    message.push_str(bootstrap_failure.map_or("initial_ok", MembershipBootstrapFailure::code));
     if let Some(error) = shutdown_error {
         message.push_str(&format!(
             "; cleanup=membership_shutdown_failed reason={}",
@@ -1713,7 +1726,7 @@ fn parse_jwks(bytes: &[u8]) -> Result<Vec<ApprovedJwk>, Box<dyn Error>> {
 }
 
 /// Every subcommand `run` dispatches, for the subcommand `--help` arm.
-const RELAY_SUBCOMMANDS: [&str; 17] = [
+const RELAY_SUBCOMMANDS: [&str; 19] = [
     "check-config",
     "check-serve-config",
     "serve",
@@ -1728,6 +1741,8 @@ const RELAY_SUBCOMMANDS: [&str; 17] = [
     "revoke-grant",
     "revoke-device",
     "revoke-credential",
+    "catalog-bundle-check",
+    "catalog-reconcile-plan",
     "recovery-initialize",
     "recovery-observe",
     "recover",
@@ -1736,13 +1751,18 @@ const RELAY_SUBCOMMANDS: [&str; 17] = [
 fn print_help() {
     println!(
         "tunnel-relay — authenticated multi-user Agent Tunnel relay\n\n\
-         Usage: tunnel-relay [--help | check-config [PATH] | check-serve-config --config PATH | initialize --config PATH | recovery-initialize --config PATH | recovery-observe --config PATH | recover --config PATH --approval PATH --expected-nonce NONCE --acknowledgement-id ID --old-primary-fenced --old-relays-fenced | activate-first-incarnation --config PATH | rebind-redis-run --config PATH --redis-restarted-in-place | provision-catalog --config PATH --records PATH [--dry-run] | add-user|add-device|add-service|set-grant --config PATH --records PATH [--dry-run] | revoke-grant|revoke-device|revoke-credential --config PATH --tenant UUID ... [--dry-run] | serve --config PATH]\n\n\
+         Usage: tunnel-relay [--help | check-config [PATH] | check-serve-config --config PATH | initialize --config PATH | catalog-bundle-check --config PATH --bundle PATH --expected-bundle-sha256 SHA256 | catalog-reconcile-plan --config PATH --baseline PATH --expected-baseline-sha256 SHA256 --target PATH --expected-target-sha256 SHA256 --output NEW_PATH | recovery-initialize --config PATH | recovery-observe --config PATH | recover --config PATH --approval PATH --expected-nonce NONCE --acknowledgement-id ID --old-primary-fenced --old-relays-fenced | activate-first-incarnation --config PATH | rebind-redis-run --config PATH --redis-restarted-in-place | provision-catalog --config PATH --records PATH [--dry-run] | add-user|add-device|add-service|set-grant --config PATH --records PATH [--dry-run] | revoke-grant|revoke-device|revoke-credential --config PATH --tenant UUID ... [--dry-run] | serve --config PATH]\n\n\
          check-config [PATH]       Validate legacy relay TOML without opening listeners.\n\
          check-serve-config --config PATH\n\
                                   Dry-run the configuration serve uses: full validation,\n\
                                   no socket, no Redis connection, no credential read.\n\
                                   Exits 0 when valid and 1 with a field-level reason.\n\
          initialize --config PATH Create the empty cluster membership fence explicitly.\n\
+         catalog-bundle-check --config PATH --bundle PATH --expected-bundle-sha256 SHA256\n\
+                                  Offline schema/identity check; custody unproven.\n\
+         catalog-reconcile-plan --config PATH --baseline PATH --expected-baseline-sha256 SHA256\n\
+           --target PATH --expected-target-sha256 SHA256 --output NEW_PATH\n\
+                                  Private offline draft only; no export, apply or Redis.\n\
          recovery-initialize --config PATH\n\
                                   Create the empty recovery approval fence explicitly.\n\
          recovery-observe --config PATH\n\
@@ -1945,12 +1965,32 @@ mod tests {
     }
 
     #[test]
-    fn membership_bootstrap_error_redacts_shutdown_details() {
-        let readiness = MembershipReadiness::Unready(MembershipUnreadyReason::CatalogUnavailable);
-        let message = membership_bootstrap_error(&readiness, Some(&MembershipRuntimeError::Join));
+    fn membership_bootstrap_error_retains_only_typed_initial_cause() {
+        let error = MembershipRuntimeError::Membership(
+            tunnel_cluster::membership::MembershipError::EqualVersionConflict {
+                node_id: "PRIVATE_NODE".to_owned(),
+                version: 987654,
+            },
+        );
+        let failure = MembershipBootstrapFailure::from(&error);
+        let readiness = MembershipReadiness::Unready(MembershipUnreadyReason::MembershipRejected);
+        let message = membership_bootstrap_error(&readiness, Some(failure), None);
         assert_eq!(
             message,
-            "cluster membership bootstrap did not reach ready: readiness=unready reason=catalog_unavailable category=catalog; cleanup=membership_shutdown_failed reason=join"
+            "cluster membership bootstrap did not reach ready: readiness=unready reason=membership_rejected category=membership bootstrap_cause=membership_equal_version_conflict"
+        );
+        assert!(!message.contains("PRIVATE_NODE"));
+        assert!(!message.contains("987654"));
+    }
+
+    #[test]
+    fn membership_bootstrap_error_redacts_shutdown_details() {
+        let readiness = MembershipReadiness::Unready(MembershipUnreadyReason::CatalogUnavailable);
+        let message =
+            membership_bootstrap_error(&readiness, None, Some(&MembershipRuntimeError::Join));
+        assert_eq!(
+            message,
+            "cluster membership bootstrap did not reach ready: readiness=unready reason=catalog_unavailable category=catalog bootstrap_cause=initial_ok; cleanup=membership_shutdown_failed reason=join"
         );
     }
 }

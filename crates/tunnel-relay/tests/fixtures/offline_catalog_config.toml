@@ -1,0 +1,29 @@
+# Synthetic offline fixture: none of these endpoints or key files is opened.
+oidc_issuer = "https://issuer.invalid/"
+oidc_audience = ["agent-tunnel"]
+oidc_jwks_path = "absent-jwks.json"
+redis_url = "rediss://redis.invalid:6379/0"
+redis_namespace = "test-schema"
+deployment_incarnation = "incarnation-a"
+device_tls_cert_chain = "absent-device-cert.pem"
+device_tls_private_key = "absent-device-key.pem"
+device_tls_client_ca = "absent-device-ca.pem"
+consumer_tls_cert_chain = "absent-consumer-cert.pem"
+consumer_tls_private_key = "absent-consumer-key.pem"
+node_id = "relay-a"
+
+[cluster]
+deployment_id = "deployment-a"
+peer_bind = "127.0.0.1:8443"
+peer_tls_cert_chain = "absent-peer-cert.pem"
+peer_tls_private_key = "absent-peer-key.pem"
+peer_tls_client_ca = "absent-peer-ca.pem"
+membership_signer_public_key_path = "absent-membership-signer.pub"
+membership_signer_trust_path = "absent-membership-trust.pem"
+checkpoint_authority_endpoint = "https://checkpoint.invalid/v1/checkpoint"
+checkpoint_authority_trust_path = "absent-checkpoint-ca.pem"
+membership_version_state_path = "absent-membership-state.json"
+
+[cluster.endpoint_policy]
+allowed_ports = [8443]
+require_private_ip = true

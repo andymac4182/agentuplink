@@ -101,9 +101,9 @@ impl ObservedRedisKey {
 /// A canonical entry included in the approval-bound durable observation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CanonicalEntry {
-    kind: CanonicalKind,
-    key: String,
-    fields: Vec<(String, String)>,
+    pub(super) kind: CanonicalKind,
+    pub(super) key: String,
+    pub(super) fields: Vec<(String, String)>,
 }
 
 /// Canonical Redis value kind.  ZSET and ephemeral entries never appear here.
@@ -145,8 +145,7 @@ impl ValidatedCatalogSnapshot {
         &self.canonical_bytes
     }
 
-    #[cfg(test)]
-    pub fn canonical_entries(&self) -> &[CanonicalEntry] {
+    pub(super) fn canonical_entries(&self) -> &[CanonicalEntry] {
         &self.canonical_entries
     }
 
@@ -1772,7 +1771,7 @@ fn append_component(bytes: &mut Vec<u8>, value: &[u8]) -> Result<(), SnapshotSch
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
 
     const PREFIX: &str = "tunnel-catalog:test-schema:";
@@ -1801,7 +1800,7 @@ mod tests {
         )
     }
 
-    fn base_catalog() -> Vec<ObservedRedisKey> {
+    pub(crate) fn base_catalog() -> Vec<ObservedRedisKey> {
         vec![
             hash(
                 &format!("tenant:{TENANT_A}"),

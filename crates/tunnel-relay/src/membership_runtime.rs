@@ -1238,8 +1238,116 @@ struct RuntimeState {
     surrender_bounds: SurrenderBounds,
 }
 
+/// Payload-free classification of the one initial bootstrap pass.
+///
+/// This is diagnostic evidence, not a retry policy. It preserves neither
+/// signed bytes nor dynamic verifier strings, and makes no lifecycle claim
+/// about a later unready snapshot or a subsequent process in combined logs.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MembershipBootstrapFailure {
+    code: &'static str,
+}
+
+impl MembershipBootstrapFailure {
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        self.code
+    }
+}
+
+impl From<&MembershipRuntimeError> for MembershipBootstrapFailure {
+    fn from(error: &MembershipRuntimeError) -> Self {
+        let code = match error {
+            MembershipRuntimeError::Authority(error) => match error {
+                CheckpointAuthorityError::InvalidEndpoint => "authority_invalid_endpoint",
+                CheckpointAuthorityError::InvalidRequest => "authority_invalid_request",
+                CheckpointAuthorityError::InvalidTrustBundle => "authority_invalid_trust_bundle",
+                CheckpointAuthorityError::InvalidClientIdentity => {
+                    "authority_invalid_client_identity"
+                }
+                CheckpointAuthorityError::Transport => "authority_transport",
+                CheckpointAuthorityError::DeadlineExceeded => "authority_deadline_exceeded",
+                CheckpointAuthorityError::HttpStatus(_) => "authority_http_status",
+                CheckpointAuthorityError::InvalidResponse => "authority_invalid_response",
+                CheckpointAuthorityError::BodyTooLarge => "authority_body_too_large",
+                CheckpointAuthorityError::Cancelled => "authority_cancelled",
+            },
+            MembershipRuntimeError::Source(error) => match error {
+                MembershipSourceError::Catalog => "source_catalog",
+                MembershipSourceError::TooManyRecords => "source_too_many_records",
+                MembershipSourceError::InvalidRecordEnvelope => "source_invalid_record_envelope",
+                MembershipSourceError::Cancelled => "source_cancelled",
+            },
+            MembershipRuntimeError::Membership(error) => match error {
+                MembershipError::InvalidPolicy(_) => "membership_invalid_policy",
+                MembershipError::MalformedJson(_) => "membership_malformed_json",
+                MembershipError::Serialization(_) => "membership_serialization",
+                MembershipError::RecordTooLarge { .. } => "membership_record_too_large",
+                MembershipError::NonCanonicalEncoding => "membership_non_canonical_encoding",
+                MembershipError::UnsupportedSchemaVersion(_) => {
+                    "membership_unsupported_schema_version"
+                }
+                MembershipError::DeploymentMismatch => "membership_deployment_mismatch",
+                MembershipError::IncarnationMismatch => "membership_incarnation_mismatch",
+                MembershipError::InvalidIdentifier(_) => "membership_invalid_identifier",
+                MembershipError::InvalidVersion => "membership_invalid_version",
+                MembershipError::RoleNotAllowed => "membership_role_not_allowed",
+                MembershipError::EndpointNotAllowed(_) => "membership_endpoint_not_allowed",
+                MembershipError::InvalidTime => "membership_invalid_time",
+                MembershipError::InvalidTimeWindow => "membership_invalid_time_window",
+                MembershipError::LifetimeExceeded => "membership_lifetime_exceeded",
+                MembershipError::IssuedInFuture => "membership_issued_in_future",
+                MembershipError::NotYetValid => "membership_not_yet_valid",
+                MembershipError::Expired => "membership_expired",
+                MembershipError::InvalidNonce => "membership_invalid_nonce",
+                MembershipError::CheckpointNonceMismatch => "membership_checkpoint_nonce_mismatch",
+                MembershipError::CheckpointRequired => "membership_checkpoint_required",
+                MembershipError::CheckpointReplay => "membership_checkpoint_replay",
+                MembershipError::CheckpointVersionRollback { .. } => {
+                    "membership_checkpoint_version_rollback"
+                }
+                MembershipError::CheckpointEqualVersionConflict { .. } => {
+                    "membership_checkpoint_equal_version_conflict"
+                }
+                MembershipError::VersionRollback { .. } => "membership_version_rollback",
+                MembershipError::EqualVersionConflict { .. } => "membership_equal_version_conflict",
+                MembershipError::VersionBelowCheckpoint { .. } => {
+                    "membership_version_below_checkpoint"
+                }
+                MembershipError::NodeNotInCheckpoint(_) => "membership_node_not_in_checkpoint",
+                MembershipError::NodeLimit { .. } => "membership_node_limit",
+                MembershipError::KeyCountExceeded { .. } => "membership_key_count_exceeded",
+                MembershipError::DuplicateRelayKey(_) => "membership_duplicate_relay_key",
+                MembershipError::RelayKeysUnordered => "membership_relay_keys_unordered",
+                MembershipError::InvalidSpkiDigest(_) => "membership_invalid_spki_digest",
+                MembershipError::InvalidRelayKeyWindow(_) => "membership_invalid_relay_key_window",
+                MembershipError::NoUsableRelayKey => "membership_no_usable_relay_key",
+                MembershipError::PeerNodeMismatch => "membership_peer_node_mismatch",
+                MembershipError::PeerKeyMismatch => "membership_peer_key_mismatch",
+                MembershipError::DuplicatePublisherKey(_) => "membership_duplicate_publisher_key",
+                MembershipError::UnknownPublisherKey(_) => "membership_unknown_publisher_key",
+                MembershipError::InvalidSignatureEncoding => {
+                    "membership_invalid_signature_encoding"
+                }
+                MembershipError::SignatureInvalid => "membership_signature_invalid",
+                MembershipError::InvalidIssuerKey => "membership_invalid_issuer_key",
+            },
+            MembershipRuntimeError::InvalidConfiguration => "runtime_invalid_configuration",
+            MembershipRuntimeError::Persistence(_) => "runtime_persistence",
+            MembershipRuntimeError::PersistenceTimeout => "runtime_persistence_timeout",
+            MembershipRuntimeError::NotReady => "runtime_not_ready",
+            MembershipRuntimeError::PeerRejected => "runtime_peer_rejected",
+            MembershipRuntimeError::CheckpointExpired => "runtime_checkpoint_expired",
+            MembershipRuntimeError::Cancelled => "runtime_cancelled",
+            MembershipRuntimeError::Join => "runtime_join",
+        };
+        Self { code }
+    }
+}
+
 /// A cancellable, joined membership reconciliation task.
 pub struct MembershipRuntimeHandle {
+    bootstrap_failure: Option<MembershipBootstrapFailure>,
     cancellation: CancellationToken,
     task: JoinHandle<Result<(), MembershipRuntimeError>>,
 }
@@ -1255,6 +1363,13 @@ impl fmt::Debug for MembershipRuntimeHandle {
 }
 
 impl MembershipRuntimeHandle {
+    /// The typed failure of the one initial pass, or `None` if it succeeded.
+    /// Later supervisor passes do not overwrite this diagnostic observation.
+    #[must_use]
+    pub fn initial_bootstrap_failure(&self) -> Option<MembershipBootstrapFailure> {
+        self.bootstrap_failure
+    }
+
     /// Request cancellation and await the supervisor task to completion.
     ///
     /// This is intentionally an unbounded, joined final shutdown.  A
@@ -1638,11 +1753,20 @@ impl MembershipRuntime {
         if self.started.swap(true, Ordering::AcqRel) {
             return Err(MembershipRuntimeError::InvalidConfiguration);
         }
-        let _ = self.bootstrap().await;
+        let bootstrap_failure = self
+            .bootstrap()
+            .await
+            .as_ref()
+            .err()
+            .map(MembershipBootstrapFailure::from);
         let runtime = Arc::clone(self);
         let cancellation = self.cancellation.clone();
         let task = tokio::spawn(async move { runtime.run_loop().await });
-        Ok(MembershipRuntimeHandle { cancellation, task })
+        Ok(MembershipRuntimeHandle {
+            bootstrap_failure,
+            cancellation,
+            task,
+        })
     }
 
     /// Run the supervisor until the runtime cancellation token is set.
@@ -3683,6 +3807,70 @@ mod tests {
                 .expect("catalog read"),
             records
         );
+    }
+
+    #[test]
+    fn bootstrap_failure_separates_equal_version_and_checkpoint_causes() {
+        let cases = [
+            (
+                MembershipError::EqualVersionConflict {
+                    node_id: "private-node".to_owned(),
+                    version: 123,
+                },
+                "membership_equal_version_conflict",
+            ),
+            (
+                MembershipError::CheckpointEqualVersionConflict { version: 123 },
+                "membership_checkpoint_equal_version_conflict",
+            ),
+            (
+                MembershipError::SignatureInvalid,
+                "membership_signature_invalid",
+            ),
+        ];
+        for (error, expected) in cases {
+            let failure =
+                MembershipBootstrapFailure::from(&MembershipRuntimeError::Membership(error));
+            assert_eq!(failure.code(), expected);
+            assert!(!format!("{failure:?}").contains("private-node"));
+            assert!(!format!("{failure:?}").contains("123"));
+        }
+    }
+
+    #[test]
+    fn bootstrap_failure_never_retains_dynamic_verifier_details() {
+        let private = "PRIVATE_TOKEN\nendpoint.example.invalid/signed-payload";
+        let errors = [
+            MembershipError::InvalidPolicy(private.to_owned()),
+            MembershipError::MalformedJson(private.to_owned()),
+            MembershipError::Serialization(private.to_owned()),
+            MembershipError::InvalidIdentifier(private.to_owned()),
+            MembershipError::EndpointNotAllowed(private.to_owned()),
+            MembershipError::NodeNotInCheckpoint(private.to_owned()),
+            MembershipError::DuplicateRelayKey(private.to_owned()),
+            MembershipError::InvalidSpkiDigest(private.to_owned()),
+            MembershipError::InvalidRelayKeyWindow(private.to_owned()),
+            MembershipError::DuplicatePublisherKey(private.to_owned()),
+            MembershipError::UnknownPublisherKey(private.to_owned()),
+        ];
+        for error in errors {
+            let failure =
+                MembershipBootstrapFailure::from(&MembershipRuntimeError::Membership(error));
+            assert!(
+                failure
+                    .code()
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
+            );
+            let debug = format!("{failure:?}");
+            for secret in [
+                "PRIVATE_TOKEN",
+                "endpoint.example.invalid",
+                "signed-payload",
+            ] {
+                assert!(!debug.contains(secret));
+            }
+        }
     }
 
     #[test]

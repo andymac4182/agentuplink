@@ -62,6 +62,7 @@ from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import release_catalog_offline  # noqa: E402
 from package_release import (  # noqa: E402
     binaries_for, device_only, device_side_example, named_examples, unresolved_links,
 )
@@ -88,7 +89,9 @@ SCOPE = (
     "per-file checksums and a PROVENANCE.txt (the CI archive carries neither; "
     "build provenance is the GitHub attestation, verified with `gh attestation "
     "verify`), a lockfile reconciliation of notices, and a launched relay and "
-    "device doing a real operation and a rotation from the archive"
+    "device doing a real operation and a rotation from the archive. "
+    "The offline catalog witness uses the archive relay with separately "
+    "source-bound repository synthetic fixtures; no live recovery/apply proof"
 )
 
 
@@ -404,6 +407,31 @@ def check_cli(root: Path, target: str, work: Path) -> Result:
     return result
 
 
+CATALOG_FIXTURES = (Path(__file__).resolve().parents[1] / "crates" / "tunnel-relay" /
+                    "tests" / "fixtures")
+
+
+def check_catalog_offline(root: Path, target: str, work: Path,
+                          fixture_root: Path = CATALOG_FIXTURES) -> Result:
+    if "tunnel-relay" not in binaries_for(target):
+        return Result("catalog-offline", True, "not applicable: this archive ships no relay")
+    env = stranger_env(work)
+    if shutil.which("cargo", path=env["PATH"]) is not None:
+        return fail("catalog-offline", "environment-not-scrubbed", "cargo reachable on system-only PATH")
+    try:
+        receipt = release_catalog_offline.check(root / "bin" / "tunnel-relay", fixture_root, work, env)
+    except Exception:
+        return fail("catalog-offline", "catalog-offline-supervision", "offline witness could not finish")
+    if receipt["status"] == "passed":
+        result = Result("catalog-offline", True,
+                        "archive relay: private bundle/no-change draft and exact hash/create-only refusals")
+    else:
+        result = fail("catalog-offline", "catalog-offline-" + receipt["first_failure"],
+                      "offline witness failed; no raw command output disclosed")
+    result.notes.append("catalog_offline_receipt=" + json.dumps(receipt, sort_keys=True, separators=(",", ":")))
+    return result
+
+
 # The dynamic libraries a clean machine of each OS provides.  Linux: glibc's
 # own libraries and the GCC runtime every glibc distribution installs.
 LINUX_SYSTEM = re.compile(r"^(libc|libm|libdl|librt|libpthread|libutil|libgcc_s)\.so\.[0-9]+$"
@@ -527,6 +555,8 @@ def run_checks(root: Path, archive: Path, checksum: Path, target: str, sha: str 
         if results[2].ok:
             results.append(check_cli(root, target, work))
         results.append(check_portability(root, target))
+        if all(result.ok for result in results):
+            results.append(check_catalog_offline(root, target, work))
         return results
 
 
@@ -681,6 +711,18 @@ def controls(root: Path, archive: Path, checksum: Path, target: str,
             return found + [planted] if binary.name == exe(target, "tunnel-client") else found
         return check_portability(root, target, reader=reader)
     expect("a planted import the clean OS lacks", "non-system-dependency", planted_import)
+    def catalog_fixture_changed(tmp):
+        if "tunnel-relay" not in binaries_for(target):
+            return None
+        fixtures = tmp / "fixtures"
+        fixtures.mkdir()
+        for name in release_catalog_offline.FIXTURES:
+            data = (CATALOG_FIXTURES / name).read_bytes()
+            if name == "offline_catalog_config.toml":
+                data += b"\n# altered fixture\n"
+            (fixtures / name).write_bytes(data)
+        return check_catalog_offline(root, target, tmp, fixtures)
+    expect("offline catalog source fixture changed", "catalog-offline-fixture-hash", catalog_fixture_changed)
     return out
 
 

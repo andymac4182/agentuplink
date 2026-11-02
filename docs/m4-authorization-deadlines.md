@@ -1,0 +1,96 @@
+# Independent authorization deadlines for handed-off work
+
+Status: source implementation and independent review complete; #290 now passes
+all three Rust jobs and the nine-mutant workflow. All 20 named tests execute on
+Linux/macOS and 19 applicable tests on Windows with the original Unix-only case
+preserved. The focused original filesystem gate4 mutation and fresh successor
+acceptance remain pending. [Current exact evidence](m6-fly-revocation-and-backup-2026-11-02.md#authorization-mutation-evidence-and-original-gate4-scope).
+Earlier source-only and #289 formatting-failure checkpoints below are historical.
+
+An unanswered refresh previously replaced a stream's last accepted confirmation
+deadline. The HTTP read boundary checked expiry only while `confirmed` was true,
+so work already handed to its exchange could outlive that earlier confirmation.
+The filesystem provider did check freshness before host dispatch, but its shared
+snapshot depended on the actor updating a freshness bit. A queued request could
+therefore outlive the confirmation while the actor had not run another tick.
+Existing new-DATA buffering, queue bounds and periodic expiry remain protections
+within their own scopes.
+
+## Correction
+
+The M2 stream retains the last confirmed deadline separately from the current
+challenge and operation deadline. Each bound keeps both clock anchors; combining
+them through a minimum must not discard a wall-clock reversal anchor. Immediate
+and deferred refresh admission preserve the accepted bound. Only a matching,
+timely confirmation with a still-live shortened deadline renews authorization.
+An already lapsed stream cannot be revived by a late confirmation.
+
+The filesystem provider independently reads all three bounds immediately before
+host work. The actor publishes them through a versioned atomic snapshot, with
+sequentially consistent fields, checked nonwrapping versions, writer exclusion
+and at most three read attempts. No unsafe code, new dependency or actor-blocking
+lock is introduced. Snapshot contention can conservatively close a live session
+with retryable 1011; this availability tradeoff is explicit and unmeasured.
+
+The observed cause is carried into provider closure. Local elapsed authorization
+remains 4006/1011; explicit invalidation remains 4001/1008. An unavailable snapshot
+has a distinct internal cause and is not reported as a measured elapsed deadline
+or revocation. Published terminal causes remain terminal. A clock-only snapshot
+observation does not itself publish a terminal state, but a provider that refuses
+dispatch closes permanently and cannot resume work after clock restoration or
+snapshot renewal. Existing writer-deadline and transport-failure cleanup remain.
+
+Cadence, quotas, replay, rotation, supported platforms and license policy are
+unchanged. M4-47's recorded account-security rejection remains separate and is
+not retried or bypassed by this change.
+
+## Review and required execution
+
+The isolated proposal starts from `753aeb5ca006889ce23b59be157342d4e72b6083`.
+Its first review finds missing independent challenge publication at the provider
+and a fallback that could lose an already published terminal cause. Two additional
+test-source compile/lint mistakes are found by inspection; they are not executed
+compiler failures. V2 corrects these findings. V3 clarifies clock-only observations,
+uses a fixed-configuration clock witness, and adds a closed-provider continuation
+after restored clock/renewal. Earlier drafts and review findings remain retained.
+
+Final reviewed proposal tree: `670e5dc549531e5d7e0fd2cc85eff4b83cab1313`.
+Patch SHA256: `3efbb61ec81b950b20d88aba40421dbf2e90428144a4dcb6a4a81fa38e8886f3`.
+Independent final review SHA256:
+`93415c6519a15763b249ddfc766ccfb505904c3bbc5ab12ac568aaa1df54a59b`.
+All ten reviewed files integrate byte-for-byte on #288's source; their original
+inputs are unchanged between the worker baseline and that candidate.
+
+Twenty new tests cover HTTP reads, independent clock bounds, immediate/deferred
+admission, late and timely renewal, shortened deadlines with no pending bytes,
+provider-first refusal, terminal causes, snapshot contention/exhaustion, stream
+isolation and writer-failure cleanup. At that source checkpoint they were **written but unrun**; #290 execution is
+recorded above. The existing
+filesystem guard-deletion matcher is adapted to the new equivalent close
+expression with its original mutation and exact-match failure requirement intact;
+the actual deletion witness still needs execution.
+
+Required evidence includes fresh pinned formatting, strict all-target workspace
+Clippy, locked workspace tests, meaningful behavioral RED controls, full affected
+M1/M2/M3/M4/M7 acceptance and supported archive/platform checks at the final
+candidate. Prior #287/#288 Rust passes do not verify these changed files. No local
+native, formatter, compiler, Docker, Redis or cache execution has occurred.
+
+## Artifact-bound follow-up
+
+The [dedicated witness controller](m6-fly-peer-readiness-2026-11-02.md#explicit-m4-76-hosted-witnesses)
+requires20 initial GREEN tests, nine compiled behavioral mutants with ten exact
+assertion failures, then20 restored GREEN tests. Every accepted inventory/test
+execution binds to its compiled executable and unchanged before/after hash.
+Its42 fake/synthetic controls and independent source review pass, with earlier
+review findings and original-source REDs preserved. This does not substitute for
+actual hosted execution, real process supervision or full required platform gates.
+
+## Focused original gate4 continuation
+
+The successor binds the exact original mutation declaration and required witness
+to a provider-dispatcher GREEN/compiled-original-deletion RED/restored GREEN
+sequence. Its 64 fake controls do not establish native execution. The literal
+broad four-crate original CLI remains outside that focused claim. The dedicated
+workflow preserves a 48-minute controller step inside a 60-minute outer job,
+source/artifact bindings and closed receipt output.

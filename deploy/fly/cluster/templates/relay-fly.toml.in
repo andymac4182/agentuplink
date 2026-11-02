@@ -1,0 +1,74 @@
+app = $app
+primary_region = $region
+kill_signal = "SIGTERM"
+kill_timeout = 60
+
+[build]
+image = $image
+
+[env]
+RUST_LOG = "info"
+AT_CLUSTER_CONFIG_B64 = $config_b64
+AT_CLUSTER_REDIS_HOST = $redis_host
+AT_CLUSTER_PUBLISHER_USER = $publisher_user
+
+[deploy]
+strategy = "immediate"
+
+[[restart]]
+policy = "on-failure"
+retries = 10
+
+[[vm]]
+cpu_kind = "shared"
+cpus = 1
+memory = $memory_mb
+
+[mounts]
+source = $volume
+destination = $state_dir
+
+[[services]]
+protocol = "tcp"
+internal_port = 8443
+auto_stop_machines = "off"
+auto_start_machines = false
+min_machines_running = 1
+
+[[services.ports]]
+port = 443
+
+[services.concurrency]
+type = "connections"
+soft_limit = 900
+hard_limit = 1000
+
+[[services.http_checks]]
+interval = "15s"
+timeout = "5s"
+grace_period = "30s"
+method = "get"
+path = "/readyz"
+protocol = "https"
+tls_server_name = $public_hostname
+tls_skip_verify = false
+
+[[services]]
+protocol = "tcp"
+internal_port = 9443
+auto_stop_machines = "off"
+auto_start_machines = false
+min_machines_running = 1
+
+[[services.ports]]
+port = 9443
+
+[services.concurrency]
+type = "connections"
+soft_limit = 900
+hard_limit = 1000
+
+[[services.tcp_checks]]
+interval = "15s"
+timeout = "5s"
+grace_period = "30s"

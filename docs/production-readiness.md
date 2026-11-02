@@ -6,7 +6,7 @@ Goal: make Agent Uplink deployable with a repeatable release, verified recovery,
 and evidence for every production blocker. Requested by the owner on 2026-10-31.
 Review baseline: `c749a78432c2d863572a601a7935abf73fa193a2`.
 
-Reviewable changes are stacked draft pull requests, in dependency order:
+The historical stacked PRs incorporated by #284 are, in dependency order:
 [hardening #260](https://github.com/andymac4182/agentuplink/pull/260),
 [offline authority #261](https://github.com/andymac4182/agentuplink/pull/261),
 [authenticated authority transports #263](https://github.com/andymac4182/agentuplink/pull/263),
@@ -29,33 +29,310 @@ then [real actor queue acceptance #278](https://github.com/andymac4182/agentupli
 
 ## Current merge and Fly continuation
 
-The owner has authorized merging and selected Fly for the initial deployment.
-The separate `codex/production-merge-candidate` branch consolidates the complete
-stack ending at [#283](https://github.com/andymac4182/agentuplink/pull/283) and
-adds C257 coverage for notice-only release inputs. Main is still `c749a784` at
-this observation. Merge only the final checked candidate using a merge commit;
-keep its main/base/head/tree identities and post-merge results explicit.
+Latest dated continuation: [#295 delivery and #296 formatting evidence](m6-restart-format-delivery-2026-11-02.md)
+records all three #295 Rust jobs and actual offline archive commands passing,
+while its Fly relay restart still fails and both recoveries are skipped.
+#296 carries the planned-restart correction, but its first Ubuntu formatting
+job fails before the new Rust tests. The isolated formatting successor and
+production startup ownership work remain in progress. Older snapshots below
+remain historical evidence; no result is borrowed across candidates.
 
-At #283 `8c531ad4` / actual same-tree `b3e011e0`, all three Rust platforms and
-full M4 pass. The actual 300-second framework gate has eight exchanges / 20,480
-bytes and joined cleanup; C244 reaches three exchanges / zero streams / zero
-replay with every original assertion. Thirteen CI jobs pass, with M7 still
-running at this observation. All five optimized builds/native archive verifiers
-and packaging pass. These results do not erase #282's unknown cleanup cause,
-#278's failure or the local C256 Clippy/quarantined-cleanup failure.
-[Consolidation evidence, release effects and open work](m6-merge-candidate-2026-11-02.md)
-bind the exact scope. The new consolidation requires its own hosted checks.
+The continuous Codex production goal remains active; the owner disabled the
+hourly automation. Main remains `626ba9365b5d3e1faf8265f0b6ff50cc9111b749`.
+Merge authorization covers a fully checked candidate and the normal configured
+development prerelease; live deployment and license exceptions remain unauthorized.
 
-Main's existing successful-CI workflow publishes an attested development
-prerelease. This merge consequence is explicit; it is not production approval
-or live deployment. License decisions and unresolved notice/provenance scope
-remain open. Fly is the selected target, but the existing single-relay profile
-is only intermediate: C258 retains the three-relay/authority/durable-Redis
-requirements. Fly account access and actual inventory are not available here.
+[Draft #294](https://github.com/andymac4182/agentuplink/pull/294) is frozen at
+`d55ffcfe0c1357bb4fa95b30ba0e2b45e729204b`, actual hosted checkout
+`475ac05ce9fcf46a203ff2951a99471620fdd95c`, shared tree
+`668827ea79c2e89e8bffda0947b80f9b11734ae0`. At the retained
+2026-11-02T13:58:35.992623Z snapshot, ordinary CI has ten passing jobs, three
+Rust formatting failures and M7 still active. All three formatting logs contain
+24 identical hunks; subsequent Clippy/workspace/example steps in those jobs
+are skipped. M0/M2/M3/M4, three-OS packaging, five optimized build/native archive
+pairs and both fresh authorization mutation workflows pass. The existing
+archive probes do not execute the new offline catalog commands.
+
+The actual Fly helper disconnect passes again, followed by relay-a restart
+exit 1. Combined logs have one closed membership-bootstrap rejection with
+`membership_rejected`; lifecycle attribution is `none`, and the underlying
+variant remains unknown. Both recovery scenarios are skipped. The
+[exact #294 report](m6-offline-catalog-delivery-2026-11-02.md) retains image,
+binary/notice, receipt and cleanup identities without claiming repair.
+
+The separate reviewed successor applies the hosted formatting hunks, adds two
+portable Windows CLI-refusal tests and a bounded optimized-archive semantic
+witness. Existing platforms/checks remain. Thirty-six new pure/mock controls
+and seven existing verifier controls pass after a retained sparse-example
+setup failure; source/static checks pass. Native semantics, actual supervision,
+fresh full Rust checks and successful restart/recovery remain owed. No production
+criterion or restriction is relaxed.
+
+A separate planned-restart source slice is reviewed and locally integrated over
+`dc2e89a0` for pure controls only; it has no new hosted result. After successful
+stop it observes final durable membership/checkpoint floors, requires compatible
+nonexhausted authority allocators and a strictly newer confirmed round, then
+performs one start and actual-readiness/durable-adoption assertions within one
+shared 60-second Runner/HTTP budget. The existing handle also retains a closed
+initial bootstrap cause without adding retries or changing trust acceptance.
+Source v2 receipt `4f51261c` and review `8376f39c` are preserved; all 357 pure
+controls pass, including 19 new. The combined local overlay passes the same
+357 controls with 483 materialized files unchanged (receipt `a5845563`). Four
+new Rust tests, fresh full native checks and actual image restart/recovery remain
+unrun. The original modeled RED, preparation failures and narrower shared-budget
+RED remain in the [standalone report](m6-fly-planned-restart-2026-11-02.md).
+General crash-start availability is open, and neither the source fix nor
+combined logs establishes the exact PR293/294 rejection variant.
+
+A preliminary root raw-pattern helper refused one existing synthetic parser
+fixture; the repository's unchanged path/pattern/digest scanner then passes
+(receipt `b8afb0e4`). The refusal remains a preparation error, with no new
+exception or source revision. A separately reviewed P1 predicate identifies an
+exact retained node/version only when both verified-evidence fields are absent
+(source `dbfe284f`, review `cb0f306d`). It neither verifies a supplied
+error nor changes acceptance/readiness/retry behavior. Its five additional Rust
+tests are prepared and unrun; the broader startup-wait and cancellation design
+remains open.
+
+Dated continuation: #294 M7 passes at 2026-11-02T14:17:02.1853540Z; terminal
+ordinary CI is 11 passing jobs and three formatting failures (receipt
+`c76704ea`). After all eight head runs are terminal, the draft is closed
+unmerged at 14:18:56Z, superseded by [#295](https://github.com/andymac4182/agentuplink/pull/295).
+The coordinator's subsequent partial snapshot reports all three #295 formatting
+steps and three-OS packaging passing while remaining native checks are active.
+Neither this partial successor result nor #294's dedicated M7 success accepts
+the separate failed Fly rehearsal or verifies the planned-restart/P1 source
+continuations. Earlier dated checkpoints remain unchanged.
+
+### Retained #293 checkpoint
+
+[Draft #293](https://github.com/andymac4182/agentuplink/pull/293) is frozen at
+`867fd212f814c334c626f57ff8da837fc2a2b9ce`, actual hosted checkout
+`b71a13e228ae46b30e0f3738cbb1da19029f3dba`, shared tree
+`db414265ca5ff657c1d52ad17c56b377d0447728`. At the retained
+2026-11-02T13:28:17.372389Z snapshot, ordinary CI has 13 of 14 jobs passing;
+M7 remains active. M0 passes 21 gates/21 declared witnesses and M2 passes three
+default rotations. Three-OS packaging, five optimized build/native
+archive verifier pairs and both independently reviewed authorization mutation
+workflows pass on this exact source.
+
+The actual Fly helper disconnect passes, but relay-a restart fails with exit 1.
+Combined logs contain a closed membership-bootstrap rejection tuple with
+`membership_rejected`; lifecycle attribution is `none` and the underlying
+variant remains unknown. Both recovery scenarios are skipped. The
+[exact #293 report](m6-offline-catalog-reconciliation-2026-11-02.md) preserves
+source/image bindings, refusal/positive controls and cleanup without attributing
+an older failure or claiming repair.
+
+The separate successor adds independently reviewed offline catalog validation
+and a conservative reconciliation draft. It performs no Redis/export/apply or
+activation operation and supplies no production custody or interlock. All 23
+prepared Rust tests, formatting, Clippy and native CLI execution remain unrun.
+Existing 338 pure/temp controls pass against the integrated source bindings;
+they are not native proof. Optimized archive semantic witnesses remain separate
+work pending review and hosted execution. All production restrictions and
+completion criteria below remain open.
+
+### Retained #292 checkpoint
+
+[Draft #292](https://github.com/andymac4182/agentuplink/pull/292) is frozen at
+`9b0820974038685e7a4c6a9195c3a75a018dfcec`, actual hosted checkout
+`990d5627da890715fcfce453632fa75016673d57`, shared tree
+`a154b7e6b76e783aa9cd297964c327a3b597469e`. At the retained
+2026-11-02T12:52:38Z snapshot, 13 of 14 ordinary CI jobs pass and M7 is active.
+Three-OS packaging and all five optimized build/native archive verifier pairs
+pass. Both fresh authorization mutation workflows pass independent review,
+including exact restoration and binary/run bindings; their focused scope and
+mock-only forced-cleanup limits remain explicit.
+
+The actual Fly helper disconnect passes with its strict stopped acknowledgement
+and independently observed clean original client exit. A later relay-a restart
+fails: the same container exits 1 and readiness/owner/membership comparisons
+are unreached. Its startup cause is unknown; successful cleanup does not rescue
+acceptance. Same-AOF and physical older-backup recovery are skipped. The
+[exact #292 report](m6-fly-relay-restart-2026-11-02.md) retains source/image
+identities, receipts, actual positive/refusal observations and earlier failures.
+
+The separate successor adds reviewed closed-vocabulary relay startup observations
+and an operator output verifier. The new verifier mode is POSIX-only; existing
+rendering/platform support is unchanged. It checks regenerated bytes and file
+identities without attesting permissions, atomicity, trust or runtime readiness.
+Exact reviewed patches pass 338 combined offline controls with unchanged source;
+new hosted image and recovery acceptance is still required. Diagnostics do not
+attribute or repair #292's unknown historical cause. A bounded dependency review
+also rejects a metadata-only cffi downgrade: both versions' actual LICENSE bytes
+are identical MIT No Attribution. All five C253 and three M3-50 policy refusals
+remain, with no exception, optional-branch removal or platform reduction.
+
+The Fly failure still blocks merge and production readiness. Actual Fly
+inventory/access/PKI/OIDC, production reconciliation and trusted custody,
+operational ownership, capacity/24-hour soak, C259 advisories, C256 quarantine
+and M4-47's security block remain open. No completion criterion is waived.
+
+### Retained #291 checkpoint
+
+[Draft #291](https://github.com/andymac4182/agentuplink/pull/291) is frozen at
+`bad8a26c4eacbe7d25e90c5106d08098c08c5105`, actual hosted checkout
+`3e63fdd12b1dd37f0b0cc43a3992f79c68e75429`, shared tree
+`18ac0514619a83833963496aeabf58145eb79613`. All 14 ordinary CI jobs pass,
+including final M7, at 2026-11-02T12:14:11Z. Three-OS packaging and all five optimized
+build/native archive verifier pairs pass. Named M4-76 tests pass 20 on Linux/macOS
+and 19 applicable cases on Windows. Both fresh authorization workflows pass
+independent review: 20 GREEN / nine compiled mutants / ten intended RED / 20
+restored GREEN, and the exact original gate4 dispatcher GREEN / compiled whole-
+guard-deletion RED / restored GREEN. The latter proves the original mutation
+and unchanged assertion, without claiming the literal broad four-crate CLI.
+
+The Fly cluster rehearsal reaches readiness, nine routes and configured
+300-second rotations. It observes one exact insufficient-scope 403 and three
+exact revoked-device 404 responses with the required positive controls. It then
+fails the explicit client disconnect exec with exit 137 and empty output;
+the mechanism remains unknown. The client main's separate exit-0 observation
+and successful owned-resource cleanup do not rescue acceptance. Relay/authority
+restart and same-AOF recovery are unreached; the physical older-backup job is
+skipped. [Exact #291 evidence](m6-fly-disconnect-2026-11-02.md) preserves the
+identities, receipt hashes, cleanup scope and earlier failures.
+
+The isolated successor helper sends one disconnect request from a distinct
+owned default-user client container, using only the exact profile volume
+read-only and no network. Strict acknowledgement and independent clean original
+container exit are required within unchanged bounds. Independent source review
+and 298 pure/mock controls pass (17 new; all 281 existing methods unchanged).
+The retained baseline RED models a possible exec lifetime schedule; it does
+not reproduce or explain the historical 137. Actual cross-container socket
+access and complete hosted baseline/restart/both-recovery verification remain
+unrun. Synthetic custody still does not supply production reconciliation or
+independently trusted operator revocation/counter/backup custody.
+
+C256's local native/cache quarantine, M4-47's security block, five C253 policy
+refusals, C259 advisory findings, actual Fly inventory/access/PKI, operational
+ownership, capacity/24-hour soak and deployment authorization remain open.
+No production completion criterion, platform check or license requirement is
+waived. The [#290 report](m6-fly-revocation-and-backup-2026-11-02.md) and earlier
+checkpoints remain dated evidence; their pending wording does not describe
+#291's completed focused proofs.
+
+### Retained #289 and earlier checkpoints
+
+[Draft #289](https://github.com/andymac4182/agentuplink/pull/289) is frozen at
+`f12de07646ded6438a6411c7ae2b49e0cc4764a3`, actual hosted checkout
+`de3cbe30a812e9f292c2a595a287c801135d7994`, tree
+`2ee8cbfee2425a58834a5e90a19594f7a5dc58b2`. All three Rust OS jobs fail
+formatting before Clippy/tests. Packaging, all five optimized build/native archive
+verifier pairs, M0/M1/M2/M3/M4 and regular container smoke pass; M7 remains active
+at this checkpoint. New M4-76 unit tests are unrun. The Fly baseline fails after113
+verified-TLS HTTP503 replies; all three corrected metrics helpers now report
+membership/clock ready but overall readiness false. Same-AOF recovery is skipped.
+Clean owned-resource removal is verified without erasing the failed result.
+
+[Exact evidence and reviewed follow-up](m6-fly-peer-readiness-2026-11-02.md)
+preserve all source/image identities and failures. Source review establishes a
+necessary peer-address mismatch: the profile signs DNS endpoints, while both
+production dial paths require numeric socket addresses. C265 supplies explicit
+private IPv6 inventory addresses with separate DNS certificate identities and
+exact fixture allocation checks. The successor also applies the twelve hosted
+formatting hunks and adds an artifact-bound20-test/nine-mutant authorization
+workflow. Independent source reviews and isolated206 Fly/42 mocked witness
+controls pass. Combined248 pure/mock controls, declared-format source scan, AST,
+diff and evidence guard also pass; exact candidate hosted verification is required.
+No required assertions or supported platforms are removed.
+
+#288 is closed unmerged only after all six head-associated runs are terminal;
+all14 ordinary CI jobs pass, while its Fly readiness and metrics-identity failures
+remain preserved. #287 and earlier failed candidates remain closed with evidence.
+Actual Fly access/inventory/PKI/operations, owner license decisions, physical backup
+recovery and live deployment authorization remain explicit. At that checkpoint the goal and hourly continuation were active; the current
+continuous goal above supersedes that scheduling state. No candidate with failed
+required checks is mergeable.
+
+Current main remains `626ba936`; the subsequent [draft #287](https://github.com/andymac4182/agentuplink/pull/287)
+is frozen at `753aeb5c`, actual same-tree checkout `e99f2c18`. Its three-OS
+packaging, all five optimized build/native verifier pairs, all three Rust jobs,
+full M3, real M0 and M2 pass; regular CI finishes all 14 jobs, including full
+M7, at 2026-11-02T17:54:59+10:00. Its Fly image rehearsal **fails** the cluster readiness deadline
+after all eight IPv6 bindings and service starts pass. No client/route/rotation
+or recovery acceptance is reached. [Exact failure and successor work](m6-fly-readiness-2026-11-02.md)
+preserve the unknown cause, clean owned-resource cleanup, C262 recovery-path
+correction and C263 diagnostics. The combined successor passes 127 local
+controls and source review; it still needs new hosted/image checks. #287 is not
+eligible to merge.
+
+The owner authorized merging and selected Fly for the initial deployment.
+[#284](https://github.com/andymac4182/agentuplink/pull/284) is now merged as
+`626ba9365b5d3e1faf8265f0b6ff50cc9111b749` at
+2026-11-02T15:40:54+10:00. Its tree `1e985753` exactly matches candidate
+`46a19cce` and actual hosted checkout `5f2053f0`. All 14 PR CI jobs,
+three-OS packaging and five optimized build/native archive verification pairs
+pass. C257's notice-input trigger scope is verified. Main's own CI run
+41395438209 also passes all 14 jobs, including full M7, completed
+2026-11-02T16:17:31+10:00; three-OS packaging passes. Automatic development
+release run 41398988746 passes five builds, five verifiers, attestation and
+publication. The [development prerelease](https://github.com/andymac4182/agentuplink/releases/tag/v0.1.0-main.41395438209.626ba9365b5d)
+publishes at 2026-11-02T16:30:47+10:00 with ten attestation subjects and eight
+assets; its four checksum sidecars match GitHub archive digests. It is not
+marked latest, and no local archive execution or Fly deployment is inferred.
+Historical #278/#282 failures and C256's local failed/quarantined cleanup remain
+retained; a successful merge does not diagnose them or establish production readiness.
+
+C258 now supplies a separate three-relay, durable-Redis and online-authority Fly
+profile, four source-bound image recipes and a bounded hosted cluster rehearsal.
+Its initial 20 renderer, 20 entrypoint and 33 rehearsal controls pass locally. At #285
+`d343d21c` / actual same-tree `fe6fc25a`, all four new images build and their
+binary/notice checks pass, but the first runtime attempt fails before bootstrap:
+Docker's local log driver rejects default compression with one retained file.
+Both recorded error hashes exactly match fixed public Moby diagnostics.
+C260 supplies an explicit compression setting with the existing size/count
+bounds and closed Docker diagnostics, with 57 local controls and passive authority
+observation. Its #286 candidate `1da066dd` / actual `02ce5072` builds all four
+images, passes preparation and starts Redis, then fails `published_port_scope`.
+C261 identifies the IPv4 host-publishing request on the IPv6-only fixture network;
+the omitted raw inspect shape remains unknown. All 20 containers, 12 volumes,
+one network and 321 command groups are absent with zero cleanup errors. This
+does not erase #285's five failed log captures. #285 and #286 are closed as
+superseded; #286's ordinary CI completed with all 14 jobs passing. The isolated
+IPv6 loopback correction passes 64 local controls and independent review, and
+#287 now proves all eight actual host bindings before its distinct readiness
+failure. [Preceding failure and source follow-up](m6-production-followup-2026-11-02.md)
+keep authority/relay startup, routing, rotation and recovery unclaimed. The [Fly guide](deploy-fly-cluster.md)
+and [exact preparation/merge report](m6-fly-cluster-preparation-2026-11-02.md)
+record source identities, review corrections, failed precommit scan and remaining
+runtime/operator scope. The historical single-relay image smoke does not replace
+this cluster proof. Fly account access and actual deployment inventory remain absent.
+
+C253's [artifact-aware checker](m6-client-license-gate.md) verifies all 324 client
+lock entries and seven aliases. Its original real gate fails on five policy
+entries and two missing archived notices. The new exact-source MIT supplements
+and verified two-text companion resolve the two notice-text gaps in an offline
+replay; all five policy failures remain. Eighty-five local controls pass and
+the CI selector includes them, with new hosted verification pending. This does
+not prove SDK/full-graph distribution or enforce the real policy gate. No license exception, platform
+omission or live deployment authorization has been inferred. The production goal remains active; the current scheduling state is recorded
+above.
+
+A separate fresh public-feed audit returns no npm advisories for the complete
+client/MCP graphs. GitHub's 19-alert banner remains inaccessible behind a 403,
+so that result does not reconcile its alerts. C259 identifies ten affected
+CUA guest/build dependency names and an upstream server/FastMCP constraint.
+The [complete-scope checker](m6-cua-dependency-audit.md) passes 76 offline
+controls; its source-bound replay preserves the actual graph's 97 active
+advisory records and failed result.
+CI exercises those controls; the real advisory gate is not yet enforced there.
+CUA remains disabled and no server-runtime exposure is inferred. Its
+[source-bound findings and remediation limits](m6-fly-continuation-2026-11-02.md#separate-advisory-review--c259)
+retain all supported fixture platforms and make no policy exception.
+
+The current open-PR review also finds #251's handler-cancellation fix and #253's
+failed-witness diagnostics absent from main. Separate reviewed adaptations now
+restore unfinished-handler ownership (M3-53) and add closed diagnostics without
+raw stderr (M0-11). M0's 11 mocked tests, two disclosure controls and scanner
+unit probes pass; M3's four Rust regressions retain only historical hosted
+evidence so far. [The successor report](m6-production-followup-2026-11-02.md)
+requires current-candidate Rust, M3/M0/full CI and all five optimized archive
+verifiers, without touching C256's local quarantine or M4-47's security block.
 
 ## Retained predecessor evidence
 
-Current published [draft #282](https://github.com/andymac4182/agentuplink/pull/282),
+Earlier published [draft #282](https://github.com/andymac4182/agentuplink/pull/282),
 `cb619ee1` / actual `bdb17f6d`, has a new hosted M4-68 connector cleanup
 failure after expected native rotation/revocation outcomes. The completed
 connector error was discarded, so the cause remains unknown. Final gate
@@ -112,7 +389,7 @@ groups are absent afterward; revocations, approval refusals and fresh-session
 recovery pass. [Exact local recovery evidence](m6-fs-ledger-retirement-2026-11-01.md#separate-current-authority-image-recovery)
 does not establish an image rebuilt at #278, default-UID recovery, or live DR.
 
-Latest fully successful hosted baseline [#277](https://github.com/andymac4182/agentuplink/pull/277)
+Earlier fully successful hosted baseline [#277](https://github.com/andymac4182/agentuplink/pull/277)
 head `bd93cfbd828a2d23415e5e406120f9a70e9e92c0` and actual runner checkout
 `3615d7a2ff4ffb5837a8e0f894f353ea68115ac4` share tree
 `00fcf8d247642d9ace69b6223c7500858385e6d3`.
@@ -269,8 +546,9 @@ provisioning failure. It does not prove readiness or production provisioning.
 The three-relay requirement
 is unchanged. The C131 diagnostic feature remains outside this candidate;
 its [causal evidence](m7-c131-diagnostic-evidence-2026-10-31.md) is separate.
-No changes have been merged or deployed, and release publication/attestation
-were skipped for the draft PR.
+At that earlier observation no changes had been merged or deployed, and release
+publication/attestation were skipped for the draft PR. The authorized #284 merge
+is recorded above; no Fly deployment follows from it.
 
 Existing task IDs in `tasks.md` retain their acceptance criteria. A historical
 green gate is not evidence that the current release is production ready. The
@@ -530,10 +808,13 @@ these completion criteria are evidenced; scheduling is not verification.
 
 ## Deployment-specific work still required
 
-The checked-in Fly configuration is one relay and one Redis in one region,
-with immediate replacement and no automatic failover. It cannot provide
-uninterrupted upgrades or high availability. Do not scale it to two relays
-without cluster configuration and the external authority.
+The legacy Fly configuration is one relay and one Redis. The separate
+[cluster profile](deploy-fly-cluster.md) prepares three stable relay apps,
+an online authority and durable Redis, with five independent volumes in one
+explicit region. Its hosted image rehearsal remains failed; neither profile
+is a verified live deployment. The legacy profile must not be scaled into a
+cluster. The new profile uses immediate replacement and has no automatic
+Redis failover or uninterrupted-upgrade claim.
 
 The configuration still contains an example OIDC issuer. Actual Fly identity,
 deployed image, JWKS, TLS certificates, catalog provisioning, backups and
@@ -558,15 +839,22 @@ lease cleanup and dedicated-guest acceptance.
 
 ## Next action
 
-Settle C253's client license policy and artifact-aware enforcement without
-silently granting exceptions. PR #277 full CI, C252's declared advisory scope,
-and the current authority image's lifecycle/default-UID fixture proofs are
-complete within their stated bounds. C251 retains an unattributed historical
-failure; no further image-pending claim remains. Keep the new six-test C240
-actor-loop draft at source-only status until actual compilation and acceptance;
-public-close proof remains separate. complete M4-47 when its recorded account-security requirement is
-satisfied. Resolve universal-license decisions, actual deployment inventory/
-PKI/OIDC, simultaneous-restart recovery, off-host capacity/soak and operational
-ownership before any deployment claim. Preserve all failed attempts and older
-artifact identities. Keep this goal active while any criterion or deployment
-input remains unresolved.
+Publish the reviewed formatting/Windows and optimized archive witness successor,
+then require fresh hosted formatting, strict Clippy, workspace/platform tests
+and actual archive-owned offline command acceptance. Preserve #294's three
+formatting failures, successful focused authorization/optimized probes, dated
+M7 status and failed Fly relay restart. Require complete source-bound Fly
+baseline/restart, same-AOF and physical older-backup acceptance without using
+successful cleanup or combined-log observations as a repair claim. Offline
+validation/no-change draft witnesses do not provide production reconciliation,
+apply tooling, independent custody or operator approval.
+
+C240's broader public-close scope, C251's unattributed historical cause and C256's
+local quarantine remain explicit. Do not retry M4-47 without its recorded
+account-security requirement. C253's five and M3-50's three license-policy
+refusals, actual Fly inventory/access/PKI/OIDC, simultaneous-restart and
+older-backup recovery, off-host capacity/soak and operational ownership remain
+required. Merge authorization applies only to reviewed, fully checked candidates;
+it does not authorize license exceptions or live deployment. Preserve all failures
+and exact artifact identities. Keep the goal active while any completion
+criterion or required deployment input is unresolved.

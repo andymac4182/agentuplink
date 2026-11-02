@@ -36,13 +36,16 @@
 //! `docs/filesystem-api.md` records that the prediction did not come true.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 #[cfg(unix)]
 use bytes::Bytes;
 
 use tunnel_fs_core::{Capability, CapabilitySet, Feature, FeatureSet, Limits, SessionErrorCode};
-use tunnel_fs_provider::{Authority, Authorization, ProviderStats, default_limits};
+use tunnel_fs_provider::{ProviderStats, default_limits};
+
+#[path = "fs_authority.rs"]
+mod fs_authority;
+pub use fs_authority::{SharedAuthority, StreamAuthority};
 use tunnel_http_bridge::{FrameReceiver, FrameSender};
 // The serving half needs the Unix-only dispatcher; on any other host `serve`
 // answers no session, and `RuntimeConfig::validate` has already refused an fs
@@ -151,84 +154,6 @@ pub fn parse_capabilities(metadata: &str) -> CapabilitySet {
         }
     }
     set
-}
-
-/// The live authorization of one admitted stream, as the provider sees it.
-///
-/// Three atomics rather than a lock: the connector actor writes them as it
-/// confirms and invalidates the stream's authorization context, and the
-/// exchange task reads them before every host call. A lock here would make the
-/// actor wait on a task it is not allowed to block on.
-#[derive(Debug)]
-pub struct StreamAuthority {
-    revision: AtomicU64,
-    /// Every capability bit, as gate 1 packs them.
-    grant: AtomicU64,
-    fresh: AtomicBool,
-}
-
-impl StreamAuthority {
-    /// The authority for a stream admitted at `revision` with `grant`.
-    #[must_use]
-    pub fn new(revision: u64, grant: CapabilitySet) -> Self {
-        Self {
-            revision: AtomicU64::new(revision),
-            grant: AtomicU64::new(pack(grant)),
-            fresh: AtomicBool::new(true),
-        }
-    }
-
-    /// Record that the authorization context is confirmed and inside its
-    /// deadline.
-    pub fn confirm(&self, revision: u64, grant: CapabilitySet) {
-        self.revision.store(revision, Ordering::Release);
-        self.grant.store(pack(grant), Ordering::Release);
-        self.fresh.store(true, Ordering::Release);
-    }
-
-    /// The capabilities this session currently carries.
-    ///
-    /// A renewal re-states them rather than re-deriving them: the contract says
-    /// normal renewal "cannot broaden permissions or change frozen scope or
-    /// revision", and any such change closes the stream instead. So there is
-    /// nothing for a confirmation to change here, and a confirmation that
-    /// *could* change it would be the widening the rule forbids.
-    #[must_use]
-    pub fn current_grant(&self) -> CapabilitySet {
-        unpack(self.grant.load(Ordering::Acquire))
-    }
-
-    /// Record that the context is stale, invalidated or revoked.
-    ///
-    /// The next host call the provider would make closes the session instead.
-    pub fn invalidate(&self) {
-        self.fresh.store(false, Ordering::Release);
-    }
-}
-
-/// The provider's view of a [`StreamAuthority`] the connector also holds.
-///
-/// A named wrapper rather than an implementation on `Arc<StreamAuthority>`,
-/// because both the trait and `Arc` come from other crates.
-#[derive(Clone, Debug)]
-pub struct SharedAuthority(Arc<StreamAuthority>);
-
-impl SharedAuthority {
-    /// Share `authority` with a provider.
-    #[must_use]
-    pub const fn new(authority: Arc<StreamAuthority>) -> Self {
-        Self(authority)
-    }
-}
-
-impl Authority for SharedAuthority {
-    fn current(&self) -> Authorization {
-        Authorization {
-            revision: self.0.revision.load(Ordering::Acquire),
-            grant: unpack(self.0.grant.load(Ordering::Acquire)),
-            fresh: self.0.fresh.load(Ordering::Acquire),
-        }
-    }
 }
 
 fn pack(grant: CapabilitySet) -> u64 {
@@ -1162,12 +1087,19 @@ mod tests {
         assert!(!live.fresh);
         assert_eq!(live.grant, grant, "invalidation is not a narrowing");
 
-        authority
-            .0
-            .confirm(12, CapabilitySet::from_slice(&[Capability::List]));
+        let deadline = crate::DualDeadline::new(
+            std::time::Instant::now(),
+            std::time::SystemTime::now(),
+            std::time::Duration::from_secs(1),
+        )
+        .unwrap();
+        assert!(!authority.0.confirm_until(11, grant, deadline, deadline));
         let live = authority.current();
-        assert_eq!(live.revision, 12);
-        assert!(live.fresh);
-        assert_eq!(live.grant, CapabilitySet::from_slice(&[Capability::List]));
+        assert_eq!(live.revision, 11);
+        assert!(
+            !live.fresh,
+            "a late confirmation cannot revive an invalidated stream"
+        );
+        assert_eq!(live.grant, grant);
     }
 }
