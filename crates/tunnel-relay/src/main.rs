@@ -26,10 +26,10 @@ use tunnel_catalog::{
 use tunnel_cluster::membership::TrustedPublisherKey;
 use tunnel_core::RelayConfig;
 use tunnel_relay::{
-    MembershipReadiness, MembershipRuntime, MembershipRuntimeConfig, MembershipRuntimeError,
-    MembershipUnreadyReason, MembershipVersionStateIdentity, MembershipVersionStateStore,
-    PeerListenerConfig, PeerListenerState, PeerReadiness, PeerRouteTarget, PeerRuntime,
-    RelayOptions, ServeConfig,
+    MembershipBootstrapFailure, MembershipReadiness, MembershipRuntime, MembershipRuntimeConfig,
+    MembershipRuntimeError, MembershipUnreadyReason, MembershipVersionStateIdentity,
+    MembershipVersionStateStore, PeerListenerConfig, PeerListenerState, PeerReadiness,
+    PeerRouteTarget, PeerRuntime, RelayOptions, ServeConfig,
     peer_rekey::{PeerRekey, PeerRekeyConfig},
     recovery::{
         QuiescenceAcknowledgement, RecoverRequest, RecoveryApprovalVersionStore,
@@ -1161,12 +1161,14 @@ async fn start_cluster(
     // pass reached Ready; an unready supervisor is useful for an explicit
     // operator restart but is unsafe for a serving process.
     let membership_handle = membership.start().await?;
+    let initial_bootstrap_failure = membership_handle.initial_bootstrap_failure();
     let membership_readiness = membership.readiness();
     if !matches!(&membership_readiness, MembershipReadiness::Ready) {
         membership_handle.cancel();
         let shutdown_result = membership_handle.shutdown().await;
         return Err(membership_bootstrap_error(
             &membership_readiness,
+            initial_bootstrap_failure,
             shutdown_result.as_ref().err(),
         )
         .into());
@@ -1422,12 +1424,15 @@ impl ClusterServing {
 
 fn membership_bootstrap_error(
     readiness: &MembershipReadiness,
+    bootstrap_failure: Option<MembershipBootstrapFailure>,
     shutdown_error: Option<&MembershipRuntimeError>,
 ) -> String {
     let (readiness_state, reason, category) = membership_readiness_code(readiness);
     let mut message = format!(
         "cluster membership bootstrap did not reach ready: readiness={readiness_state} reason={reason} category={category}"
     );
+    message.push_str(" bootstrap_cause=");
+    message.push_str(bootstrap_failure.map_or("initial_ok", MembershipBootstrapFailure::code));
     if let Some(error) = shutdown_error {
         message.push_str(&format!(
             "; cleanup=membership_shutdown_failed reason={}",
@@ -1960,12 +1965,31 @@ mod tests {
     }
 
     #[test]
-    fn membership_bootstrap_error_redacts_shutdown_details() {
-        let readiness = MembershipReadiness::Unready(MembershipUnreadyReason::CatalogUnavailable);
-        let message = membership_bootstrap_error(&readiness, Some(&MembershipRuntimeError::Join));
+    fn membership_bootstrap_error_retains_only_typed_initial_cause() {
+        let error = MembershipRuntimeError::Membership(
+            tunnel_cluster::membership::MembershipError::EqualVersionConflict {
+                node_id: "PRIVATE_NODE".to_owned(),
+                version: 987654,
+            },
+        );
+        let failure = MembershipBootstrapFailure::from(&error);
+        let readiness = MembershipReadiness::Unready(MembershipUnreadyReason::MembershipRejected);
+        let message = membership_bootstrap_error(&readiness, Some(failure), None);
         assert_eq!(
             message,
-            "cluster membership bootstrap did not reach ready: readiness=unready reason=catalog_unavailable category=catalog; cleanup=membership_shutdown_failed reason=join"
+            "cluster membership bootstrap did not reach ready: readiness=unready reason=membership_rejected category=membership bootstrap_cause=membership_equal_version_conflict"
+        );
+        assert!(!message.contains("PRIVATE_NODE"));
+        assert!(!message.contains("987654"));
+    }
+
+    #[test]
+    fn membership_bootstrap_error_redacts_shutdown_details() {
+        let readiness = MembershipReadiness::Unready(MembershipUnreadyReason::CatalogUnavailable);
+        let message = membership_bootstrap_error(&readiness, None, Some(&MembershipRuntimeError::Join));
+        assert_eq!(
+            message,
+            "cluster membership bootstrap did not reach ready: readiness=unready reason=catalog_unavailable category=catalog bootstrap_cause=initial_ok; cleanup=membership_shutdown_failed reason=join"
         );
     }
 }

@@ -466,6 +466,74 @@ RELAY_SHUTDOWN_REASONS = (
     "persistence_timeout", "not_ready", "peer_rejected", "checkpoint_expired", "cancelled", "join",
 )
 
+RELAY_BOOTSTRAP_CAUSES = (
+    "initial_ok",
+    "authority_invalid_endpoint",
+    "authority_invalid_request",
+    "authority_invalid_trust_bundle",
+    "authority_invalid_client_identity",
+    "authority_transport",
+    "authority_deadline_exceeded",
+    "authority_http_status",
+    "authority_invalid_response",
+    "authority_body_too_large",
+    "authority_cancelled",
+    "source_catalog",
+    "source_too_many_records",
+    "source_invalid_record_envelope",
+    "source_cancelled",
+    "membership_invalid_policy",
+    "membership_malformed_json",
+    "membership_serialization",
+    "membership_record_too_large",
+    "membership_non_canonical_encoding",
+    "membership_unsupported_schema_version",
+    "membership_deployment_mismatch",
+    "membership_incarnation_mismatch",
+    "membership_invalid_identifier",
+    "membership_invalid_version",
+    "membership_role_not_allowed",
+    "membership_endpoint_not_allowed",
+    "membership_invalid_time",
+    "membership_invalid_time_window",
+    "membership_lifetime_exceeded",
+    "membership_issued_in_future",
+    "membership_not_yet_valid",
+    "membership_expired",
+    "membership_invalid_nonce",
+    "membership_checkpoint_nonce_mismatch",
+    "membership_checkpoint_required",
+    "membership_checkpoint_replay",
+    "membership_checkpoint_version_rollback",
+    "membership_checkpoint_equal_version_conflict",
+    "membership_version_rollback",
+    "membership_equal_version_conflict",
+    "membership_version_below_checkpoint",
+    "membership_node_not_in_checkpoint",
+    "membership_node_limit",
+    "membership_key_count_exceeded",
+    "membership_duplicate_relay_key",
+    "membership_relay_keys_unordered",
+    "membership_invalid_spki_digest",
+    "membership_invalid_relay_key_window",
+    "membership_no_usable_relay_key",
+    "membership_peer_node_mismatch",
+    "membership_peer_key_mismatch",
+    "membership_duplicate_publisher_key",
+    "membership_unknown_publisher_key",
+    "membership_invalid_signature_encoding",
+    "membership_signature_invalid",
+    "membership_invalid_issuer_key",
+    "runtime_invalid_configuration",
+    "runtime_persistence",
+    "runtime_persistence_timeout",
+    "runtime_not_ready",
+    "runtime_peer_rejected",
+    "runtime_checkpoint_expired",
+    "runtime_cancelled",
+    "runtime_join",
+)
+
 
 def relay_terminal_observation(data):
     """Observe complete closed-vocabulary lines, without lifecycle/cause attribution.
@@ -503,13 +571,17 @@ def relay_terminal_observation(data):
             match = re.fullmatch(
                 r"cluster membership bootstrap did not reach ready: readiness=([a-z_]+) "
                 r"reason=([a-z_]+) category=([a-z_]+)"
+                r"(?: bootstrap_cause=([a-z_]+))?"
                 r"(?:; cleanup=membership_shutdown_failed reason=([a-z_]+))?", body)
             if match is not None:
-                state, reason, category, cleanup = match.groups()
+                state, reason, category, cause, cleanup = match.groups()
                 if (state, reason, category) in RELAY_BOOTSTRAP_TUPLES and (
+                        cause is None or cause in RELAY_BOOTSTRAP_CAUSES) and (
                         cleanup is None or cleanup in RELAY_SHUTDOWN_REASONS):
                     observation = {"code": "membership_bootstrap_not_ready", "readiness": state,
                                    "reason": reason, "category": category}
+                    if cause is not None:
+                        observation["bootstrap_cause"] = cause
                     if cleanup is not None:
                         observation["cleanup_reason"] = cleanup
         if observation is None:
@@ -923,6 +995,67 @@ def relay_observation(raw, inventory, node):
             and isinstance(state["node_versions"], dict) and set(state["node_versions"]) <= set(NODES)
             and all(u64(v) for v in state["node_versions"].values()), "relay_observation_state")
     return state
+
+
+def stopped_relay_floors(raw, inventory, node):
+    state = relay_observation(raw, inventory, node)
+    require(set(state["node_versions"]) == set(NODES)
+            and state["checkpoint_version"] is not None
+            and state["checkpoint_version"] > 0
+            and all(value > 0 for value in state["node_versions"].values()), "restart_final_floors")
+    require(state["checkpoint_version"] < 2**64 - 1
+            and all(value < 2**64 - 1 for value in state["node_versions"].values()), "restart_counter_exhausted")
+    return state
+
+
+class PlannedRelayRestart:
+    """Unsigned preparation only; the restarted relay still verifies every record."""
+    def __init__(self, floors):
+        self.floors = json.loads(canonical(floors))
+        self.latest, self.target = None, None
+
+    def observe(self, current):
+        require(current["checkpoint_high_water"] < 2**64 - 1
+                and current["membership_high_water"] < 2**64 - 1, "restart_counter_exhausted")
+        require(current["checkpoint_high_water"] >= self.floors["checkpoint_version"]
+                and current["membership_high_water"] >= max(self.floors["node_versions"].values()),
+                "restart_authority_below_final_floors")
+        self.latest = current
+        confirmed = current["confirmed"]
+        if self.target is None and confirmed is not None and all(
+                confirmed["membership_version"] > floor for floor in self.floors["node_versions"].values()):
+            self.target = {"membership_version": confirmed["membership_version"],
+                           "expires_ns": timestamp_ns(confirmed["expires_at"])}
+        return self.target is not None
+
+    def current(self, now):
+        require(self.target is not None and now < self.target["expires_ns"], "restart_target_expired")
+
+    def adopted(self, state, now):
+        self.current(now)
+        require(state["checkpoint_version"] is not None
+                and state["checkpoint_version"] > self.floors["checkpoint_version"]
+                and set(state["node_versions"]) == set(NODES)
+                and all(state["node_versions"][node] > self.floors["node_versions"][node]
+                        and state["node_versions"][node] >= self.target["membership_version"] for node in NODES),
+                "restart_verified_adoption")
+
+
+@contextmanager
+def planned_restart_budget(run):
+    # The same absolute 60 seconds covers reads, the single start, readiness,
+    # adoption and owned-command cleanup. HTTP must share it, not the outer
+    # 1500-second budget. Never extend an already shorter network deadline.
+    global NETWORK_DEADLINE
+    original = NETWORK_DEADLINE
+    with run.budget(60):
+        run.deadline = run.deadline if original is None else min(original, run.deadline)
+        NETWORK_DEADLINE = run.deadline
+        try:
+            yield
+            run.guard()
+        finally:
+            NETWORK_DEADLINE = original
 
 
 class PublicationWatch:
@@ -1788,6 +1921,38 @@ overlap_seconds = 30
         self.run.guard()
         return publication_observation(raw, self.authority_inventory, self.run_id, utc_ns(), previous)
 
+    def restart_relay(self):
+        self.docker.stop(self.relays[0])
+        with planned_restart_budget(self.run):
+            name = self.membership_files["relay-a"]
+            raw = self.docker.read_volume(self.states["relay-a"], [name], max_bytes=MAX_RELAY_OBSERVATION)[name]
+            self.run.guard()
+            floors = stopped_relay_floors(raw, self.authority_inventory, "relay-a")
+            watch = PlannedRelayRestart(floors)
+            self.event("relay_stopped_final_floors", node="relay-a", final_state=floors)
+
+            def newer_confirmed():
+                return watch.observe(self.publication(watch.latest))
+
+            wait_until(self.run, newer_confirmed, 60, "relay_restart_newer_publication")
+            self.run.guard()
+            watch.current(utc_ns())
+            self.event("relay_restart_prepared", node="relay-a", membership_version=watch.target["membership_version"],
+                       final_state=floors, unsigned_observation=True)
+            # Exactly one start, after the final stopped floors and strictly
+            # newer confirmed round. A failed start is never retried here.
+            self.docker.start(self.relays[0])
+            self.consumer_ports[0] = self.docker.port(self.relays[0], 8443)
+            self.device_ports[0] = self.docker.port(self.relays[0], 9443)
+            self.wait_ready()
+            after = self.docker.read_volume(self.states["relay-a"], [name], max_bytes=MAX_RELAY_OBSERVATION)[name]
+            self.run.guard()
+            state = relay_observation(after, self.authority_inventory, "relay-a")
+            watch.adopted(state, utc_ns())
+            check_persisted_version(json.loads(raw), json.loads(after))
+            self.event("relay_restart_verified_adoption", node="relay-a", final_state=state,
+                       membership_version=watch.target["membership_version"], signed_relay_verification=True)
+
     def restart_authority(self):
         self.docker.stop(self.authority)
         # Read only after the process is stopped. A pre-stop observation can
@@ -2189,18 +2354,11 @@ overlap_seconds = 30
         # The normal CLI's bounded disconnect joins its connector; a successful
         # stop alone is not used as a new connection/rotation assertion.
         self.disconnect_client(self.clients[0], self.devices[0])
-        membership_file = self.membership_files["relay-a"]
-        old_state = json.loads(self.docker.read_volume(self.states["relay-a"], [membership_file])[membership_file])
-        self.docker.stop(self.relays[0])
-        self.docker.start(self.relays[0])
-        self.consumer_ports[0], self.device_ports[0] = self.docker.port(self.relays[0], 8443), self.docker.port(self.relays[0], 9443)
-        self.wait_ready()
+        self.restart_relay()
         self.start_client(0)
         new_owner = self.owner(0)
         require(new_owner["boot_id"] != old_owner["boot_id"] and new_owner["session_id"] != old_owner["session_id"]
                 and int(new_owner["owner_epoch"]) > int(old_owner["owner_epoch"]), "relay_restart_fresh_owner")
-        new_state = json.loads(self.docker.read_volume(self.states["relay-a"], [membership_file])[membership_file])
-        check_persisted_version(old_state, new_state)
         self.all_routes()
         self.event("relay_restart", stable_node="relay-a", new_boot=True, new_session=True, persisted_version_monotonic=True, revoked_grant_refused=True)
         self.restart_authority()

@@ -60,6 +60,42 @@ setup failure; source/static checks pass. Native semantics, actual supervision,
 fresh full Rust checks and successful restart/recovery remain owed. No production
 criterion or restriction is relaxed.
 
+A separate planned-restart source slice is reviewed and locally integrated over
+`dc2e89a0` for pure controls only; it has no new hosted result. After successful
+stop it observes final durable membership/checkpoint floors, requires compatible
+nonexhausted authority allocators and a strictly newer confirmed round, then
+performs one start and actual-readiness/durable-adoption assertions within one
+shared 60-second Runner/HTTP budget. The existing handle also retains a closed
+initial bootstrap cause without adding retries or changing trust acceptance.
+Source v2 receipt `4f51261c` and review `8376f39c` are preserved; all 357 pure
+controls pass, including 19 new. The combined local overlay passes the same
+357 controls with 483 materialized files unchanged (receipt `a5845563`). Four
+new Rust tests, fresh full native checks and actual image restart/recovery remain
+unrun. The original modeled RED, preparation failures and narrower shared-budget
+RED remain in the [standalone report](m6-fly-planned-restart-2026-11-02.md).
+General crash-start availability is open, and neither the source fix nor
+combined logs establishes the exact PR293/294 rejection variant.
+
+A preliminary root raw-pattern helper refused one existing synthetic parser
+fixture; the repository's unchanged path/pattern/digest scanner then passes
+(receipt `b8afb0e4`). The refusal remains a preparation error, with no new
+exception or source revision. A separately reviewed P1 predicate identifies an
+exact retained node/version only when both verified-evidence fields are absent
+(source `dbfe284f`, review `cb0f306d`). It neither verifies a supplied
+error nor changes acceptance/readiness/retry behavior. Its five additional Rust
+tests are prepared and unrun; the broader startup-wait and cancellation design
+remains open.
+
+Dated continuation: #294 M7 passes at 2026-11-02T14:17:02.1853540Z; terminal
+ordinary CI is 11 passing jobs and three formatting failures (receipt
+`c76704ea`). After all eight head runs are terminal, the draft is closed
+unmerged at 14:18:56Z, superseded by [#295](https://github.com/andymac4182/agentuplink/pull/295).
+The coordinator's subsequent partial snapshot reports all three #295 formatting
+steps and three-OS packaging passing while remaining native checks are active.
+Neither this partial successor result nor #294's dedicated M7 success accepts
+the separate failed Fly rehearsal or verifies the planned-restart/P1 source
+continuations. Earlier dated checkpoints remain unchanged.
+
 ### Retained #293 checkpoint
 
 [Draft #293](https://github.com/andymac4182/agentuplink/pull/293) is frozen at

@@ -373,6 +373,32 @@ restored readiness before continuing. Record both forward and rollback image
 digests and compatible configuration/state versions. Existing sessions may be
 interrupted; this profile does not promise uninterrupted upgrades.
 
+For a planned same-incarnation relay restart, first stop the old process
+successfully, then read its **final** persisted membership envelope. A read while
+it is running can miss its last checkpoint or node-version advance. Retain the
+exact deployment/incarnation/node identity, all three positive node-version
+floors and checkpoint floor. The authority's durable membership and checkpoint
+allocators must already be at least those independently known floors; refuse a
+rollback or an exhausted counter rather than resetting state. Before one new
+start, require a current confirmed authority membership round strictly above
+**every** final node floor, with the exact approved inventory and Redis run.
+A higher allocator without a confirmed round, a fresh checkpoint for the old
+round, or sleeping for a publication interval is insufficient. The authority
+state is unsigned preparation evidence; the restarted relay must still verify
+its nonce-bound checkpoint and signed memberships, become ready, and durably
+advance its checkpoint and every node floor before accepting the restart.
+
+The synthetic image rehearsal gives this preparation, single start, readiness
+and durable-adoption observation one shared 60-second deadline after successful
+stop, including bounded reads and HTTP requests. It does not retry a refused
+start. The shipped relay intentionally rejects an equal restored membership
+version because the persisted file does not retain the verified signed bytes.
+General crash-restart availability between publisher rounds remains open;
+neither this planned-restart procedure nor Fly's configured process retries
+proves it. The additional `bootstrap_cause` diagnostic names only the initial
+typed pass and does not attribute a line in combined container logs to one
+process lifetime or establish the exact cause of earlier hosted failures.
+
 Image rollback never restores an older membership, recovery or authority state
 volume, resets a counter, or revives a retired key. The legacy single-relay image
 is not a cluster rollback image. Authority upgrades stop the sole writer, replace
