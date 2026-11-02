@@ -42,6 +42,85 @@ const raised = async (run: () => Promise<unknown>): Promise<Error> => {
 
 const codeOf = (error: Error): string => (error as { code?: string }).code ?? '';
 
+describe('Mastra recursive depth ceiling', () => {
+  const depthLimit = (maxTraversalDepth: number, maxTraversalEntries = 10_000): object => ({
+    limits: { ...descriptorFixture().limits, maxTraversalDepth, maxTraversalEntries },
+  });
+  const walked = (wired: Wired): string[] => wired.connection.received.flatMap((request) =>
+    request.kind === 'Twalk' ? [`/${request.wnames.join('/')}`] : []);
+
+  it('refuses an explicit depth above the descriptor before dispatch', async () => {
+    const { fs, wired } = await mount({ 'a/b/f.txt': 'deep' }, depthLimit(1));
+    const before = wired.connection.received.length;
+    const error = await raised(async () => fs.readdir('/', { recursive: true, maxDepth: 2 }));
+    assert.equal(codeOf(error), 'TUNNEL_ELOOP');
+    assert.ok(error.cause instanceof FilesystemError);
+    assert.equal(error.cause.outcome, 'not_started');
+    assert.equal(wired.connection.received.length, before);
+  });
+
+  it('fails default recursion at the descriptor ceiling instead of returning a complete-looking prefix', async () => {
+    const { fs, wired } = await mount({ 'a/b/f.txt': 'deep', 'ok.txt': 'live' }, depthLimit(1));
+    const error = await raised(async () => fs.readdir('/', { recursive: true }));
+    assert.equal(codeOf(error), 'TUNNEL_ELOOP');
+    assert.ok(error.cause instanceof FilesystemError);
+    assert.equal(error.cause.outcome, 'not_started');
+    assert.deepEqual(walked(wired), ['/', '/a']);
+    assert.equal(await fs.readFile('/ok.txt', { encoding: 'utf8' }), 'live');
+  });
+
+  for (const [maxDepth, names, paths] of [
+    [0, ['a'], ['/']],
+    [1, ['a', 'a/b'], ['/', '/a']],
+  ] as const) {
+    it(`preserves the native explicit depth-${maxDepth} view below the ceiling`, async () => {
+      const { fs, wired } = await mount({ 'a/b/f.txt': 'deep' }, depthLimit(2));
+      const entries = await fs.readdir('/', { recursive: true, maxDepth });
+      assert.deepEqual(entries.map((entry) => entry.name), names);
+      assert.deepEqual(walked(wired), paths);
+    });
+  }
+
+  it('preserves an explicit depth equal to the ceiling on a deeper tree', async () => {
+    const { fs, wired } = await mount({ 'a/b/f.txt': 'deep' }, depthLimit(1));
+    const entries = await fs.readdir('/', { recursive: true, maxDepth: 1 });
+    assert.deepEqual(entries.map((entry) => entry.name), ['a', 'a/b']);
+    assert.deepEqual(walked(wired), ['/', '/a']);
+  });
+
+  it('completes default recursion exactly at the ceiling with usable prefixed names', async () => {
+    const { fs, wired } = await mount({ 'a/b/f.ts': 'deep', 'a/b/g.md': 'other' }, depthLimit(2));
+    const entries = await fs.readdir('/', { recursive: true, extension: '.ts' });
+    assert.deepEqual(entries.map((entry) => entry.name), ['a', 'a/b', 'a/b/f.ts']);
+    assert.deepEqual(walked(wired), ['/', '/a', '/a/b']);
+    assert.equal(await fs.readFile('/a/b/f.ts', { encoding: 'utf8' }), 'deep');
+  });
+
+  it('keeps a nonrecursive listing independent from descendant depth', async () => {
+    const { fs, wired } = await mount({ 'a/b/f.txt': 'deep' }, depthLimit(1));
+    assert.deepEqual((await fs.readdir('/')).map((entry) => entry.name), ['a']);
+    assert.deepEqual(walked(wired), ['/']);
+  });
+
+  it('still enforces the entry quota across individually small directories', async () => {
+    const { fs } = await mount({ 'a/b/f.txt': 'deep' }, depthLimit(2, 2));
+    const error = await raised(async () => fs.readdir('/', { recursive: true }));
+    assert.equal(codeOf(error), 'TUNNEL_EFBIG');
+  });
+
+  it('refuses invalid requested depths without dispatch', async () => {
+    const { fs, wired } = await mount({ 'a/b/f.txt': 'deep' }, depthLimit(2));
+    for (const maxDepth of [-1, 0.5, Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY]) {
+      const before = wired.connection.received.length;
+      const error = await raised(async () => fs.readdir('/', { recursive: true, maxDepth }));
+      assert.equal(codeOf(error), 'TUNNEL_EINVAL');
+      assert.ok(error.cause instanceof FilesystemError);
+      assert.equal(error.cause.outcome, 'not_started');
+      assert.equal(wired.connection.received.length, before);
+    }
+  });
+});
+
 describe('identity, lifecycle and what the provider tells an agent', () => {
   it('reports an id, a provider and a read-only flag derived from the grant', async () => {
     const { fs } = await mount();

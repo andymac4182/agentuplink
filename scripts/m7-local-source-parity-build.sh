@@ -477,6 +477,7 @@ copy_binary() {
 : > "$output_run/binary-records.tsv"
 copy_binary tunnel-client
 copy_binary tunnel-relay
+copy_binary tunnel-authority
 copy_binary tunnel-test-harness
 # The sentinel is not an optional extra of this bundle: tunnel-deadman is
 # resolved relative to the client's own current_exe(), so omitting it here
@@ -541,6 +542,7 @@ run_cli_help() {
 }
 
 run_cli_help tunnel-relay "$bin_dir/tunnel-relay" "$output_run/cli-help-tunnel-relay.txt"
+run_cli_help tunnel-authority "$bin_dir/tunnel-authority" "$output_run/cli-help-tunnel-authority.txt"
 run_cli_help tunnel-test-harness "$bin_dir/tunnel-test-harness" "$output_run/cli-help-tunnel-test-harness.txt"
 
 tab=$(printf '\t')
@@ -551,6 +553,7 @@ source_manifest_checksum=$(sha256_file "$source_manifest_snapshot")
     printf '%s  %s\n' "$(sha256_file "$client_help")" cli-help.txt
     printf '%s  %s\n' "$(sha256_file "$client_version")" cli-version.txt
     printf '%s  %s\n' "$(sha256_file "$output_run/cli-help-tunnel-relay.txt")" cli-help-tunnel-relay.txt
+    printf '%s  %s\n' "$(sha256_file "$output_run/cli-help-tunnel-authority.txt")" cli-help-tunnel-authority.txt
     printf '%s  %s\n' "$(sha256_file "$output_run/cli-help-tunnel-test-harness.txt")" cli-help-tunnel-test-harness.txt
     while IFS="$tab" read -r parity_binary_name parity_binary_sha256 parity_binary_file; do
         printf '%s  %s\n' "$parity_binary_sha256" "bundle/bin/$parity_binary_name"

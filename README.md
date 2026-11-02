@@ -89,6 +89,7 @@ restoration of arbitrary backups.
 | [Tunnel protocol](docs/protocol.md) | Pairing, rotation, replay, failure semantics, limits |
 | [Join an existing relay](docs/join-relay.md) | Testers: download a release, get a device certificate from an operator, connect, and call the echo |
 | [Operator guide](docs/operator.md) | Download, verify, credentials, deployment, readiness and diagnostics, executed by a docs check; what the alpha cannot do yet |
+| [Production deployment goal](docs/production-readiness.md) | Current readiness review, release-blocking work, candidate checks and deployment completion criteria |
 | [Runtime and client CLI](docs/runtime.md) | Axum listeners, device mTLS, commands, debug surfaces |
 | [M1 acceptance harness](docs/m1-harness.md) | Redis-backed real-socket verification, credentials, fixtures, and evidence |
 | [M2 verification](docs/m2-verification.md) | Rotation implementation status and required recovery/real-socket evidence |

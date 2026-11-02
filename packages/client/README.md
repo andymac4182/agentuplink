@@ -41,6 +41,7 @@ or a fake in-memory adapter is insufficient to claim remote compatibility".
 | `src/session.ts` | The consumer session: lifecycle, tags, fids, flush, close codes, **outcome classification** |
 | `src/paths.ts` | The virtual path namespace, refusing exactly what gate 1 refuses |
 | `src/filesystem.ts` | `connectFilesystem`, the API methods, the composite operations and the budgets |
+| `src/operation-deadline.ts` | A monotonic budget shared by nested filesystem calls, streams and source waits |
 | `src/adapters/files-sdk.ts` | `createFilesAdapter`: `files-sdk` 2.4.0's `Adapter<Raw>`, the object view |
 | `src/adapters/mastra.ts` | `TunnelMastraFilesystem`: `@mastra/core` 1.65.0's `WorkspaceFilesystem`, with both timestamp policies |
 | `src/adapters/just-bash.ts` | `TunnelJustBashFilesystem`: `just-bash` 3.4.2's `IFileSystem`, plus `drainOperationFailures()` |
@@ -56,6 +57,37 @@ and reply history. A request whose bytes never reached the transport is
 **mutation** that never answered is `unknown`, whatever close code ended the
 session, because the device may have performed it and no code on the wire says
 which.
+
+## Operation deadlines
+
+Filesystem operation options accept `timeoutMs`: a positive integer in
+milliseconds, defaulting to the descriptor's `defaultOperationTimeoutSeconds`
+and bounded by its `maxOperationTimeoutSeconds`. Invalid values fail before
+application dispatch. Nested reads, writes, copy and recursive traversal share
+one budget; individually timely requests cannot extend it. Lazy read/directory
+iterators start on their first `next()`, including pauses after that point.
+
+A deadline stops new application requests and reports `DEADLINE_EXCEEDED` with
+the existing effect outcome and acknowledged-byte floor. A stalled upload source
+cannot resume writes after cancellation. Cleanup may finish in the background
+under its existing request deadline. An unanswered walk keeps its fid until
+protocol settlement permits cleanup; an unacknowledged clunk keeps that fid
+reserved against the session quota. A local timeout or flush alone cannot
+prove a clunk released the number.
+No mutation is replayed. Caller abort keeps its original-reply-before-`Rflush`
+semantics, and a known completed operation can return success while cleanup
+finishes. A valid final reply processed before the expiry callback can also
+return success after the nominal deadline when the event loop was blocked.
+This preserves the acknowledged result; the next application request still
+refuses at the original monotonic deadline. If the timer is processed first,
+an unacknowledged dispatched mutation remains `unknown`. Synchronous code
+cannot be preempted, so this is not a hard wall-time guarantee during an
+event-loop stall.
+
+This is a budget for each shared-client operation. Separate adapter calls such
+as `mkdir` followed by `writeFile` do not yet share a whole-framework-call budget.
+The focused tests use the loopback mock peer, not a real relay/device, and do
+not close M4-21's complete advertised-boundary acceptance suite.
 
 ## What this is for
 
@@ -113,6 +145,57 @@ registers each adapter with the real thing that consumes it — `new Files({
 adapter })`, `new Workspace({ filesystem })`, `new Bash({ fs })`,
 `ai.uploadFile({ api })` — against the same loopback harness. It needs the
 install and is therefore **not** part of `npm test`.
+
+The root manifest overrides Mastra's exact `@modelcontextprotocol/server`
+dependency from `2.0.0` to `2.3.0`, which fixes its HTTP isolation, audience and
+request-limit advisories. Mastra core references that package only for
+`ElicitRequest`, `ElicitResult` and `ServerContext` types; its `MCPServerBase`
+is abstract, and the filesystem adapter does not serve MCP. The override keeps
+Mastra `1.65.0` because tested upgrades to `1.68.0`, `1.69.0` and `1.81.0`
+omit the first tool result from the Agent transcript used by our demo. The
+unchanged Agent contract passes with this override. Additional peer tests
+exercise the actual replacement server SDK's initialization, tools,
+concurrent principal isolation, wrong-audience refusal and HTTP body bound.
+The audience and body-bound tests fail against `2.0.0`.
+
+The scoped just-bash override resolves its `minimatch` dependency to `11.0.1`
+for GHSA-g3hv-75wg-m249. Direct framework pins remain unchanged. The advisory
+concerns pattern amplification at `optimizationLevel >= 2`; the actual Bash
+matcher normally uses the default level. Peer tests cover the fixed split
+bound and large-set behavior in a bounded child, ordinary match semantics,
+native Bash globs and the remote filesystem view. These controls do not claim
+a reproduced exploit through the remote adapter's default configuration.
+
+The lockfile delta is limited to `minimatch` 10.2.6 → 11.0.1 and new
+`@isaacs/nonrecursive-glob-match` 1.0.3; locked `brace-expansion` 5.0.12
+is unchanged. Both changed packages declare `BlueOak-1.0.0`. That license
+was already present in this client graph but is outside the current
+`deny.toml` allowlist; the MCP lockfile license check does not cover the
+client peer graph. M6-C253 tracks the missing coverage and policy resolution.
+Functional and advisory passes do not approve that license or an exception.
+
+**npm overrides apply only at an application's root.** A consuming application
+using either affected pin must carry its override in its own root manifest
+(or use a separately verified fixed framework release):
+
+```json
+{
+  "overrides": {
+    "@mastra/core": { "@modelcontextprotocol/server": "2.3.0" },
+    "just-bash": { "minimatch": "11.0.1" }
+  }
+}
+```
+
+This private package's overrides do not propagate into a consuming
+application's dependency tree. `npm run test:consumer-overrides` packs this
+package and runs npm's real lockfile resolver for two isolated consumers:
+without the application override, just-bash still resolves minimatch 10.x;
+with it, the dependency resolves to 11.0.1. This explicit CI gate needs registry
+access, executes no package scripts and installs no consumer node_modules.
+These checks do not certify the separately packaged `@mastra/mcp` server or
+every application configuration. Run `npm audit --audit-level=high` alongside
+`npm run check`; no advisory is ignored by this package.
 
 Two things a consumer has to know, both found by running the real packages:
 `createFilesAdapter` takes the consumer's own `FilesError` class, because
@@ -318,8 +401,9 @@ this client's own socket path would not be.
   loopback development harness, which this client requires to be asked for
   explicitly and refuses for any non-loopback host.
 * **A rotating device tunnel**, a cross-relay hop, a real grant, a real
-  revocation, and every clock the contract names: this client enforces its own
-  request deadline, and the device enforces none.
+  revocation, and every advertised clock boundary. The shared client now enforces
+  request and aggregate operation deadlines; its loopback suite does not prove
+  the real device’s idle/stall behavior or the full M4-21 boundary matrix.
 * **The four native adapters against a relay or a device, in a test.** They
   compile against their pinned published packages' own declarations and run
   against the real `Files`, `Workspace`, `Agent`, `Bash`, `generateText` and

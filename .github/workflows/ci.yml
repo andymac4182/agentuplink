@@ -18,6 +18,112 @@ env:
   CARGO_INCREMENTAL: "0"
 
 jobs:
+  python-audit:
+    name: Python MCP conformance dependency advisories
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Audit the fully pinned Python test environment
+        run: |
+          python3 -m venv "$RUNNER_TEMP/mcp-audit"
+          "$RUNNER_TEMP/mcp-audit/bin/pip" install pip-audit==2.10.1
+          "$RUNNER_TEMP/mcp-audit/bin/pip-audit" --require-hashes --disable-pip --progress-spinner off --requirement tests/mcp-sdk-conformance/python/requirements.txt
+      # M3-50 preparation: exercise the fail-closed checker with seeded
+      # archives. The live universal licence gate remains blocked on explicit
+      # policy disposition; see docs/mcp-test-dependency-gate.md. This is not
+      # evidence that the real dependency graph satisfies the licence policy.
+      - name: Exercise MCP dependency gate failure controls
+        run: |
+          python3 -m venv "$RUNNER_TEMP/mcp-license-checker"
+          "$RUNNER_TEMP/mcp-license-checker/bin/pip" install --require-hashes --only-binary=:all: -r scripts/m3-test-dependency-gate-requirements.txt
+          "$RUNNER_TEMP/mcp-license-checker/bin/python" -m unittest discover -s scripts -p test_m3_test_dependency_gate.py -v
+
+  typescript:
+    name: TypeScript client and framework adapters
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: packages/client
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: packages/client/package-lock.json
+      - run: npm ci --ignore-scripts
+      - run: npm run check
+      - name: Verify consuming-root npm override behavior
+        run: npm run test:consumer-overrides
+      - run: npm audit --audit-level=high
+      - name: Audit the pinned MCP conformance dependencies
+        working-directory: tests/mcp-sdk-conformance
+        run: |
+          npm ci --ignore-scripts
+          npm audit --audit-level=high
+
+  fly-deployment:
+    name: Fly deployment images and real-socket smoke test
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.95.0 --profile minimal
+      - name: Build the device binaries
+        run: cargo +1.95.0 build --locked -p tunnel-client -p tunnel-deadman --bins
+      # This uses disposable synthetic PKI, an isolated Docker network and
+      # an AOF volume. It builds the actual deployment Dockerfiles, provisions
+      # the catalog through the shipped image, sends an authenticated echo,
+      # checks revocation, and proves orderly shutdown. No Fly access needed.
+      - name: Prove the shipped container deployment
+        env:
+          TUNNEL_CLIENT: ${{ github.workspace }}/target/debug/tunnel-client
+        run: bash deploy/fly/local-proof.sh
+      - name: Prove bounded Redis AOF rewrite overlap without swap
+        run: |
+          set -euo pipefail
+          python3 scripts/test_m6_redis_aof_headroom.py
+          # BuildKit need not retain an inspectable base image. Pull the exact
+          # source pin so the gate can verify its layer prefix before load.
+          redis_base=$(awk '$1 == "FROM" { print $2; exit }' deploy/fly/redis/Dockerfile)
+          docker pull "$redis_base"
+          python3 scripts/m6-redis-aof-headroom.py \
+            --image agentuplink-redis:m6c60 \
+            --output "$RUNNER_TEMP/c239-headroom"
+      - name: Retain Redis rewrite measurements on success and failure
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: redis-aof-headroom
+          path: ${{ runner.temp }}/c239-headroom/
+          if-no-files-found: ignore
+          retention-days: 14
+      - name: Build the independent authority image and verify startup boundaries
+        run: |
+          set -euo pipefail
+          docker build --file deploy/authority/Dockerfile --tag agentuplink-authority:ci .
+          # Check the effective image user, then exercise its actual default
+          # entrypoint without mounts. Missing independent configuration must
+          # fail; the service must never initialize authority state on startup.
+          test "$(docker run --rm --network none --entrypoint id agentuplink-authority:ci -u)" = 10002
+          docker run --rm --network none agentuplink-authority:ci --help | grep -F 'tunnel-authority serve --config PATH'
+          set +e
+          timeout 10s docker run --rm --network none --read-only agentuplink-authority:ci >"$RUNNER_TEMP/authority-missing-config.log" 2>&1
+          status=$?
+          set -e
+          cat "$RUNNER_TEMP/authority-missing-config.log"
+          test "$status" -eq 1
+          grep -F 'input is missing, inaccessible or a symlink' "$RUNNER_TEMP/authority-missing-config.log"
+
   rust:
     name: Rust (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -135,6 +241,10 @@ jobs:
         # licence by file rather than by manifest field, so this covers both
         # needs. Alternatively pass `--no-offline` to the script.
         run: cargo +1.95.0 fetch --locked
+      - name: Check current Rust security advisories
+        # The offline release gate below deliberately does not run advisories.
+        # cargo-deny fetches the current RustSec database for this check.
+        run: cargo +1.95.0 deny --locked check advisories
       - name: Prove the checks can still fail
         # **Runs before the checks themselves, deliberately.** Each control
         # plants a synthetic case and requires the corresponding check to go
@@ -155,10 +265,9 @@ jobs:
           # gate go green on a repository that fails the gate -- an automation
           # that cannot report the one problem it exists to catch.
           #
-          # This job is therefore expected to FAIL while the repository is
-          # public (docs/tasks.md M6-C01). That is the correct behaviour and
-          # must not be "fixed" by dropping the check again; it goes green when
-          # the owner restores privacy.
+          # The owner subsequently approved public visibility. The check now
+          # compares GitHub against repository-visibility in Cargo.toml;
+          # either kind of unexpected visibility change must fail the gate.
           GH_TOKEN: ${{ github.token }}
         run: python3 scripts/m6-release-checks.py
 
@@ -193,6 +302,18 @@ jobs:
         run: cargo +1.95.0 build --workspace --bins --locked
       - name: Test authoritative Redis catalog
         run: cargo +1.95.0 test -p tunnel-catalog --test redis_catalog --locked -- --ignored
+      - name: Verify offline authority approvals through real Redis recovery
+        run: cargo +1.95.0 test -p tunnel-authority --test recovery_redis --locked -- --ignored
+      - name: Verify replacement-device credential-expiry workaround
+        shell: bash
+        env:
+          TUNNEL_CLIENT_BIN: ${{ github.workspace }}/target/debug/tunnel-client
+        run: |
+          cargo +1.95.0 test -p tunnel-relay --test m6_provisioning_process --locked \
+            reenrolment_drill::m6c233_reenrolment_preserves_access_and_retires_old_identity \
+            -- --ignored --exact --nocapture | tee "$RUNNER_TEMP/reenrolment.log"
+          grep -F "test result: ok. 1 passed" "$RUNNER_TEMP/reenrolment.log"
+          grep -F "m6c233-reenrolment ok nonce=" "$RUNNER_TEMP/reenrolment.log"
       - name: Verify production relay, client, authorization and transport failures
         run: cargo +1.95.0 run --locked -p tunnel-test-harness -- verify
       - name: Verify Redis AOF restart and explicit recovery
@@ -404,13 +525,15 @@ jobs:
           persist-credentials: false
       - name: Install Rust 1.95.0
         run: rustup toolchain install 1.95.0 --profile minimal
-      # Gate 6 runs the shared TypeScript client's own sources under node,
-      # which needs native type stripping (packages/client: node >= 24). The
-      # gate imports no npm package, so there is no install step.
-      - name: Install Node 24
+      # M4-68 executes installed frameworks across the actual 300-second
+      # policy interval, in addition to gate 6's dependency-free client.
+      - name: Install pinned Node for framework rotation
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: "24"
+          node-version-file: packages/client/.node-version
+      - name: Install exact framework dependencies
+        working-directory: packages/client
+        run: npm ci
       - name: Run M4 filesystem harness gates
         run: sh scripts/m4-harness-verify.sh
       # Task row M4-08's last gap: a real mount inside an export on Linux,

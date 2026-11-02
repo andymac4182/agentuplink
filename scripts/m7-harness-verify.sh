@@ -44,6 +44,15 @@ gate "committed owner write with lost reply is not replayed" \
   cargo test -p tunnel-catalog --test redis_authority_lost_reply --locked -- --ignored --test-threads=1
 gate "Redis cluster integration tests" \
   cargo test -p tunnel-catalog --test redis_cluster --locked -- --ignored --test-threads=1
+gate "membership publisher explicit Redis TLS and restricted ACL" \
+  cargo test -p tunnel-test-harness --test m7_membership_publisher_tls --locked -- --ignored --test-threads=1
+gate "independent online authority publication, mTLS and durable restart refusal" \
+  cargo test -p tunnel-test-harness --test m6_online_authority --locked \
+    online_authority_publishes_for_three_relays_and_fails_closed_across_lifecycle -- --ignored --exact --test-threads=1
+gate "online authority committed publication lost reply and real Redis restart refusal" \
+  bash scripts/m6-authority-faults-verify.sh
+gate "shipped authority and recovery CLI across three configured relays and an older Redis backup" \
+  bash scripts/m6-authority-recovery-verify.sh
 gate "Redis recovery integration tests" \
   cargo test -p tunnel-catalog --test redis_recovery --locked -- --ignored --test-threads=1
 gate "Redis recovery-race integration tests" \
@@ -105,6 +114,16 @@ gate "live membership boot replacement tests" \
   cargo test -p tunnel-test-harness --test m7_live_membership_boot_replacement --locked -- --test-threads=1
 gate "privileged RPC analogue tests" \
   cargo test -p tunnel-test-harness --test m7_privileged_rpc --locked -- --test-threads=1
+
+gate "forwarded device control survives quiet peer idle and releases a blackholed device" \
+  cargo test -p tunnel-test-harness --lib --locked \
+    production_cluster::forwarded_control_liveness::m6c68_forwarded_control_releases_a_blackholed_device_and_reconnects \
+    -- --ignored --exact --test-threads=1 --nocapture
+
+gate "actual CLI reconnects after both forwarded device paths vanish" \
+  cargo test -p tunnel-test-harness --lib --locked \
+    production_cluster::forwarded_control_liveness::cli_reconnect::m6c68_cli_reconnects_after_both_forwarded_paths_vanish \
+    -- --ignored --exact --test-threads=1 --nocapture
 
 gate "M7 transport acceptance" \
   cargo run --locked -p tunnel-test-harness -- verify-m7-transport

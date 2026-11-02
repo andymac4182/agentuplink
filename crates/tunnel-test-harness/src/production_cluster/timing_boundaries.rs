@@ -90,8 +90,9 @@ pub struct TimingBoundaryEvidence {
     /// before the five-second client grant deadline while the owner still had
     /// usable lease time.
     pub authorization_expired_before_owner_safe_deadline: bool,
-    /// Static, payload-free authorization invalidation code observed on the
-    /// exact owner session/stream that was paused for this probe.
+    /// Static, payload-free `AUTHORIZATION_STALE` code observed on the exact
+    /// owner session/stream after its successful refresh missed the challenge
+    /// deadline. Explicit credential/grant expiry is a different cause.
     pub authorization_typed_expiry_cause_observed: bool,
     /// Dispatch count before/after the paused-process probe.
     pub authorization_dispatch_before: u64,
@@ -284,7 +285,7 @@ pub fn validate_timing_boundary_evidence(evidence: &TimingBoundaryEvidence) -> R
     }
     let mut missing_typed_causes = Vec::new();
     if !evidence.authorization_typed_expiry_cause_observed {
-        missing_typed_causes.push("authorization invalidation cause");
+        missing_typed_causes.push("authorization challenge staleness cause");
     }
     if !evidence.rotation_typed_deadline_cause_observed {
         missing_typed_causes.push("rotation RecoveryReason::Deadline");
@@ -517,7 +518,7 @@ mod c17_validator_tests {
             }),
             (
                 "authorization_typed_expiry_cause_observed",
-                "authorization invalidation cause",
+                "authorization challenge staleness cause",
                 |e| e.authorization_typed_expiry_cause_observed = false,
             ),
             (
@@ -1357,6 +1358,107 @@ fn authorization_stream<'a>(
         })
 }
 
+// The gate delays a successful refresh beyond only its challenge window.
+// M4-70 distinguishes that stale result from actual authority expiry or
+// revocation; accepting those other causes would invalidate this timing proof.
+fn authorization_challenge_lapse_observed(
+    snapshot: &RelaySnapshot,
+    session_id: &str,
+    epoch: u64,
+    stream_id: u64,
+) -> bool {
+    let matching_sessions = snapshot
+        .sessions
+        .iter()
+        .filter(|session| session.session_id == session_id && session.epoch == epoch)
+        .count();
+    matching_sessions == 1
+        && authorization_stream(snapshot, session_id, epoch, stream_id).is_some_and(|stream| {
+            stream.authorization_failure_code == Some("AUTHORIZATION_STALE") && stream.terminal
+        })
+}
+
+#[cfg(test)]
+mod authorization_cause_tests {
+    use super::{RelaySnapshot, authorization_challenge_lapse_observed};
+    use tunnel_relay::{RelaySessionSnapshot, RelayStreamSnapshot};
+
+    fn snapshot() -> RelaySnapshot {
+        RelaySnapshot {
+            sessions: vec![RelaySessionSnapshot {
+                session_id: "timing-session".into(),
+                epoch: 7,
+                streams: vec![RelayStreamSnapshot {
+                    stream_id: 11,
+                    terminal: true,
+                    authorization_failure_code: Some("AUTHORIZATION_STALE"),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn observed(snapshot: &RelaySnapshot) -> bool {
+        authorization_challenge_lapse_observed(snapshot, "timing-session", 7, 11)
+    }
+
+    #[test]
+    fn m6c245_expired_refresh_requires_stale_reason() {
+        assert!(observed(&snapshot()));
+    }
+
+    #[test]
+    fn m6c245_authority_loss_is_not_refresh_lapse() {
+        for reason in [
+            "AUTHORIZATION_EXPIRED",
+            "AUTHORIZATION_REVOKED",
+            "AUTHORIZATION_CHANGED",
+            "GRANT_UNAVAILABLE",
+            "OWNER_UNAVAILABLE",
+            "AUTHORIZATION_UNAVAILABLE",
+            "AUTHORIZATION_INVALIDATED",
+        ] {
+            let mut snapshot = snapshot();
+            snapshot.sessions[0].streams[0].authorization_failure_code = Some(reason);
+            assert!(!observed(&snapshot), "unexpected cause accepted: {reason}");
+        }
+    }
+
+    #[test]
+    fn m6c245_refresh_cause_requires_exact_terminal_scope() {
+        let mut cases = Vec::new();
+        let mut wrong_session = snapshot();
+        wrong_session.sessions[0].session_id = "another-session".into();
+        cases.push(("session", wrong_session));
+        let mut wrong_epoch = snapshot();
+        wrong_epoch.sessions[0].epoch += 1;
+        cases.push(("epoch", wrong_epoch));
+        let mut wrong_stream = snapshot();
+        wrong_stream.sessions[0].streams[0].stream_id += 1;
+        cases.push(("stream", wrong_stream));
+        let mut live = snapshot();
+        live.sessions[0].streams[0].terminal = false;
+        cases.push(("nonterminal", live));
+        let mut absent_reason = snapshot();
+        absent_reason.sessions[0].streams[0].authorization_failure_code = None;
+        cases.push(("absent reason", absent_reason));
+        let mut duplicate_session = snapshot();
+        duplicate_session
+            .sessions
+            .push(duplicate_session.sessions[0].clone());
+        cases.push(("duplicate session", duplicate_session));
+        let mut missing_stream = snapshot();
+        missing_stream.sessions[0].streams.clear();
+        cases.push(("missing stream", missing_stream));
+        cases.push(("missing session", RelaySnapshot::default()));
+        for (label, snapshot) in cases {
+            assert!(!observed(&snapshot), "unexpected scope accepted: {label}");
+        }
+    }
+}
+
 async fn wait_for_authorization_challenge(
     relay: &super::ProductionRelay,
     session_id: &str,
@@ -1758,25 +1860,12 @@ async fn run_authorization_expiry(
                     > u64::try_from(OWNER_LEASE_SAFETY_MARGIN.as_millis()).unwrap_or(u64::MAX)
         });
         let owner_snapshot = owner_relay.snapshot().await?;
-        let matching_sessions = owner_snapshot
-            .sessions
-            .iter()
-            .filter(|session| {
-                session.session_id == owner_before.token.session_id
-                    && session.epoch == owner_before.token.epoch
-            })
-            .collect::<Vec<_>>();
-        let typed_expiry_cause_observed = matching_sessions.len() == 1
-            && authorization_stream(
-                &owner_snapshot,
-                &owner_before.token.session_id,
-                owner_before.token.epoch,
-                authorization_stream_id,
-            )
-            .is_some_and(|stream| {
-                stream.authorization_failure_code == Some("AUTHORIZATION_EXPIRED")
-                    && stream.terminal
-            });
+        let typed_expiry_cause_observed = authorization_challenge_lapse_observed(
+            &owner_snapshot,
+            &owner_before.token.session_id,
+            owner_before.token.epoch,
+            authorization_stream_id,
+        );
         let dispatch_after = owner_snapshot.lifetime_application_dispatches;
         Ok::<_, HarnessError>(AuthorizationPauseObservation {
             probe,

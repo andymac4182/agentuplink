@@ -131,13 +131,18 @@ pub mod reset_reason {
     /// The operation was cancelled (consumer disconnect or explicit cancel).
     pub const CANCELLED: u16 = 4_005;
 
+    /// A local deadline or challenge window lapsed without an authority verdict.
+    /// The stream ends; a new session must pass full admission again.
+    pub const AUTHORIZATION_STALE: u16 = 4_006;
+
     /// Every registered code, in ascending order.
-    pub const ALL: [u16; 5] = [
+    pub const ALL: [u16; 6] = [
         AUTHORIZATION_EXPIRED,
         PROTOCOL,
         RECORD_LIMIT,
         ADAPTER_FAILURE,
         CANCELLED,
+        AUTHORIZATION_STALE,
     ];
 
     /// Whether `code` is registered.
@@ -565,6 +570,22 @@ impl std::error::Error for FrameError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn m4c70_stale_authorization_has_a_distinct_registered_reset() {
+        assert!(reset_reason::is_registered(4_006));
+        assert_eq!(reset_reason::AUTHORIZATION_EXPIRED, 4_001);
+        assert!(!reset_reason::is_registered(4_007));
+        let frame = Frame::reset(1, 1, 7, 1, 0, 4_006);
+        let bytes = frame.encode().expect("registered reset encodes");
+        assert_eq!(
+            Frame::decode(&bytes)
+                .expect("reset round trip")
+                .reset_reason()
+                .expect("reason"),
+            Some(4_006)
+        );
+    }
 
     fn sample_data(payload: Vec<u8>) -> Frame {
         Frame::data(7, 11, 19, 3, 2, payload)

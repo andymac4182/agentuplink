@@ -1,0 +1,32 @@
+[Unit]
+Description=Agent Uplink independent membership authority
+Documentation=https://github.com/andymac4182/agentuplink/blob/main/docs/authority.md
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=600
+StartLimitBurst=3
+
+[Service]
+Type=exec
+User=agentuplink-authority
+Group=agentuplink-authority
+UMask=0077
+StateDirectory=agentuplink-authority
+StateDirectoryMode=0700
+# Create the owned secrets/ and state/ directories and explicitly initialize
+# state before enabling this unit. Never add automatic initialization here.
+ExecStart=/usr/local/bin/tunnel-authority serve --config /var/lib/agentuplink-authority/secrets/authority.toml
+KillSignal=SIGTERM
+KillMode=mixed
+TimeoutStopSec=10s
+Restart=on-failure
+RestartSec=10s
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadOnlyPaths=/var/lib/agentuplink-authority/secrets
+ReadWritePaths=/var/lib/agentuplink-authority/state
+
+[Install]
+WantedBy=multi-user.target

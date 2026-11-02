@@ -774,7 +774,9 @@ fn write_approval(
 }
 
 async fn run_relay_cli(args: &[&str]) -> Output {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_tunnel-relay"))
+    let relay_binary = std::env::var_os("TUNNEL_RELAY_BIN")
+        .unwrap_or_else(|| env!("CARGO_BIN_EXE_tunnel-relay").into());
+    let mut child = Command::new(relay_binary)
         .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

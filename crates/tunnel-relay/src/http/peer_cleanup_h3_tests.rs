@@ -404,7 +404,7 @@ impl PeerRequestHandler for DirectControlHandler {
                     PeerFaultRole::Owner,
                     PeerFaultContext::unrouted(Uuid::nil(), device.device_id, None),
                 );
-                super::super::handle_peer_device_control(inbound, handle, device, &fault)
+                super::super::handle_peer_device_control(inbound, handle, device, &fault, None)
                     .await
                     .map_err(|error| PeerTransportError::H3(error.to_string()))
             }

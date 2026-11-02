@@ -1,5 +1,8 @@
 use super::*;
 
+#[path = "peer_runtime_clean_eof_tests.rs"]
+mod clean_eof_tests;
+
 use std::{
     net::SocketAddr,
     sync::{
@@ -103,6 +106,7 @@ impl PeerBindingProvider for ReadyProvider {
 }
 
 struct ProbeHandler {
+    handler_override: Option<Arc<dyn PeerRequestHandler>>,
     runtime: Arc<PeerRuntime>,
     mode: Arc<AtomicU8>,
     cancel: CancellationToken,
@@ -121,6 +125,9 @@ impl PeerRequestHandler for ProbeHandler {
         request: Request<()>,
         stream: PeerServerStream,
     ) -> PeerHandlerFuture {
+        if let Some(handler) = &self.handler_override {
+            return handler.handle(identity, request, stream);
+        }
         let runtime = Arc::clone(&self.runtime);
         let mode = ProbeMode::from_u8(self.mode.load(Ordering::Acquire));
         let cancel = self.cancel.clone();
@@ -303,6 +310,32 @@ impl H3Fixture {
         stream_timeout: Duration,
         idle_timeout: Duration,
     ) -> Self {
+        Self::new_with_optional_handler(
+            mode,
+            max_streams_per_connection,
+            stream_timeout,
+            idle_timeout,
+            None,
+        )
+    }
+
+    fn new_with_handler(handler: Arc<dyn PeerRequestHandler>) -> Self {
+        Self::new_with_optional_handler(
+            ProbeMode::Runtime,
+            4,
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+            Some(handler),
+        )
+    }
+
+    fn new_with_optional_handler(
+        mode: ProbeMode,
+        max_streams_per_connection: usize,
+        stream_timeout: Duration,
+        idle_timeout: Duration,
+        handler_override: Option<Arc<dyn PeerRequestHandler>>,
+    ) -> Self {
         let pki = FixturePki::new();
         let source_leaf = pki.issue_peer(SOURCE_NODE);
         let destination_leaf = pki.issue_peer(DESTINATION_NODE);
@@ -416,6 +449,7 @@ impl H3Fixture {
         let release_probe = Arc::new(tokio::sync::Notify::new());
         let cancel = CancellationToken::new();
         let handler = ProbeHandler {
+            handler_override,
             runtime: Arc::clone(&server_runtime),
             mode: Arc::clone(&mode),
             customer_started: Arc::clone(&customer_started),

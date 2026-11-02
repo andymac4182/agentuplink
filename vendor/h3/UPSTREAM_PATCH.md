@@ -18,3 +18,44 @@ failure, which always carries a defined 0x1xx code.
 
 This vendored crate is not a workspace member, so it carries no runnable test of
 its own; the accessor's behaviour is exercised through `tunnel-transport`.
+
+## M6-C246: unresolved request cancellation and accounting
+
+The upstream crate/version/archive checksum above remains unchanged. The
+incremental patch `c246-unresolved-request.patch` applies on repository source
+`b566d201070cd8b75c8dd30b0ece48d81bf2059f` (the existing locally patched h3 baseline).
+Its SHA-256 is `81e3d61ad3557bb7bb34d6838e3c2006c5a07e3dbe24e8ac6d909b365c6a6266`. Replaying it onto both pinned baseline source files
+reproduced the fixed file hashes exactly; the patch reverses cleanly. Apply or
+reverse this zero-context patch with `git apply --unidiff-zero` against the
+pinned baseline; zero-context storage avoids whitespace-only context lines.
+
+Two opt-in APIs leave `resolve_request()` source-compatible:
+`RequestResolver::reject(code)` resets both request directions without parsing
+headers, and `resolve_request_with_rejection_on_cancel(code)` owns cancellation
+guards before returning its future. Dropping that future before its first poll,
+during a partial header read, or while resolving an oversized-header reply
+resets that request rather than implicitly finishing an empty response. The
+guards disarm on normal success or an ordinary error, preserving existing
+malformed-header/protocol error classification. No connection-wide error is
+reclassified or suppressed; no unsafe code is introduced.
+
+`RequestEnd` ownership now begins when the resolver is constructed, at the
+same accepted-stream accounting boundary, and transfers into the resolved
+request stream. Dropping/rejecting an unresolved resolver therefore releases
+its ongoing-stream entry once. Successful streams retain their existing Arc
+ownership across send/receive halves and normal drop.
+
+The application uses request-scoped `H3_REQUEST_REJECTED` before dispatch for
+planned cancellation, header-read timeout, stream-capacity refusal and late
+drain resolution. Pin refusal retains its authentication error and uses
+`H3_REQUEST_CANCELLED`. Transport limits, admission predicates, and the public
+GOAWAY/error classifiers are unchanged.
+
+Validation lives in `tunnel-transport`'s `m6c246_*` loopback mTLS/H3 tests:
+unpolled/pre-cancel and in-progress partial-header cancellation, a scoped-reset
+wire control, request accounting through GOAWAY completion, real semaphore
+capacity refusal with an admitted sibling, normal released-capacity traffic,
+and an exact server-side malformed-frame protocol error. The latter records
+server classification; the fixture's early task return does not prove that
+the same wire close code reached the client. Full transport checks and broader
+acceptance are recorded under M6-C246 in `docs/tasks.md`.

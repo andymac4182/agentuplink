@@ -939,8 +939,7 @@ impl RekeyFixture {
     ) -> Result<u32> {
         let process = ManagedProcess::spawn(
             label,
-            ProcessSpec::new(&self.relay_binary)
-                .arg("serve")
+            common::relay_serve_process_spec(&self.relay_binary)
                 .arg("--config")
                 .arg(config.display().to_string()),
         )

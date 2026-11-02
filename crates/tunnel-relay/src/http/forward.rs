@@ -1884,11 +1884,13 @@ pub(crate) async fn http_forward_route(
         match export.config.with_deadline(token_remaining) {
             Ok(config) => config,
             Err(_) => {
-                return error_response(
-                    StatusCode::UNAUTHORIZED,
-                    "UNAUTHORIZED",
-                    "consumer token expired before dispatch",
-                    "not_dispatched",
+                return authorization::with_bearer_challenge(
+                    refused_consumer_token_response("consumer token expired before dispatch"),
+                    &exports,
+                    request.headers(),
+                    request.uri(),
+                    &OidcError::ClaimsRejected,
+                    &authorization::scopes_supported(oidc),
                 );
             }
         }

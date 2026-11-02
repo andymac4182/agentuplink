@@ -33,8 +33,17 @@ gate "M4 filesystem gate 5: write grants, the hard-link write rule, an interrupt
 gate "M4 filesystem gate 6: the real TypeScript client against real relay and device sockets" \
   cargo run --locked -p tunnel-test-harness -- verify-m4-fs-client-e2e
 
+# Unlike gate 6, this loads the actual pinned framework packages. Dependency
+# installation is a separate prerequisite so a missing framework cannot be
+# mistaken for an adapter passing against a local substitute.
+gate "M4-68: four installed frameworks across an actual 300-second rotation and grant revocation" \
+  cargo run --locked -p tunnel-test-harness -- verify-m4-fs-adapters-rotation
+
 gate "M6-C200: the real TypeScript client against a real relay listener at its connection limit" \
   cargo run --locked -p tunnel-test-harness -- verify-m6-ts-connection-limit
+
+gate "M6-C244: real endpoint fid ownership until walk and clunk confirmation" \
+  cargo run --locked -p tunnel-test-harness -- verify-m6-ts-fid-ordering
 
 gate "M4 filesystem gate 7: a live 9P session across a real scheduled rotation, with the exchange in flight" \
   cargo run --locked -p tunnel-test-harness -- verify-m4-fs-rotation

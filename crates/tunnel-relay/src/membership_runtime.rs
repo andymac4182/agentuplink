@@ -48,6 +48,7 @@ use crate::{
     config::ClusterConfig,
     membership_version_state::{MembershipVersionStateStore, MembershipVersionStateStoreError},
     peer_runtime::peer_readiness::PeerRouteTarget,
+    redis_connection::{RedisTlsMaterialKind, read_material},
 };
 
 /// The largest checkpoint request/response body accepted by this runtime.
@@ -273,6 +274,7 @@ pub enum CheckpointAuthorityError {
     InvalidEndpoint,
     InvalidRequest,
     InvalidTrustBundle,
+    InvalidClientIdentity,
     Transport,
     DeadlineExceeded,
     HttpStatus(u16),
@@ -301,7 +303,10 @@ impl CheckpointAuthorityError {
             Self::HttpStatus(status) => {
                 !(*status >= 400 && *status < 500) || *status == 408 || *status == 429
             }
-            Self::InvalidEndpoint | Self::InvalidRequest | Self::InvalidTrustBundle => false,
+            Self::InvalidEndpoint
+            | Self::InvalidRequest
+            | Self::InvalidTrustBundle
+            | Self::InvalidClientIdentity => false,
             Self::Transport
             | Self::DeadlineExceeded
             | Self::InvalidResponse
@@ -318,6 +323,9 @@ impl fmt::Display for CheckpointAuthorityError {
             Self::InvalidRequest => formatter.write_str("invalid checkpoint authority request"),
             Self::InvalidTrustBundle => {
                 formatter.write_str("invalid checkpoint authority trust bundle")
+            }
+            Self::InvalidClientIdentity => {
+                formatter.write_str("invalid checkpoint authority client identity")
             }
             Self::Transport => formatter.write_str("checkpoint authority transport failed"),
             Self::DeadlineExceeded => formatter.write_str("checkpoint authority deadline exceeded"),
@@ -1002,6 +1010,16 @@ impl PeerAdmissionCancellation {
             reason: Arc::new(AtomicU8::new(0)),
             expires_at: Some(SharedAdmissionExpiry::new(expires_at, None)),
         }
+    }
+
+    /// Model the reason-CAS-before-token-cancel interval without dispatching
+    /// cancellation. Only receive-path tests may construct this intermediate state.
+    #[cfg(test)]
+    pub(crate) fn with_reason_for_test(self, reason: PeerInvalidationReason) -> Self {
+        self.reason
+            .compare_exchange(0, reason.code(), Ordering::AcqRel, Ordering::Acquire)
+            .expect("test admission reason is not already latched");
+        self
     }
 
     #[must_use]
@@ -2849,12 +2867,17 @@ impl RuntimeState {
                     expires_at.min(binding.valid_until())
                         < peer.admission.deadline.trust_expires_at()
                 });
+            // Reconcile may observe the old deadline before an expiry sweep
+            // does. Keep that positive evidence for both the re-bind refusal
+            // and its cause: the new candidate cannot turn an expired
+            // admission into a membership change or revocation (M6-C232).
+            let deadline_expired = peer.admission.deadline.is_expired();
             let permitted = rebind_permitted(RebindCheck {
                 previous_version: peer.record_version,
                 current_version,
                 binding_changed,
                 trust_deadline_shrank,
-                deadline_expired: peer.admission.deadline.is_expired(),
+                deadline_expired,
             });
             match current {
                 Ok(binding) if permitted => {
@@ -2894,7 +2917,9 @@ impl RuntimeState {
                         token: peer.admission.invalidation,
                         reason_cell: peer.admission.invalidation_reason,
                         callback: self.callback.clone(),
-                        reason: if current.is_err() {
+                        reason: if deadline_expired {
+                            PeerInvalidationReason::TrustExpired
+                        } else if current.is_err() {
                             PeerInvalidationReason::MembershipRevoked
                         } else {
                             default_reason
@@ -3118,15 +3143,66 @@ impl HttpsCheckpointAuthority {
         })
     }
 
+    /// Construct a mutually authenticated HTTPS client. Invalid configured
+    /// credentials fail here; neither construction nor requests fall back to
+    /// an anonymous client. HTTPS identity is independent of signing trust.
+    pub fn new_with_client_identity(
+        endpoint: impl AsRef<str>,
+        trust_bundle_pem: &[u8],
+        client_certificate_pem: &[u8],
+        client_private_key_pem: &[u8],
+        timeout: Duration,
+    ) -> Result<Self, CheckpointAuthorityError> {
+        let endpoint = ParsedAuthorityEndpoint::parse(endpoint.as_ref())?;
+        if timeout.is_zero() || timeout > MAX_CHECKPOINT_REQUEST_TIMEOUT {
+            return Err(CheckpointAuthorityError::InvalidRequest);
+        }
+        // Preserve the distinct trust-bundle failure before loading identity.
+        parse_root_certificates(trust_bundle_pem)?;
+        let tls = tunnel_transport::load_client_config_from_pem_with_alpn(
+            client_certificate_pem,
+            client_private_key_pem,
+            trust_bundle_pem,
+            &[b"http/1.1"],
+        )
+        .map_err(|_| CheckpointAuthorityError::InvalidClientIdentity)?;
+        Ok(Self {
+            endpoint,
+            tls,
+            timeout,
+        })
+    }
+
     /// Construct from the operator-provisioned cluster paths.
     pub fn from_cluster_config(cluster: &ClusterConfig) -> Result<Self, CheckpointAuthorityError> {
         let trust_bundle = std::fs::read(&cluster.checkpoint_authority_trust_path)
             .map_err(|_| CheckpointAuthorityError::InvalidTrustBundle)?;
-        Self::new(
-            &cluster.checkpoint_authority_endpoint,
-            &trust_bundle,
-            Duration::from_secs(cluster.checkpoint_timeout_seconds),
-        )
+        let timeout = Duration::from_secs(cluster.checkpoint_timeout_seconds);
+        match (
+            &cluster.checkpoint_authority_client_cert_chain,
+            &cluster.checkpoint_authority_client_private_key,
+        ) {
+            (None, None) => Self::new(
+                &cluster.checkpoint_authority_endpoint,
+                &trust_bundle,
+                timeout,
+            ),
+            (Some(chain), Some(key)) => {
+                let certificate =
+                    read_material(chain, RedisTlsMaterialKind::ClientCertificate, false)
+                        .map_err(|_| CheckpointAuthorityError::InvalidClientIdentity)?;
+                let private_key = read_material(key, RedisTlsMaterialKind::ClientPrivateKey, true)
+                    .map_err(|_| CheckpointAuthorityError::InvalidClientIdentity)?;
+                Self::new_with_client_identity(
+                    &cluster.checkpoint_authority_endpoint,
+                    &trust_bundle,
+                    &certificate,
+                    &private_key,
+                    timeout,
+                )
+            }
+            _ => Err(CheckpointAuthorityError::InvalidClientIdentity),
+        }
     }
 
     async fn fetch_inner(

@@ -112,6 +112,27 @@ loaded before Redis records are considered. The
 checkpoint authority trust path remains a PEM CA bundle for the HTTPS
 authority and is independent from the Ed25519 membership signer keys.
 
+For an authority requiring mTLS, configure both
+`cluster.checkpoint_authority_client_cert_chain` and
+`cluster.checkpoint_authority_client_private_key`. The pair identifies this
+relay to the HTTPS authority; it contains no membership-signing key. Configured
+identity errors fail closed without retrying anonymously. The private key is
+loaded with the bounded, no-symlink TLS-file reader and must be owner-readable
+and writable with no group/other permissions on Unix (normally mode 0600).
+Omitting both paths preserves compatibility with existing external
+HTTPS authorities; the planned shipped authority requires mTLS and will reject
+such clients. Certificate authentication does not replace the authority's
+authorization of a node or the relay's signed-checkpoint verification.
+
+Operator publishers can use `RedisMembershipPublisher::connect_with_tls` with
+an explicit Redis CA and optional Redis client identity. This uses the same
+verified `rediss://`, bounded PING/INFO and Redis run-identity checks as the
+catalog. Give the publisher a separate authenticated Redis ACL restricted to
+its membership operator keys. The separate `tunnel-authority serve` command combines the publisher, mandatory-mTLS
+checkpoint responder and independent durable version allocators; its explicit
+approval and failure contract is in [authority.md](authority.md) (M6-C234).
+M6-C22 retains the complete deployment/operator/recovery acceptance.
+
 Certificates must identify the deployment, node, and relay role using a documented SAN profile and appropriate client/server usage. Certificate names, validity, chain constraints, role, and allowed leaf SPKI SHA-256 digest must all match. A device-role certificate fails the peer listener even if it has a chain to another trusted deployment intermediate. Use distinct relay and device intermediates/listeners by default.
 
 An operator-authorized membership publisher signs records using a standard signature implementation and an unambiguous, versioned canonical encoding. It publishes current records to Redis over authenticated TLS with an ACL restricted to the membership namespace. A relay may renew only its scoped presence and owner leases; it cannot authorize a new peer key. Public keys are public data, but unauthorized registry modification is an integrity incident.
@@ -158,13 +179,15 @@ For planned rotation, authorize the next key before use, publish a signed record
 
 **Readiness is bound to the served key only.** A staged or merely approved successor never satisfies it, so a relay whose *served* key the newest record no longer approves still fails closed exactly as the next paragraph describes. Two limits are recorded rather than hidden: the relay does not GOAWAY-drain **inbound** connections its peers opened under the predecessor, so a stream riding one is torn down when the predecessor is withdrawn and the dialing relay attributes that to the key (M8-C47); and a restarted relay serves whatever `peer_tls_cert_chain` names, so after a rotation the operator must point it at the successor's files before the next restart (M8-C48). The trigger (`SIGHUP`), the hold and the overlap defaults are applied by default pending owner confirmation (2026-09-25); the evidence is `verify-m8-acp-cluster`'s `genuine-peer-key-rotation` case and the `m8_relay_rekey_process` gate, recorded on M8-C24 and M8-C46.
 
-A serving relay replaces its accepted peer pins from a newer signed record without restarting: the pin snapshot published to the peer transport is derived from verifier-filtered current route targets, so a record that approves both keys admits both certificates, and the replacement-only record retires the old pin for the listener and the outbound pool at the same revision. Two consequences are observable and required. A relay whose *own* key the newest record no longer approves fails closed: it withdraws that route from readiness and refuses new work at once, and it surrenders the device ownership it holds and closes those sessions once the condition is confirmed, rather than continuing to serve behind an unapproved certificate (see *Own served key retired* below). And a retired pin is retired in both directions — the relay refuses an inbound handshake presenting it, and refuses to use it when dialing, opening no request stream toward an endpoint that presents it. `m7_deployment_spki_replacement` is the configured two-process gate for this walk, and it also requires the replacement process itself to serve: it takes the owner claim under a boot identity the retired process cannot have had, a fresh device session attaches to it, and a public consumer request across the replaced route returns the exact canary bytes. [testing.md](testing.md) records its evidence and its bounded convergence tolerances.
+A serving relay replaces its accepted peer pins from a newer signed record without restarting: the pin snapshot published to the peer transport is derived from verifier-filtered current route targets, so a record that approves both keys admits both certificates, and the replacement-only record retires the old pin for the listener and the outbound pool at the same revision. Two consequences are observable and required. A relay whose *own* key the newest record no longer approves fails closed: it withdraws that route from readiness and refuses new work at once, and it surrenders the device ownership it holds and closes those sessions once the condition is confirmed, rather than continuing to serve behind an unapproved certificate (see *Own served key retired* below). And a retired pin is retired in both directions — the relay refuses an inbound handshake presenting it, and refuses to use it when dialing, opening no request stream toward an endpoint that presents it. `m7_deployment_spki_replacement` is the configured two-process gate for this walk. Its replacement phase requires both relays ready, then attaches a fresh device to replacement B and serves an exact public canary through A. The replacement owner must preserve tenant/device/node/incarnation while changing boot/session and increasing epoch, match the connector identity, and remain unchanged with the device generation across the canary. The device must stop cleanly before the next fault phase. These assertions were added after the 2026-10-31 source review found that an earlier documentation claim had no corresponding committed test; M7-C06 records the new evidence separately from that historical claim. [testing.md](testing.md) records the current evidence and bounded convergence tolerances.
 
 The membership record lifetime remains 60 seconds during the longer key overlap: the publisher must keep issuing fresh authorization. A key's presence in an older valid overlap record is not a reason to extend a connection past its current trust deadline. A *fresh* record that re-approves the same key is: a successful reconcile re-binds each active admission whose node, boot, key, endpoint and server name are unchanged and whose signed boundary did not shrink, and moves its monotonic deadline to the boundary that evidence supports, exactly as a new admission would get (M7-C80). Nothing else extends it -- not a Redis read, a cache hit, a late response or a clock correction. TLS 1.3 resumption tickets must be tied to the accepted node/key/version and invalidated on retirement or revocation. Disable peer resumption in the first profile if the stack cannot enforce that binding.
 
 Revocation publishes a higher-version signed record removing the key or marking it revoked. Every observing node immediately rejects new requests and closes affected peer connections. With a connected registry, the target propagation interval is five seconds. Under lost updates or registry partitions, trust lasts no longer than the previous signed record's remaining 60-second lifetime plus the allowed five-second clock skew (M7-C173); this is a bounded revocation delay, not instantaneous revocation.
 
 Both relays on a pooled HTTP/3 stream enforce the same signed trust deadline, so either side may reset or end the stream before the other side's invalidation dispatcher runs. Each relay attributes the first terminal cause from its own admission edge: a typed trust-expiry invalidation, or the admission's own monotonic deadline having passed before the peer reset or close was observed. Only the peer reset/close family is reclassified; `GOAWAY`, timeouts, limit and authentication failures keep their own classification, and nothing is reclassified before the deadline. The owner records that cause on a bounded, payload-free per-stream terminal latch (identifiers, owner fencing identity, cursors, carrier generation and a closed cause label; at most 32 entries, first transition only) before `STREAM_FORGET` reclaims the logical stream. A handler dropped immediately at the cancellation edge still enqueues that cause through its cleanup guard; the latch never keeps a stream alive, and a missing stream or session is never itself evidence of expiry.
+
+Clean body EOF is classified on the same positive admission evidence in both peer receive directions (M6-C238), after the bounded record decoder finishes successfully. The classifier reads the admission state at that point: a typed trust-expiry reason or its own passed monotonic deadline yields membership expiry; an earlier explicit different reason takes precedence, and a live or absent admission keeps ordinary EOF. A partial record keeps its typed truncation error and releases its reservation before this classification can run. EOF itself does not establish why the remote side ended the stream, and this receive-only rule does not reclassify successfully decoded records, sends or finishes.
 
 Already executing device actions can outlive transport closure and follow adapter cancellation/outcome rules. A key compromise triggers operator review of affected grants and operation audit records. Removing a Redis key alone is not sufficient revocation because caches and signed records may remain valid.
 
@@ -187,6 +210,25 @@ The data attachment ticket additionally binds the validated device SPKI digest, 
 Terminate device mTLS in the Rust device listener in the initial deployment. A public load balancer passes TLS through to that listener. External TLS termination requires a separately reviewed authenticated identity-forwarding deployment profile; plain forwarded certificate headers from the internet are never trusted. Separate hostnames/listeners may be needed for ordinary consumer HTTPS and mandatory device mTLS.
 
 ## Peer topology and HTTP/3 listener
+
+Forwarded device control has separate device-path and peer-path heartbeats
+(M6-C68/M6-C229). The ingress sends WebSocket Pings every 10 seconds and expires
+30 seconds without device input, cancelling both peer halves to release the
+remote owner. WebSocket Pongs terminate at the ingress. To keep a healthy quiet
+H3 control stream active, the owner sends the existing protocol `PING` at
+`min(10 seconds, peer_idle_timeout / 3)` and the device's protocol `PONG` traverses
+the hop. The owner uses one absolute receive deadline, renewed only by inbound
+records; neither its ticker nor outbound traffic resets it. Peer admission,
+signed-trust expiry, device authorization and owner fencing still apply.
+
+An accepted peer request owns its ongoing-request cleanup entry before header
+resolution starts. Planned cancellation, header-read timeout, and capacity
+refusal before dispatch reset that request with `H3_REQUEST_REJECTED`, including
+when resolution is never polled or is cancelled while headers are incomplete.
+They must not finish an empty response or poison an admitted sibling. Dropping
+an unresolved request releases its cleanup entry so GOAWAY can complete; normal
+resolution transfers that ownership to the stream. Malformed HTTP/3 frames keep
+their existing connection-level protocol errors (M6-C246).
 
 Use bounded on-demand direct connections. Relay A opens one outgoing HTTP/3 connection to relay B when A needs to forward work; B may separately open one outgoing connection to A. Reuse each outgoing connection for many HTTP requests, and retire idle connections after 60 seconds. Limit simultaneous connection attempts per destination to one and aggregate attempts globally. Back off with jitter after failures.
 
@@ -421,6 +463,13 @@ Cluster readiness requires valid local identity, a fresh membership checkpoint/r
 Reachability is measured independently of the responder's own readiness. `GET /internal/v1/health` is "Authenticated version/readiness metadata, bounded response", so a relay answers an authenticated peer's bounded reachability probe whether or not its own cluster prerequisites currently hold: a route whose purpose is to report readiness cannot require the responder to already be ready. Gating that probe on the receiving relay's readiness makes each relay's route readiness depend on its peer's readiness, so a relay next to a starting, degraded, or flapping peer cannot converge even though the peer is reachable, and it makes "peer starting" indistinguishable from the blocked-UDP case which must "fail route readiness explicitly". Withdrawing readiness therefore drops reachability and capacity evidence and fences the route revision — `/readyz` and public admission fail closed at once — while keeping the verified route and pin set installed as the signed evidence of which peer certificates are approved. **Which unready states keep the installed pin set is a recorded owner decision, but its implementation (M7-C86) is held**, together with the shared pin wiring (M7-C90) and the republication on return to `Ready` (M7-C91) that were built with it: each of those changes, measured on its own and in combination, regressed `verify-m7-trust-expiry` against `origin/main` (base 20 of 20; the wiring without the split 10-18 of 20), so none is in effect. Every unready reason still withdraws the pin set, and the serving relay and the fixture keep their separate wiring. Two readiness reasons were separated and are in effect: `missing_local_membership` also covers a candidate that verified cleanly but holds no record for this relay at or above the checkpoint's minimum version (it used to report `membership_rejected`), and `missing_local_key` names a relay whose own certificate is not an approved key of its own record; both still withdraw the pin set today.
 
 **Attributing a peer-reset close to trust expiry does not depend on the pin set.** This describes existing behaviour, not a mechanism added for it. A relay that observes a peer reset a pooled stream attributes it to trust expiry on positive evidence about the *admission*: its own invalidation dispatcher recorded `TrustExpired` for that edge, or the monotonic deadline it derived at admission from the signed trust window has passed. What the pin set happens to contain is not evidence either way, and an explicit different invalidation reason — revocation, a record replacement — is never reinterpreted as expiry.
+
+When reconcile first observes an admission whose existing monotonic deadline
+has already passed, it records `TrustExpired` even if the candidate renews the
+record or can no longer bind the expired key (M6-C232). It never renews that
+admission. A revocation or replacement already latched before expiry keeps its
+first cause. This classification uses the admission's passed deadline; it adds
+no expiry inference from a remote close or the contents of the pin set.
 
 A stronger rule was written here and reverted: that attribution should instead key on `VerifiedPeerBinding::valid_until`, the earlier of the record's and the authorising key's expiry. Instrumentation refuted the premise. In the measured configuration the governing signed boundary is the trust/checkpoint window, which the monotonic deadline already carries and which is *earlier* than `valid_until` — 11:42:26.741 against 11:43:21.399 on the same admission — so a `valid_until` arm could only fire later than the arm that already exists. That ordering is not guaranteed in general: `valid_until` is the earlier of the record's and the authorising key's expiry, and a key can leave its own window while the record carrying it stays valid, so a different deployment could order them the other way. See M7-C83 for the samples.
 

@@ -1128,8 +1128,7 @@ async fn start_relay(
 ) -> Result<ManagedProcess> {
     let mut process = ManagedProcess::spawn(
         format!("m7-checkpoint-refresh-relay-{stage}"),
-        ProcessSpec::new(&fixture.relay_binary)
-            .arg("serve")
+        common::relay_serve_process_spec(&fixture.relay_binary)
             .arg("--config")
             .arg(fixture.config_path.display().to_string()),
     )
@@ -1258,8 +1257,7 @@ async fn expect_startup_rejection(
     let observations_before_launch = fixture.checkpoint_state.observations().len();
     let mut process = ManagedProcess::spawn(
         format!("m7-checkpoint-refresh-reject-{label}"),
-        ProcessSpec::new(&fixture.relay_binary)
-            .arg("serve")
+        common::relay_serve_process_spec(&fixture.relay_binary)
             .arg("--config")
             .arg(fixture.config_path.display().to_string()),
     )

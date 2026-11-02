@@ -7,9 +7,9 @@ name: Release packaging tests
 # GitHub's `*` does not match `/`.  `LICENSE` because `package()` copies it.
 on:
   push:
-    paths: ['scripts/*release*.py', 'scripts/test_docs_inventory.py', 'crates/tunnel-client/src/main.rs', '.github/workflows/release*.yml', 'docs/**', 'examples/**', 'Cargo.toml', 'LICENSE']
+    paths: ['scripts/*release*.py', 'scripts/container_notices.py', 'scripts/test_container_notices.py', 'deploy/notices/rust/**', 'scripts/test_docs_inventory.py', 'crates/tunnel-client/src/main.rs', '.github/workflows/release*.yml', 'docs/**', 'examples/**', 'Cargo.toml', 'LICENSE']
   pull_request:
-    paths: ['scripts/*release*.py', 'scripts/test_docs_inventory.py', 'crates/tunnel-client/src/main.rs', '.github/workflows/release*.yml', 'docs/**', 'examples/**', 'Cargo.toml', 'LICENSE']
+    paths: ['scripts/*release*.py', 'scripts/container_notices.py', 'scripts/test_container_notices.py', 'deploy/notices/rust/**', 'scripts/test_docs_inventory.py', 'crates/tunnel-client/src/main.rs', '.github/workflows/release*.yml', 'docs/**', 'examples/**', 'Cargo.toml', 'LICENSE']
 permissions:
   contents: read
 jobs:
@@ -31,6 +31,7 @@ jobs:
         with:
           persist-credentials: false
       - run: python3 scripts/test_package_release.py
+      - run: python3 scripts/test_container_notices.py
       - run: python3 scripts/test_release_artifact_cli.py
       - run: python3 scripts/test_verify_release_archive.py
       # M6-C219: the bundle-free half of the executed-guide check (fence

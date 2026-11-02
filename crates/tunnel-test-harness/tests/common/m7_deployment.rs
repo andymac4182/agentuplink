@@ -35,7 +35,7 @@ use tokio::{
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 use tokio_util::sync::CancellationToken;
 use tunnel_test_harness::cluster_fixture::TestMembershipAuthority;
-use tunnel_test_harness::{HarnessError, ManagedProcess, OidcFixture, Result};
+use tunnel_test_harness::{HarnessError, ManagedProcess, OidcFixture, ProcessSpec, Result};
 
 pub(crate) const READY_DEADLINE: Duration = Duration::from_secs(20);
 pub(crate) const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
@@ -50,6 +50,16 @@ pub(crate) const AUXILIARY_CONNECTION_DEADLINE: Duration = Duration::from_secs(5
 /// would leave one slot for a reconnect or a second client (M7-C177).
 pub(crate) const REDIS_PROXY_CONNECTION_LIMIT: usize = 32;
 pub(crate) const AUXILIARY_SHUTDOWN_DEADLINE: Duration = Duration::from_secs(2);
+
+/// Configured-relay gates assert WARN failure diagnostics and INFO re-key
+/// stages. Pin the relay's normal default for these children: inheriting an
+/// unrelated runner's error-only RUST_LOG would suppress required evidence.
+/// A fixture may append its own more specific filter with ProcessSpec::env.
+pub(crate) fn relay_serve_process_spec(binary: impl Into<PathBuf>) -> ProcessSpec {
+    ProcessSpec::new(binary)
+        .env("RUST_LOG", "info")
+        .arg("serve")
+}
 
 pub(crate) async fn wait_for_ready(
     process: &mut ManagedProcess,

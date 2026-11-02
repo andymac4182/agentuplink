@@ -12,6 +12,9 @@
 # redis:8.4.0-alpine is the Redis every local harness in this repository runs
 # against. The digest is the multi-architecture index.
 FROM redis:8.4.0-alpine@sha256:4eec4565e45aa0b3966554c866bc73211e281b0b3d89fe9a33c982e6faca809d
+COPY notices/ /usr/local/share/licenses/agentuplink-redis/
+RUN test "$REDIS_DOWNLOAD_SHA" = b947d9015622669b5bee8ec954f658b3278d42dbefae23a92d9b7704bfe143f9 \
+ && cd /usr/local/share/licenses/agentuplink-redis && sha256sum -c SHA256SUMS
 COPY entrypoint.sh /usr/local/bin/agentuplink-redis-entrypoint
 RUN chmod 0755 /usr/local/bin/agentuplink-redis-entrypoint
 EXPOSE 6379

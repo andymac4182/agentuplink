@@ -11,7 +11,9 @@ publish = false
 async-trait = "0.1.89"
 base64 = "0.22.1"
 chrono = { version = "0.4.45", features = ["clock", "serde"] }
-jsonwebtoken = { version = "10.3.0", features = ["rust_crypto"] }
+# The RustCrypto provider pulls crypto-bigint 0.5 through unused EC algorithms
+# (RUSTSEC-2026-0387). AWS-LC preserves the RS256/EdDSA verification contract.
+jsonwebtoken = { version = "10.3.0", features = ["aws_lc_rs"] }
 ring = "0.17.14"
 # Only to classify a TLS failure by its typed variant (redis-rs already links it).
 rustls = { version = "0.23", default-features = false, features = ["std"] }

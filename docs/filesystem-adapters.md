@@ -113,6 +113,19 @@ Expose virtual paths only. Omit local `basePath`/mount configuration; no FUSE or
 
 Mastra requires `createdAt` and numeric sizes. When birth time is unavailable, use the observed mtime for `createdAt` and expose `createdAtSource:'mtime-fallback'` through provider metadata/instructions. This is a compatibility convention, not a historical creation-time claim. Apply the same safe Date/ms conversion throughout. Unknown node types fail instead of becoming fake regular files. Materialized directory/file results fail on limits rather than silently truncate.
 
+For recursive `readdir`, an explicit nonnegative integer `maxDepth` selects
+Mastra's bounded view: `0` lists the current directory, `1` also lists its
+immediate subdirectories, and so on. It must not exceed the descriptor's
+`maxTraversalDepth`, including when the requested view would otherwise fit a
+shallow tree. Invalid values fail before dispatch with `TUNNEL_EINVAL`; values
+above the ceiling fail with `TUNNEL_ELOOP`. A value equal to the ceiling is a
+valid requested view. Without `maxDepth`, recursive listing must complete:
+discovering a directory that requires descent beyond the ceiling fails with
+`TUNNEL_ELOOP`, rather than returning a partial array as complete. These errors
+retain the typed tunnel cause. The descriptor's entry quota still applies to
+both requested views and complete listings. See task M4-75; broader advertised
+limit acceptance remains M4-21.
+
 ### Timestamp checks: explicit compatibility choice
 
 The `mtimePolicy` constructor option is `'reject'` by default. A requested `expectedMtime` then fails before any mutation. Native Mastra read tracking often supplies this condition internally even if the model did not request it; this default therefore does not support ordinary read-then-edit tools on writable mounts.

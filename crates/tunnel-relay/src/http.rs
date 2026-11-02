@@ -202,7 +202,7 @@ impl ConsumerUpgradeBarrier {
 }
 
 /// One-shot fixture seam immediately after the device's `HELLO` has been
-/// received and parsed on an owner-local device control socket, and
+/// received and parsed on an owner-local or forwarded device control socket, and
 /// immediately before the relay registers the control stream and produces the
 /// `WELCOME`.  It mirrors [`ConsumerUpgradeBarrier`] exactly: it is optional,
 /// is `None` on every ordinary relay path, and changes no product behaviour
@@ -766,7 +766,7 @@ pub(crate) struct HttpState {
     /// Fixture-only one-shot gate after public readiness and exact owner-route
     /// resolution but before the remote H3 admission attempt.
     pub(crate) peer_admission_barrier: Option<Arc<PeerAdmissionBarrier>>,
-    /// Fixture-only one-shot gate on an owner-local device control socket,
+    /// Fixture-only one-shot gate on a device control socket,
     /// after the device's HELLO is received and before the relay registers
     /// the control stream and emits the WELCOME.  `None` on every ordinary
     /// relay path, including every consumer route.
@@ -1150,12 +1150,7 @@ async fn echo(
         }
     };
     if validated.expires_at <= Utc::now() {
-        return error_response(
-            StatusCode::UNAUTHORIZED,
-            "UNAUTHORIZED",
-            "consumer token expired before dispatch",
-            "not_dispatched",
-        );
+        return refused_consumer_token_response("consumer token expired before dispatch");
     }
     if let Some(response) = cluster_unready_response(&state) {
         return response;
@@ -1188,12 +1183,7 @@ async fn echo(
                             // The token was already accepted above; only
                             // re-framing it for the owner failed.  Same text
                             // as every other refused token (M6-C53).
-                            return error_response(
-                                StatusCode::UNAUTHORIZED,
-                                "UNAUTHORIZED",
-                                CONSUMER_TOKEN_REFUSED,
-                                "not_dispatched",
-                            );
+                            return refused_consumer_token_response(CONSUMER_TOKEN_REFUSED);
                         }
                     };
                 let envelope = RequestEnvelope::new(
@@ -2427,11 +2417,26 @@ async fn authenticate(
 /// same cause gets the same status and the same message on every route.
 /// `stage` is logged by the relay and never sent: the consumer is not told
 /// which check failed.
+/// `challenge` describes only the credential verdict; a grant denial and an
+/// unavailable verifier are never labelled as an insufficient token scope.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ConsumerRefusal {
     pub(crate) status: StatusCode,
     pub(crate) message: &'static str,
     pub(crate) stage: &'static str,
+    challenge: Option<&'static str>,
+}
+
+impl ConsumerRefusal {
+    fn with_bearer_challenge(self, mut response: Response) -> Response {
+        if let Some(challenge) = self.challenge {
+            response.headers_mut().insert(
+                header::WWW_AUTHENTICATE,
+                HeaderValue::from_static(challenge),
+            );
+        }
+        response
+    }
 }
 
 /// The message for every presented-but-refused credential.  It is true of
@@ -2459,17 +2464,20 @@ pub(crate) fn classify_consumer_refusal(error: &OidcError) -> ConsumerRefusal {
         status: StatusCode::UNAUTHORIZED,
         message: CONSUMER_TOKEN_REFUSED,
         stage,
+        challenge: Some("Bearer error=\"invalid_token\""),
     };
     match error {
         OidcError::Catalog(_) => ConsumerRefusal {
             status: StatusCode::SERVICE_UNAVAILABLE,
             message: "consumer authorization is unavailable",
             stage: "identity_lookup_unavailable",
+            challenge: None,
         },
         OidcError::MissingBearer => ConsumerRefusal {
             status: StatusCode::UNAUTHORIZED,
             message: "a consumer access token is required",
             stage: "bearer",
+            challenge: Some("Bearer"),
         },
         OidcError::InvalidToken => refused("token"),
         OidcError::DisallowedAlgorithm => refused("algorithm"),
@@ -2482,11 +2490,13 @@ pub(crate) fn classify_consumer_refusal(error: &OidcError) -> ConsumerRefusal {
             status: StatusCode::SERVICE_UNAVAILABLE,
             message: "consumer authorization is unavailable",
             stage: "verifier_configuration",
+            challenge: None,
         },
         OidcError::InsufficientScope => ConsumerRefusal {
             status: StatusCode::FORBIDDEN,
             message: "the consumer access token does not grant this route's scope",
             stage: "scope",
+            challenge: Some("Bearer error=\"insufficient_scope\""),
         },
     }
 }
@@ -2563,7 +2573,24 @@ fn consumer_authentication_response(error: &OidcError, route: &'static str) -> R
         StatusCode::FORBIDDEN => "FORBIDDEN",
         _ => "UNAUTHORIZED",
     };
-    error_response(refusal.status, code, refusal.message, "not_dispatched")
+    refusal.with_bearer_challenge(error_response(
+        refusal.status,
+        code,
+        refusal.message,
+        "not_dispatched",
+    ))
+}
+
+/// A token accepted at ingress was refused before dispatch. Keep this
+/// boundary's existing message while publishing the same safe challenge as
+/// the initial verifier, without manufacturing another refusal log event.
+fn refused_consumer_token_response(message: &'static str) -> Response {
+    classify_consumer_refusal(&OidcError::InvalidToken).with_bearer_challenge(error_response(
+        StatusCode::UNAUTHORIZED,
+        "UNAUTHORIZED",
+        message,
+        "not_dispatched",
+    ))
 }
 
 fn bearer(headers: &HeaderMap) -> &str {
@@ -2931,40 +2958,101 @@ async fn handle_remote_device_control(
     );
     let exchange = peer.open(&route, envelope).await?;
     let (mut send, mut recv) = exchange.split();
-    loop {
-        tokio::select! {
-            inbound = socket.next() => {
-                let Some(inbound) = inbound else { break; };
-                let message = inbound.map_err(|_| PeerRuntimeError::Closed)?;
-                match message {
-                    Message::Text(text) if text.len() <= MAX_CONTROL_BYTES => {
-                        send.send_message(PeerRecordKind::CompleteControlText, text.as_bytes()).await?;
+    let mut liveness = ControlLiveness::new(tokio::time::Instant::now());
+    let mut pings = control_ping_ticker();
+    // Keep every fallible pump operation inside this result. Otherwise a `?`
+    // bypasses the explicit cancellation below, leaving the owner dependent
+    // on eventual transport cleanup to notice the vanished device.
+    let result = async {
+        loop {
+            match next_forwarded_control_event(socket, &mut liveness, &mut pings, recv.recv_message()).await {
+                ForwardedControlEvent::Device(inbound) => {
+                    let Some(inbound) = inbound else { break; };
+                    let message = inbound.map_err(|_| PeerRuntimeError::Closed)?;
+                    match message {
+                        Message::Text(text) if text.len() <= MAX_CONTROL_BYTES => {
+                            send.send_message(PeerRecordKind::CompleteControlText, text.as_bytes()).await?;
+                        }
+                        Message::Ping(payload) => {
+                            if !send_socket(&mut *socket, Message::Pong(payload)).await { break; }
+                        }
+                        Message::Close(_) => break,
+                        Message::Pong(_) => {}
+                        _ => break,
                     }
-                    Message::Ping(payload) => {
-                        if !send_socket(&mut *socket, Message::Pong(payload)).await { break; }
-                    }
-                    Message::Close(_) => break,
-                    Message::Pong(_) => {}
-                    _ => break,
                 }
-            }
-            remote = recv.recv_message() => {
-                let Some(record) = remote? else { break; };
-                match record.kind() {
-                    PeerRecordKind::CompleteControlText => {
-                        let text = record.as_text().map_err(PeerRuntimeError::Frame)?;
-                        if !send_socket(&mut *socket, Message::Text(text.to_owned().into())).await { break; }
+                ForwardedControlEvent::Peer(remote) => {
+                    let Some(record) = remote? else { break; };
+                    match record.kind() {
+                        PeerRecordKind::CompleteControlText => {
+                            let text = record.as_text().map_err(PeerRuntimeError::Frame)?;
+                            if !send_socket(&mut *socket, Message::Text(text.to_owned().into())).await { break; }
+                        }
+                        PeerRecordKind::Close => break,
+                        _ => break,
                     }
-                    PeerRecordKind::Close => break,
-                    _ => break,
+                }
+                ForwardedControlEvent::Ping => {
+                    if !send_socket(&mut *socket, Message::Ping(Default::default())).await { break; }
+                }
+                ForwardedControlEvent::IdleTimeout => {
+                    tracing::info!(
+                        device_id = %route.owner_token().device_id,
+                        idle_timeout_ms = u64::try_from(DEVICE_CONTROL_IDLE_TIMEOUT.as_millis()).unwrap_or(u64::MAX),
+                        phase = "control_liveness_timeout",
+                        route = "forwarded",
+                    );
+                    break;
                 }
             }
         }
-    }
+        Ok(())
+    }.await;
+    // The ingress owns device-path liveness: owner traffic and successful
+    // local writes cannot prove that the device still receives anything.
+    // Reset both peer halves before attempting the bounded WebSocket close,
+    // so the owner can release the session even if that write stalls.
     send.cancel();
     recv.cancel();
-    let _ = send_socket(&mut *socket, Message::Close(None)).await;
-    Ok(())
+    // Preserve the caller's typed admission-refusal close on errors.
+    if result.is_ok() {
+        let _ = send_socket(&mut *socket, Message::Close(None)).await;
+    }
+    result
+}
+
+/// One scheduling decision in the forwarded control pump. The generic stream
+/// and peer future allow the real scheduling rules to be exercised with a
+/// paused clock, without adding a fixture-only timeout to the wire protocol.
+enum ForwardedControlEvent<E, P> {
+    Device(Option<Result<Message, E>>),
+    Peer(P),
+    Ping,
+    IdleTimeout,
+}
+
+async fn next_forwarded_control_event<S, E, F, P>(
+    socket: &mut S,
+    liveness: &mut ControlLiveness,
+    pings: &mut tokio::time::Interval,
+    peer_receive: F,
+) -> ForwardedControlEvent<E, P>
+where
+    S: futures_util::Stream<Item = Result<Message, E>> + Unpin,
+    F: std::future::Future<Output = P>,
+{
+    tokio::select! {
+        biased;
+        // A buffered device frame wins a simultaneous deadline. Only these
+        // frames renew the deadline; even continuous owner output must not.
+        inbound = socket.next() => {
+            liveness.observe_inbound(tokio::time::Instant::now());
+            ForwardedControlEvent::Device(inbound)
+        }
+        () = tokio::time::sleep_until(liveness.deadline()) => ForwardedControlEvent::IdleTimeout,
+        _ = pings.tick() => ForwardedControlEvent::Ping,
+        remote = peer_receive => ForwardedControlEvent::Peer(remote),
+    }
 }
 
 async fn handle_remote_device_data(
@@ -3078,6 +3166,29 @@ pub fn peer_ingress_handler_with_http_forward(
     local_boot_id: String,
     http_forward: Option<crate::http::forward::HttpForwardExports>,
 ) -> impl PeerIngressHandler {
+    peer_ingress_handler_with_control_attach_barrier(
+        handle,
+        catalog,
+        oidc,
+        local_node_id,
+        local_boot_id,
+        http_forward,
+        None,
+    )
+}
+
+/// The ordinary peer callback with the existing bounded, one-shot fixture
+/// barrier also available at forwarded HELLO registration. Production callers
+/// supply `None`; no admission check or registration policy is bypassed.
+pub(crate) fn peer_ingress_handler_with_control_attach_barrier(
+    handle: RelayHandle,
+    catalog: SharedCatalog,
+    oidc: Arc<OidcVerifier>,
+    local_node_id: String,
+    local_boot_id: String,
+    http_forward: Option<crate::http::forward::HttpForwardExports>,
+    control_attach_barrier: Option<(Arc<ControlAttachBarrier>, Duration)>,
+) -> impl PeerIngressHandler {
     move |request: InboundPeerRequest| {
         let handle = handle.clone();
         let catalog = catalog.clone();
@@ -3085,6 +3196,7 @@ pub fn peer_ingress_handler_with_http_forward(
         let local_node_id = local_node_id.clone();
         let local_boot_id = local_boot_id.clone();
         let http_forward = http_forward.clone();
+        let control_attach_barrier = control_attach_barrier.clone();
         async move {
             handle_peer_ingress(
                 request,
@@ -3094,12 +3206,14 @@ pub fn peer_ingress_handler_with_http_forward(
                 &local_node_id,
                 &local_boot_id,
                 http_forward,
+                control_attach_barrier,
             )
             .await
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_peer_ingress(
     request: InboundPeerRequest,
     handle: RelayHandle,
@@ -3108,6 +3222,7 @@ async fn handle_peer_ingress(
     local_node_id: &str,
     local_boot_id: &str,
     http_forward: Option<crate::http::forward::HttpForwardExports>,
+    control_attach_barrier: Option<(Arc<ControlAttachBarrier>, Duration)>,
 ) -> Result<(), PeerRuntimeError> {
     // The owner-side observer starts at the `owner` stage: every check
     // before the stream is split is this relay's own admission decision.
@@ -3137,6 +3252,7 @@ async fn handle_peer_ingress(
         local_boot_id,
         &fault,
         http_forward,
+        control_attach_barrier,
     )
     .await;
     if let Err(error) = &result {
@@ -3155,6 +3271,7 @@ async fn handle_peer_ingress_inner(
     local_boot_id: &str,
     fault: &PeerFaultObserver,
     http_forward: Option<crate::http::forward::HttpForwardExports>,
+    control_attach_barrier: Option<(Arc<ControlAttachBarrier>, Duration)>,
 ) -> Result<(), PeerRuntimeError> {
     let envelope = request.envelope().clone();
     let destination = envelope.destination.clone();
@@ -3264,7 +3381,14 @@ async fn handle_peer_ingress_inner(
                         return Err(error);
                     }
                 };
-            handle_peer_device_control(request, handle.clone(), device, fault).await
+            handle_peer_device_control(
+                request,
+                handle.clone(),
+                device,
+                fault,
+                control_attach_barrier,
+            )
+            .await
         }
         InternalRequest::DeviceData(request_body) => {
             let device =
@@ -3494,6 +3618,7 @@ async fn handle_peer_device_control(
     handle: RelayHandle,
     device: tunnel_catalog::DeviceIdentity,
     fault: &PeerFaultObserver,
+    control_attach_barrier: Option<(Arc<ControlAttachBarrier>, Duration)>,
 ) -> Result<(), PeerRuntimeError> {
     let spki = device.spki_fingerprint.clone();
     let (mut send, mut recv) = request.split();
@@ -3506,6 +3631,9 @@ async fn handle_peer_device_control(
         tunnel_protocol::ControlMessage::Hello(hello) => hello,
         _ => return Err(PeerRuntimeError::UnexpectedRecord(first.kind())),
     };
+    if let Some((barrier, budget)) = control_attach_barrier {
+        barrier.wait_before_control_attach(budget).await;
+    }
     // A refused registration -- a duplicate owner claim, an unauthorized
     // device, or a HELLO this cluster will not admit -- is an ordinary outcome
     // of this request, not a peer protocol violation.  It must be answered on
@@ -3531,29 +3659,71 @@ async fn handle_peer_device_control(
     let welcome = registration.welcome;
     let mut outbound = registration.rx;
     let mut cleanup = handle.control_cleanup_guard(key.clone());
+    let peer_idle_timeout = recv.idle_timeout();
+    let mut last_peer_inbound = tokio::time::Instant::now();
+    let mut pings = peer_control_ping_ticker(peer_idle_timeout);
     let result: Result<(), PeerRuntimeError> = async {
         send.respond(StatusCode::OK).await?;
         send.send_message(PeerRecordKind::CompleteControlText, welcome.as_bytes())
             .await?;
         loop {
-            tokio::select! {
-                inbound = recv.recv_message() => {
-                    let Some(record) = inbound? else { break; };
+            // A ticker or owner output must not restart the peer's receive
+            // timeout. Keep one absolute deadline until a peer frame arrives.
+            let deadline = last_peer_inbound + peer_idle_timeout;
+            match next_peer_control_event(
+                recv.recv_message_until(deadline),
+                outbound.recv(),
+                &mut pings,
+                deadline,
+            )
+            .await
+            {
+                PeerControlEvent::Inbound(inbound) => {
+                    let Some(record) = inbound? else {
+                        break;
+                    };
+                    last_peer_inbound = tokio::time::Instant::now();
                     if record.kind() != PeerRecordKind::CompleteControlText {
                         break;
                     }
-                    let message = wire::parse_control(record.body()).map_err(|_| PeerRuntimeError::Closed)?;
-                    handle.inbound_control(key.clone(), message).await.map_err(|_| PeerRuntimeError::Closed)?;
+                    let message =
+                        wire::parse_control(record.body()).map_err(|_| PeerRuntimeError::Closed)?;
+                    handle
+                        .inbound_control(key.clone(), message)
+                        .await
+                        .map_err(|_| PeerRuntimeError::Closed)?;
                 }
-                item = outbound.recv() => {
-                    match item {
-                        Some(crate::actor::ControlOutbound::Text(mut text)) => {
-                            let sent = send.send_message(PeerRecordKind::CompleteControlText, text.as_bytes()).await;
-                            text.release();
-                            sent?;
-                        }
-                        Some(crate::actor::ControlOutbound::Close) | None => break,
+                PeerControlEvent::Outbound(item) => match item {
+                    Some(crate::actor::ControlOutbound::Text(mut text)) => {
+                        let sent = send
+                            .send_message(PeerRecordKind::CompleteControlText, text.as_bytes())
+                            .await;
+                        text.release();
+                        sent?;
                     }
+                    Some(crate::actor::ControlOutbound::Close) | None => break,
+                },
+                PeerControlEvent::Ping => {
+                    // WebSocket Pongs terminate at the ingress. This existing
+                    // protocol PING reaches the device through the peer hop;
+                    // its PONG keeps the otherwise quiet H3 request alive.
+                    // Session and epoch, not a changing data generation, bind
+                    // it across rotation. Both supported device clients
+                    // already answer this protocol message.
+                    let ping = wire::encode_control_message(
+                        &tunnel_protocol::ControlMessage::Ping(tunnel_protocol::Ping::new(
+                            wire::random_token(),
+                            key.session_id.clone(),
+                            key.epoch,
+                            Uuid::new_v4().as_u64_pair().0,
+                        )),
+                    )
+                    .map_err(|_| PeerRuntimeError::Closed)?;
+                    send.send_message(PeerRecordKind::CompleteControlText, ping.as_bytes())
+                        .await?;
+                }
+                PeerControlEvent::IdleTimeout => {
+                    return Err(PeerRuntimeError::Transport(PeerTransportError::Timeout));
                 }
             }
         }
@@ -3578,6 +3748,49 @@ async fn handle_peer_device_control(
         Ok(()) => send.finish().await,
         Err(error) => Err(error),
     }
+}
+
+/// The owner must keep a quiet peer control stream active without allowing
+/// its own writes to extend the inbound idle bound.
+enum PeerControlEvent<P, O> {
+    Inbound(P),
+    Outbound(O),
+    Ping,
+    IdleTimeout,
+}
+
+async fn next_peer_control_event<F, P, G, O>(
+    inbound: F,
+    outbound: G,
+    pings: &mut tokio::time::Interval,
+    deadline: tokio::time::Instant,
+) -> PeerControlEvent<P, O>
+where
+    F: std::future::Future<Output = P>,
+    G: std::future::Future<Output = O>,
+{
+    tokio::select! {
+        biased;
+        // Buffered inbound traffic wins a simultaneous deadline. Otherwise
+        // neither periodic heartbeats nor a busy owner can starve expiry.
+        received = inbound => PeerControlEvent::Inbound(received),
+        () = tokio::time::sleep_until(deadline) => PeerControlEvent::IdleTimeout,
+        _ = pings.tick() => PeerControlEvent::Ping,
+        item = outbound => PeerControlEvent::Outbound(item),
+    }
+}
+
+fn peer_control_ping_ticker(peer_idle_timeout: Duration) -> tokio::time::Interval {
+    // Configured peer idle bounds are 1..=60 seconds. Dividing in Duration
+    // retains a subsecond cadence at the one-second minimum. The transport
+    // API also accepts smaller positive test bounds; never pass interval_at
+    // a zero period when their division rounds down.
+    let period = DEVICE_CONTROL_PING_INTERVAL
+        .min(peer_idle_timeout / 3)
+        .max(Duration::from_nanos(1));
+    let mut pings = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+    pings.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    pings
 }
 
 async fn handle_peer_device_data(
@@ -4846,7 +5059,17 @@ fn peer_failure_response(error: PeerRuntimeError) -> Response {
             "unknown",
         ),
     };
-    error_response(status, code, "owner forwarding did not complete", execution)
+    let mut response = error_response(status, code, "owner forwarding did not complete", execution);
+    // This mapper is used only by consumer echo, stream and HTTP forwarding.
+    // The peer gives us a status, not its credential verdict: challenge a
+    // 401 without inventing an error, and never call an opaque 403 a scope
+    // failure (it can be an envelope or grant-policy refusal).
+    if status == StatusCode::UNAUTHORIZED {
+        response
+            .headers_mut()
+            .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
+    }
+    response
 }
 
 /// The consumer answer for a refusal from this relay's own actor, as the
@@ -5276,6 +5499,205 @@ mod tests {
             "an older observation must not pull the deadline back"
         );
         assert!(liveness.deadline() >= pong + DEVICE_CONTROL_PING_INTERVAL * 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn forwarded_control_pings_then_expires_a_silent_device() {
+        use super::{
+            ControlLiveness, ForwardedControlEvent, control_ping_ticker,
+            next_forwarded_control_event,
+        };
+        let admitted = tokio::time::Instant::now();
+        let mut liveness = ControlLiveness::new(admitted);
+        let mut pings = control_ping_ticker();
+        let mut socket = futures_util::stream::pending::<Result<Message, ()>>();
+        for interval in 1..=2 {
+            assert!(matches!(
+                next_forwarded_control_event(
+                    &mut socket,
+                    &mut liveness,
+                    &mut pings,
+                    std::future::pending::<()>(),
+                )
+                .await,
+                ForwardedControlEvent::Ping,
+            ));
+            assert_eq!(
+                tokio::time::Instant::now(),
+                admitted + super::DEVICE_CONTROL_PING_INTERVAL * interval,
+            );
+        }
+        assert!(matches!(
+            next_forwarded_control_event(
+                &mut socket,
+                &mut liveness,
+                &mut pings,
+                std::future::pending::<()>(),
+            )
+            .await,
+            ForwardedControlEvent::IdleTimeout,
+        ));
+        assert_eq!(
+            tokio::time::Instant::now(),
+            admitted + super::DEVICE_CONTROL_IDLE_TIMEOUT,
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn forwarded_control_owner_output_cannot_hide_a_dead_device() {
+        use super::{
+            ControlLiveness, ForwardedControlEvent, control_ping_ticker,
+            next_forwarded_control_event,
+        };
+        let admitted = tokio::time::Instant::now();
+        let mut liveness = ControlLiveness::new(admitted);
+        let mut pings = control_ping_ticker();
+        let mut socket = futures_util::stream::pending::<Result<Message, ()>>();
+        assert!(matches!(
+            next_forwarded_control_event(
+                &mut socket,
+                &mut liveness,
+                &mut pings,
+                std::future::ready(()),
+            )
+            .await,
+            ForwardedControlEvent::Peer(()),
+        ));
+        tokio::time::advance(super::DEVICE_CONTROL_IDLE_TIMEOUT).await;
+        // Both a pending Ping and another owner record are ready. Neither
+        // may starve expiry or reset it without an inbound device frame.
+        assert!(matches!(
+            next_forwarded_control_event(
+                &mut socket,
+                &mut liveness,
+                &mut pings,
+                std::future::ready(()),
+            )
+            .await,
+            ForwardedControlEvent::IdleTimeout,
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn forwarded_control_buffered_pong_wins_a_simultaneous_deadline() {
+        use super::{
+            ControlLiveness, ForwardedControlEvent, control_ping_ticker,
+            next_forwarded_control_event,
+        };
+        let admitted = tokio::time::Instant::now();
+        let mut liveness = ControlLiveness::new(admitted);
+        let mut pings = control_ping_ticker();
+        let mut socket =
+            futures_util::stream::iter([Ok::<_, ()>(Message::Pong(Default::default()))]);
+        tokio::time::advance(super::DEVICE_CONTROL_IDLE_TIMEOUT).await;
+        assert!(matches!(
+            next_forwarded_control_event(
+                &mut socket,
+                &mut liveness,
+                &mut pings,
+                std::future::ready(()),
+            )
+            .await,
+            ForwardedControlEvent::Device(Some(Ok(Message::Pong(_)))),
+        ));
+        assert_eq!(
+            liveness.deadline(),
+            tokio::time::Instant::now() + super::DEVICE_CONTROL_IDLE_TIMEOUT,
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn peer_control_heartbeats_keep_the_configured_inbound_deadline() {
+        use super::{PeerControlEvent, next_peer_control_event, peer_control_ping_ticker};
+        // Exercise both validated configuration endpoints. In particular,
+        // integer-second division must not turn the one-second bound into a
+        // zero-period ticker, and emitted heartbeats cannot defer expiry.
+        for seconds in [1, 60] {
+            let idle = std::time::Duration::from_secs(seconds);
+            let admitted = tokio::time::Instant::now();
+            let deadline = admitted + idle;
+            let mut pings = peer_control_ping_ticker(idle);
+            let mut ping_count = 0;
+            loop {
+                let event = next_peer_control_event(
+                    std::future::pending::<()>(),
+                    std::future::pending::<()>(),
+                    &mut pings,
+                    deadline,
+                )
+                .await;
+                match event {
+                    PeerControlEvent::Ping => {
+                        ping_count += 1;
+                        assert!(tokio::time::Instant::now() < deadline);
+                        assert!(ping_count <= 6, "heartbeats must not postpone expiry");
+                    }
+                    PeerControlEvent::IdleTimeout => break,
+                    _ => panic!("neither pending stream can produce an event"),
+                }
+            }
+            assert!(ping_count >= 2, "multiple heartbeats precede idle expiry");
+            assert_eq!(tokio::time::Instant::now(), deadline);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn peer_control_busy_owner_cannot_starve_heartbeat_or_expiry() {
+        use super::{PeerControlEvent, next_peer_control_event, peer_control_ping_ticker};
+        let idle = std::time::Duration::from_secs(60);
+        let deadline = tokio::time::Instant::now() + idle;
+        let mut pings = peer_control_ping_ticker(idle);
+        assert!(matches!(
+            next_peer_control_event(
+                std::future::pending::<()>(),
+                std::future::ready(()),
+                &mut pings,
+                deadline,
+            )
+            .await,
+            PeerControlEvent::Outbound(()),
+        ));
+        tokio::time::advance(super::DEVICE_CONTROL_PING_INTERVAL).await;
+        assert!(matches!(
+            next_peer_control_event(
+                std::future::pending::<()>(),
+                std::future::ready(()),
+                &mut pings,
+                deadline,
+            )
+            .await,
+            PeerControlEvent::Ping,
+        ));
+        tokio::time::advance(idle - super::DEVICE_CONTROL_PING_INTERVAL).await;
+        assert!(matches!(
+            next_peer_control_event(
+                std::future::pending::<()>(),
+                std::future::ready(()),
+                &mut pings,
+                deadline,
+            )
+            .await,
+            PeerControlEvent::IdleTimeout,
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn peer_control_buffered_inbound_wins_a_simultaneous_deadline() {
+        use super::{PeerControlEvent, next_peer_control_event, peer_control_ping_ticker};
+        let idle = std::time::Duration::from_secs(60);
+        let deadline = tokio::time::Instant::now() + idle;
+        let mut pings = peer_control_ping_ticker(idle);
+        tokio::time::advance(idle).await;
+        assert!(matches!(
+            next_peer_control_event(
+                std::future::ready("buffered inbound"),
+                std::future::ready(()),
+                &mut pings,
+                deadline,
+            )
+            .await,
+            PeerControlEvent::Inbound("buffered inbound"),
+        ));
     }
 
     use super::{
@@ -6136,17 +6558,24 @@ mod consumer_authentication_status_tests {
         // The credential was never evaluated, so calling it rejected tells a
         // consumer holding good credentials that they were refused, and is
         // indistinguishable at the HTTP boundary from a real refusal.
-        let response = consumer_authentication_response(
-            &OidcError::Catalog(CatalogError::Conflict("catalog unreachable")),
-            "unit",
-        );
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-        let body = axum::body::to_bytes(response.into_body(), 1024)
-            .await
-            .expect("bounded body");
-        let body: serde_json::Value = serde_json::from_slice(&body).expect("response JSON");
-        assert_eq!(body["code"], "AUTHORIZATION_UNAVAILABLE");
-        assert_eq!(body["execution"], "not_dispatched");
+        for error in [
+            OidcError::Catalog(CatalogError::Conflict("catalog unreachable")),
+            OidcError::InvalidConfiguration,
+        ] {
+            let response = consumer_authentication_response(&error, "unit");
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert!(
+                !response
+                    .headers()
+                    .contains_key(super::header::WWW_AUTHENTICATE)
+            );
+            let body = axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .expect("bounded body");
+            let body: serde_json::Value = serde_json::from_slice(&body).expect("response JSON");
+            assert_eq!(body["code"], "AUTHORIZATION_UNAVAILABLE");
+            assert_eq!(body["execution"], "not_dispatched");
+        }
     }
 
     #[tokio::test]
@@ -6170,6 +6599,23 @@ mod consumer_authentication_status_tests {
                 StatusCode::UNAUTHORIZED,
                 "an evaluated credential failure must stay a rejection"
             );
+            let expected = if matches!(error, OidcError::MissingBearer) {
+                "Bearer"
+            } else {
+                "Bearer error=\"invalid_token\""
+            };
+            assert_eq!(
+                response
+                    .headers()
+                    .get_all(super::header::WWW_AUTHENTICATE)
+                    .iter()
+                    .count(),
+                1
+            );
+            assert_eq!(
+                response.headers()[super::header::WWW_AUTHENTICATE],
+                expected
+            );
             let body = axum::body::to_bytes(response.into_body(), 1024)
                 .await
                 .expect("bounded body");
@@ -6177,6 +6623,65 @@ mod consumer_authentication_status_tests {
             assert_eq!(body["code"], "UNAUTHORIZED");
             assert_eq!(body["execution"], "not_dispatched");
         }
+    }
+
+    #[tokio::test]
+    async fn late_consumer_token_refusals_keep_their_body_and_publish_invalid_token() {
+        for message in [
+            "consumer token expired before dispatch",
+            super::CONSUMER_TOKEN_REFUSED,
+        ] {
+            let response = super::refused_consumer_token_response(message);
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            assert_eq!(
+                response.headers()[super::header::WWW_AUTHENTICATE],
+                "Bearer error=\"invalid_token\""
+            );
+            let body = axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .expect("bounded body");
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&body).expect("response JSON"),
+                serde_json::json!({
+                    "code": "UNAUTHORIZED", "execution": "not_dispatched", "message": message,
+                })
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn opaque_peer_refusals_challenge_only_401_without_inventing_a_scope_verdict() {
+        for status in [StatusCode::UNAUTHORIZED, StatusCode::FORBIDDEN] {
+            let response =
+                super::peer_failure_response(super::PeerRuntimeError::RemoteStatus(status));
+            assert_eq!(response.status(), status);
+            let challenge = response.headers().get(super::header::WWW_AUTHENTICATE);
+            assert_eq!(
+                challenge.and_then(|value| value.to_str().ok()),
+                (status == StatusCode::UNAUTHORIZED).then_some("Bearer")
+            );
+            let body = axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .expect("bounded body");
+            let body: serde_json::Value = serde_json::from_slice(&body).expect("response JSON");
+            assert_eq!(body["execution"], "not_dispatched");
+            assert_eq!(body["message"], "owner forwarding did not complete");
+            assert_eq!(
+                body["code"],
+                if status == StatusCode::UNAUTHORIZED {
+                    "UNAUTHORIZED"
+                } else {
+                    "FORBIDDEN"
+                }
+            );
+        }
+        let grant = super::local_consumer_admission_response("unit", super::RelayError::Forbidden);
+        assert_eq!(grant.status(), StatusCode::FORBIDDEN);
+        assert!(
+            !grant
+                .headers()
+                .contains_key(super::header::WWW_AUTHENTICATE)
+        );
     }
 }
 

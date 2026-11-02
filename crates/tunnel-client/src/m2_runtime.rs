@@ -1775,9 +1775,8 @@ struct M2Actor {
     rotations_completed: u64,
     /// The filesystem mutation ledger, summed over completed exchanges.
     ///
-    /// Folded in at `HttpActorRequest::Done`, which is the one place a
-    /// filesystem exchange's own counters reach the actor, and published in
-    /// every status snapshot from there on.
+    /// Folded in exactly once from the completed report slot at retirement or
+    /// from `HttpActorRequest::Done`, then retained in every status snapshot.
     fs_counters: crate::FsCounters,
     status: watch::Sender<ConnectionStatus>,
     cancellation: CancellationToken,
@@ -1953,6 +1952,8 @@ async fn run_m2_session(
         control_local_addr,
     };
     actor.publish_status();
+    #[cfg(test)]
+    tests::c240_actor_loop::observe(&actor, None);
     let mut deadline_timer = tokio::time::interval_at(
         tokio::time::Instant::now() + M2_DEADLINE_POLL,
         M2_DEADLINE_POLL,
@@ -2059,14 +2060,26 @@ async fn run_m2_session(
         // HTTP exchanges' progress clocks pause for exactly the writer
         // freeze this event may have started or ended.
         actor.publish_http_freeze();
+        #[cfg(test)]
+        tests::c240_actor_loop::observe(&actor, None);
     };
     // Read before this loop cancels the token itself below: only a stop or a
     // dropped handle has cancelled it at this point.
     let result = m2_session_result(cancellation.is_cancelled(), result);
     readiness.send(Readiness::Stopping).ok();
+    #[cfg(test)]
+    tests::c240_actor_loop::phase("stopping");
     cancellation.cancel();
     actor.close_all_carriers().await;
-    let _ = control_writer.await;
+    {
+        // Preserve the original result-drop boundary before Closed publication.
+        let _control_join = control_writer.await;
+        #[cfg(test)]
+        tests::c240_actor_loop::control_joined(matches!(
+            _control_join,
+            Ok(Ok(())) | Ok(Err(ClientError::Cancelled))
+        ));
+    }
     let reason = match &result {
         Ok(()) => "stopped".to_owned(),
         Err(ClientError::Cancelled) => "cancelled".to_owned(),
@@ -2074,6 +2087,8 @@ async fn run_m2_session(
     };
     actor.publish_closed(reason.clone());
     readiness.send(Readiness::Closed { reason }).ok();
+    #[cfg(test)]
+    tests::c240_actor_loop::phase("closed");
     result
 }
 
@@ -2401,6 +2416,8 @@ impl M2Actor {
             .checked_add(additional)
             .is_none_or(|total| total > maximum)
         {
+            #[cfg(test)]
+            tests::c240_actor_loop::observe(self, Some(additional));
             return Err(ClientError::QueueLimit);
         }
         Ok(())
@@ -5318,7 +5335,8 @@ impl M2Actor {
             .get(&invalidated.stream_id)
             .is_some_and(|stream| stream.auth.challenge_id == invalidated.challenge_id)
         {
-            self.expire_stream(invalidated.stream_id).await?;
+            self.invalidate_stream(invalidated.stream_id, M2_RESET_AUTH_EXPIRED)
+                .await?;
         }
         Ok(())
     }
@@ -6135,6 +6153,7 @@ impl M2Actor {
             // STREAM_FORGET, so the journal stays bounded by the streams the
             // session still holds rather than by the streams it has served.
             self.open_journal.release_matching(stream_id, &operation_id);
+            self.collect_completed_fs_report(stream_id);
             self.streams.remove(&stream_id);
             self.pending_forgets.remove(&stream_id);
             // Reclamation is progress: exhaustion is a latency again.
@@ -6446,7 +6465,10 @@ impl M2Actor {
                         if stream.pending_bytes.saturating_add(payload.len())
                             > self.config.limits.max_queue_bytes
                         {
-                            return self.expire_stream(stream_id).await;
+                            // Retain the existing queue-limit terminal classification.
+                            return self
+                                .invalidate_stream(stream_id, M2_RESET_AUTH_EXPIRED)
+                                .await;
                         }
                         stream.pending_bytes += payload.len();
                         stream.pending.push_back(BufferedInput::Data(payload));
@@ -7123,6 +7145,8 @@ impl M2Actor {
         if deadline.expired() {
             return self.expire_stream(stream_id).await;
         }
+        #[cfg(test)]
+        tests::c240_actor_loop::dispatch(stream_id);
         if http {
             self.http_dispatch_payload(stream_id, payload);
             Ok(())
@@ -9037,6 +9061,18 @@ impl M2Actor {
     }
 
     async fn expire_stream(&mut self, stream_id: u64) -> Result<(), ClientError> {
+        self.invalidate_stream(
+            stream_id,
+            tunnel_protocol::reset_reason::AUTHORIZATION_STALE,
+        )
+        .await
+    }
+
+    async fn invalidate_stream(
+        &mut self,
+        stream_id: u64,
+        reset_reason: u16,
+    ) -> Result<(), ClientError> {
         #[cfg(test)]
         {
             self.expire_stream_calls = self.expire_stream_calls.saturating_add(1);
@@ -9046,7 +9082,7 @@ impl M2Actor {
             // remains, and a RESET now would be one it never acknowledges.
             return Ok(());
         }
-        self.http_abort(stream_id, M2_RESET_AUTH_EXPIRED);
+        self.http_abort(stream_id, reset_reason);
         if let Some(stream) = self.streams.get_mut(&stream_id) {
             // Counted once per stream. The expired-stream selection skips
             // streams already invalidated (task row M6-C88), and the guard
@@ -9069,7 +9105,7 @@ impl M2Actor {
             stream_id,
             kind: FrameKind::Reset,
             payload: Vec::new(),
-            reset_reason: Some(M2_RESET_AUTH_EXPIRED),
+            reset_reason: Some(reset_reason),
         })
         .await
     }
@@ -9124,7 +9160,12 @@ impl M2Actor {
         if let Some(mut pending) = self.pending_candidate.take() {
             if let Some(dial) = pending.dial.take() {
                 dial.abort();
-                let _ = dial.await;
+                let _joined = dial.await;
+                #[cfg(test)]
+                tests::c240_actor_loop::dial_joined(match &_joined {
+                    Ok(()) => true,
+                    Err(error) => error.is_cancelled(),
+                });
             }
             if let Some(socket) = pending.socket.take() {
                 evidence = Some(
@@ -9419,7 +9460,12 @@ impl M2Actor {
         if let Some(mut pending) = self.pending_candidate.take() {
             if let Some(dial) = pending.dial.take() {
                 dial.abort();
-                let _ = dial.await;
+                let _joined = dial.await;
+                #[cfg(test)]
+                tests::c240_actor_loop::dial_joined(match &_joined {
+                    Ok(()) => true,
+                    Err(error) => error.is_cancelled(),
+                });
             }
             if let Some(socket) = pending.socket.take() {
                 let _ = close_unattached_socket(socket, pending.attempt.new_connection_id).await;
@@ -9504,8 +9550,14 @@ async fn join_carrier_task(mut task: JoinHandle<()>) -> bool {
 
 async fn join_carrier_task_with_timeout(task: &mut JoinHandle<()>, timeout: Duration) -> bool {
     match tokio::time::timeout(timeout, &mut *task).await {
-        Ok(_) => true,
+        Ok(_joined) => {
+            #[cfg(test)]
+            tests::c240_actor_loop::carrier_task_joined(_joined.is_ok());
+            true
+        }
         Err(_) => {
+            #[cfg(test)]
+            tests::c240_actor_loop::carrier_task_joined(false);
             // A timed-out task still owns the sink until it is explicitly
             // aborted and joined.  Dropping the handle here would detach the
             // task and invalidate the local-closure evidence.
@@ -9542,7 +9594,9 @@ async fn close_carrier(mut carrier: Carrier) -> ClosureEvidence {
                 tokio::select! {
                     biased;
                     reply = wait => reply.is_ok(),
-                    _ = writer => {
+                    _joined = writer => {
+                        #[cfg(test)]
+                        tests::c240_actor_loop::carrier_task_joined(_joined.is_ok());
                         writer_finished = true;
                         false
                     }
@@ -9570,6 +9624,8 @@ async fn close_carrier(mut carrier: Carrier) -> ClosureEvidence {
     } else {
         true
     };
+    #[cfg(test)]
+    tests::c240_actor_loop::carrier_closed(&connection_id, writer_joined && reader_joined);
     ClosureEvidence {
         connection_id,
         // Joining both carrier tasks proves that no local task still owns the
@@ -9583,6 +9639,10 @@ async fn close_carrier(mut carrier: Carrier) -> ClosureEvidence {
 #[cfg(test)]
 mod tests {
     use super::*;
+    pub(super) mod c240_actor_loop;
+    mod c240_queue_boundary;
+    #[cfg(unix)]
+    mod fs_report_retirement;
     use crate::test_hooks;
     use futures_util::{SinkExt, StreamExt};
     use std::sync::{Arc, atomic::AtomicBool};
@@ -10334,6 +10394,102 @@ mod tests {
                 .get(&7)
                 .is_none_or(|stream| stream.auth.invalidated)
         );
+    }
+
+    /// M4-70 observes the RESET emitted by the real deadline/invalidation
+    /// entry points, including a terminal held behind a rotation freeze.
+    async fn m4c70_reset_for_cause(local_deadline: Option<bool>, frozen: bool, reason: u16) {
+        let (mut actor, _key, mut receiver, _control_receiver) =
+            test_actor_with_carrier(M2_CARRIER_QUEUE_FRAMES);
+        let mut stream = test_stream();
+        stream.sequence = StreamState::new(7, 1_024).expect("stream sequence");
+        stream.auth.confirmed = true;
+        stream.auth.refresh_in_flight = false;
+        let live = DualDeadline::new(Instant::now(), SystemTime::now(), Duration::from_secs(60))
+            .expect("live deadline");
+        let expired = DualDeadline::new(
+            Instant::now() - Duration::from_secs(1),
+            SystemTime::now(),
+            Duration::from_millis(1),
+        )
+        .expect("expired deadline");
+        stream.auth.deadline = if local_deadline == Some(true) {
+            expired
+        } else {
+            live
+        };
+        stream.auth.operation_deadline = if local_deadline == Some(false) {
+            expired
+        } else {
+            live
+        };
+        stream.pending.push_back(BufferedInput::Data(vec![0x2a]));
+        stream.pending_bytes = 1;
+        actor.pending_output_bytes = 1;
+        actor.streams.insert(7, stream);
+        actor.writes_frozen = frozen;
+        if local_deadline.is_some() {
+            actor.refresh_authorizations().await.expect("deadline pass");
+        } else {
+            actor
+                .handle_authorization_invalidated(AuthorizationInvalidated::new(
+                    "m4c70-invalidation",
+                    "session",
+                    1,
+                    7,
+                    "challenge",
+                    1,
+                    "grant unavailable",
+                ))
+                .await
+                .expect("explicit invalidation");
+        }
+        assert!(actor.streams[&7].auth.invalidated);
+        assert!(actor.streams[&7].pending.is_empty());
+        assert_eq!(actor.streams[&7].pending_bytes, 0);
+        assert_eq!(actor.pending_output_bytes, 0);
+        if frozen {
+            assert!(receiver.try_recv().is_err(), "no data writes during freeze");
+            assert_eq!(actor.pending_outputs.len(), 1);
+            assert_eq!(actor.pending_outputs[0].reset_reason, Some(reason));
+            actor.writes_frozen = false;
+            actor.flush_pending_outputs().await.expect("terminal flush");
+        }
+        let mut reasons = Vec::new();
+        while let Ok(command) = receiver.try_recv() {
+            if let CarrierCommand::Frame(frame) = command {
+                let frame = Frame::decode(&frame.bytes).expect("emitted frame");
+                if let Some(reason) = frame.reset_reason().expect("reset framing") {
+                    reasons.push(reason);
+                }
+            }
+        }
+        assert_eq!(
+            reasons,
+            [reason],
+            "exactly one RESET for the observed cause"
+        );
+        assert!(actor.pending_outputs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn m4c70_local_authorization_lapse_emits_retryable_reset() {
+        m4c70_reset_for_cause(Some(true), false, 4_006).await;
+    }
+
+    #[tokio::test]
+    async fn m4c70_local_operation_deadline_emits_retryable_reset() {
+        m4c70_reset_for_cause(Some(false), false, 4_006).await;
+    }
+
+    #[tokio::test]
+    async fn m4c70_explicit_authorization_invalidation_remains_terminal() {
+        m4c70_reset_for_cause(None, false, 4_001).await;
+    }
+
+    #[tokio::test]
+    async fn m4c70_a_frozen_lapse_keeps_its_retryable_reason() {
+        m4c70_reset_for_cause(Some(true), true, 4_006).await;
     }
 
     #[tokio::test]

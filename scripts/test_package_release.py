@@ -82,6 +82,53 @@ class PackagingTests(unittest.TestCase):
         for target in TARGETS:
             package(self.root, target, self.sha, "123", self.output, {"packages": []})
 
+    def notice_dependency(self):
+        directory = self.root / "dependency"
+        directory.mkdir()
+        (directory / "Cargo.toml").write_text('[package]\nname="dep"\nversion="1.0.0"\n')
+        (self.root / "Cargo.lock").write_text('version=4\n[[package]]\nname="dep"\nversion="1.0.0"\nsource="registry+fixture"\nchecksum="abc"\n')
+        dep = {"name": "dep", "version": "1.0.0", "license": "MIT", "source": "registry+fixture", "manifest_path": str(directory / "Cargo.toml")}
+        return directory, {"packages": [dep]}
+
+    def test_nested_notices_are_retained_and_declared_escape_refused(self):
+        directory, metadata = self.notice_dependency()
+        nested = directory / "native"
+        nested.mkdir()
+        (nested / "COPYING").write_bytes(b"Native library notice\r\n")
+        archive = package(self.root, TARGETS[0], self.sha, "123", self.output, metadata)
+        with tarfile.open(archive) as handle:
+            self.assertEqual(handle.extractfile("notices/dep-1.0.0/native/COPYING").read(), b"Native library notice\r\n")
+        metadata["packages"][0]["license_file"] = "../LICENSE"
+        with self.assertRaisesRegex(ValueError, "escapes source package"):
+            package(self.root, TARGETS[0], self.sha, "123", self.output, metadata)
+
+    def test_unresolved_archive_notice_is_explicit_and_supplement_must_match(self):
+        import hashlib
+        directory, metadata = self.notice_dependency()
+        supplements = self.root / "deploy/notices/rust"
+        supplements.mkdir(parents=True)
+        registry = supplements / "supplements.json"
+        registry.write_text(json.dumps({"schema": 1, "packages": []}))
+        archive = package(self.root, TARGETS[0], self.sha, "123", self.output, metadata)
+        with tarfile.open(archive) as handle:
+            unresolved = json.load(handle.extractfile("notices/dependencies.json"))[0]
+            self.assertEqual(unresolved["notice_files"], [])
+            self.assertEqual(unresolved["notice_status"], "unresolved upstream notice text")
+        data = b"Exact upstream license text\n"
+        (supplements / "dep-LICENSE").write_bytes(data)
+        (directory / ".cargo_vcs_info.json").write_text(json.dumps({"git": {"sha1": "1" * 40}}))
+        registry.write_text(json.dumps({"schema": 1, "packages": [{
+            "name": "dep", "version": "1.0.0", "source": "registry+fixture", "license": "MIT",
+            "crate_checksum": "abc", "vcs_commit": "1" * 40,
+            "notices": [{"file": "dep-LICENSE", "sha256": hashlib.sha256(data).hexdigest(), "url": "https://example.invalid/commit/LICENSE"}],
+        }]}))
+        archive = package(self.root, TARGETS[0], self.sha, "123", self.output, metadata)
+        with tarfile.open(archive) as handle:
+            self.assertEqual(handle.extractfile("notices/dep-1.0.0/dep-LICENSE").read(), data)
+        (directory / ".cargo_vcs_info.json").write_text(json.dumps({"git": {"sha1": "2" * 40}}))
+        with self.assertRaisesRegex(ValueError, "locked source identity"):
+            package(self.root, TARGETS[0], self.sha, "123", self.output, metadata)
+
     def test_publish_refuses_a_crlf_checksum(self):
         # M6-C217: the last gate before publishing compares bytes.
         self.build_all()
@@ -90,6 +137,30 @@ class PackagingTests(unittest.TestCase):
         sidecar.write_bytes(sidecar.read_bytes().replace(b"\n", b"\r\n"))
         with self.assertRaises(ValueError):
             assets(self.output, tag)
+
+    def test_supplemented_notices_preserve_every_archive_checksum(self):
+        import hashlib
+        directory, metadata = self.notice_dependency()
+        supplements = self.root / "deploy/notices/rust"
+        supplements.mkdir(parents=True)
+        data = b"Exact upstream license text\n"
+        (supplements / "dep-LICENSE").write_bytes(data)
+        (directory / ".cargo_vcs_info.json").write_text(json.dumps({"git": {"sha1": "1" * 40}}))
+        (supplements / "supplements.json").write_text(json.dumps({"schema": 1, "packages": [{
+            "name": "dep", "version": "1.0.0", "source": "registry+fixture", "license": "MIT",
+            "crate_checksum": "abc", "vcs_commit": "1" * 40,
+            "notices": [{"file": "dep-LICENSE", "sha256": hashlib.sha256(data).hexdigest(),
+                         "url": "https://example.invalid/commit/LICENSE"}],
+        }]}))
+        for target in TARGETS + CI_ONLY_TARGETS:
+            with self.subTest(target=target):
+                archive = package(self.root, target, self.sha, "123", self.output, metadata)
+                checksum = archive.with_name(archive.name + ".sha256")
+                self.assertTrue(checksum.is_file(), checksum.name)
+                self.assertEqual(checksum.read_bytes(),
+                                 f"{hashlib.sha256(archive.read_bytes()).hexdigest()}  {archive.name}\n".encode())
+        self.assertFalse((self.output / "dep-LICENSE.sha256").exists())
+        self.assertEqual(len(assets(self.output, version(self.root, self.sha, "123"))), 8)
 
     def test_complete_archives_and_checksums(self):
         self.build_all()
@@ -118,6 +189,8 @@ class PackagingTests(unittest.TestCase):
             # The relay is in every Unix bundle and in no Windows bundle.
             has_relay = any("tunnel-relay" in name for name in names)
             self.assertEqual(has_relay, not manifest["target"].endswith("windows-msvc"), file.name)
+            has_authority = any("tunnel-authority" in name for name in names)
+            self.assertEqual(has_authority, has_relay, file.name)
             self.assertEqual(manifest["sourceSha"], self.sha)
             # M6-C50: the guide and exactly the documents it links ship.
             documents = sorted(name for name in names if name.startswith("docs/"))
@@ -286,6 +359,7 @@ class PackagingTests(unittest.TestCase):
             self.assertIn("bin/tunnel-client", names)
             self.assertIn("bin/tunnel-deadman", names)
             self.assertNotIn("bin/tunnel-relay", names)
+            self.assertNotIn("bin/tunnel-authority", names)
             self.assertFalse([n for n in names if n.startswith("examples/") and "relay" in n], names)
         published = assets(self.output, version(self.root, self.sha, "123"))
         self.assertEqual(len(published), 2 * len(TARGETS))
@@ -339,6 +413,11 @@ class PackagingTests(unittest.TestCase):
 
     def test_missing_helper_fails(self):
         (self.root / "target" / TARGETS[0] / "release" / "tunnel-deadman").unlink()
+        with self.assertRaises(ValueError):
+            package(self.root, TARGETS[0], self.sha, "123", self.output, {"packages": []})
+
+    def test_missing_offline_authority_fails_server_package(self):
+        (self.root / "target" / TARGETS[0] / "release" / "tunnel-authority").unlink()
         with self.assertRaises(ValueError):
             package(self.root, TARGETS[0], self.sha, "123", self.output, {"packages": []})
 

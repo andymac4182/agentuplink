@@ -378,8 +378,7 @@ async fn run_fault_case(fault: Fault) -> Result<()> {
         Ok(()) if fixture_fault_expects_initialize_success(fault) => {
             let mut process = match ManagedProcess::spawn(
                 format!("m7-bootstrap-failure-{}", fault.name()),
-                ProcessSpec::new(&fixture.relay_binary)
-                    .arg("serve")
+                common::relay_serve_process_spec(&fixture.relay_binary)
                     .arg("--config")
                     .arg(fixture.config_path.display().to_string()),
             )
@@ -472,8 +471,7 @@ async fn run_unreachable_peer_case(fixture: ProcessFixture) -> Result<()> {
 
     let mut process = match ManagedProcess::spawn(
         format!("m7-bootstrap-failure-{}", fault.name()),
-        ProcessSpec::new(&fixture.relay_binary)
-            .arg("serve")
+        common::relay_serve_process_spec(&fixture.relay_binary)
             .arg("--config")
             .arg(fixture.config_path.display().to_string()),
     )

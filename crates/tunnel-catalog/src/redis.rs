@@ -320,12 +320,33 @@ impl std::fmt::Debug for RedisMembershipPublisher {
 }
 
 impl RedisMembershipPublisher {
+    /// The verified Redis process this publisher is bound to. An operator
+    /// authority must compare it with its independently approved durable run
+    /// before publishing; connecting must never approve a new Redis run.
+    pub fn bound_redis_run_id(&self) -> String {
+        self.catalog.bound_redis_run_id()
+    }
+
     /// Connect with the operator's separately authenticated Redis URL.  ACL
     /// enforcement is intentionally delegated to Redis deployment policy; the
     /// catalog code never treats signed bytes as trust anchors.
     pub async fn connect(redis_url: &str, namespace: &str) -> Result<Self, CatalogError> {
         Ok(Self {
             catalog: RedisCatalog::connect(redis_url, namespace).await?,
+        })
+    }
+
+    /// Connect the operator publisher over verified Redis TLS with explicit
+    /// trust and optional client identity. The existing catalog path enforces
+    /// rediss://, bounded PING/INFO verification and Redis run identity.
+    /// Deployments must supply separate membership-only Redis ACL credentials.
+    pub async fn connect_with_tls(
+        redis_url: &str,
+        namespace: &str,
+        tls: RedisTlsOptions,
+    ) -> Result<Self, CatalogError> {
+        Ok(Self {
+            catalog: RedisCatalog::connect_with_tls(redis_url, namespace, tls).await?,
         })
     }
 

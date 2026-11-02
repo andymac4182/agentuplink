@@ -43,6 +43,10 @@
 #    test (M6-C31, in step 2) proves each addition refuses an unprovisioned
 #    namespace, a stale incarnation and every duplicate, and leaves the
 #    incarnation, run and reservation keys unchanged.
+#    M6-C233 additionally rehearses replacement-device re-enrolment: real
+#    120-second OLD certificate, two migrated grants, live old revocation,
+#    a restarted NEW client and relay, and service past OLD's real expiry.
+#    This is single-relay coverage; same-device renewal remains deferred.
 #
 # 7. Runs task row M6-C65's catalog test in step 2: the `unbound` and
 #    `run_changed` classes of `serve`'s fence, `rebind-redis-run`'s catalog
@@ -133,7 +137,7 @@ echo "m6-provisioning-verify: end-to-end shipped-binary gate" >&2
 cargo test -p tunnel-relay --test m6_provisioning_process --locked -- --ignored --nocapture \
   --test-threads=1 --skip m6c65_ --skip m6c67_ --skip m8_acp_demo > "$scratch/e2e.log" 2>&1 || { cat "$scratch/e2e.log" >&2; exit 1; }
 cat "$scratch/e2e.log"
-require "end-to-end gate" "$scratch/e2e.log" "test result: ok. 8 passed" "m6c21-e2e ok nonce=" "last_seen_listed=true" \
+require "end-to-end gate" "$scratch/e2e.log" "test result: ok. 9 passed" "m6c21-e2e ok nonce=" "last_seen_listed=true" \
   "m6c34-serve-before-provisioning ok exit=1 class=unprovisioned keys=2" \
   "m6c57-mcp ok nonce=" "tools_call=200 marker_echoed=true" \
   "backend_invocations=1 stranger_status=401" "stock_client_headers=200 unlisted_header_named=400" \
@@ -150,6 +154,8 @@ require "end-to-end gate" "$scratch/e2e.log" "test result: ok. 8 passed" "m6c21-
   "m6c31-catalog ok nonce=" "serve_restarts=0 grant_pickup_ms=" \
   "grant_pickup_attempts=1" "revoke_grant_attempts=1" \
   "close_reason=AUTHORIZATION_REVOKED" "device_exit=3 revoked_device_grant_refused=true" \
+  "m6c233-reenrolment ok nonce=" "scope=single-relay migrated_users=2" \
+  "old_identity_exit=3 old_expiry_crossed=true" "grant_policy_preserved=true ungranted_denied=true clean_stop=true" \
   "m6c24-metrics ok nonce=" "sessions=1 refusal_identity>=1 freeze_hold_series=13"
 if [ -n "${TUNNEL_RELAY_BIN:-}" ]; then
   require "end-to-end gate ran the requested relay" "$scratch/e2e.log" "relay=$TUNNEL_RELAY_BIN"

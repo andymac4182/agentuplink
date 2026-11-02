@@ -28,7 +28,7 @@ http-body-util = "0.1"
 # other http-forward gates share.
 hyper = { version = "1.7", features = ["http1", "http2", "client"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
-jsonwebtoken = { version = "10.3.0", features = ["rust_crypto"] }
+jsonwebtoken = { version = "10.3.0", features = ["aws_lc_rs"] }
 rcgen = "0.13"
 # The M3-03 gate's cloud-side client is the pinned official Rust MCP SDK
 # (docs/mcp.md, "Pinned in code").

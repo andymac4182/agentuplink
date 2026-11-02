@@ -10,7 +10,9 @@
 //! itself is fine, and the relay logged nothing at all.
 //!
 //! Every request here crosses the real consumer router on a loopback socket:
-//! `devices`, `echo`, `stream`, `http-forward` and `fs`.  Each route keeps its
+//! `devices`, `services`, `echo`, `stream`, `http-forward` and both `fs`
+//! entry points. M6-C94 also asserts the complete challenge and its cardinality.
+//! Each route keeps its
 //! documented code vocabulary -- the flat body's `UNAUTHORIZED`/`FORBIDDEN`,
 //! the filesystem contract's `UNAUTHENTICATED`/`ACCESS_DENIED`
 //! (`docs/filesystem-api.md`) -- and the status and message are asserted
@@ -149,16 +151,17 @@ async fn start() -> (std::net::SocketAddr, Signer) {
     let limits = RelayLimits::default();
     let handle = RelayHandle::spawn(options, catalog.clone());
     let router = consumer_router_with_peer_and_barriers(
-        handle,
+        handle.clone(),
         catalog,
         oidc,
-        limits,
+        limits.clone(),
         None,
         None,
         None,
         Some(crate::http::forward::HttpForwardExports::new()),
         crate::health::ReadinessChecks::default(),
-    );
+    )
+    .merge(super::device_router(handle, limits));
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let address = listener.local_addr().expect("address");
     tokio::spawn(async move {
@@ -169,13 +172,17 @@ async fn start() -> (std::net::SocketAddr, Signer) {
     (address, Signer { key })
 }
 
-/// The five consumer routes, each as `(label, request line and headers)`.
+/// Every consumer authentication boundary as `(label, request line and headers)`.
 fn routes() -> Vec<(&'static str, String)> {
     let device = Uuid::new_v4();
     let service = Uuid::new_v4();
     let base = format!("/v1/devices/{device}/services/{service}");
     vec![
         ("devices", "GET /v1/devices HTTP/1.1\r\n".to_owned()),
+        (
+            "services",
+            format!("GET /v1/devices/{device}/services HTTP/1.1\r\n"),
+        ),
         (
             "echo",
             format!("POST {base}/echo HTTP/1.1\r\nContent-Length: 0\r\n"),
@@ -197,15 +204,25 @@ fn routes() -> Vec<(&'static str, String)> {
             ),
         ),
         ("fs", format!("GET {base}/fs HTTP/1.1\r\n")),
+        (
+            "fs-upgrade",
+            format!(
+                "GET {base}/fs HTTP/1.1\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\
+                 Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+                 Sec-WebSocket-Protocol: {}\r\n",
+                tunnel_fs_core::TRANSPORT_SUBPROTOCOL
+            ),
+        ),
     ]
 }
 
-/// Send one request and read its status and JSON body.
+/// Read every challenge, not just the first: duplicate headers can make
+/// otherwise correct credentials look like distinct authentication schemes.
 async fn send(
     address: std::net::SocketAddr,
     head: &str,
     authorization: Option<&str>,
-) -> (u16, serde_json::Value) {
+) -> (u16, serde_json::Value, Vec<String>) {
     let mut socket = TcpStream::connect(address).await.expect("connect");
     let mut request = format!("{head}Host: 127.0.0.1\r\nConnection: close\r\n");
     if head.contains("Upgrade: websocket") {
@@ -233,6 +250,14 @@ async fn send(
             .nth(1)
             .and_then(|code| code.parse().ok())
             .expect("status");
+        let challenges = head
+            .lines()
+            .filter_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("www-authenticate")
+                    .then(|| value.trim().to_owned())
+            })
+            .collect();
         let length = head
             .lines()
             .find_map(|line| {
@@ -248,7 +273,7 @@ async fn send(
         } else {
             serde_json::from_slice(&body).expect("JSON body")
         };
-        (status, body)
+        (status, body, challenges)
     })
     .await
     .expect("answered in time")
@@ -342,27 +367,56 @@ async fn every_route_gives_each_refusal_cause_one_status_and_one_truthful_messag
     let mut all_logs = String::new();
     for (cause, authorization, status, message, stage) in causes {
         for (route, head) in routes() {
-            // `/v1/devices` asks for no scope: a token lacking one is fine.
-            if route == "devices" && cause == "wrong scope" {
+            // Discovery asks for no route scope: a token lacking one is fine.
+            if matches!(route, "devices" | "services") && cause == "wrong scope" {
                 continue;
             }
             captured.0.lock().expect("log buffer").clear();
-            let (got, body) = send(address, &head, authorization).await;
+            let (got, body, challenges) = send(address, &head, authorization).await;
             let (code, got_message) = code_and_message(&body);
             assert_eq!(got, status, "{route}/{cause}: {body}");
             assert_eq!(got_message, message, "{route}/{cause}: {body}");
             let expected_code = match (route, status) {
-                ("fs", 401) => "UNAUTHENTICATED",
-                ("fs", _) => "ACCESS_DENIED",
+                ("fs" | "fs-upgrade", 401) => "UNAUTHENTICATED",
+                ("fs" | "fs-upgrade", _) => "ACCESS_DENIED",
                 (_, 401) => "UNAUTHORIZED",
                 _ => "FORBIDDEN",
             };
             assert_eq!(code, expected_code, "{route}/{cause}: {body}");
+            let error = match cause {
+                "no token" => None,
+                "wrong scope" => Some("insufficient_scope"),
+                _ => Some("invalid_token"),
+            };
+            let mut parameters = Vec::new();
+            if let Some(error) = error {
+                parameters.push(format!("error=\"{error}\""));
+            }
+            if route == "http-forward" {
+                let path = head.split_whitespace().nth(1).expect("resource path");
+                parameters.push(format!(
+                    "resource_metadata=\"https://127.0.0.1/.well-known/oauth-protected-resource{path}\""
+                ));
+                parameters.push("scope=\"http:invoke\"".to_owned());
+            }
+            let expected_challenge = if parameters.is_empty() {
+                "Bearer".to_owned()
+            } else {
+                format!("Bearer {}", parameters.join(", "))
+            };
+            assert_eq!(challenges, [expected_challenge], "{route}/{cause}");
+            if matches!(route, "fs" | "fs-upgrade") {
+                assert!(body.get("execution").is_none(), "FS contract: {body}");
+                assert!(body["error"]["requestId"].is_string());
+            } else {
+                assert_eq!(body["execution"], "not_dispatched");
+            }
             let logs = captured.text();
+            let log_route = if route == "fs-upgrade" { "fs" } else { route };
             assert!(
                 logs.lines()
                     .any(|line| line.contains("consumer request refused")
-                        && line.contains(&format!("route=\"{route}\""))
+                        && line.contains(&format!("route=\"{log_route}\""))
                         && line.contains(&format!("stage=\"{stage}\""))
                         && line.contains(&format!("status={status}"))),
                 "{route}/{cause}: no refusal line naming route, stage and status in {logs}"
@@ -388,7 +442,7 @@ async fn every_route_gives_each_refusal_cause_one_status_and_one_truthful_messag
     // which the loop above already used).
     captured.0.lock().expect("log buffer").clear();
     for _ in 0..60 {
-        let (status, _) = send(address, "GET /v1/devices HTTP/1.1\r\n", None).await;
+        let (status, _, _) = send(address, "GET /v1/devices HTTP/1.1\r\n", None).await;
         assert_eq!(status, 401);
     }
     let flood = captured.text();
@@ -406,6 +460,38 @@ async fn every_route_gives_each_refusal_cause_one_status_and_one_truthful_messag
         !logs.contains("consumer-refusal-stranger"),
         "claims are not logged"
     );
+
+    // A valid credential that reaches discovery or export resolution is not
+    // challenged merely because the requested device/service is absent.
+    let valid = format!(
+        "Bearer {}",
+        signer.token(KNOWN_SUBJECT, 300, "echo:invoke http:invoke fs:connect")
+    );
+    for (route, head) in routes() {
+        let (status, _, challenges) = send(address, &head, Some(&valid)).await;
+        assert_eq!(
+            status,
+            if route == "devices" { 200 } else { 404 },
+            "{route}"
+        );
+        assert!(challenges.is_empty(), "{route}: {challenges:?}");
+    }
+
+    // A device socket's 401 describes mTLS, not the consumer Bearer scheme.
+    for (path, protocol) in [
+        ("control", super::CONTROL_SUBPROTOCOL),
+        ("data", super::DATA_SUBPROTOCOL),
+    ] {
+        let head = format!(
+            "GET /v1/tunnel/{path} HTTP/1.1\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\
+             Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+             Sec-WebSocket-Protocol: {protocol}\r\n"
+        );
+        let (status, body, challenges) = send(address, &head, None).await;
+        assert_eq!(status, 401, "{path}: {body}");
+        assert_eq!(body["code"], "DEVICE_MTLS_REQUIRED");
+        assert!(challenges.is_empty(), "{path}: {challenges:?}");
+    }
     let _ = std::io::stderr().flush();
 }
 

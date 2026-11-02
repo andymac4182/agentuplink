@@ -14,6 +14,7 @@ export {
   upgradeRejectionError,
   type ConnectOptions,
   type DirectoryEntry,
+  type OperationOptions,
   type ReadOptions,
   type Stat,
   type WriteOptions,

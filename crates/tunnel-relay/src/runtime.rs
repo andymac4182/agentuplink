@@ -509,6 +509,7 @@ pub(crate) fn terminal_close_reason(reason: &str) -> &'static str {
         "OWNER_FENCED",
         "AUTHORITY_UNAVAILABLE",
         "AUTHORIZATION_REVOKED",
+        "AUTHORIZATION_STALE",
         "CONTROL_CLOSED",
         "ROTATION_CANDIDATE_FAILED",
         "RECOVERY_START_FAILED",

@@ -414,7 +414,8 @@ fn hold_udp_outside_ephemeral_range() -> UdpSocket {
 }
 
 fn relay_binary() -> std::ffi::OsString {
-    std::ffi::OsString::from(env!("CARGO_BIN_EXE_tunnel-relay"))
+    std::env::var_os("TUNNEL_RELAY_BIN")
+        .unwrap_or_else(|| env!("CARGO_BIN_EXE_tunnel-relay").into())
 }
 
 fn run_relay_bounded<I, S>(args: I) -> Output

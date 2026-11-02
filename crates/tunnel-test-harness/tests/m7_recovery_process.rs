@@ -910,8 +910,7 @@ async fn start_relay(
 ) -> Result<ManagedProcess> {
     let mut process = ManagedProcess::spawn(
         name,
-        ProcessSpec::new(binary)
-            .arg("serve")
+        common::relay_serve_process_spec(binary)
             .arg("--config")
             .arg(config.display().to_string()),
     )
@@ -1362,8 +1361,7 @@ async fn assert_old_writer_refused(
 ) -> Result<()> {
     let mut process = ManagedProcess::spawn(
         "m7-recovery-process-stale-relay",
-        ProcessSpec::new(binary)
-            .arg("serve")
+        common::relay_serve_process_spec(binary)
             .arg("--config")
             .arg(config.display().to_string()),
     )

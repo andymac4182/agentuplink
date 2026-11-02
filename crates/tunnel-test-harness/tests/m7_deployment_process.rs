@@ -401,8 +401,7 @@ async fn serve_and_probe(
 ) -> Result<()> {
     let mut process = ManagedProcess::spawn(
         "m7-process-relay",
-        ProcessSpec::new(binary)
-            .arg("serve")
+        common::relay_serve_process_spec(binary)
             .arg("--config")
             .arg(config.display().to_string()),
     )

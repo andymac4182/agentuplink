@@ -1,0 +1,175 @@
+diff --git a/vendor/h3/src/server/connection.rs b/vendor/h3/src/server/connection.rs
+index a9ba582a..c1be4b5c 100644
+--- a/vendor/h3/src/server/connection.rs
++++ b/vendor/h3/src/server/connection.rs
+@@ -9,0 +10 @@ use std::{
++    sync::Arc,
+@@ -146,0 +148,4 @@ where
++        let request_end = Arc::new(RequestEnd {
++            request_end: self.request_end_send.clone(),
++            stream_id: stream.send_id(),
++        });
+@@ -149 +154 @@ where
+-            request_end_send: self.request_end_send.clone(),
++            request_end,
+diff --git a/vendor/h3/src/server/request.rs b/vendor/h3/src/server/request.rs
+index ecc20868..8028a0e4 100644
+--- a/vendor/h3/src/server/request.rs
++++ b/vendor/h3/src/server/request.rs
+@@ -6 +5,0 @@ use http::{Request, StatusCode};
+-use tokio::sync::mpsc::UnboundedSender;
+@@ -23 +22 @@ use crate::{
+-    quic::{self, SendStream, StreamId},
++    quic::{self, SendStream},
+@@ -39 +38 @@ where
+-    pub(super) request_end_send: UnboundedSender<StreamId>,
++    pub(super) request_end: Arc<RequestEnd>,
+@@ -44,0 +44,46 @@ where
++// These guards are opt-in: existing resolve_request callers retain their API.
++// Construct the first guard before returning the future, so even an unpolled
++// future releases the request with a reset instead of an empty response FIN.
++struct RejectResolverOnDrop<C, B>
++where
++    C: quic::Connection<B>,
++    B: Buf,
++{
++    resolver: Option<RequestResolver<C, B>>,
++    error_code: Code,
++}
++
++impl<C, B> Drop for RejectResolverOnDrop<C, B>
++where
++    C: quic::Connection<B>,
++    B: Buf,
++{
++    fn drop(&mut self) {
++        if let Some(resolver) = self.resolver.take() {
++            resolver.reject(self.error_code);
++        }
++    }
++}
++
++struct RejectResolvedOnDrop<C, B>
++where
++    C: quic::Connection<B>,
++    B: Buf,
++{
++    stream: Option<RequestStream<C::BidiStream, B>>,
++    error_code: Code,
++}
++
++impl<C, B> Drop for RejectResolvedOnDrop<C, B>
++where
++    C: quic::Connection<B>,
++    B: Buf,
++{
++    fn drop(&mut self) {
++        if let Some(stream) = self.stream.as_mut() {
++            stream.stop_stream(self.error_code);
++            stream.stop_sending(self.error_code);
++        }
++    }
++}
++
+@@ -66,0 +112,64 @@ where
++    /// Reject this request without resolving its headers or dispatching it.
++    /// Resets both stream directions and releases its ongoing-request entry.
++    pub fn reject(mut self, error_code: Code) {
++        self.frame_stream.reset(error_code.value());
++        self.frame_stream.stop_sending(error_code);
++    }
++
++    /// Resolve the request, resetting it with `error_code` if the returned
++    /// future is dropped before completion, including before its first poll.
++    /// Use `H3_REQUEST_REJECTED` only before application dispatch. Normal
++    /// successful resolution transfers ownership to the returned stream;
++    /// ordinary resolution errors retain their original error classification.
++    pub fn resolve_request_with_rejection_on_cancel(
++        self,
++        error_code: Code,
++    ) -> impl std::future::Future<
++        Output = Result<(Request<()>, RequestStream<C::BidiStream, B>), StreamError>,
++    > {
++        let mut unresolved = RejectResolverOnDrop {
++            resolver: Some(self),
++            error_code,
++        };
++        async move {
++            let frame = std::future::poll_fn(|cx| {
++                unresolved
++                    .resolver
++                    .as_mut()
++                    .expect("resolver retained until header frame completes")
++                    .frame_stream
++                    .poll_next(cx)
++            })
++            .await;
++            let resolver = unresolved
++                .resolver
++                .take()
++                .expect("resolver retained until header frame completes");
++            let ResolvedRequest {
++                request_stream,
++                decoded,
++                max_field_section_size,
++            } = resolver.accept_with_frame(frame)?;
++            let mut resolved = RejectResolvedOnDrop::<C, B> {
++                stream: Some(request_stream),
++                error_code,
++            };
++            let result = ResolvedRequest::<C, B>::resolve_parts(
++                resolved
++                    .stream
++                    .as_mut()
++                    .expect("stream retained during resolution"),
++                decoded,
++                max_field_section_size,
++            )
++            .await;
++            // Disarm on both success and an ordinary error: cancellation
++            // cleanup must not rewrite a malformed-request/protocol error.
++            let stream = resolved
++                .stream
++                .take()
++                .expect("stream retained during resolution");
++            result.map(|request| (request, stream))
++        }
++    }
++
+@@ -145,4 +254 @@ where
+-            request_end: Arc::new(RequestEnd {
+-                request_end: self.request_end_send.clone(),
+-                stream_id: self.frame_stream.send_id(),
+-            }),
++            request_end: self.request_end,
+@@ -198 +304,15 @@ where
+-        let fields = match self.decoded {
++        let request = Self::resolve_parts(
++            &mut self.request_stream,
++            self.decoded,
++            self.max_field_section_size,
++        )
++        .await?;
++        Ok((request, self.request_stream))
++    }
++
++    async fn resolve_parts(
++        request_stream: &mut RequestStream<C::BidiStream, B>,
++        decoded: Result<qpack::Decoded, u64>,
++        max_field_section_size: u64,
++    ) -> Result<Request<()>, StreamError> {
++        let fields = match decoded {
+@@ -202 +322 @@ where
+-                self.request_stream
++                request_stream
+@@ -213 +333 @@ where
+-                    max_size: self.max_field_section_size,
++                    max_size: max_field_section_size,
+@@ -233,2 +353,2 @@ where
+-                self.request_stream.stop_stream(error_code);
+-                self.request_stream.stop_sending(error_code);
++                request_stream.stop_stream(error_code);
++                request_stream.stop_sending(error_code);
+@@ -257 +377 @@ where
+-        Ok((req, self.request_stream))
++        Ok(req)

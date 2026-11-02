@@ -55,6 +55,9 @@ const AUDIENCE: &str = "agent-tunnel";
 const CANARY: &str = "m1-device-a-synthetic";
 const STEP_DEADLINE: Duration = Duration::from_secs(20);
 
+#[path = "m6_provisioning_process/reenrolment_drill.rs"]
+mod reenrolment_drill;
+
 fn repository() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
 }

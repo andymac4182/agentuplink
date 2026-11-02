@@ -74,6 +74,8 @@ use uuid::Uuid;
 
 mod c11_diagnostics;
 mod concurrent_load;
+#[cfg(test)]
+mod forwarded_control_liveness;
 mod i08_goaway_rotation;
 mod i08_synthetic_rotation;
 mod m7_i08_recovery_attempts;
@@ -231,12 +233,18 @@ pub use fs_write_restart::{
     FsWriteRestartEvidence, WriteRestartObservation, classify_held_outcome,
     validate_fs_write_restart_evidence, verify as verify_fs_write_restart,
 };
+mod fs_adapters_rotation;
 /// Gate 6's end-to-end half: the real `@agent-tunnel/client`, run by `node`,
 /// against this cluster's real relay and device sockets.
 mod fs_client_e2e;
+pub use fs_adapters_rotation::{
+    FsAdaptersRotationEvidence, validate_fs_adapters_rotation_evidence,
+    verify as verify_fs_adapters_rotation,
+};
 pub use fs_client_e2e::{
-    DeviceLedger, FsClientE2eEvidence, validate_fs_client_e2e_evidence as validate_fs_client_e2e,
-    verify as verify_fs_client_e2e,
+    DeviceLedger, FsClientE2eEvidence, FsFidOrderingEvidence,
+    validate_fs_client_e2e_evidence as validate_fs_client_e2e, validate_fs_fid_ordering_evidence,
+    verify as verify_fs_client_e2e, verify_fid_ordering as verify_fs_fid_ordering,
 };
 mod http_forward_rotation;
 pub use http_forward_rotation::{
@@ -2162,7 +2170,7 @@ impl ProductionCluster {
 
     /// Start a three-relay cluster with one-shot device control-attach
     /// barriers keyed by relay node ID.  Each barrier holds exactly one
-    /// owner-local device control socket between its `HELLO` and the
+    /// owner-local or forwarded device control socket between its `HELLO` and the
     /// registration that produces its `WELCOME`.  An empty map preserves the
     /// ordinary production harness path.  The barrier is single-use: once
     /// released it is a pass-through for every later control attach, so a
@@ -2228,6 +2236,33 @@ impl ProductionCluster {
         max_pending_operations: Option<usize>,
         peer_admission_barrier: Option<(&'static str, Arc<PeerAdmissionBarrier>)>,
         control_attach_barriers: BTreeMap<String, Arc<ControlAttachBarrier>>,
+    ) -> Result<Self> {
+        Self::start_with_peer_idle_timeout(
+            harness,
+            catalog,
+            consumer_send_buffer,
+            upgrade_barriers,
+            max_pending_operations,
+            peer_admission_barrier,
+            control_attach_barriers,
+            PRODUCTION_PEER_IDLE_TIMEOUT,
+        )
+        .await
+    }
+
+    // Existing gates retain their accelerated ten-second peer policy. A
+    // device-liveness fixture uses the production peer timeout so an earlier
+    // transport timeout cannot stand in for the device's own idle deadline.
+    #[allow(clippy::too_many_arguments)]
+    async fn start_with_peer_idle_timeout(
+        harness: &mut RunningHarness,
+        catalog: SharedCatalog,
+        consumer_send_buffer: Option<(&'static str, u32)>,
+        upgrade_barriers: BTreeMap<String, Arc<ConsumerUpgradeBarrier>>,
+        max_pending_operations: Option<usize>,
+        peer_admission_barrier: Option<(&'static str, Arc<PeerAdmissionBarrier>)>,
+        control_attach_barriers: BTreeMap<String, Arc<ControlAttachBarrier>>,
+        peer_idle_timeout: Duration,
     ) -> Result<Self> {
         let mut fixture =
             ClusterFixture::with_deployment(&harness.pki, DEPLOYMENT_ID, DEPLOYMENT_INCARCATION)?;
@@ -2512,6 +2547,7 @@ impl ProductionCluster {
                 peer_admission_barrier,
                 control_attach_barrier,
                 max_pending_operations,
+                peer_idle_timeout,
                 startup_cleanup_deadline,
             )
             .await
@@ -5603,6 +5639,7 @@ async fn start_relay(
     consumer_peer_admission_barrier: Option<Arc<PeerAdmissionBarrier>>,
     device_control_attach_barrier: Option<Arc<ControlAttachBarrier>>,
     max_pending_operations: Option<usize>,
+    peer_idle_timeout: Duration,
     startup_cleanup_deadline: tokio::time::Instant,
 ) -> Result<ProductionRelay> {
     let peer_cert_path = files.join(format!("{}-peer-chain.pem", node.node_id));
@@ -5637,6 +5674,8 @@ async fn start_relay(
         membership_signer_trust_path: Some(signer_trust_path.clone()),
         checkpoint_authority_endpoint: "https://localhost:443/v1/checkpoint".to_owned(),
         checkpoint_authority_trust_path: server_ca_path.clone(),
+        checkpoint_authority_client_cert_chain: None,
+        checkpoint_authority_client_private_key: None,
         membership_version_state_path: files
             .join(format!("{}-membership-version-state.json", node.node_id)),
         endpoint_policy: tunnel_relay::PrivateEndpointPolicyConfig {
@@ -5777,7 +5816,7 @@ async fn start_relay(
         .quinn_client_config(node.peer_ca_pem().as_bytes())
         .map_err(|error| HarnessError::Pki(format!("peer client TLS {}: {error}", node.node_id)))?;
     let peer_limits = PeerTransportLimits::default()
-        .with_timeouts(PRODUCTION_PEER_IDLE_TIMEOUT, Duration::from_secs(5))
+        .with_timeouts(peer_idle_timeout, Duration::from_secs(5))
         .map_err(|error| HarnessError::Process(format!("peer limits: {error}")))?;
     peer_limits
         .apply_to_server_config(&mut peer_server)

@@ -7,13 +7,11 @@
 //! certificate to A's private listener, and an impostor QUIC server with the
 //! retired certificate sits at B's endpoint after the overlap ends.  Public
 //! canaries enter A and are answered by a device attached to B at the initial
-//! and overlap phases.  After the replacement, relay A's readiness recovering
-//! is the evidence that A adopted the new pin without restarting; the
-//! replacement process's own public admission is deliberately not exercised
-//! (see the readiness-convergence limitation in docs/testing.md and the
-//! phase 5 comment below), so this gate does not prove a post-replacement
-//! public canary.  Every assertion is local to this source build; evidence is
-//! payload-free.
+//! and overlap phases. After replacement B becomes ready, a fresh device
+//! session must acquire a new boot/session and higher owner epoch, serve an
+//! exact public canary through A without changing owner or generation, and
+//! stop cleanly before the next fault. Every assertion is local to this
+//! source build; evidence is payload-free.
 
 // The harness library is Unix-only (see `src/entry.rs`).
 #![cfg(unix)]
@@ -128,6 +126,41 @@ async fn run_spki_replacement_gate() -> Result<()> {
     }
 }
 
+#[test]
+fn configured_relay_filter_overrides_error_only_parent_logging() {
+    // Apply the inherited environment and then the fixture's child overrides
+    // just as ManagedProcess does, without changing this test process's env.
+    let spec = common::relay_serve_process_spec("fixture-relay");
+    let probe = |overrides: &[(String, String)]| {
+        std::process::Command::new("sh")
+            .env("RUST_LOG", "error")
+            .envs(overrides.iter().map(|(key, value)| (key, value)))
+            .args(["-c", "test \"$RUST_LOG\" = info"])
+            .status()
+            .expect("child environment probe")
+            .success()
+    };
+    assert!(
+        !probe(&[]),
+        "the inherited error-only filter is insufficient"
+    );
+    assert!(
+        probe(&spec.env),
+        "fixture must enable its required INFO/WARN evidence"
+    );
+}
+
+#[test]
+fn probe_failure_count_includes_events_after_the_diagnostic_prefix() {
+    let warning = "authenticated peer readiness probe failed";
+    let capture = format!(
+        "{}\n{warning}\n{warning}\n",
+        "startup diagnostic ".repeat(300)
+    );
+    assert_eq!(count_probe_failures(&common::truncate(&capture)), 0);
+    assert_eq!(count_probe_failures(&capture), 2);
+}
+
 // ---------------------------------------------------------------------------
 // Evidence
 // ---------------------------------------------------------------------------
@@ -141,6 +174,56 @@ struct OwnerEvidence {
     device_id: Uuid,
     session_id: String,
     epoch: u64,
+}
+
+#[derive(Debug, Clone)]
+struct ReplacementEvidence {
+    owner_before_canary: OwnerEvidence,
+    owner_after_canary: OwnerEvidence,
+    connector_session_id: String,
+    connector_epoch: u64,
+    generation_before_canary: u64,
+    generation_after_canary: u64,
+    canary_attempts: usize,
+    pre_dispatch_refusals: usize,
+    stopped_cleanly: bool,
+}
+
+impl ReplacementEvidence {
+    fn validate(&self, previous: &OwnerEvidence) -> Result<()> {
+        let owner = &self.owner_before_canary;
+        if owner.node_id != previous.node_id
+            || owner.deployment_incarnation != previous.deployment_incarnation
+            || owner.tenant_id != previous.tenant_id
+            || owner.device_id != previous.device_id
+            || owner.boot_id.is_empty()
+            || owner.boot_id == previous.boot_id
+            || owner.session_id.is_empty()
+            || owner.session_id == previous.session_id
+            || owner.epoch <= previous.epoch
+            || owner.session_id != self.connector_session_id
+            || owner.epoch != self.connector_epoch
+        {
+            bail!(
+                "replacement owner did not prove the same device on a fresh relay boot/session and higher epoch"
+            );
+        }
+        if self.owner_after_canary != self.owner_before_canary {
+            bail!("replacement owner changed across the public canary");
+        }
+        if self.generation_before_canary == 0
+            || self.generation_after_canary != self.generation_before_canary
+        {
+            bail!("replacement device generation changed across the public canary");
+        }
+        if self.canary_attempts == 0 || self.pre_dispatch_refusals != self.canary_attempts - 1 {
+            bail!("replacement canary did not complete after only typed pre-dispatch refusals");
+        }
+        if !self.stopped_cleanly {
+            bail!("replacement device did not survive until clean shutdown");
+        }
+        Ok(())
+    }
 }
 
 /// Outcome of one harness peer connection presented to relay A's private
@@ -206,6 +289,7 @@ struct SpkiReplacementEvidence {
     impostor: ImpostorEvidence,
     a_probe_failure_diagnostic: bool,
     a_ready_after_replacement: bool,
+    replacement: ReplacementEvidence,
     a_unready_under_unsigned_record: bool,
     rogue_cert_under_unsigned_record: PeerProbeOutcome,
     new_cert_under_unsigned_record: PeerProbeOutcome,
@@ -324,6 +408,7 @@ impl SpkiReplacementEvidence {
         if !self.a_ready_after_replacement {
             bail!("relay A readiness did not recover on the replacement route");
         }
+        self.replacement.validate(&self.initial_owner)?;
         if !self.a_unready_under_unsigned_record {
             bail!("relay A stayed ready while an unsigned record was published");
         }
@@ -351,7 +436,7 @@ impl SpkiReplacementEvidence {
     }
 
     fn evidence_line(&self) -> String {
-        format!(
+        let summary = format!(
             "m7-configured-spki-replacement a_pid={} b_old_pid={} b_new_pid={} old_spki={} replacement_spki={} rogue_spki={} initial_boot={} initial_session={} initial_epoch={} device_generation={} checkpoint_requests={}->{} new_cert_before_record={} old_cert_before_record={} new_cert_during_overlap={} old_cert_during_overlap={} overlap_readiness_samples={} overlap_unready_samples={} a_unready_after_b_old_stopped={} stale_record_publish_refused={} old_cert_after_overlap={} new_cert_after_overlap={} a_unready_after_pin_retired={} retired_owner_released={} retired_relay_closed_device_session={} retired_route_status={} retired_route_code={} retired_route_execution={} impostor_connections={} impostor_from_relay_a={} impostor_streams={} impostor_closes_without_stream={} a_probe_failure_diagnostic={} a_ready_after_replacement={} a_unready_under_unsigned_record={} rogue_cert_under_unsigned_record={} new_cert_under_unsigned_record={} a_ready_after_recovery={} rogue_cert_after_recovery={} old_cert_after_recovery={} new_cert_after_recovery={} diagnostics_payload_free={} cleanup_joined={}",
             self.a_pid,
             self.b_old_pid,
@@ -396,6 +481,17 @@ impl SpkiReplacementEvidence {
             probe_code(&self.new_cert_after_recovery),
             self.diagnostics_payload_free,
             self.cleanup_joined,
+        );
+        format!(
+            "{summary} replacement_boot={} replacement_session={} replacement_epoch={} replacement_generation={} replacement_canary_attempts={} replacement_pre_dispatch_refusals={} replacement_owner_stable={} replacement_stopped_cleanly={}",
+            self.replacement.owner_before_canary.boot_id,
+            self.replacement.owner_before_canary.session_id,
+            self.replacement.owner_before_canary.epoch,
+            self.replacement.generation_after_canary,
+            self.replacement.canary_attempts,
+            self.replacement.pre_dispatch_refusals,
+            self.replacement.owner_before_canary == self.replacement.owner_after_canary,
+            self.replacement.stopped_cleanly,
         )
     }
 }
@@ -479,6 +575,7 @@ struct SpkiReplacementFixture {
     deployment_incarnation: String,
     signer: Arc<TestMembershipAuthority>,
     rogue_signer: TestMembershipAuthority,
+    node_a: RelayNodeFixture,
     node_b: RelayNodeFixture,
     device: tunnel_test_harness::DeviceFixture,
     service_id: Uuid,
@@ -862,6 +959,7 @@ async fn create_fixture_inner(
         deployment_incarnation,
         signer,
         rogue_signer,
+        node_a,
         node_b,
         device,
         service_id,
@@ -939,6 +1037,24 @@ fn sign_record(
 }
 
 impl SpkiReplacementFixture {
+    fn sign_a(&self, version: u64) -> Result<SignedMembershipRecord> {
+        let key = FixturePeerKey {
+            key_id: "relay-a-peer".into(),
+            spki_sha256: self.a_spki.to_hex(),
+            not_before: Utc::now(),
+            expires_at: Utc::now(),
+            revoked: false,
+        };
+        sign_record(
+            &self.signer,
+            &self.deployment_id,
+            &self.deployment_incarnation,
+            &self.node_a,
+            version,
+            vec![fresh_key(&key)],
+        )
+    }
+
     fn sign_b(&self, version: u64, keys: Vec<FixturePeerKey>) -> Result<SignedMembershipRecord> {
         sign_record(
             &self.signer,
@@ -1045,8 +1161,15 @@ impl SpkiReplacementFixture {
         .await
     }
 
-    async fn connect_device(&mut self, phase: &str) -> Result<u64> {
-        let mut client = connect_fresh(&self.client_config).await?;
+    async fn connect_device(&mut self, phase: &str) -> Result<tunnel_client::SessionInfo> {
+        if self.client.is_some() {
+            bail!("{phase}: a previous device handle was not stopped");
+        }
+        // Retain the handle before awaiting readiness so timeout/failure
+        // cleanup can still stop and join the newly started connector.
+        let client = self
+            .client
+            .insert(connect_fresh(&self.client_config).await?);
         let session = timeout(CONNECT_DEADLINE, client.wait_ready())
             .await
             .map_err(|_| HarnessError::Timeout(format!("{phase} device readiness")))?
@@ -1054,8 +1177,85 @@ impl SpkiReplacementFixture {
         if session.generation == 0 {
             bail!("{phase}: device reported generation zero");
         }
-        self.client = Some(client);
-        Ok(session.generation)
+        Ok(session)
+    }
+
+    async fn exercise_replacement(
+        &mut self,
+        previous: &OwnerEvidence,
+        deadline: Instant,
+    ) -> Result<ReplacementEvidence> {
+        let end = (Instant::now() + TRANSITION_DEADLINE).min(deadline);
+        let session = timeout(
+            end.saturating_duration_since(Instant::now()),
+            self.connect_device("replacement"),
+        )
+        .await
+        .map_err(|_| HarnessError::Timeout("replacement device attach deadline".into()))??;
+        let owner_before_canary = self.owner(end).await?;
+        let (canary_attempts, pre_dispatch_refusals) = self.replacement_canary(end).await?;
+        let owner_after_canary = self.owner(end).await?;
+        let generation_after_canary = self.device_generation()?;
+        let client = self
+            .client
+            .as_ref()
+            .ok_or_else(|| HarnessError::Process("replacement device is missing".into()))?;
+        timeout(
+            SHUTDOWN_DEADLINE.min(end.saturating_duration_since(Instant::now())),
+            client.stop(),
+        )
+        .await
+        .map_err(|_| HarnessError::Timeout("replacement device clean stop deadline".into()))?
+        .map_err(|error| {
+            HarnessError::Process(format!("replacement device clean stop: {error}"))
+        })?;
+        self.client.take();
+        let evidence = ReplacementEvidence {
+            owner_before_canary,
+            owner_after_canary,
+            connector_session_id: session.session_id,
+            connector_epoch: session.epoch,
+            generation_before_canary: session.generation,
+            generation_after_canary,
+            canary_attempts,
+            pre_dispatch_refusals,
+            stopped_cleanly: true,
+        };
+        evidence.validate(previous)?;
+        Ok(evidence)
+    }
+
+    async fn replacement_canary(&self, end: Instant) -> Result<(usize, usize)> {
+        let mut attempts = 0;
+        let mut refusals = 0;
+        loop {
+            if Instant::now() >= end {
+                bail!(
+                    "replacement canary did not converge before the bounded deadline: attempts={attempts} pre_dispatch_refusals={refusals}"
+                );
+            }
+            attempts += 1;
+            let (status, body) = timeout(
+                end.saturating_duration_since(Instant::now()),
+                post_echo(EchoProbe {
+                    consumer_bind: self.a_consumer_bind,
+                    server_ca_der: &self.server_ca_der,
+                    token: &self.client_token,
+                    device_id: self.device.id,
+                    service_id: self.service_id,
+                    payload: PAYLOAD,
+                    canary: CANARY.as_bytes(),
+                    phase: "spki-replacement",
+                }),
+            )
+            .await
+            .map_err(|_| HarnessError::Timeout("replacement canary exchange deadline".into()))??;
+            if replacement_canary_response(status, &body)? {
+                return Ok((attempts, refusals));
+            }
+            refusals += 1;
+            sleep(POLL_INTERVAL.min(end.saturating_duration_since(Instant::now()))).await;
+        }
     }
 
     /// Stop a device whose control socket the owning relay may already have
@@ -1201,8 +1401,7 @@ impl SpkiReplacementFixture {
     ) -> Result<u32> {
         let process = ManagedProcess::spawn(
             label,
-            ProcessSpec::new(&self.relay_binary)
-                .arg("serve")
+            common::relay_serve_process_spec(&self.relay_binary)
                 .arg("--config")
                 .arg(config.display().to_string()),
         )
@@ -1288,12 +1487,20 @@ impl SpkiReplacementFixture {
         .await
     }
 
-    fn slot_diagnostic(&self, label: &str) -> Result<String> {
-        self.processes
+    fn slot_probe_failures(&self, label: &str) -> Result<usize> {
+        let process = &self
+            .processes
             .iter()
             .find(|slot| slot.label == label)
-            .map(|slot| process_diagnostic(&slot.process))
-            .ok_or_else(|| HarnessError::Process(format!("missing process slot {label}")))
+            .ok_or_else(|| HarnessError::Process(format!("missing process slot {label}")))?
+            .process;
+        // ManagedProcess already bounds each capture to 1 MiB. The 4096-char
+        // human diagnostic is a prefix, so counting it would stop observing
+        // new failures once unrelated startup output filled that prefix.
+        Ok(
+            count_probe_failures(&String::from_utf8_lossy(&process.stdout()))
+                + count_probe_failures(&String::from_utf8_lossy(&process.stderr())),
+        )
     }
 
     async fn exercise(&mut self, deadline: Instant) -> Result<SpkiReplacementEvidence> {
@@ -1319,7 +1526,7 @@ impl SpkiReplacementFixture {
             .await?;
         self.wait_for_pair_ready("relay-a", "relay-b-old").await?;
         self.wait_for_a_readiness(true, "initial", deadline).await?;
-        let device_generation_before_overlap = self.connect_device("initial").await?;
+        let device_generation_before_overlap = self.connect_device("initial").await?.generation;
         let initial_owner = self.owner(deadline).await?;
         self.echo_via_a("spki-initial").await?;
 
@@ -1403,7 +1610,7 @@ impl SpkiReplacementFixture {
         // Phase 4: an impostor presenting the retired certificate at B's
         // endpoint.  A dials it for its readiness probe, fails the pin check
         // and never opens a request stream.
-        let a_probe_failures_before = count_probe_failures(&self.slot_diagnostic("relay-a")?);
+        let a_probe_failures_before = self.slot_probe_failures("relay-a")?;
         let impostor = ImpostorServer::start(
             self.b_peer_bind,
             &self.old_credential,
@@ -1413,16 +1620,17 @@ impl SpkiReplacementFixture {
         let impostor_end = (Instant::now() + IMPOSTOR_DEADLINE).min(deadline);
         loop {
             let snapshot = impostor.snapshot();
+            let a_probe_failures_now = self.slot_probe_failures("relay-a")?;
             if snapshot.connections_from_relay_a >= 1
                 && snapshot.closes_without_stream >= snapshot.connections_from_relay_a
-                && count_probe_failures(&self.slot_diagnostic("relay-a")?) > a_probe_failures_before
+                && a_probe_failures_now > a_probe_failures_before
             {
                 break;
             }
             if Instant::now() >= impostor_end {
                 let _ = impostor.stop().await;
                 bail!(
-                    "relay A did not dial and reject the retired-certificate endpoint before the bounded deadline: {snapshot:?}"
+                    "relay A did not dial and reject the retired-certificate endpoint before the bounded deadline: {snapshot:?}; probe_failures_before={a_probe_failures_before} probe_failures_now={a_probe_failures_now}"
                 );
             }
             sleep(POLL_INTERVAL).await;
@@ -1440,18 +1648,24 @@ impl SpkiReplacementFixture {
             );
         }
         let a_probe_failure_diagnostic =
-            count_probe_failures(&self.slot_diagnostic("relay-a")?) > a_probe_failures_before;
+            self.slot_probe_failures("relay-a")? > a_probe_failures_before;
         wait_for_ports_released(self.b_consumer_bind, self.b_device_bind, self.b_peer_bind).await?;
 
         // Phase 5: the replacement process with the new certificate takes
         // over B's endpoint; A recovers readiness, the device re-attaches and
         // a public canary crosses the replaced route with exact identities.
         //
-        // The replacement process restores relay B's persisted version fence,
-        // which already records every record version the retired process
-        // accepted.  Re-reading any of those versions would be a typed
-        // equal-version conflict by design, so the replacement boot is given
-        // fresh higher signed records for both nodes.
+        // The replacement has its own membership state file. Refresh both
+        // nodes' signed records before it boots: A's initial 55-second record
+        // must not expire while the replacement is converging and serving.
+        let record_a_boot = self.sign_a(2)?;
+        publish_membership(
+            &self.upstream_url,
+            &self.namespace,
+            "relay-a",
+            &record_a_boot,
+        )
+        .await?;
         let record_b_boot = self.sign_b(4, vec![self.replacement_key.clone()])?;
         publish_membership(
             &self.upstream_url,
@@ -1472,12 +1686,15 @@ impl SpkiReplacementFixture {
         self.wait_for_a_readiness(true, "replacement", deadline)
             .await?;
         let a_ready_after_replacement = true;
-        // Relay A now uses the replacement certificate for this route without
-        // ever having restarted: its readiness recovered only because the
-        // authenticated probe to the replacement process passed the new pin.
-        // The replacement process's own public admission is deliberately not
-        // exercised here; see the readiness-convergence limitation recorded in
-        // docs/testing.md.
+        // start_slot already required replacement B's own public readiness.
+        // The old client was stopped before the impostor phase; this fresh
+        // client can therefore be served only by the new B process.
+        let replacement = timeout(
+            TRANSITION_DEADLINE.min(deadline.saturating_duration_since(Instant::now())),
+            self.exercise_replacement(&initial_owner, deadline),
+        )
+        .await
+        .map_err(|_| HarnessError::Timeout("replacement acceptance deadline".into()))??;
 
         // Phase 6: a record signed by an untrusted key names a rogue SPKI.
         // Both relays fail closed; the rogue pin never enters A's trust set.
@@ -1577,6 +1794,7 @@ impl SpkiReplacementFixture {
             impostor: impostor_evidence,
             a_probe_failure_diagnostic,
             a_ready_after_replacement,
+            replacement,
             a_unready_under_unsigned_record,
             rogue_cert_under_unsigned_record,
             new_cert_under_unsigned_record,
@@ -2094,8 +2312,7 @@ async fn start_relay(
 ) -> Result<ManagedProcess> {
     let mut process = ManagedProcess::spawn(
         name,
-        ProcessSpec::new(binary)
-            .arg("serve")
+        common::relay_serve_process_spec(binary)
             .arg("--config")
             .arg(config.display().to_string()),
     )
@@ -2286,6 +2503,142 @@ struct EchoProbe<'a> {
 struct WireError {
     code: String,
     execution: String,
+}
+
+/// Return true only for the exact successful canary. A fresh request may be
+/// issued only after these two typed refusals prove no dispatch occurred.
+fn replacement_canary_response(status: u16, body: &[u8]) -> Result<bool> {
+    if status == 200 {
+        expect_canary_body("spki-replacement", body, CANARY.as_bytes(), PAYLOAD)?;
+        return Ok(true);
+    }
+    let wire = serde_json::from_slice::<WireError>(body);
+    if status == 503
+        && let Ok(wire) = &wire
+        && wire.execution == "not_dispatched"
+        && matches!(wire.code.as_str(), "CLUSTER_UNREADY" | "PEER_UNTRUSTED")
+    {
+        return Ok(false);
+    }
+    let typed = wire.map_or_else(
+        |_| "untyped".to_owned(),
+        |wire| format!("code={} execution={}", wire.code, wire.execution),
+    );
+    bail!("replacement canary refused without a safe convergence retry: status={status} {typed}");
+}
+
+#[test]
+fn replacement_canary_requires_exact_bytes_and_never_retries_auth_or_ambiguous_results() {
+    let expected = [CANARY.as_bytes(), PAYLOAD].concat();
+    assert!(replacement_canary_response(200, &expected).unwrap());
+    let mut altered = expected.clone();
+    *altered.last_mut().unwrap() ^= 1;
+    assert!(replacement_canary_response(200, &altered).is_err());
+    assert!(replacement_canary_response(200, CANARY.as_bytes()).is_err());
+    for code in ["CLUSTER_UNREADY", "PEER_UNTRUSTED"] {
+        let body = serde_json::json!({"code": code, "execution": "not_dispatched"});
+        let bytes = serde_json::to_vec(&body).unwrap();
+        assert!(!replacement_canary_response(503, &bytes).unwrap());
+        for status in [401, 403, 404, 500] {
+            assert!(replacement_canary_response(status, &bytes).is_err());
+        }
+        for execution in ["unknown", "dispatched", "completed", ""] {
+            let bytes =
+                serde_json::to_vec(&serde_json::json!({"code": code, "execution": execution}))
+                    .unwrap();
+            assert!(replacement_canary_response(503, &bytes).is_err());
+        }
+    }
+    for body in [
+        br#"{"code":"UNAUTHORIZED","execution":"not_dispatched"}"#.as_slice(),
+        br#"{"code":"PEER_UNAVAILABLE","execution":"not_dispatched"}"#,
+        br#"{"code":"CLUSTER_UNREADY"}"#,
+        b"not an error envelope",
+    ] {
+        assert!(replacement_canary_response(503, body).is_err());
+    }
+}
+
+#[test]
+fn replacement_evidence_rejects_old_or_changed_owners_and_lost_sessions() {
+    let previous = OwnerEvidence {
+        node_id: "relay-b".into(),
+        boot_id: "previous-boot".into(),
+        deployment_incarnation: "fixture-incarnation".into(),
+        tenant_id: Uuid::from_u128(1),
+        device_id: Uuid::from_u128(2),
+        session_id: "previous-session".into(),
+        epoch: 1,
+    };
+    let owner = OwnerEvidence {
+        boot_id: "replacement-boot".into(),
+        session_id: "replacement-session".into(),
+        epoch: 2,
+        ..previous.clone()
+    };
+    let valid = ReplacementEvidence {
+        owner_before_canary: owner.clone(),
+        owner_after_canary: owner,
+        connector_session_id: "replacement-session".into(),
+        connector_epoch: 2,
+        generation_before_canary: 1,
+        generation_after_canary: 1,
+        canary_attempts: 2,
+        pre_dispatch_refusals: 1,
+        stopped_cleanly: true,
+    };
+    valid.validate(&previous).unwrap();
+    for substitute in [
+        previous.clone(),
+        OwnerEvidence {
+            node_id: "relay-a".into(),
+            ..valid.owner_before_canary.clone()
+        },
+        OwnerEvidence {
+            boot_id: previous.boot_id.clone(),
+            ..valid.owner_before_canary.clone()
+        },
+        OwnerEvidence {
+            session_id: previous.session_id.clone(),
+            ..valid.owner_before_canary.clone()
+        },
+        OwnerEvidence {
+            epoch: previous.epoch,
+            ..valid.owner_before_canary.clone()
+        },
+        OwnerEvidence {
+            device_id: Uuid::from_u128(3),
+            ..valid.owner_before_canary.clone()
+        },
+        OwnerEvidence {
+            tenant_id: Uuid::from_u128(3),
+            ..valid.owner_before_canary.clone()
+        },
+        OwnerEvidence {
+            deployment_incarnation: "other-incarnation".into(),
+            ..valid.owner_before_canary.clone()
+        },
+    ] {
+        let mut rejected = valid.clone();
+        rejected.owner_before_canary = substitute.clone();
+        rejected.owner_after_canary = substitute;
+        assert!(rejected.validate(&previous).is_err());
+    }
+    let mutations: [fn(&mut ReplacementEvidence); 8] = [
+        |e| e.owner_after_canary.epoch += 1,
+        |e| e.connector_epoch += 1,
+        |e| e.connector_session_id = "unrelated-session".into(),
+        |e| e.generation_after_canary += 1,
+        |e| e.generation_before_canary = 0,
+        |e| e.canary_attempts = 0,
+        |e| e.pre_dispatch_refusals = 0,
+        |e| e.stopped_cleanly = false,
+    ];
+    for mutate in mutations {
+        let mut rejected = valid.clone();
+        mutate(&mut rejected);
+        assert!(rejected.validate(&previous).is_err());
+    }
 }
 
 /// Issue the public consumer request and require the exact canary response.

@@ -67,6 +67,23 @@ The transport command exercises real mTLS/H3 fault cases. The cluster command
 uses a synthetic owner callback. The production command uses real relay actors,
 CLI/device WebSockets and public consumers across three relays.
 
+The M7 script also runs the exact ignored test
+`production_cluster::forwarded_control_liveness::cli_reconnect::m6c68_cli_reconnects_after_both_forwarded_paths_vanish`.
+It starts the shipped CLI through ingress B onto remote owner A, requires 70
+seconds of healthy control-session idleness, then cuts both current client TCP
+sockets while retaining their relay halves. Same-session M2 data recovery during
+idle time is recorded separately; it is not a control reconnect. The old actor
+session and owner token must disappear within 35 seconds, before a renewed lease
+expires. The same CLI PID must report `disconnected`, `OWNER_BUSY` backoff, and a
+second `ready`/`reconnected` session with a higher epoch within 40 seconds. The
+fixture caps retry delays at one second, matching the existing single-relay gate;
+it does not change production liveness deadlines. Exact public canaries through
+C and a successful stopped event complete the check. The separate raw forwarded
+control gate still proves protocol heartbeat bindings and isolates cleanup from
+the production 60-second peer timeout. All three negative controls and the
+restored CLI/raw/barrier checks passed locally; M6-C68 remains open for the
+complete combined candidate workspace and M1/M2/M7 gates.
+
 `verify-m7-production` also records and asserts the IN-10/OG-05 heartbeat,
 liveness and shutdown evidence, printed as a
 `M7 production heartbeat/liveness/shutdown:` line and enforced by
@@ -503,35 +520,36 @@ forwarders and the catalog namespace. The deterministic statement of the same
 replacement rule is `tunnel-cluster`'s
 `membership::tests::peer_key_replacement_walks_old_then_overlap_then_new`.
 
-The replacement process is then required to serve, not merely to converge. Once
-A is ready again, the gate waits for the replacement's own `/readyz`, attaches a
-fresh device session to the device listener that process now owns, reads the
-owner claim back from Redis and requires it to name the same node and deployment
-incarnation under a **different `boot_id`** from the claim the retired process
-held, with a fresh session id and a higher owner epoch, and then drives a public
-consumer request into relay A which must return the exact canary and payload
-bytes across the replaced peer route. The session must still be the one the
-replacement served when it is stopped, and its generation must not have moved
-across the canary. Typical evidence is
-`replacement_epoch=2 replacement_device_generation=1 replacement_canary_attempts=9`.
+The replacement phase refreshes A's signed record at version 2 and B's at
+version 4 before starting B with the replacement certificate. Both records
+keep the fixture's 55-second lifetime; refreshing A prevents its initial
+record from expiring during replacement convergence. After B's own public
+readiness and A's recovered readiness, a fresh device attaches to B's existing
+listener. Its Redis owner must name the same tenant, device, node and deployment
+incarnation as the retired owner, with a different nonempty boot/session and a
+strictly higher epoch. The session and epoch must also match the new connector's
+reported `DataReady` identity.
 
-Two convergence tolerances are bounded and counted rather than silent. The
-device attach is retried inside the transition deadline, because a relay that
-is still failing closed refuses it at the upgrade or during the control
-handshake. The canary tolerates the typed `503` pre-dispatch boundary
-(`CLUSTER_UNREADY` while A's readiness is still converging, `PEER_UNTRUSTED`
-while A's peer trust for the replacement is), and at most two `401` outcomes.
-The `401` allowance exists because the relay maps a *catalog* failure inside
-consumer authentication to `UNAUTHORIZED` rather than to the
-`AUTHORIZATION_UNAVAILABLE` boundary that sits beside it in the same function,
-so an authority blip during convergence is indistinguishable at the HTTP
-boundary from a real rejection; the third `401` fails the gate, so a genuinely
-broken authorization can never be waited out. Both counts appear in the
-evidence line, and four consecutive local runs recorded `pre_dispatch_401=0`.
-Relay A's own signed record is also re-issued at a higher version before the
-replacement process boots: every record in this fixture carries a lifetime
-shorter than the relay's 60-second bound, and without that refresh the
-replacement's peer trust for relay A ages out mid-phase.
+A public request through A must return the exact canary plus payload from that
+replacement session. Its owner token and active generation must remain
+unchanged across the exchange, and the device must stop cleanly before the
+unsigned-record phase begins. The new attach, canary and stop sequence shares
+one 20-second deadline inside the existing 150-second gate deadline. A request
+may be retried only after `503 CLUSTER_UNREADY` or `503 PEER_UNTRUSTED` explicitly
+reports `not_dispatched`. Authentication refusals, other statuses/codes,
+untyped errors, transport failures, ambiguous execution and changed response
+bytes fail immediately. Evidence reports replacement boot/session/epoch,
+generation, attempt/refusal counts, stable ownership and clean shutdown without
+payloads or credentials.
+
+A source/history review on 2026-10-31 found that the 2026-09-15 documentation
+claim of four successful replacement-canary runs was not backed by committed
+code in this test at `89acdcad`: phase 5 still contained its original explicit
+exclusion of public admission. The historical tracker entry remains recorded,
+but is not current candidate evidence. Its old claim of tolerated 401 responses also does
+not describe this test. The replacement acceptance above was added after that
+review; current runs and negative controls are recorded on M7-C06, separately
+from the unsupported historical claim.
 
 One boundary is deliberate and not claimed by this gate: the typed public
 outcome across the retired route is the readiness boundary rather than
@@ -548,10 +566,9 @@ was reachable but momentarily unready refused the probe and the prober observed
 Reachability is now measured independently of the responder's own readiness; see
 the readiness paragraph in [cluster.md](cluster.md) and the deterministic
 regressions `real_h3_probe_converges_while_peer_cluster_readiness_is_withdrawn`
-and `real_h3_probe_converges_across_a_peer_readiness_flap`. With that fix in
-place the replacement boot is now asserted through the replacement process
-itself as described above, so a device session and consumer request served *by*
-the replaced process are covered by this gate.
+and `real_h3_probe_converges_across_a_peer_readiness_flap`. Those regressions
+establish the readiness fix separately; replacement application traffic is
+now required by the configured SPKI gate itself.
 
 ### Live-catalog Redis process restart
 
@@ -879,6 +896,15 @@ buffer size. A workload that cannot fill the channel must say so with numbers;
 it must not be relabelled as success against a logical count.
 
 ## Filesystem API and framework interoperability
+
+The [M4-68 installed-framework rotation gate](m4-adapters-rotation.md) specifies
+the real 300-second run, independent host oracle, per-stream fence proof and
+revocation cases. At `3ebe8b48`, the corrected full gate passed locally in
+312.455 seconds after seven focused Rust controls and scoped strict checks.
+The first failed attempt, its exact 404 contract correction and both frozen
+artifact identities remain recorded. Full Node checks passed at 601 offline
+and 33 peer tests with all 58 inputs unchanged at this run. Final aggregate
+and hosted acceptance remain separate.
 
 Test the common path from each framework's native adapter through the shared TypeScript filesystem client, authenticated binary WebSocket, relay logical stream, and confined Rust 9P2000.L server. Use the endpoint discovery and session contract in [filesystem-api.md](filesystem-api.md); constructing a compatible-looking object or passing an in-process mock proves neither endpoint interoperability nor authorization. Consumer filesystem sockets are separate from the device's two steady-state sockets; monitor both classes so multiple mounted clients do not produce a false rotation-bound failure.
 
