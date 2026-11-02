@@ -1,0 +1,109 @@
+{
+  "commit": "d2070d76a8ba07e6c7fa142caeb51ffd756e47eb",
+  "evidence": {
+    "archive_member_bindings": [
+      {
+        "archive_path": "package/src/all-entities.js",
+        "bytes": 1497,
+        "git_blob_sha1": "2000c46e04f81e3e81e545d65087f2b1c68e62a7",
+        "match": true,
+        "sha256": "2f1340ab32dce314f41638b7ee6d0368b974e3302983154b815a6d49a6dfb63b",
+        "source_path": "Entity/src/all-entities.js",
+        "upstream_blob_sha1": "2000c46e04f81e3e81e545d65087f2b1c68e62a7"
+      },
+      {
+        "archive_path": "package/src/entities.js",
+        "bytes": 18791,
+        "git_blob_sha1": "8c5723d2a77ae09d8b3f53032e1c33ad946f2251",
+        "match": true,
+        "sha256": "96ec5d127a4e8cd77bdc678422f0d57c8ff9e37bcec999983da71a7b72ce9a0e",
+        "source_path": "Entity/src/entities.js",
+        "upstream_blob_sha1": "8c5723d2a77ae09d8b3f53032e1c33ad946f2251"
+      },
+      {
+        "archive_path": "package/src/EntityDecoder.js",
+        "bytes": 25816,
+        "git_blob_sha1": "71f9180d1c9ad2d106ca376b5d734ce30e50b16a",
+        "match": true,
+        "sha256": "a56cf2bf8174e0adf94970d70e003afcfc3923a53d0cf973f92d374cfe684544",
+        "source_path": "Entity/src/EntityDecoder.js",
+        "upstream_blob_sha1": "71f9180d1c9ad2d106ca376b5d734ce30e50b16a"
+      },
+      {
+        "archive_path": "package/src/EntityEncoder.js",
+        "bytes": 8479,
+        "git_blob_sha1": "a9f596f1178e1a5cb297b5c4a4e67e926e4c65fd",
+        "match": true,
+        "sha256": "812a2077e073564d6470b8fda8ac0d20ecaaf75ddb1594d55d28acc2da8a1a71",
+        "source_path": "Entity/src/EntityEncoder.js",
+        "upstream_blob_sha1": "a9f596f1178e1a5cb297b5c4a4e67e926e4c65fd"
+      },
+      {
+        "archive_path": "package/src/entityTries.js",
+        "bytes": 2359,
+        "git_blob_sha1": "c8aaeff7dcfddf5908eaef4c447a3e8ab3ec1ccb",
+        "match": true,
+        "sha256": "fa2838d141fba0e8ee5bd2197956c3f6b1d23668be2c8841a585614ea7051f99",
+        "source_path": "Entity/src/entityTries.js",
+        "upstream_blob_sha1": "c8aaeff7dcfddf5908eaef4c447a3e8ab3ec1ccb"
+      },
+      {
+        "archive_path": "package/src/index.js",
+        "bytes": 515,
+        "git_blob_sha1": "e2b214514adac5a446d6422ca582d143e1cfd583",
+        "match": true,
+        "sha256": "79a65ddeda08664d00b7b82f5a903ea437de1dff54a02ed469e9cb1067cb568b",
+        "source_path": "Entity/src/index.js",
+        "upstream_blob_sha1": "e2b214514adac5a446d6422ca582d143e1cfd583"
+      },
+      {
+        "archive_path": "package/package.json",
+        "bytes": 1270,
+        "git_blob_sha1": "a45f577462532b13ce4362d33c71d88787bee872",
+        "match": false,
+        "sha256": "548526ce0e1cad9ffe904fba19067013c9fea336eafd3cd52a337ec44406c9ed",
+        "source_path": "Entity/package.json",
+        "upstream_blob_sha1": "9c02c3425a41e1a103b2802409608df4bf099991"
+      },
+      {
+        "archive_path": "package/README.md",
+        "bytes": 3485,
+        "git_blob_sha1": "73717d6ea7d910b9b070ba89ede7cec0655c477f",
+        "match": true,
+        "sha256": "7e3484a07c208b5c5813290a993244c6841efc3d4241c29a07ef948e8129a758",
+        "source_path": "Entity/README.md",
+        "upstream_blob_sha1": "73717d6ea7d910b9b070ba89ede7cec0655c477f"
+      },
+      {
+        "archive_path": "package/src/index.d.ts",
+        "bytes": 12183,
+        "git_blob_sha1": "c513cf5256a287d739ef6afd056feeb843f34f00",
+        "match": true,
+        "sha256": "aea4188bf00c7d6474a34adb715810cfa9e45acafb1b4931e63db0b4253c07da",
+        "source_path": "Entity/src/index.d.ts",
+        "upstream_blob_sha1": "c513cf5256a287d739ef6afd056feeb843f34f00"
+      }
+    ],
+    "metadata_comparison": {
+      "exact_text_after_single_version_replacement": true,
+      "only_json_difference_is_version": true,
+      "published_version": "3.0.0",
+      "source_version": "2.2.0",
+      "upstream_blob": "9c02c3425a41e1a103b2802409608df4bf099991",
+      "upstream_sha256": "6a025503d776124cd4371fcba8383afcc30a640c5783f96093f76f19ecb66241"
+    }
+  },
+  "limitations": [
+    "The registry gitHead is a publisher assertion; source package.json says2.2.0 rather than the published3.0.0.",
+    "Copyright2026 Nodable is retained; package author Amit Gupta is not substituted for the copyright holder."
+  ],
+  "name": "@nodable/entities",
+  "notice_path": "LICENSE",
+  "notice_sha256": "750cb3fb6362804957ef52caaf9b5c824015be44d494637330d7cd8834d31d40",
+  "package_directory": "Entity",
+  "reason": "The root MIT grant accompanies Entity/. All seven shipped src files and README match exact commit blobs; package metadata differs only in version (source2.2.0, published3.0.0). The complete notice is preserved, not inferred from a label.",
+  "repository": "nodable/val-parsers",
+  "review_scope": "Source-bound MIT notice applicability only; no exception, rebuilt-output proof or bundled-component audit.",
+  "schema": 1,
+  "version": "3.0.0"
+}

@@ -358,6 +358,126 @@ class Validation(unittest.TestCase):
             self.assertEqual(path.read_bytes(), b"first")
 
 
+class LoopbackPublication(unittest.TestCase):
+    @staticmethod
+    def docker_with_inspection(value):
+        run = mock.Mock()
+        docker = rehearsal.Docker(run, "owner", {})
+        docker.inspect = mock.Mock(return_value=value)
+        return docker, run
+
+    @staticmethod
+    def binding(address="::1", port="49152"):
+        return {"NetworkSettings": {"Ports": {"6379/tcp": [{"HostIp": address, "HostPort": port}]}}}
+
+    def test_create_publishes_only_ipv6_loopback_with_random_host_ports(self):
+        docker = rehearsal.Docker(mock.Mock(), "owner", {})
+        docker.network = {"id": "network"}
+        commands = []
+        docker.call = lambda args, **kw: commands.append(args) or ("a" * 64).encode()
+        docker.inspect = mock.Mock()
+        ports = (6379, 8444, 8443, 9443)
+        docker.create("relay-a", "sha256:" + "b" * 64, ports=ports)
+        args = commands[0]
+        self.assertEqual([args[i + 1] for i, value in enumerate(args) if value == "--publish"],
+                         [f"[::1]::{port}" for port in ports])
+        self.assertNotIn("127.0.0.1", " ".join(args))
+
+    def test_single_ipv6_loopback_binding_is_accepted_and_projected(self):
+        for port in ("1", "49152", "65535"):
+            with self.subTest(port=port):
+                docker, run = self.docker_with_inspection(self.binding(port=port))
+                try:
+                    actual = docker.port({"role": "redis"}, 6379)
+                except rehearsal.Refused as exc:
+                    self.fail(f"a single valid IPv6 loopback binding was refused: {exc}")
+                self.assertEqual(actual, int(port))
+                event, = run.event.call_args_list
+                self.assertEqual(event.args, ("published_port_binding",))
+                self.assertEqual(event.kwargs, {
+                    "role": "redis", "container_port": 6379, "network_settings_type": "object",
+                    "ports_type": "object", "binding_present": True, "bindings_type": "array",
+                    "binding_count": 1, "binding_type": "object", "host_ip_type": "string",
+                    "host_ip_class": "ipv6_loopback", "host_port_type": "string",
+                    "host_port_valid": True, "accepted": True})
+
+    def test_http_uses_ipv6_loopback_and_preserves_tls_sni_and_host(self):
+        context, raw, wrapped = mock.Mock(), mock.Mock(), mock.Mock()
+        context.wrap_socket.return_value = wrapped
+        connection = mock.Mock()
+        response = connection.getresponse.return_value
+        response.status, response.read.return_value = 200, b"ready"
+        with mock.patch.object(rehearsal.http.client, "HTTPConnection", return_value=connection) as http, \
+                mock.patch.object(rehearsal.socket, "create_connection", return_value=raw) as connect:
+            self.assertEqual(rehearsal._http_request(49152, "relay.synthetic.invalid", context, "/readyz"), (200, b"ready"))
+        http.assert_called_once_with("::1", 49152, timeout=5)
+        connect.assert_called_once_with(("::1", 49152), timeout=5)
+        context.wrap_socket.assert_called_once_with(raw, server_hostname="relay.synthetic.invalid")
+        self.assertIs(connection.sock, wrapped)
+        self.assertEqual(connection.request.call_args.kwargs["headers"]["Host"], "relay.synthetic.invalid")
+        connection.close.assert_called_once_with()
+
+    def test_redis_uses_ipv6_loopback_and_preserves_tls_sni(self):
+        context, raw, sock = mock.Mock(), mock.Mock(), mock.MagicMock()
+        sock.__enter__.return_value = sock
+        sock.makefile.return_value = io.BytesIO(b"+OK\r\n+PONG\r\n")
+        context.wrap_socket.return_value = sock
+        with mock.patch.object(rehearsal.socket, "create_connection", return_value=raw) as connect, \
+                mock.patch.object(rehearsal, "bounded_network", side_effect=nullcontext):
+            self.assertEqual(rehearsal.Redis(49153, "redis.synthetic.invalid", context, "synthetic-password").command("PING"), "PONG")
+        connect.assert_called_once_with(("::1", 49153), timeout=5)
+        context.wrap_socket.assert_called_once_with(raw, server_hostname="redis.synthetic.invalid")
+        self.assertEqual(sock.sendall.call_count, 2)
+
+    def test_missing_null_wrong_shape_and_multiple_bindings_stay_refused(self):
+        cases = [({}, "missing", None),
+                 ({"NetworkSettings": None}, "missing", None),
+                 ({"NetworkSettings": {"Ports": None}}, "missing", None),
+                 ({"NetworkSettings": {"Ports": {}}}, "missing", None),
+                 ({"NetworkSettings": {"Ports": {"6379/tcp": None}}}, "null", None),
+                 ({"NetworkSettings": {"Ports": {"6379/tcp": "private-value"}}}, "string", None),
+                 ({"NetworkSettings": {"Ports": {"6379/tcp": []}}}, "array", 0),
+                 ({"NetworkSettings": {"Ports": {"6379/tcp": [None]}}}, "array", 1)]
+        duplicate = self.binding()
+        duplicate["NetworkSettings"]["Ports"]["6379/tcp"] *= 2
+        cases.append((duplicate, "array", 2))
+        for value, kind, count in cases:
+            with self.subTest(kind=kind, count=count):
+                docker, run = self.docker_with_inspection(value)
+                with self.assertRaisesRegex(rehearsal.Refused, "^published_port_scope$"):
+                    docker.port({"role": "redis"}, 6379)
+                event = run.event.call_args.kwargs
+                self.assertEqual((event["bindings_type"], event["binding_count"]), (kind, count))
+                self.assertFalse(event["accepted"])
+                self.assertNotIn("private-value", json.dumps(event))
+
+    def test_ipv4_wildcards_other_addresses_and_malformed_ports_stay_refused(self):
+        for address in ("127.0.0.1", "0.0.0.0", "::", "::ffff:127.0.0.1", "0:0:0:0:0:0:0:1", "private-address", None, 1):
+            with self.subTest(address=address):
+                docker, run = self.docker_with_inspection(self.binding(address=address))
+                with self.assertRaisesRegex(rehearsal.Refused, "^published_port_scope$"):
+                    docker.port({"role": "redis"}, 6379)
+                self.assertFalse(run.event.call_args.kwargs["accepted"])
+        for port in ("0", "65536", "01", "-1", "+1", "1 ", " 1", "1\n", "١", "private-port", "9" * 10000, 1, True, None):
+            with self.subTest(port_type=type(port).__name__):
+                docker, run = self.docker_with_inspection(self.binding(port=port))
+                with self.assertRaisesRegex(rehearsal.Refused, "^published_port_scope$"):
+                    docker.port({"role": "redis"}, 6379)
+                self.assertFalse(run.event.call_args.kwargs["host_port_valid"])
+
+    def test_binding_diagnostics_withhold_unrecorded_values_and_credentials(self):
+        secret = "unrecorded-value-credential-or-pem-body"
+        for value in ({"NetworkSettings": secret}, {"NetworkSettings": {"Ports": secret}},
+                      self.binding(address=secret, port=secret), self.binding(address={secret: secret}, port=[secret])):
+            docker, run = self.docker_with_inspection(value)
+            with self.assertRaisesRegex(rehearsal.Refused, "^published_port_scope$"):
+                docker.port({"role": "redis"}, 6379)
+            serialized = json.dumps(run.event.call_args.kwargs)
+            self.assertNotIn(secret, serialized)
+            self.assertNotIn("HostIp", serialized)
+            self.assertNotIn("HostPort", serialized)
+
+
 class Cleanup(unittest.TestCase):
     def fixture(self, *, oom=False, ambiguous=None, fail_logs=False, fail_stop=False, foreign=False):
         expected, observed = owned()

@@ -1,0 +1,79 @@
+{
+  "packages": [
+    {
+      "applicability": {
+        "file": "nodable-entities-3.0.0-applicability.json",
+        "sha256": "0ec944b02f121c77afc66a3f767186adbc5c5334fa345cc947cee2c5833e3d42"
+      },
+      "artifact_sha256": "aac1b10aae6c2c7f1fe8f82f4ba7e665605441286acbcb50d8864be4eda2e6bf",
+      "integrity": "sha512-8L9xFeTYKhm49xfIypoe2W5wV1m/3Z58kT+7kR9A8OyFxcPduI4VmxaUMQyKYrRjUoLLSXv6EKKID5Tvj9cUVw==",
+      "license": "MIT",
+      "metadata_sha256": "548526ce0e1cad9ffe904fba19067013c9fea336eafd3cd52a337ec44406c9ed",
+      "name": "@nodable/entities",
+      "notice": {
+        "bytes": 1064,
+        "file": "nodable-entities-3.0.0-MIT.txt",
+        "sha256": "750cb3fb6362804957ef52caaf9b5c824015be44d494637330d7cd8834d31d40"
+      },
+      "path": "node_modules/@nodable/entities",
+      "registry": {
+        "file": "nodable-entities-3.0.0-registry.json",
+        "git_head": "d2070d76a8ba07e6c7fa142caeb51ffd756e47eb",
+        "repository": {
+          "type": "git",
+          "url": "git+https://github.com/nodable/val-parsers.git"
+        },
+        "sha256": "aebf2940a5d66662c8afed6875a3b35adee126228dc1102f3d02f835b2b6a786",
+        "url": "https://registry.npmjs.org/%40nodable%2Fentities/3.0.0"
+      },
+      "source": {
+        "commit": "d2070d76a8ba07e6c7fa142caeb51ffd756e47eb",
+        "notice_blob_sha1": "561468f111a66df52cc0f1934642bb9fdd22a212",
+        "notice_path": "LICENSE",
+        "package_directory": "Entity",
+        "repository": "nodable/val-parsers"
+      },
+      "url": "https://registry.npmjs.org/@nodable/entities/-/entities-3.0.0.tgz",
+      "version": "3.0.0"
+    },
+    {
+      "applicability": {
+        "file": "files-sdk-2.4.0-applicability.json",
+        "sha256": "cf696fcabfb09578433e7c0d260740a0830518b1738df65d71c1d7a20d346793"
+      },
+      "artifact_sha256": "bf26487f786b3435d9f8635499b3bb471ff5df06c810bd3c32452ccf301835e7",
+      "integrity": "sha512-IYDDePk9CV+rPN1IZJCEJLgEMgYFEQgz3NLoeSdhj7FcR64HosLKyrzSiQPf3JbrCUSiLxGB5wrx3N3wybVI9w==",
+      "license": "MIT",
+      "metadata_sha256": "8f40cfa237851de5817c74b78a32bbfc2690c0c7093fc03de0abfa49b662cc6e",
+      "name": "files-sdk",
+      "notice": {
+        "bytes": 1071,
+        "file": "files-sdk-2.4.0-MIT.txt",
+        "sha256": "e76b3f525b681b119e7284939032d1fd66e41d0d41b9e24dbe0170683562335c"
+      },
+      "path": "node_modules/files-sdk",
+      "registry": {
+        "file": "files-sdk-2.4.0-registry.json",
+        "git_head": "a56c91381343ee017becf70c46b66c72cf9c1b09",
+        "repository": {
+          "directory": "packages/files-sdk",
+          "type": "git",
+          "url": "git+https://github.com/haydenbleasel/files-sdk.git"
+        },
+        "sha256": "d2ea19bf840a014a9dac87d5dc53db4ba2c73a6104450d4803760480ed93dee8",
+        "url": "https://registry.npmjs.org/files-sdk/2.4.0"
+      },
+      "source": {
+        "commit": "a56c91381343ee017becf70c46b66c72cf9c1b09",
+        "notice_blob_sha1": "e653e969fe5a0288ea892ddf1a219d9066d8bfbc",
+        "notice_path": "LICENSE",
+        "package_directory": "packages/files-sdk",
+        "repository": "haydenbleasel/files-sdk"
+      },
+      "url": "https://registry.npmjs.org/files-sdk/-/files-sdk-2.4.0.tgz",
+      "version": "2.4.0"
+    }
+  ],
+  "schema": 1,
+  "scope": "Two exact MIT notice supplements; no license-policy exceptions."
+}

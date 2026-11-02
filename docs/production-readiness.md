@@ -48,27 +48,35 @@ retained; a successful merge does not diagnose them or establish production read
 
 C258 now supplies a separate three-relay, durable-Redis and online-authority Fly
 profile, four source-bound image recipes and a bounded hosted cluster rehearsal.
-Its 20 renderer, 20 entrypoint and 33 rehearsal controls pass locally. At #285
+Its initial 20 renderer, 20 entrypoint and 33 rehearsal controls pass locally. At #285
 `d343d21c` / actual same-tree `fe6fc25a`, all four new images build and their
 binary/notice checks pass, but the first runtime attempt fails before bootstrap:
 Docker's local log driver rejects default compression with one retained file.
 Both recorded error hashes exactly match fixed public Moby diagnostics.
 C260 supplies an explicit compression setting with the existing size/count
-bounds and closed Docker diagnostics. Its combined controller has 57 passing
-local controls, including passive authority publication/adoption observation;
-corrected hosted runtime verification remains pending. The failed attempt and
-five cleanup log errors remain failed. Owned
-resource removal succeeds. [Exact failure and correction](m6-fly-continuation-2026-11-02.md)
-keep application startup, rotation and recovery acceptance unclaimed. The [Fly guide](deploy-fly-cluster.md)
+bounds and closed Docker diagnostics, with 57 local controls and passive authority
+observation. Its #286 candidate `1da066dd` / actual `02ce5072` builds all four
+images, passes preparation and starts Redis, then fails `published_port_scope`.
+C261 identifies the IPv4 host-publishing request on the IPv6-only fixture network;
+the omitted raw inspect shape remains unknown. All 20 containers, 12 volumes,
+one network and 321 command groups are absent with zero cleanup errors. This
+does not erase #285's five failed log captures. #285 is closed as superseded;
+#286 stays frozen while its other checks finish. The isolated IPv6 loopback
+correction passes 64 local controls and independent review but needs a new
+hosted run. [Current failure and source follow-up](m6-production-followup-2026-11-02.md)
+keep authority/relay startup, routing, rotation and recovery unclaimed. The [Fly guide](deploy-fly-cluster.md)
 and [exact preparation/merge report](m6-fly-cluster-preparation-2026-11-02.md)
 record source identities, review corrections, failed precommit scan and remaining
 runtime/operator scope. The historical single-relay image smoke does not replace
 this cluster proof. Fly account access and actual deployment inventory remain absent.
 
 C253's [artifact-aware checker](m6-client-license-gate.md) verifies all 324 client
-lock entries and seven aliases, but the real gate fails on five policy entries
-and two missing archived notices. Its 55 seeded controls pass; CI now runs these
-controls without claiming full policy enforcement. No license exception, platform
+lock entries and seven aliases. Its original real gate fails on five policy
+entries and two missing archived notices. The new exact-source MIT supplements
+and verified two-text companion resolve the two notice-text gaps in an offline
+replay; all five policy failures remain. Eighty-five local controls pass and
+the CI selector includes them, with new hosted verification pending. This does
+not prove SDK/full-graph distribution or enforce the real policy gate. No license exception, platform
 omission or live deployment authorization has been inferred. The production goal
 and hourly continuation remain active.
 
@@ -83,6 +91,15 @@ CI exercises those controls; the real advisory gate is not yet enforced there.
 CUA remains disabled and no server-runtime exposure is inferred. Its
 [source-bound findings and remediation limits](m6-fly-continuation-2026-11-02.md#separate-advisory-review--c259)
 retain all supported fixture platforms and make no policy exception.
+
+The current open-PR review also finds #251's handler-cancellation fix and #253's
+failed-witness diagnostics absent from main. Separate reviewed adaptations now
+restore unfinished-handler ownership (M3-53) and add closed diagnostics without
+raw stderr (M0-11). M0's 11 mocked tests, two disclosure controls and scanner
+unit probes pass; M3's four Rust regressions retain only historical hosted
+evidence so far. [The successor report](m6-production-followup-2026-11-02.md)
+requires current-candidate Rust, M3/M0/full CI and all five optimized archive
+verifiers, without touching C256's local quarantine or M4-47's security block.
 
 ## Retained predecessor evidence
 

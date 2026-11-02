@@ -32,6 +32,10 @@ PARSER_PATH = Path(__file__).with_name("m3-test-dependency-gate.py")
 SPEC = importlib.util.spec_from_file_location("client_license_spdx", PARSER_PATH)
 parser = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(parser)
+NOTICE_PATH = Path(__file__).with_name("client_license_notices.py")
+NOTICE_SPEC = importlib.util.spec_from_file_location("client_notice_supplements", NOTICE_PATH)
+notices = importlib.util.module_from_spec(NOTICE_SPEC)
+NOTICE_SPEC.loader.exec_module(notices)
 GateError, require = parser.GateError, parser.require
 expression, allowed_expression = parser.expression, parser.allowed_expression
 json_document, sha256 = parser.json_document, parser.sha256
@@ -227,9 +231,11 @@ class Budget:
         require(self.total <= MAX_TOTAL, "evidence-total-byte-cap")
         self.check()
 
-    def reserve_write(self, size):
+    def reserve_write(self, size, *, directory=None):
         self.check()
-        require(shutil.disk_usage(self.directory).free >= DISK_FLOOR + size, "evidence-disk-reserve")
+        free = shutil.disk_usage(self.directory if directory is None else directory).free
+        self.minimum_free = min(self.minimum_free or free, free)
+        require(free >= DISK_FLOOR + size, "evidence-disk-reserve")
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -349,10 +355,10 @@ def archive_record(node, data, directory, budget):
     return record
 
 
-def decide(record, allow):
+def decide(record, allow, *, supplement_verified=False):
     declared = [expression(record["license"]), expression(record["artifact_license"])]
     require(declared[0] == declared[1], "conflicting-license-metadata")
-    require(record["notice_files"], "missing-artifact-license-notice")
+    require(record["notice_files"] or supplement_verified is True, "missing-artifact-license-notice")
     allowed_expression(declared[0], allow)
     return declared[0]
 
@@ -378,19 +384,19 @@ def alias_evidence(aliases, records):
 
 
 def run(root, cache, offline=False, *, expected_nodes=EXPECTED_NODES,
-        expected_aliases=EXPECTED_ALIASES, root_license_sha256=ROOT_LICENSE_SHA256):
+        expected_aliases=EXPECTED_ALIASES, root_license_sha256=ROOT_LICENSE_SHA256, notice_bundle=None):
     report = {"schema": 1, "scope": "all client lock nodes; dev, optional and all platforms",
               "started_unix": int(time.time()), "status": "failed", "errors": [], "packages": [], "aliases": [],
               "advisories_checked": False, "bundled_component_audit": False,
               "policy_exceptions": [], "offline": offline}
-    inputs, tool_inputs, budget = {}, {}, None
+    inputs, tool_inputs, budget, catalog, bundle_ready = {}, {}, None, None, False
     try:
         require(packaging.__version__ == parser.TOOL_VERSION, "tool-version-mismatch")
         require(cache.is_dir() and not cache.is_symlink(), "cache-directory-required")
         budget = Budget(cache)
         budget.check()
         inputs = {path: (root / path).read_bytes() for path in INPUTS}
-        tool_inputs = {str(path): path.read_bytes() for path in (Path(__file__), PARSER_PATH)}
+        tool_inputs = {str(path): path.read_bytes() for path in (Path(__file__), PARSER_PATH, NOTICE_PATH)}
         report["input_sha256"] = {path: sha256(data) for path, data in inputs.items()}
         report["tool"] = {"packaging": packaging.__version__, "source_sha256": {path: sha256(data) for path, data in tool_inputs.items()}}
         policy = tomllib.loads(inputs["deny.toml"].decode())["licenses"]
@@ -403,6 +409,9 @@ def run(root, cache, offline=False, *, expected_nodes=EXPECTED_NODES,
         allowed_expression("MIT", allow)
         nodes, aliases = graph(json_document(inputs["packages/client/package.json"]),
                                json_document(inputs["packages/client/package-lock.json"]), expected_nodes, expected_aliases)
+        catalog = notices.Catalog(root)
+        inputs.update(catalog.inputs)
+        report["input_sha256"].update({path: sha256(data) for path, data in catalog.inputs.items()})
         report["counts"] = {"lock_nodes": len(nodes), "alias_nodes": len(aliases), "artifact_verified": 0, "policy_pass": 0}
         records = {}
         for path, node in sorted(nodes.items()):
@@ -412,13 +421,6 @@ def run(root, cache, offline=False, *, expected_nodes=EXPECTED_NODES,
                 records[path] = record
                 report["counts"]["artifact_verified"] += 1
                 report["packages"].append(record)
-                try:
-                    record["accepted_expression"] = decide(record, allow)
-                    record["policy_status"] = "passed"
-                    report["counts"]["policy_pass"] += 1
-                except (GateError, ValueError, TypeError) as error:
-                    record["policy_status"] = "failed"
-                    report["errors"].append({"path": path, "stage": "policy", "reason": str(error)})
             except (OSError, ValueError, tarfile.TarError, EOFError, TypeError) as error:
                 report["errors"].append({"path": path, "stage": "artifact", "reason": str(error)})
                 # Resource/deadline guards are fatal; policy/metadata errors retain other evidence.
@@ -429,9 +431,45 @@ def run(root, cache, offline=False, *, expected_nodes=EXPECTED_NODES,
         except GateError as error:
             report["errors"].append({"stage": "aliases", "reason": str(error)})
         require(len(records) == len(nodes), "artifact-coverage-incomplete")
+        verified_supplements = set()
+        try:
+            catalog.bind_records(records)
+            if catalog.entries:
+                require(notice_bundle is not None, "supplement-bundle-required")
+                report["supplement_bundle"] = catalog.stage_bundle(
+                    records, inputs["packages/client/package-lock.json"], notice_bundle, budget)
+                bundle_ready = True
+                verified_supplements = set(catalog.entries)
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            report["errors"].append({"stage": "supplement-bundle", "reason": str(error)})
+        for path, record in records.items():
+            if path in verified_supplements:
+                # Never invent archive notice_files. This proof refers to the
+                # independently verified, actually written companion bundle.
+                entry = catalog.entries[path]
+                record["supplemental_notice"] = {
+                    "origin": "reviewed-upstream-notice-companion", "notice": entry["notice"],
+                    "source": entry["source"], "applicability": entry["applicability"],
+                    "bundle_manifest_sha256": report["supplement_bundle"]["manifest_sha256"],
+                }
+            try:
+                record["accepted_expression"] = decide(record, allow, supplement_verified=path in verified_supplements)
+                record["policy_status"] = "passed"
+                report["counts"]["policy_pass"] += 1
+            except (GateError, ValueError, TypeError) as error:
+                record["policy_status"] = "failed"
+                report["errors"].append({"path": path, "stage": "policy", "reason": str(error)})
     except (OSError, ValueError, KeyError, TypeError) as error:
         report["errors"].append({"stage": "gate", "reason": str(error)})
     finally:
+        if catalog:
+            try:
+                catalog.final_inputs()
+                if bundle_ready:
+                    require(catalog.verify_bundle(notice_bundle, inputs["packages/client/package-lock.json"])
+                            == report["supplement_bundle"], "supplement-bundle-changed")
+            except (OSError, ValueError, KeyError, TypeError) as error:
+                report["errors"].append({"stage": "final-supplements", "reason": str(error)})
         for path, data in inputs.items():
             try:
                 require((root / path).read_bytes() == data, "source-input-changed")
@@ -462,10 +500,12 @@ def main():
     args.add_argument("--cache", type=Path, required=True, help="owned artifact directory; existing bytes are always rehashed")
     args.add_argument("--report", type=Path, required=True, help="new report pathname; never overwrite earlier evidence")
     args.add_argument("--offline", action="store_true", help="require every compressed archive already cached")
+    args.add_argument("--notice-bundle", type=Path, required=True,
+                      help="new directory for the two MIT notice supplements; not full dependency/SDK distribution acceptance")
     options = args.parse_args()
     # Reserve the output before any network I/O, so every invocation keeps its own outcome.
     with options.report.open("x") as output:
-        report = run(options.root.resolve(), options.cache, options.offline)
+        report = run(options.root.resolve(), options.cache, options.offline, notice_bundle=options.notice_bundle)
         json.dump(report, output, indent=2, sort_keys=True)
         output.write("\n")
     print(f"C253 {report['status'].upper()}: {len(report['errors'])} blocker(s); {report.get('counts', {})}")

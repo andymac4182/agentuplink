@@ -33,6 +33,7 @@ import uuid
 
 ROOT = Path(__file__).resolve().parents[1]
 DOCKER = ["docker", "--host=unix:///var/run/docker.sock"]
+HOST_LOOPBACK = "::1"  # published ports must match the IPv6-only bridge
 OWNER_LABEL = "io.agentuplink.fly-rehearsal"
 IMAGE_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
 ID_RE = re.compile(r"[0-9a-f]{64}\Z")
@@ -204,6 +205,49 @@ def safe_engine_projection(server, log_drivers):
     fields["unknown_log_driver_count"] = sum(item not in known for item in log_drivers)
     require("local" in fields["known_log_drivers"], "docker_local_logging_unavailable")
     return fields
+
+
+def published_binding_shape(value, port):
+    """Closed diagnostics for one requested mapping, never raw inspect values.
+
+    Missing/null/multiple mappings remain distinct without disclosing any
+    address or port string. Only one canonical IPv6 loopback binding passes.
+    This describes the current inspect result, not a past failure's cause.
+    """
+    missing = object()
+
+    def kind(item):
+        if item is missing:
+            return "missing"
+        return {type(None): "null", dict: "object", list: "array", str: "string",
+                bool: "boolean", int: "number", float: "number"}.get(type(item), "other")
+
+    settings = value.get("NetworkSettings", missing) if isinstance(value, dict) else missing
+    ports = settings.get("Ports", missing) if isinstance(settings, dict) else missing
+    bindings = ports.get(f"{port}/tcp", missing) if isinstance(ports, dict) else missing
+    count = len(bindings) if isinstance(bindings, list) else None
+    binding = bindings[0] if count == 1 else missing
+    address = binding.get("HostIp", missing) if isinstance(binding, dict) else missing
+    host_port = binding.get("HostPort", missing) if isinstance(binding, dict) else missing
+    if address is missing:
+        address_class = "missing"
+    elif not isinstance(address, str):
+        address_class = "invalid_type"
+    elif address == HOST_LOOPBACK:
+        address_class = "ipv6_loopback"
+    elif address == "127.0.0.1":
+        address_class = "ipv4_loopback"
+    elif address in {"0.0.0.0", "::"}:
+        address_class = "wildcard"
+    else:
+        address_class = "other"
+    valid_port = (isinstance(host_port, str) and re.fullmatch(r"[1-9][0-9]{0,4}", host_port) is not None
+                  and int(host_port) <= 65535)
+    return {"network_settings_type": kind(settings), "ports_type": kind(ports),
+            "binding_present": bindings is not missing, "bindings_type": kind(bindings), "binding_count": count,
+            "binding_type": kind(binding), "host_ip_type": kind(address), "host_ip_class": address_class,
+            "host_port_type": kind(host_port), "host_port_valid": valid_port,
+            "accepted": count == 1 and address_class == "ipv6_loopback" and valid_port}
 
 
 def safe_log_receipt(path, *, docker=False):
@@ -631,7 +675,7 @@ class Docker:
         for alias in aliases:
             args += ["--network-alias", alias]
         for port in ports:
-            args += ["--publish", f"127.0.0.1::{port}"]
+            args += ["--publish", f"[{HOST_LOOPBACK}]::{port}"]
         if env is not None:
             require(all(re.fullmatch(r"[A-Z_][A-Z_0-9]*", key) and isinstance(value, str) and not any(c in value for c in "\r\n\x00") for key, value in env.items()), "environment_shape")
             path = self.run.private / (name + ".env")
@@ -673,9 +717,11 @@ class Docker:
         require(not state.get("Running") and state.get("ExitCode") == 0, "service_unclean_stop")
 
     def port(self, item, port):
-        bindings = self.inspect(item)["NetworkSettings"]["Ports"].get(f"{port}/tcp")
-        require(isinstance(bindings, list) and len(bindings) == 1 and bindings[0]["HostIp"] == "127.0.0.1", "published_port_scope")
-        return int(bindings[0]["HostPort"])
+        observed = self.inspect(item)
+        shape = published_binding_shape(observed, port)
+        self.run.event("published_port_binding", role=item["role"], container_port=port, **shape)
+        require(shape["accepted"], "published_port_scope")
+        return int(observed["NetworkSettings"]["Ports"][f"{port}/tcp"][0]["HostPort"])
 
     def setup_volume(self, name, uid, gid, files=None, directories=()):
         payload = {"uid": uid, "gid": gid, "directories": list(directories),
@@ -855,9 +901,9 @@ def http_request(port, host, context, path, *, method="GET", data=b"", headers=N
 
 
 def _http_request(port, host, context, path, *, method="GET", data=b"", headers=None):
-    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    connection = http.client.HTTPConnection(HOST_LOOPBACK, port, timeout=5)
     try:
-        connection.sock = context.wrap_socket(socket.create_connection(("127.0.0.1", port), timeout=5), server_hostname=host)
+        connection.sock = context.wrap_socket(socket.create_connection((HOST_LOOPBACK, port), timeout=5), server_hostname=host)
         connection.request(method, path, body=data, headers={"Host": host, "Connection": "close", **(headers or {})})
         response = connection.getresponse()
         body = response.read(65537)
@@ -912,7 +958,7 @@ class Redis:
         self.port, self.host, self.context, self.password = port, host, context, password
 
     def command(self, *parts, user="default", password=None):
-        with bounded_network(), self.context.wrap_socket(socket.create_connection(("127.0.0.1", self.port), timeout=5), server_hostname=self.host) as sock:
+        with bounded_network(), self.context.wrap_socket(socket.create_connection((HOST_LOOPBACK, self.port), timeout=5), server_hostname=self.host) as sock:
             with sock.makefile("rb", buffering=0) as stream:
                 # Raw SocketIO.write may short-write; SSL sendall completes the
                 # frame or fails under the same absolute request timer.

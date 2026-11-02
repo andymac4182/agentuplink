@@ -15,6 +15,7 @@ SPEC = importlib.util.spec_from_file_location("client_license_gate", Path(__file
 gate = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(gate)
 REPOSITORY = Path(__file__).resolve().parents[1]
+EMPTY_SUPPLEMENTS = gate.notices.canonical({"schema": 1, "scope": "Two exact MIT notice supplements; no license-policy exceptions.", "packages": []})
 
 
 def tarball(metadata, notice=True, extra=(), root="package"):
@@ -73,11 +74,15 @@ class Fixture:
         (self.root / "packages/client/package-lock.json").write_text(json.dumps(self.lock))
         (self.root / "deny.toml").write_text('[licenses]\nallow = ["MIT", "Apache-2.0", "BSD-3-Clause"]\nexceptions = []\n')
         (self.root / "LICENSE").write_bytes((REPOSITORY / "LICENSE").read_bytes())
+        supplements = self.root / gate.notices.DIRECTORY
+        supplements.mkdir(parents=True, exist_ok=True)
+        (supplements / "supplements.json").write_bytes(EMPTY_SUPPLEMENTS)
 
     def run(self, fetch=None, **kwargs):
         # Resource safety has separate tests; fixture parsing and decisions are real.
         with patch.object(gate, "fetch", side_effect=fetch or (lambda url, budget: self.files[url])), \
-                patch.object(gate.Budget, "check"), patch.object(gate.Budget, "reserve_write"):
+                patch.object(gate.Budget, "check"), patch.object(gate.Budget, "reserve_write"), \
+                patch.object(gate.notices, "MANIFEST_SHA256", gate.sha256(EMPTY_SUPPLEMENTS)):
             return gate.run(self.root, self.cache, expected_nodes=3, expected_aliases=1, **kwargs)
 
 
