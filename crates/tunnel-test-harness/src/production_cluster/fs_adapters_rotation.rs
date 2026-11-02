@@ -13,7 +13,7 @@ use std::{
 };
 use tokio::time::{sleep, sleep_until, timeout, timeout_at};
 use tunnel_client::{
-    ConnectOptions, ConnectionHandle, FsExportSettings, LocalExport, LocalExportKind,
+    ClientError, ConnectOptions, ConnectionHandle, FsExportSettings, LocalExport, LocalExportKind,
     http_forward::HttpHandlers,
 };
 use tunnel_core::RotationConfig;
@@ -43,6 +43,40 @@ const SUBPROTOCOL: &str = tunnel_fs_core::TRANSPORT_SUBPROTOCOL;
 
 fn fail(message: &str) -> HarnessError {
     HarnessError::Process(format!("fs adapters rotation: {message}"))
+}
+
+#[derive(Clone, Copy)]
+enum ConnectorCleanupStage {
+    Initial,
+    FinalJoin,
+}
+
+impl ConnectorCleanupStage {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Initial => "connector cleanup",
+            Self::FinalJoin => "connector final join",
+        }
+    }
+}
+
+fn connector_cleanup_result(
+    stage: ConnectorCleanupStage,
+    result: std::result::Result<std::result::Result<(), ClientError>, tokio::time::error::Elapsed>,
+) -> Result<()> {
+    let stage = stage.label();
+    match result {
+        Ok(result) => result.map_err(|error| {
+            // Closed labels only: Protocol/Transport details can hold arbitrary
+            // strings. A completed supervisor failure is not a cleanup timeout.
+            fail(&format!(
+                "{stage} failed code={} retryable={}",
+                error.code(),
+                error.retryable()
+            ))
+        }),
+        Err(_) => Err(fail(&format!("{stage} deadline"))),
+    }
 }
 
 fn millis(duration: Duration) -> u64 {
@@ -325,10 +359,10 @@ async fn run(
     if let Some(control) = control.take() {
         control.close().await;
     }
-    let stopped = match timeout(CLEANUP_TIMEOUT, client.stop()).await {
-        Ok(result) => result.map_err(|_| fail("connector cleanup failed")),
-        Err(_) => Err(fail("connector cleanup deadline")),
-    };
+    let stopped = connector_cleanup_result(
+        ConnectorCleanupStage::Initial,
+        timeout(CLEANUP_TIMEOUT, client.stop()).await,
+    );
     let retry_join = stopped.is_err();
     push_cleanup_error(&mut errors, "connector cleanup", stopped);
     push_cleanup_error(
@@ -342,10 +376,10 @@ async fn run(
         // stop() retains its join handle when its caller times out. Closing
         // the transport may unblock it; retain and join that same supervisor,
         // without erasing the initial cleanup failure or restarting anything.
-        let joined = match timeout(CLEANUP_TIMEOUT, client.stop()).await {
-            Ok(result) => result.map_err(|_| fail("connector final join failed")),
-            Err(_) => Err(fail("connector final join deadline")),
-        };
+        let joined = connector_cleanup_result(
+            ConnectorCleanupStage::FinalJoin,
+            timeout(CLEANUP_TIMEOUT, client.stop()).await,
+        );
         push_cleanup_error(&mut errors, "connector final join", joined);
     }
     finish_scenario_with_cleanup(scenario, errors)
@@ -1212,6 +1246,92 @@ fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fs_adapters_rotation_connector_cleanup_diagnostics_are_closed_labels() {
+        for (stage, label) in [
+            (ConnectorCleanupStage::Initial, "connector cleanup"),
+            (ConnectorCleanupStage::FinalJoin, "connector final join"),
+        ] {
+            for (error, code, retryable) in [
+                (
+                    ClientError::Protocol("private-token-sentinel".into()),
+                    "PROTOCOL_ERROR",
+                    false,
+                ),
+                (
+                    ClientError::Transport {
+                        scope: "private-scope-sentinel",
+                        detail: "private-path-sentinel".into(),
+                    },
+                    "TRANSPORT_ERROR",
+                    true,
+                ),
+            ] {
+                let diagnostic = connector_cleanup_result(stage, Ok(Err(error)))
+                    .unwrap_err()
+                    .to_string();
+                assert_eq!(
+                    diagnostic,
+                    format!(
+                        "managed process error: fs adapters rotation: {label} failed code={code} retryable={retryable}"
+                    )
+                );
+                assert!(!diagnostic.contains("private-"));
+            }
+        }
+    }
+
+    #[test]
+    fn fs_adapters_rotation_connector_cleanup_retains_first_failure_after_successful_join() {
+        let mut errors = Vec::new();
+        let stopped = connector_cleanup_result(
+            ConnectorCleanupStage::Initial,
+            Ok(Err(ClientError::QueueLimit)),
+        );
+        assert!(stopped.is_err());
+        push_cleanup_error(&mut errors, "connector cleanup", stopped);
+        push_cleanup_error(&mut errors, "proxy cleanup", Ok(()));
+        let joined = connector_cleanup_result(ConnectorCleanupStage::FinalJoin, Ok(Ok(())));
+        assert!(joined.is_ok());
+        push_cleanup_error(&mut errors, "connector final join", joined);
+        assert_eq!(
+            finish_scenario_with_cleanup(Ok(()), errors)
+                .unwrap_err()
+                .to_string(),
+            "managed process error: cleanup failed: connector cleanup: managed process error: fs adapters rotation: connector cleanup failed code=RESOURCE_EXHAUSTED retryable=false"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fs_adapters_rotation_connector_cleanup_distinguishes_timeout_from_completed_error() {
+        for (stage, label) in [
+            (ConnectorCleanupStage::Initial, "connector cleanup"),
+            (ConnectorCleanupStage::FinalJoin, "connector final join"),
+        ] {
+            let started = tokio::time::Instant::now();
+            let elapsed = timeout(
+                CLEANUP_TIMEOUT,
+                std::future::pending::<std::result::Result<(), ClientError>>(),
+            )
+            .await;
+            assert_eq!(started.elapsed(), CLEANUP_TIMEOUT);
+            assert_eq!(
+                connector_cleanup_result(stage, elapsed)
+                    .unwrap_err()
+                    .to_string(),
+                format!("managed process error: fs adapters rotation: {label} deadline")
+            );
+            assert_eq!(
+                connector_cleanup_result(stage, Ok(Err(ClientError::HandshakeTimeout)))
+                    .unwrap_err()
+                    .to_string(),
+                format!(
+                    "managed process error: fs adapters rotation: {label} failed code=DEADLINE_EXCEEDED retryable=true"
+                )
+            );
+        }
+    }
 
     #[test]
     fn fs_adapters_rotation_refusal_requires_exact_status_and_nested_code() {
