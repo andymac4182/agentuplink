@@ -533,5 +533,69 @@ class ReviewRegressionTests(unittest.TestCase):
                 obj.explicit_recovery()
 
 
+class PeerAddressCompositionTests(unittest.TestCase):
+    def test_recovery_unique_names_keep_exact_role_and_reuse_ip_only_after_owned_removal(self):
+        run = mock.Mock(index=1)
+        image = "sha256:" + "b" * 64
+        docker = m.RecoveryDocker(run, "owner", {"relay": image})
+        docker.network = {"id": "network", "subnet": "fd42:1234:5678::/64"}
+        docker.peer_ipv6 = m.base.peer_ipv6_addresses(docker.network["subnet"])
+        commands = []
+        def command(args, **_kwargs):
+            commands.append(args)
+            run.index += 1
+            return (("a" if run.index < 5 else "b") * 64).encode() if args[:2] == ["container", "create"] else b""
+        docker.call = command
+        docker.inspect = mock.Mock(return_value={"State": {"Running": False, "OOMKilled": False, "ExitCode": 0}})
+        address = docker.peer_ipv6["relay-a"]
+        first = docker.create("relay-a", image, peer_ipv6=address)
+        self.assertEqual(first["role"], "relay-a")
+        self.assertTrue(first["name"].endswith("-relay-a-r1"))
+        with self.assertRaises(m.Refused):
+            docker.create("relay-a", image, peer_ipv6=address)
+        docker.remove_finished(first)
+        second = docker.create("relay-a", image, peer_ipv6=address)
+        self.assertEqual(second["role"], "relay-a")
+        self.assertEqual(second["peer_ipv6"], first["peer_ipv6"])
+        self.assertNotEqual(second["name"], first["name"])
+        self.assertEqual(docker.containers, [second])
+        creates = [args for args in commands if args[:2] == ["container", "create"]]
+        self.assertEqual(len(creates), 2)
+        for args in creates:
+            self.assertIn(m.base.OWNER_LABEL + ".role=relay-a", args)
+            self.assertEqual(args[args.index("--ip6") + 1], address)
+
+    def test_recovery_restart_passes_all_three_original_reviewed_addresses(self):
+        obj = object.__new__(m.RecoveryRehearsal)
+        addresses = m.base.peer_ipv6_addresses("fd42:1234:5678::/64")
+        obj.inventory = {"relays": [{"node_id": node, "app": "owned-" + node, "peer_ipv6": addresses[node]}
+                                   for node in m.base.NODES]}
+        obj.authority_inventory, obj.run_id = dict(INV, revision=2), RUN
+        obj.stopped_authority = {"inventory": {"revision": 1}, "membership_high_water": 20,
+                                 "checkpoint_high_water": 80, "known_node_ids": list(m.base.NODES)}
+        approved = {**obj.stopped_authority, "inventory": obj.authority_inventory,
+                    "schema_version": 1, "expected_redis_run_id": RUN, "confirmed": None}
+        obj.states = {node: node for node in (*m.base.NODES, "authority")}
+        obj.env = {node: {} for node in m.base.NODES}
+        obj.public_hosts, obj.relays = ["a.invalid", "b.invalid", "c.invalid"], []
+        obj.operator, obj.start_authority = mock.Mock(), mock.Mock()
+        obj.publication = mock.Mock(return_value={"confirmed": {"membership_version": 21}})
+        obj.run = mock.Mock()
+        obj.run.budget.side_effect = lambda _seconds: contextlib.nullcontext()
+        obj.docker = mock.Mock()
+        obj.docker.images = {"relay": "sha256:" + "b" * 64}
+        obj.docker.read_volume.return_value = {"authority.json": m.canonical(approved)}
+        obj.docker.create.side_effect = lambda node, *_args, **_kwargs: {"id": node}
+        obj.docker.port.return_value = 12345
+        obj.adopt = mock.Mock(side_effect=RuntimeError("stop after real relay creation wiring"))
+        with self.assertRaisesRegex(RuntimeError, "stop after real relay creation wiring"):
+            obj.restart_serving()
+        self.assertEqual(obj.docker.create.call_count, 3)
+        for call, node in zip(obj.docker.create.call_args_list, m.base.NODES, strict=True):
+            self.assertEqual(call.args[0], node)
+            self.assertEqual(call.kwargs["peer_ipv6"], addresses[node])
+        obj.run.budget.assert_called_once_with(30)
+
+
 if __name__ == "__main__":
     unittest.main()

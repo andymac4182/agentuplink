@@ -32,7 +32,8 @@ struct DeadlineWords {
 impl AtomicDeadline {
     fn store(&self, words: DeadlineWords) {
         self.monotonic.store(words.monotonic, Ordering::SeqCst);
-        self.wall_started.store(words.wall_started, Ordering::SeqCst);
+        self.wall_started
+            .store(words.wall_started, Ordering::SeqCst);
         self.wall.store(words.wall, Ordering::SeqCst);
     }
 
@@ -346,7 +347,8 @@ impl SharedAuthority {
 
 impl Authority for SharedAuthority {
     fn current(&self) -> Authorization {
-        self.0.current_with_clock(|| (Instant::now(), SystemTime::now()))
+        self.0
+            .current_with_clock(|| (Instant::now(), SystemTime::now()))
     }
 }
 
@@ -400,8 +402,8 @@ mod tests {
         }
         let shorter_operation = deadline(1);
         let authority = StreamAuthority::new_until(1, grant(), confirmation, shorter_operation);
-        let observed = authority
-            .current_with_clock(|| (shorter_operation.monotonic, shorter_operation.wall));
+        let observed =
+            authority.current_with_clock(|| (shorter_operation.monotonic, shorter_operation.wall));
         assert!(!observed.fresh, "the operation is an independent bound");
         // The later operation anchor must survive alongside the confirmation.
         let later_operation = DualDeadline::new(
@@ -478,10 +480,12 @@ mod tests {
         let authority = StreamAuthority::new_until(1, grant(), original, operation);
         let challenge = deadline(5);
         assert!(authority.begin_refresh(challenge));
-        let reversed =
-            authority.current_with_clock(|| (now, wall - Duration::from_millis(500)));
+        let reversed = authority.current_with_clock(|| (now, wall - Duration::from_millis(500)));
         assert!(!reversed.fresh);
-        assert_eq!(reversed.freshness_failure, FreshnessFailure::DeadlineElapsed);
+        assert_eq!(
+            reversed.freshness_failure,
+            FreshnessFailure::DeadlineElapsed
+        );
         // A new challenge also cannot extend the old accepted permission.
         assert!(
             !authority

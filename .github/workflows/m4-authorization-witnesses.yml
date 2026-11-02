@@ -1,0 +1,80 @@
+# Dedicated Linux job: no shared Cargo cache, Redis, Docker, or deployment.
+name: M4 authorization mutation witnesses
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/m4-authorization-witnesses.yml'
+      - 'scripts/m4_authorization_witnesses.py'
+      - 'scripts/test_m4_authorization_witnesses.py'
+      - 'scripts/fs-guard-deletion.py'
+      - '.cargo/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - 'crates/**'
+      - 'vendor/**'
+      - 'examples/**'
+  pull_request:
+    paths:
+      - '.github/workflows/m4-authorization-witnesses.yml'
+      - 'scripts/m4_authorization_witnesses.py'
+      - 'scripts/test_m4_authorization_witnesses.py'
+      - 'scripts/fs-guard-deletion.py'
+      - '.cargo/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - 'crates/**'
+      - 'vendor/**'
+      - 'examples/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# The job owns a private target and temporary source mutations. Let restoration
+# and the final receipt finish when a newer candidate is published.
+concurrency:
+  group: m4-authorization-${{ github.event_name }}-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  authorization-witnesses:
+    runs-on: ubuntu-latest
+    # Includes setup and receipt upload; controller bounds remain unchanged.
+    timeout-minutes: 60
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - name: Dedicated checkout of the immutable workflow commit
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.sha }}
+          path: m4-witness-source
+          persist-credentials: false
+      - name: Install pinned Rust toolchain
+        timeout-minutes: 5
+        run: rustup toolchain install 1.95.0 --profile minimal
+      - name: Synthetic controller controls
+        timeout-minutes: 2
+        working-directory: m4-witness-source
+        run: python3 -m unittest discover -s scripts -p test_m4_authorization_witnesses.py -v
+      - name: Twenty GREEN, nine isolated mutants, twenty restored GREEN
+        timeout-minutes: 48
+        working-directory: m4-witness-source
+        env:
+          WITNESS_EXPECTED_COMMIT: ${{ github.sha }}
+        run: |
+          python3 scripts/m4_authorization_witnesses.py \
+            --expected-commit "$WITNESS_EXPECTED_COMMIT" \
+            --output "$RUNNER_TEMP/m4-authorization-witnesses-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+      - name: Upload only the closed receipt; raw logs and source backups stay private
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: m4-authorization-witness-receipt-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/m4-authorization-witnesses-${{ github.run_id }}-${{ github.run_attempt }}/public/receipt.json
+          if-no-files-found: error
+          retention-days: 7

@@ -38,7 +38,7 @@ membership_version_state_path = $membership_state_path
 
 [cluster.endpoint_policy]
 allowed_hosts = $hosts
-allowed_server_names = $hosts
+allowed_server_names = $server_names
 allowed_ports = [7443]
 require_private_ip = true
 

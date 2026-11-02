@@ -16,6 +16,7 @@ import hashlib
 import http.client
 import importlib.util
 import inspect
+import ipaddress
 import json
 import os
 from pathlib import Path
@@ -472,7 +473,39 @@ def check_container(value, expected, owner):
             and host.get("PidsLimit") == 256, "container_resource_limits")
     require((host.get("RestartPolicy") or {}).get("Name") == "no", "container_restart_policy")
     require(host.get("LogConfig") == LOG_CONFIG, "container_logging_configuration")
+    if "peer_ipv6" in expected:
+        networks = value.get("NetworkSettings", {}).get("Networks", {})
+        require(isinstance(networks, dict) and len(networks) == 1, "container_peer_network")
+        attached = next(iter(networks.values()))
+        require(isinstance(attached, dict)
+                and (attached.get("IPAMConfig") or {}).get("IPv6Address") == expected["peer_ipv6"],
+                "container_requested_peer_ipv6")
+        require(attached.get("NetworkID") in (None, "", expected["network"])
+                and attached.get("GlobalIPv6Address") in (None, "", expected["peer_ipv6"]),
+                "container_peer_attachment_identity")
+        # Docker create records IPAM intent before network attachment. Actual
+        # address/network identity is mandatory once the service is running.
+        if value.get("State", {}).get("Running") is True:
+            require(attached.get("NetworkID") == expected["network"]
+                    and attached.get("GlobalIPv6Address") == expected["peer_ipv6"]
+                    and attached.get("GlobalIPv6PrefixLen") == 64,
+                    "container_actual_peer_ipv6")
     return value.get("State", {})
+
+
+def peer_ipv6_addresses(subnet):
+    require(type(subnet) is str, "peer_network_subnet")
+    try:
+        network = ipaddress.IPv6Network(subnet, strict=True)
+    except (ipaddress.AddressValueError, ipaddress.NetmaskValueError, ValueError):
+        raise Refused("peer_network_subnet") from None
+    require(str(network) == subnet and network.prefixlen == 64
+            and network.subnet_of(ipaddress.IPv6Network("fc00::/7")), "peer_network_subnet")
+    # Keep explicit peer addresses far from Docker's low sequential helper
+    # allocations and the subnet gateway. This is private fixture allocation,
+    # never a guessed Fly machine address.
+    return {node: str(network.network_address + (1 << 63) + index + 1)
+            for index, node in enumerate(NODES)}
 
 
 def checked_status(raw, device):
@@ -778,6 +811,7 @@ class Docker:
         self.run, self.owner, self.images = run, owner, images
         self.containers, self.volumes = [], []
         self.network = None
+        self.peer_ipv6 = {}
         self.inventory = []
 
     def call(self, args, **kw):
@@ -817,11 +851,24 @@ class Docker:
         return name
 
     def create(self, role, image, *, mounts=(), env=None, aliases=(), ports=(), command=(), entrypoint=None,
-               user=None, network=True, memory=256, interactive=False):
+               user=None, network=True, memory=256, interactive=False, peer_ipv6=None, name_sequence=None):
         name = f"{self.owner}-{len(self.containers):03d}-{role}"
+        if name_sequence is not None:
+            require(u64(name_sequence), "container_name_sequence")
+            name += "-r" + str(name_sequence)
         net = self.network["id"] if network else "none"
         item = {"id": None, "name": name, "role": role, "image": image, "mounts": list(mounts),
                 "network": net, "memory": memory * 1024**2}
+        if role in NODES or peer_ipv6 is not None:
+            require(role in NODES and network and image == self.images.get("relay")
+                    and self.network is not None and "subnet" in self.network,
+                    "peer_container_assignment")
+            approved = peer_ipv6_addresses(self.network["subnet"])
+            require(self.peer_ipv6 == approved and type(peer_ipv6) is str
+                    and peer_ipv6 == approved[role], "peer_container_assignment")
+            require(not any(prior.get("peer_ipv6") == peer_ipv6 for prior in self.containers),
+                    "peer_container_duplicate_address")
+            item["peer_ipv6"] = peer_ipv6
         known = {"generate-key", "initialize", "recovery-initialize", "activate-first-incarnation", "provision-catalog",
                  "add-device", "add-service", "set-grant", "revoke-grant", "initialize-membership", "check-config", "connect"}
         item["subcommand"] = command[0] if command and command[0] in known else ("python-helper" if entrypoint == "/usr/bin/python3" else "serve-or-inspect")
@@ -833,6 +880,8 @@ class Docker:
                 "--memory-swap", str(item["memory"]), "--pids-limit", "256", "--restart=no", "--cap-drop=ALL",
                 "--security-opt=no-new-privileges", "--log-driver=local", "--log-opt=max-size=2m", "--log-opt=max-file=1",
                 "--log-opt=compress=false"]
+        if peer_ipv6 is not None:
+            args += ["--ip6", peer_ipv6]
         if user == "0:0":
             # These three capabilities are only used by the explicit owned-volume
             # initializer/reader, never by an ordinary serving entrypoint.
@@ -1246,15 +1295,21 @@ class Rehearsal:
             self.pki.ca(name)
         self.password, self.publisher_password = secrets.token_hex(32), secrets.token_hex(32)
         self.jwks, self.token = self.pki.jwt(inv["oidc"]["issuer"], "synthetic-user")
-        subnet = "fd" + secrets.token_hex(1) + ":" + secrets.token_hex(2) + ":" + secrets.token_hex(2) + "::/64"
+        subnet = str(ipaddress.IPv6Network("fd" + secrets.token_hex(1) + ":" + secrets.token_hex(2)
+                                          + ":" + secrets.token_hex(2) + "::/64"))
         name = self.prefix + "-network"
-        d.network = {"name": name, "id": name}  # resolve/verify name if create outcome is ambiguous
+        d.network = {"name": name, "id": name, "subnet": subnet}  # resolve/verify name if create outcome is ambiguous
         nid = d.call(["network", "create", "--driver=bridge", "--ipv4=false", "--ipv6", "--subnet", subnet,
                       "--label", OWNER_LABEL + "=" + self.prefix, name]).decode().strip()
         require(ID_RE.fullmatch(nid), "network_id")
         d.network["id"] = nid
         network = json.loads(d.call(["network", "inspect", nid]))[0]
         require(network.get("EnableIPv6") is True and network.get("EnableIPv4") is False, "network_not_ipv6_only")
+        require(network.get("Id") == nid and network.get("Name") == name
+                and (network.get("Labels") or {}).get(OWNER_LABEL) == self.prefix
+                and [row.get("Subnet") for row in network.get("IPAM", {}).get("Config", [])] == [subnet],
+                "network_peer_subnet_identity")
+        d.peer_ipv6 = peer_ipv6_addresses(subnet)
         self.event("network", ipv6_only=True, network_id=nid)
         for role in ("authority", "redis"):
             inv[role]["app"] = self.prefix + "-" + role
@@ -1265,6 +1320,7 @@ class Rehearsal:
         self.peer_ids, self.checkpoint_ids, self.server_ids = [], [], []
         for i, relay in enumerate(inv["relays"]):
             node = relay["node_id"]
+            relay["peer_ipv6"] = d.peer_ipv6[node]
             relay["app"], relay["volume"] = self.prefix + "-" + node, self.prefix.replace("-", "_") + "_" + node.replace("-", "_")
             host = node + "." + self.prefix + ".invalid"
             relay["public_hostname"] = host
@@ -1538,7 +1594,8 @@ overlap_seconds = 30
             node = relay["node_id"]
             item = d.create(node, d.images["relay"], memory=512, env=self.env[node],
                      mounts=[(self.states[node], ROLE_BASE["relay"] + "/state", True)],
-                     aliases=[relay["app"] + ".internal", self.public_hosts[i]], ports=[8443, 9443])
+                     aliases=[relay["app"] + ".internal", self.public_hosts[i]], ports=[8443, 9443],
+                     peer_ipv6=relay["peer_ipv6"])
             d.start(item)
             self.relays.append(item)
         self.consumer_ports = [d.port(item, 8443) for item in self.relays]

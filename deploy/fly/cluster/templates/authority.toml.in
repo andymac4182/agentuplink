@@ -10,5 +10,5 @@ tls_client_ca = "/var/lib/agentuplink-authority/secrets/checkpoint-client-ca.pem
 
 [endpoint_policy]
 allowed_hosts = $hosts
-allowed_server_names = $hosts
+allowed_server_names = $server_names
 allowed_ports = [7443]

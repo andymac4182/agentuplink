@@ -29,23 +29,35 @@ then [real actor queue acceptance #278](https://github.com/andymac4182/agentupli
 
 ## Current merge and Fly continuation
 
-[Draft #288](https://github.com/andymac4182/agentuplink/pull/288) is frozen at
-`0ee715d0a942042c69d6fd4010c62bd4374c3b90`, tree
-`40e3cb34a8883ca0a423874a299e7db31c457f8f`. Its three-OS packaging passes
-at actual checkout `802ee4ac4f3c6e8f2d7a8c67adb7fbe7f897de38`; all three Rust
-OS jobs, full M3 and all five optimized build/native archive verifier pairs also
-pass. Ordinary CI remains active. The Fly runtime fails readiness again: relay-a
-returns 111 verified-TLS HTTP503 unready responses, while all three metrics
-helpers refuse the unsupported effective-GID10001 assertion. The actual group
-ID and underlying unready cause are not retained or inferred. Exact failure and
-clean owned-resource cleanup are [recorded separately](m6-fly-readiness-2026-11-02.md#pr288-hosted-readiness-and-diagnostic-failure). #287 is closed unmerged as superseded;
-its failures remain below. A separate [same-AOF recovery controller](m6-fly-recovery-rehearsal.md)
-passes 62 pure controls and independent review, and is integrated for future
-hosted execution after successful baseline topology. Physical backup recovery
-and actual Fly verification remain distinct and absent.
-The separate [M4-76 authorization correction](m4-authorization-deadlines.md) is
-also integrated after independent v3 review. Its 20 new tests and all changed
-Rust/native checks remain unrun; #288 passes do not verify the new source.
+[Draft #289](https://github.com/andymac4182/agentuplink/pull/289) is frozen at
+`f12de07646ded6438a6411c7ae2b49e0cc4764a3`, actual hosted checkout
+`de3cbe30a812e9f292c2a595a287c801135d7994`, tree
+`2ee8cbfee2425a58834a5e90a19594f7a5dc58b2`. All three Rust OS jobs fail
+formatting before Clippy/tests. Packaging, all five optimized build/native archive
+verifier pairs, M0/M1/M2/M3/M4 and regular container smoke pass; M7 remains active
+at this checkpoint. New M4-76 unit tests are unrun. The Fly baseline fails after113
+verified-TLS HTTP503 replies; all three corrected metrics helpers now report
+membership/clock ready but overall readiness false. Same-AOF recovery is skipped.
+Clean owned-resource removal is verified without erasing the failed result.
+
+[Exact evidence and reviewed follow-up](m6-fly-peer-readiness-2026-11-02.md)
+preserve all source/image identities and failures. Source review establishes a
+necessary peer-address mismatch: the profile signs DNS endpoints, while both
+production dial paths require numeric socket addresses. C265 supplies explicit
+private IPv6 inventory addresses with separate DNS certificate identities and
+exact fixture allocation checks. The successor also applies the twelve hosted
+formatting hunks and adds an artifact-bound20-test/nine-mutant authorization
+workflow. Independent source reviews and isolated206 Fly/42 mocked witness
+controls pass. Combined248 pure/mock controls, declared-format source scan, AST,
+diff and evidence guard also pass; exact candidate hosted verification is required.
+No required assertions or supported platforms are removed.
+
+#288 is closed unmerged only after all six head-associated runs are terminal;
+all14 ordinary CI jobs pass, while its Fly readiness and metrics-identity failures
+remain preserved. #287 and earlier failed candidates remain closed with evidence.
+Actual Fly access/inventory/PKI/operations, owner license decisions, physical backup
+recovery and live deployment authorization remain explicit. The goal and hourly
+continuation stay active; no candidate with failed required checks is mergeable.
 
 Current main remains `626ba936`; the subsequent [draft #287](https://github.com/andymac4182/agentuplink/pull/287)
 is frozen at `753aeb5c`, actual same-tree checkout `e99f2c18`. Its three-OS

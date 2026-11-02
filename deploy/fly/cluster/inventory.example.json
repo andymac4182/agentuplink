@@ -25,6 +25,7 @@
   "relays": [
     {
       "node_id": "relay-a",
+      "peer_ipv6": "fd42:5a1e:1:0:8000::1",
       "app": "synthetic-fly-relay-a",
       "volume": "synthetic_relay_a_state",
       "memory_mb": 512,
@@ -41,6 +42,7 @@
     },
     {
       "node_id": "relay-b",
+      "peer_ipv6": "fd42:5a1e:1:0:8000::2",
       "app": "synthetic-fly-relay-b",
       "volume": "synthetic_relay_b_state",
       "memory_mb": 512,
@@ -57,6 +59,7 @@
     },
     {
       "node_id": "relay-c",
+      "peer_ipv6": "fd42:5a1e:1:0:8000::3",
       "app": "synthetic-fly-relay-c",
       "volume": "synthetic_relay_c_state",
       "memory_mb": 512,

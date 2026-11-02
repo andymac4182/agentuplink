@@ -90,7 +90,11 @@ impl Fixture {
             assert!(self.actor.streams[&STREAM].auth.confirmed);
             assert_eq!(self.actor.pending_authorization_refreshes.len(), 1);
             let before = self.actor.pending_authorization_refreshes[&STREAM].auth_deadline;
-            drop(self.control.try_recv().expect("release one real queue slot"));
+            drop(
+                self.control
+                    .try_recv()
+                    .expect("release one real queue slot"),
+            );
             self.actor
                 .flush_pending_authorization_refreshes(Instant::now(), SystemTime::now())
                 .await
@@ -283,7 +287,10 @@ async fn m4c76_both_queued_filesystem_refresh_paths_publish_the_challenge_bound(
             !observed.fresh,
             "provider checks the admitted challenge without actor tick"
         );
-        assert_eq!(observed.freshness_failure, FreshnessFailure::DeadlineElapsed);
+        assert_eq!(
+            observed.freshness_failure,
+            FreshnessFailure::DeadlineElapsed
+        );
     }
 }
 
@@ -312,7 +319,11 @@ async fn m4c76_a_refresh_still_waiting_for_queue_space_expires_without_nonce_rep
             None,
         )
         .expect("fill actual control queue");
-    fixture.actor.refresh_authorizations().await.expect("defer refresh");
+    fixture
+        .actor
+        .refresh_authorizations()
+        .await
+        .expect("defer refresh");
     assert!(fixture.actor.streams[&STREAM].auth.confirmed);
     assert_eq!(fixture.actor.pending_authorization_refreshes.len(), 1);
     let original_id = fixture.actor.streams[&STREAM].auth.challenge_id.clone();
@@ -327,7 +338,10 @@ async fn m4c76_a_refresh_still_waiting_for_queue_space_expires_without_nonce_rep
         .expect("expired deferred refresh");
     assert!(fixture.actor.pending_authorization_refreshes.is_empty());
     assert!(fixture.actor.streams[&STREAM].auth.invalidated);
-    assert_eq!(fixture.actor.streams[&STREAM].auth.challenge_id, original_id);
+    assert_eq!(
+        fixture.actor.streams[&STREAM].auth.challenge_id,
+        original_id
+    );
     assert_eq!(fixture.control.len(), 1, "only the original filler remains");
     assert_eq!(fixture.reset_reasons(), [4_006]);
 }
@@ -337,7 +351,8 @@ fn m4c76_every_deadline_keeps_its_own_wall_reversal_anchor() {
     let start = Instant::now();
     let wall = SystemTime::now();
     let mut stream = test_stream();
-    stream.auth.operation_deadline = DualDeadline::new(start, wall, Duration::from_secs(60)).unwrap();
+    stream.auth.operation_deadline =
+        DualDeadline::new(start, wall, Duration::from_secs(60)).unwrap();
     stream.last_confirmed_deadline =
         DualDeadline::new(start, wall + Duration::from_secs(1), Duration::from_secs(5));
     stream.auth.deadline = DualDeadline::new(
@@ -366,10 +381,17 @@ fn m4c76_every_deadline_keeps_its_own_wall_reversal_anchor() {
 async fn m4c76_queued_challenge_expiry_keeps_transport_failure_and_releases_budget() {
     let mut fixture = Fixture::new().await;
     fixture.actor.config.limits.grant_timeout_ms = 200;
-    fixture.actor.refresh_authorizations().await.expect("refresh");
+    fixture
+        .actor
+        .refresh_authorizations()
+        .await
+        .expect("refresh");
     let deadline = fixture.actor.streams[&STREAM].auth.deadline;
     let budget = Arc::clone(&fixture.actor.control_queue.budget);
-    assert!(budget.current() > 0, "the real queued message owns a charge");
+    assert!(
+        budget.current() > 0,
+        "the real queued message owns a charge"
+    );
     let (socket, mut peer) = test_websocket_pair().await.expect("real control socket");
     let (sink, reader) = socket.split();
     tokio::time::sleep_until(tokio::time::Instant::from_std(
@@ -394,7 +416,11 @@ async fn m4c76_queued_challenge_expiry_keeps_transport_failure_and_releases_budg
     let classified = crate::writer_failure_result(false, Some(failure.0)).unwrap_err();
     assert_eq!(classified.code(), "TRANSPORT_ERROR");
     assert!(classified.retryable());
-    assert_eq!(budget.current(), 0, "queued message released at writer exit");
+    assert_eq!(
+        budget.current(),
+        0,
+        "queued message released at writer exit"
+    );
     drop(reader);
     // No expired challenge reached the peer, and both local socket halves
     // were dropped after the writer joined. This is writer cleanup evidence,

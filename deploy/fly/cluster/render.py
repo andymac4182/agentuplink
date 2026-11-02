@@ -49,6 +49,18 @@ def membership_state_path(incarnation):
         incarnation.encode('utf-8')).hexdigest() + '.json'
 
 
+def peer_ipv6(value):
+    require(type(value) is str, 'invalid-peer-ipv6')
+    try:
+        address = ipaddress.IPv6Address(value)
+    except ipaddress.AddressValueError:
+        raise ProfileError('invalid-peer-ipv6') from None
+    require(address.scope_id is None and str(address) == value
+            and address in ipaddress.IPv6Network('fc00::/7'),
+            'peer-ipv6-must-be-canonical-ula')
+    return value
+
+
 def digest(value, label):
     text(value, r'[0-9a-f]{64}', label)
     require(value != '0' * 64, label)
@@ -141,9 +153,10 @@ def validate_inventory(data, example=False):
     require(type(data['relays']) is list and len(data['relays']) == 3, 'exactly-three-relays-required')
     pins = []
     for relay in data['relays']:
-        service(relay, {'node_id', 'public_hostname', 'consumer_certificate_trust',
+        service(relay, {'node_id', 'peer_ipv6', 'public_hostname', 'consumer_certificate_trust',
                         'peer_key', 'checkpoint_client_spki'})
         require(relay['node_id'] in NODES, 'invalid-node-id')
+        peer_ipv6(relay['peer_ipv6'])
         hostname(relay['public_hostname'], example, 'invalid-public-hostname')
         require(relay['consumer_certificate_trust'] == 'public',
                 'publicly-trusted-consumer-certificate-required-for-fly-readiness')
@@ -157,6 +170,7 @@ def validate_inventory(data, example=False):
                 'peer-key-inactive-at-evaluation-time')
         pins.extend([key['spki_sha256'], relay['checkpoint_client_spki']])
     require({r['node_id'] for r in data['relays']} == set(NODES), 'duplicate-node-id')
+    require(len({r['peer_ipv6'] for r in data['relays']}) == 3, 'duplicate-peer-ipv6')
     require(len({r['public_hostname'] for r in data['relays']}) == 3, 'duplicate-public-hostname')
     require(len(set(pins)) == 6, 'distinct-peer-and-checkpoint-identities-required')
     service(data['redis'], {'publisher_user'})
@@ -211,7 +225,8 @@ def sha(value):
 def render(data, example=False):
     validate_inventory(data, example)
     relays = sorted(data['relays'], key=lambda r: r['node_id'])
-    hosts = [r['app'] + '.internal' for r in relays]
+    hosts = [r['peer_ipv6'] for r in relays]
+    server_names = [r['app'] + '.internal' for r in relays]
     redis_host = data['redis']['app'] + '.internal'
     publisher = data['redis']['publisher_user']
     output, template_hashes, roles = {}, {}, {}
@@ -230,7 +245,7 @@ def render(data, example=False):
         'redis_namespace': data['redis_namespace'],
         'deployment_incarnation': data['deployment_incarnation'],
         **data['membership'], 'nodes': [
-            {'node_id': r['node_id'], 'peer_endpoint': r['app'] + '.internal:7443',
+            {'node_id': r['node_id'], 'peer_endpoint': '[' + r['peer_ipv6'] + ']:7443',
              'server_name': r['app'] + '.internal',
              'keys': [{**r['peer_key'], 'revoked': False}],
              'checkpoint_client_spkis': [r['checkpoint_client_spki']]}
@@ -254,14 +269,15 @@ def render(data, example=False):
                 'deployment_id': data['deployment_id'],
                 'incarnation': data['deployment_incarnation'], 'peer_bind': data['peer_bind'],
                 'membership_state_path': membership_state_path(data['deployment_incarnation']),
-                'hosts': hosts, 'checkpoint_endpoint': 'https://' + data['authority']['app']
+                'hosts': hosts, 'server_names': server_names, 'checkpoint_endpoint': 'https://' + data['authority']['app']
                     + '.internal:8444/v1/checkpoint'})
             config_path = name + '/relay.toml'
             output[config_path] = config
             values.update(config_b64=encoded(config), public_hostname=item['public_hostname'])
             fly = template('relay-fly.toml.in', values)
         elif role == 'authority':
-            config = template('authority.toml.in', {'bind': data['authority_bind'], 'hosts': hosts})
+            config = template('authority.toml.in', {'bind': data['authority_bind'], 'hosts': hosts,
+                                                  'server_names': server_names})
             config_path = 'authority/authority.toml'
             output[config_path] = config
             output['authority/inventory.json'] = authority_inventory

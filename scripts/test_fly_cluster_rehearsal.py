@@ -393,13 +393,14 @@ class LoopbackPublication(unittest.TestCase):
         return {"NetworkSettings": {"Ports": {"6379/tcp": [{"HostIp": address, "HostPort": port}]}}}
 
     def test_create_publishes_only_ipv6_loopback_with_random_host_ports(self):
-        docker = rehearsal.Docker(mock.Mock(), "owner", {})
-        docker.network = {"id": "network"}
+        docker = rehearsal.Docker(mock.Mock(), "owner", {"relay": "sha256:" + "b" * 64})
+        docker.network = {"id": "network", "subnet": "fd42:1234:5678::/64"}
+        docker.peer_ipv6 = rehearsal.peer_ipv6_addresses(docker.network["subnet"])
         commands = []
         docker.call = lambda args, **kw: commands.append(args) or ("a" * 64).encode()
         docker.inspect = mock.Mock()
         ports = (6379, 8444, 8443, 9443)
-        docker.create("relay-a", "sha256:" + "b" * 64, ports=ports)
+        docker.create("relay-a", "sha256:" + "b" * 64, ports=ports, peer_ipv6=docker.peer_ipv6["relay-a"])
         args = commands[0]
         self.assertEqual([args[i + 1] for i, value in enumerate(args) if value == "--publish"],
                          [f"[::1]::{port}" for port in ports])
@@ -952,7 +953,9 @@ class SourceContract(unittest.TestCase):
         # orchestration order, not actual service startup or Redis semantics.
         dummy = object.__new__(rehearsal.Rehearsal)
         calls = []
-        dummy.inventory = {"relays": [{"node_id": "relay-" + x, "app": "app-" + x} for x in "abc"]}
+        peer_addresses = rehearsal.peer_ipv6_addresses("fd42:1234:5678::/64")
+        dummy.inventory = {"relays": [{"node_id": "relay-" + x, "app": "app-" + x,
+                                       "peer_ipv6": peer_addresses["relay-" + x]} for x in "abc"]}
         dummy.docker = mock.Mock()
         dummy.docker.images = {"redis": "redis", "relay": "relay"}
         dummy.docker.create.side_effect = lambda *args, **kw: calls.append(("create", args[0])) or {"id": args[0]}
@@ -1269,6 +1272,117 @@ class PassivePublication(unittest.TestCase):
         self.assertTrue(all(deadline == 130 for deadline in deadlines[1:]))
         self.assertEqual(fixture.run.deadline, 500)
         fixture.checkpoint.assert_not_called()
+
+
+class PeerIPv6Assignment(unittest.TestCase):
+    SUBNET = "fd42:1234:5678::/64"
+    IMAGE = "sha256:" + "b" * 64
+
+    def docker(self):
+        docker = rehearsal.Docker(mock.Mock(), "owner", {"relay": self.IMAGE})
+        docker.network = {"id": "network", "subnet": self.SUBNET}
+        docker.peer_ipv6 = rehearsal.peer_ipv6_addresses(self.SUBNET)
+        docker.call = mock.Mock(return_value=("a" * 64).encode())
+        docker.inspect = mock.Mock()
+        return docker
+
+    def test_addresses_are_unique_high_suffixes_in_exact_private_subnet(self):
+        planned = rehearsal.peer_ipv6_addresses(self.SUBNET)
+        network = rehearsal.ipaddress.IPv6Network(self.SUBNET)
+        self.assertEqual(set(planned), set(rehearsal.NODES))
+        self.assertEqual(len(set(planned.values())), 3)
+        for index, node in enumerate(rehearsal.NODES):
+            address = rehearsal.ipaddress.IPv6Address(planned[node])
+            self.assertIn(address, network)
+            self.assertEqual(str(address), planned[node])
+            self.assertEqual(int(address) - int(network.network_address), (1 << 63) + index + 1)
+
+    def test_subnet_refuses_wrong_family_nonprivate_noncanonical_or_host_bits(self):
+        for subnet in (None, True, "10.0.0.0/24", "::/64", "fe80::/64", "2001:db8::/64",
+                       "fd42::/48", "FD42::/64", "fd42:0000::/64", "fd42::1/64"):
+            with self.subTest(subnet=subnet), self.assertRaises(rehearsal.Refused):
+                rehearsal.peer_ipv6_addresses(subnet)
+
+    def test_create_uses_exact_reviewed_address(self):
+        docker = self.docker()
+        address = docker.peer_ipv6["relay-a"]
+        item = docker.create("relay-a", self.IMAGE, peer_ipv6=address)
+        args = docker.call.call_args.args[0]
+        self.assertEqual(args[args.index("--ip6") + 1], address)
+        self.assertEqual(item["peer_ipv6"], address)
+        self.assertEqual(item["network"], "network")
+
+    def test_relay_create_requires_its_own_address_before_any_command(self):
+        for address in (None, "fd42:9999::1", "fd42:1234:5678:0:8000::2", "::1", "10.0.0.1"):
+            docker = self.docker()
+            with self.subTest(address=address), self.assertRaises(rehearsal.Refused):
+                docker.create("relay-a", self.IMAGE, peer_ipv6=address)
+            docker.call.assert_not_called()
+            self.assertFalse(docker.containers)
+
+    def test_assignments_cannot_be_changed_or_duplicated(self):
+        docker = self.docker()
+        address = docker.peer_ipv6["relay-a"]
+        docker.peer_ipv6["relay-b"] = address
+        with self.assertRaises(rehearsal.Refused):
+            docker.create("relay-a", self.IMAGE, peer_ipv6=address)
+        docker.call.assert_not_called()
+        docker = self.docker()
+        docker.create("relay-a", self.IMAGE, peer_ipv6=address)
+        with self.assertRaisesRegex(rehearsal.Refused, "peer_container_duplicate_address"):
+            docker.create("relay-a", self.IMAGE, peer_ipv6=address)
+        self.assertEqual(docker.call.call_count, 1)
+
+    def test_helpers_and_network_none_cannot_claim_peer_address(self):
+        for role, network, image in (("helper", True, self.IMAGE), ("relay-a", False, self.IMAGE),
+                                     ("relay-a", True, "sha256:" + "c" * 64)):
+            docker = self.docker()
+            with self.subTest(role=role, network=network, image=image), self.assertRaises(rehearsal.Refused):
+                docker.create(role, image, network=network, peer_ipv6=docker.peer_ipv6["relay-a"])
+            docker.call.assert_not_called()
+
+    def test_private_name_sequence_is_bounded_without_changing_role(self):
+        for sequence in (True, -1, 2**64, "7", 1.0):
+            docker = self.docker()
+            with self.subTest(sequence=sequence), self.assertRaises(rehearsal.Refused):
+                docker.create("helper", self.IMAGE, network=False, name_sequence=sequence)
+            docker.call.assert_not_called()
+        docker = self.docker()
+        item = docker.create("helper", self.IMAGE, network=False, name_sequence=7)
+        self.assertEqual(item["name"], "owner-000-helper-r7")
+        self.assertEqual(item["role"], "helper")
+
+    def observed(self, running):
+        expected, observed = owned()
+        address = rehearsal.peer_ipv6_addresses(self.SUBNET)["relay-a"]
+        expected["peer_ipv6"] = address
+        observed["State"]["Running"] = running
+        attached = {"IPAMConfig": {"IPv6Address": address}, "NetworkID": "network" if running else "",
+                    "GlobalIPv6Address": address if running else "", "GlobalIPv6PrefixLen": 64 if running else 0}
+        observed["NetworkSettings"] = {"Networks": {"owned-network": attached}}
+        return expected, observed
+
+    def test_created_container_requires_requested_ip_but_not_early_attachment(self):
+        expected, observed = self.observed(False)
+        rehearsal.check_container(observed, expected, "owner")
+        observed["State"]["Running"] = True
+        with self.assertRaisesRegex(rehearsal.Refused, "container_actual_peer_ipv6"):
+            rehearsal.check_container(observed, expected, "owner")
+
+    def test_running_peer_requires_exact_network_address_and_prefix(self):
+        expected, observed = self.observed(True)
+        rehearsal.check_container(observed, expected, "owner")
+        for key, value in (("NetworkID", "foreign"), ("NetworkID", ""),
+                           ("GlobalIPv6Address", "fd42:9999::1"), ("GlobalIPv6Address", ""),
+                           ("GlobalIPv6PrefixLen", 48), ("IPAMConfig", {})):
+            changed = copy.deepcopy(observed)
+            changed["NetworkSettings"]["Networks"]["owned-network"][key] = value
+            with self.subTest(key=key, value=value), self.assertRaises(rehearsal.Refused):
+                rehearsal.check_container(changed, expected, "owner")
+        changed = copy.deepcopy(observed)
+        changed["NetworkSettings"]["Networks"]["second"] = {}
+        with self.assertRaises(rehearsal.Refused):
+            rehearsal.check_container(changed, expected, "owner")
 
 
 if __name__ == "__main__":

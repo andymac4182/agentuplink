@@ -29,6 +29,12 @@ class FlyClusterTests(unittest.TestCase):
     def render(self, data=None):
         return renderer.render(self.data if data is None else data, example=True)
 
+    def test_signed_peer_endpoints_are_numeric_ipv6(self):
+        inventory = json.loads(self.render()['authority/inventory.json'])
+        for node in inventory['nodes']:
+            self.assertRegex(node['peer_endpoint'], r'^\[[0-9a-f:]+\]:7443$',
+                             'production peer dialing requires a numeric SocketAddr')
+
     def production(self):
         data = copy.deepcopy(self.data)
         data['purpose'] = 'deployment'
@@ -123,12 +129,13 @@ class FlyClusterTests(unittest.TestCase):
 
     def test_three_hosts_and_shared_authority_scope_match_without_override_slots(self):
         files = self.render()
-        hosts = [r['app'] + '.internal' for r in self.data['relays']]
+        hosts = [r['peer_ipv6'] for r in self.data['relays']]
+        server_names = [r['app'] + '.internal' for r in self.data['relays']]
         inventory = json.loads(files['authority/inventory.json'])
         authority = tomllib.loads(files['authority/authority.toml'].decode())
         self.assertEqual(authority['bind'], '[::]:8444')
         self.assertEqual(authority['endpoint_policy'], {
-            'allowed_hosts': hosts, 'allowed_server_names': hosts, 'allowed_ports': [7443]})
+            'allowed_hosts': hosts, 'allowed_server_names': server_names, 'allowed_ports': [7443]})
         for relay in self.data['relays']:
             name = relay['node_id']
             config = tomllib.loads(files[name + '/relay.toml'].decode())
@@ -140,7 +147,7 @@ class FlyClusterTests(unittest.TestCase):
             self.assertEqual(config['cluster']['deployment_id'], inventory['deployment_id'])
             self.assertEqual(config['cluster']['peer_bind'], '[::]:7443')
             self.assertEqual(config['cluster']['endpoint_policy']['allowed_hosts'], hosts)
-            self.assertEqual(config['cluster']['endpoint_policy']['allowed_server_names'], hosts)
+            self.assertEqual(config['cluster']['endpoint_policy']['allowed_server_names'], server_names)
             self.assertEqual(config['cluster']['endpoint_policy']['allowed_ports'], [7443])
             self.assertEqual(config['cluster']['checkpoint_authority_endpoint'],
                              'https://' + self.data['authority']['app'] + '.internal:8444/v1/checkpoint')
@@ -152,9 +159,31 @@ class FlyClusterTests(unittest.TestCase):
                                                  'overlap_seconds': 30})
             self.assertEqual(config['listener_max_connections'], 64)
             node = next(n for n in inventory['nodes'] if n['node_id'] == name)
-            self.assertEqual(node['peer_endpoint'], relay['app'] + '.internal:7443')
+            self.assertEqual(node['peer_endpoint'], '[' + relay['peer_ipv6'] + ']:7443')
             self.assertEqual(node['server_name'], relay['app'] + '.internal')
             self.assertEqual(node['checkpoint_client_spkis'], [relay['checkpoint_client_spki']])
+
+    def test_peer_ipv6_is_required_and_unique(self):
+        self.refused(lambda data: data['relays'][0].pop('peer_ipv6'))
+        self.refused(lambda data: data['relays'][1].update(peer_ipv6=data['relays'][0]['peer_ipv6']))
+
+    def test_peer_ipv6_refuses_noncanonical_nonprivate_and_nonliteral_values(self):
+        for value in (None, True, 1, '', 'relay-a.internal', '10.0.0.1', '::1', '::',
+                      'fe80::1', 'ff02::1', '2001:db8::1', '2606:4700::1111',
+                      'fd42:0000::1', 'FD42::1', '[fd42::1]', 'fd42::1/64', 'fd42::1%eth0'):
+            with self.subTest(value=value):
+                self.refused(lambda data: data['relays'][0].update(peer_ipv6=value))
+
+    def test_peer_address_revision_change_preserves_tls_identity_and_other_nodes(self):
+        old = json.loads(self.render()['authority/inventory.json'])
+        self.data['membership']['revision'] += 1
+        self.data['relays'][0]['peer_ipv6'] = 'fdaa:1:2:3:4:5:6:7'
+        new = json.loads(self.render()['authority/inventory.json'])
+        self.assertEqual(new['revision'], old['revision'] + 1)
+        self.assertNotEqual(new['nodes'][0]['peer_endpoint'], old['nodes'][0]['peer_endpoint'])
+        self.assertEqual(new['nodes'][0]['server_name'], old['nodes'][0]['server_name'])
+        self.assertEqual(new['nodes'][0]['keys'], old['nodes'][0]['keys'])
+        self.assertEqual(new['nodes'][1:], old['nodes'][1:])
 
     def test_tls_passthrough_and_verified_consumer_readiness_gate_are_retained(self):
         files = self.render()

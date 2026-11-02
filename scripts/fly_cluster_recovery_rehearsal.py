@@ -256,10 +256,10 @@ class RecoveryDocker(base.Docker):
         self.run.event("owned_container_removed", role=item["role"], id=item["id"], independently_absent=True)
 
     def create(self, role, image, **kwargs):
-        # base names use the current list length; roles get a monotonic suffix
-        # so prompt removal cannot collide with retained live-container names.
-        role = role + "-r" + str(self.run.index)
-        return super().create(role, image, **kwargs)
+        # Keep exact role/label identity for peer assignment and diagnostics.
+        # Only the name gets the monotonic suffix, preserving unique names
+        # when prompt removal reduces the current container-list length.
+        return super().create(role, image, name_sequence=self.run.index, **kwargs)
 
     def one_shot(self, role, image, **kwargs):
         data, expected = kwargs.pop("data", None), kwargs.pop("expected_exit", 0)
@@ -686,7 +686,8 @@ operations = ["echo:invoke"]
             node = relay["node_id"]
             item = self.docker.create(node, self.docker.images["relay"], memory=512, env=self.env[node],
                 mounts=[(self.states[node], base.ROLE_BASE["relay"] + "/state", True)],
-                aliases=[relay["app"] + ".internal", self.public_hosts[i]], ports=[8443, 9443])
+                aliases=[relay["app"] + ".internal", self.public_hosts[i]], ports=[8443, 9443],
+                peer_ipv6=relay["peer_ipv6"])
             self.docker.start(item)
             self.relays.append(item)
         self.consumer_ports = [self.docker.port(item, 8443) for item in self.relays]

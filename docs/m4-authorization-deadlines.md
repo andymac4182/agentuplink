@@ -1,8 +1,10 @@
 # Independent authorization deadlines for handed-off work
 
-Status: M4-76 source implementation and independent review complete; compilation,
-formatting, regression execution and full acceptance remain pending. This is a
-source-derived defect and correction, not an executed timing reproduction.
+Status: M4-76 source implementation and independent review complete. Production
+binaries build on five optimized platforms and in the #289 image, but three
+Rust jobs stop at formatting before Clippy/unit execution. The20 new regressions
+and behavioral witnesses remain unrun. This is a source-derived defect and
+correction, not an executed timing reproduction.
 
 An unanswered refresh previously replaced a stream's last accepted confirmation
 deadline. The HTTP read boundary checked expiry only while `confirmed` was true,
@@ -71,3 +73,13 @@ Clippy, locked workspace tests, meaningful behavioral RED controls, full affecte
 M1/M2/M3/M4/M7 acceptance and supported archive/platform checks at the final
 candidate. Prior #287/#288 Rust passes do not verify these changed files. No local
 native, formatter, compiler, Docker, Redis or cache execution has occurred.
+
+## Artifact-bound follow-up
+
+The [dedicated witness controller](m6-fly-peer-readiness-2026-11-02.md#explicit-m4-76-hosted-witnesses)
+requires20 initial GREEN tests, nine compiled behavioral mutants with ten exact
+assertion failures, then20 restored GREEN tests. Every accepted inventory/test
+execution binds to its compiled executable and unchanged before/after hash.
+Its42 fake/synthetic controls and independent source review pass, with earlier
+review findings and original-source REDs preserved. This does not substitute for
+actual hosted execution, real process supervision or full required platform gates.

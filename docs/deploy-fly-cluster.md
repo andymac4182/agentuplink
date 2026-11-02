@@ -23,7 +23,7 @@ with exactly one intended machine and one independent durable volume per app.
 | Authority | None | IPv6 TLS TCP 8444, mandatory checkpoint-client mTLS | Approval state, both monotonic counters and stable sibling lock |
 
 App names, region, volume names/sizes, memory, source-bound image digests,
-deployment ID, durable namespace, incarnation, OIDC settings, public hostnames,
+deployment ID, durable namespace, incarnation, OIDC settings, public hostnames, each relay's private IPv6,
 publisher public key and relay/checkpoint public pins are explicit inputs.
 There is no default live account, app, namespace, PKI or resource purchase.
 The example's `syd`, 512 MiB machines and 1 GiB volumes are synthetic planning
@@ -49,10 +49,38 @@ All three production image references must have the form
 `registry.fly.io/APP@sha256:DIGEST`, using actual registry manifest digests.
 Mutable tags, unknown fields, duplicate JSON keys, node/app/volume collisions,
 inactive key windows at the supplied instant, unsafe endpoints and credential
-URLs are refused. The renderer derives each approved peer endpoint and TLS
-server name as that relay app's `.internal` name; its exact three-name allowlist
-is identical in every relay and the authority. Private binds are explicitly
-IPv6, including the outbound QUIC address family selected by `peer_bind`.
+URLs are refused. Each relay requires an explicit canonical private IPv6
+`peer_ipv6` from its reviewed machine inventory. The renderer signs
+`[peer_ipv6]:7443` as its peer endpoint and keeps that app's `.internal` name
+as the separate certificate server name. Every relay and the authority receive
+the same three literal-address and three DNS-server-name allowlists. This
+matches the current peer transport, which dials numeric socket addresses and
+does not resolve peer DNS names. Authority and Redis service discovery continue
+to use their separate verified DNS names. General peer-DNS dialing is not
+implemented by this profile correction. Private binds remain IPv6, including
+the outbound QUIC address family selected by `peer_bind`.
+
+The renderer accepts only distinct, unscoped, canonical IPv6 literals in the
+unique-local range `fc00::/7`; that syntax check does not establish that an
+address belongs to the approved Fly organization or machine. After account and
+resource approval, retrieve the actual machine inventory read-only, for example:
+
+```sh
+fly machine list --app "$RELAY_APP" --json > "$PRIVATE_INVENTORY/relay-machines.json"
+fly machine status "$RELAY_MACHINE_ID" --app "$RELAY_APP" --json > "$PRIVATE_INVENTORY/relay-machine.json"
+```
+
+Match the intended app, exact machine and volume IDs, region and returned 6PN
+`private_ip` against the deployment plan before entering `peer_ipv6`. Never copy
+the synthetic example's addresses or infer an address from its app name. Keep
+these account-specific inventory files private. A machine replacement may have
+a different 6PN address: stop/fence the old machine, review the new address for
+the same stable node, and approve the next authority inventory revision with
+that new signed endpoint before serving. Preserve certificate-name/SPKI checks,
+all membership/recovery state and authority high-water counters. Require fresh
+publication, all-peer readiness and real cross-relay traffic; do not reset state
+or silently rebind an old approval. Even a same-incarnation upgrade from the
+earlier DNS-endpoint profile needs this explicit inventory/config approval.
 
 No inventory field accepts a password, private key, certificate body, JWT or
 Redis URL. Public key and SPKI fields are public hex values only; operators
@@ -173,8 +201,9 @@ The device service's TCP check and the private Redis/authority TCP checks prove
 only listener liveness. Authority readiness needs an approved, CA/name-verified
 checkpoint-client identity; do not add a public or certificate-bypass authority
 endpoint. Private UDP H3 goes directly over the organization network, without a
-public UDP service. Exactly one intended running machine per relay app is
-required for the `.internal` name to identify that node unambiguously.
+public UDP service. Exactly one intended running machine per relay app remains
+required. Its independently inventoried 6PN address is the signed dial target;
+the `.internal` name remains its certificate identity, not a DNS dial fallback.
 
 Verify actual Fly private DNS/IPv6 connectivity, every H3 route, certificate
 hostname/pin refusals and readiness-aware public routing. The rendered family
@@ -215,7 +244,8 @@ machine/volume IDs before commands that could attach, replace or start them.
 5. Start all three relays before waiting for cluster-wide peer readiness. Do not
    wait for relay a to reach all-peer readiness before starting absent b/c.
    Distinguish machine-running from application-ready in the startup orchestration.
-   Stop/remove bootstrap machines before relying on a one-machine app's DNS.
+   Stop/remove temporary bootstrap machines before serving the same node; the
+   signed address must identify the intended serving machine, not a temporary one.
 6. Verify external consumer/device TLS, exact authenticated cross-relay echo,
    identity/grant refusal controls, revocation, reconnect, an actual 300-second
    device data-socket rotation and bounded shutdown. Run supported MCP/ACP/filesystem acceptance;
@@ -314,7 +344,12 @@ from source checks and the bounded image rehearsal.
 The [same-AOF image rehearsal](m6-fly-recovery-rehearsal.md) exercises explicit
 operator-approved recovery after all relays and the authority stop and the same
 Redis AOF volume restarts. CI runs it after successful baseline topology, with
-immutable image IDs from the exact checkout. It verifies preserved revocations,
+immutable image IDs from the exact checkout. The owned IPv6-only Docker network
+assigns the three relays explicit, distinct high-suffix addresses from its own
+private subnet. Those same numeric addresses appear in signed membership and
+are checked against each running container; recovery retains them when it
+recreates the relays. Helpers use separate automatic addresses. This synthetic
+allocation is not a source of actual Fly machine addresses. It verifies preserved revocations,
 higher approval fences, new incarnation membership files, unchanged authority
 allocators and fresh sessions across three publication/adoption rounds. Source
 controls and review pass; current-image execution is pending. This does not

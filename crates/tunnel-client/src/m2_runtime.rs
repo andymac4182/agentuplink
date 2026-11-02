@@ -5191,7 +5191,7 @@ impl M2Actor {
             .iter()
             .filter_map(|(&stream_id, stream)| {
                 (!stream.auth.invalidated && stream.authorization_expired_at(now, wall_now))
-                .then_some(stream_id)
+                    .then_some(stream_id)
             })
             .collect();
         for stream_id in expired_ids {
