@@ -24,19 +24,50 @@ and [integrated acceptance #273](https://github.com/andymac4182/agentuplink/pull
 then [filesystem confirmation #274](https://github.com/andymac4182/agentuplink/pull/274)
 and [Mastra depth / authority lock #275](https://github.com/andymac4182/agentuplink/pull/275),
 then [terminal retirement observer #276](https://github.com/andymac4182/agentuplink/pull/276)
-and [client matcher correction #277](https://github.com/andymac4182/agentuplink/pull/277).
+and [client matcher correction #277](https://github.com/andymac4182/agentuplink/pull/277),
+then [real actor queue acceptance #278](https://github.com/andymac4182/agentuplink/pull/278).
 
-The next C240 implementation is locally verified at
-`bf21e353ede811088cf31b64f8b9076d28378f11` (tree
-`2b3aa8f155d65c4ac07b327e835fbf440216de78`): all six new real actor-loop tests
-and four existing handler controls pass on the first compiled run,10/0/0 in
-2.78s. A separate full workspace format check passes. The first overall
-attempt remains **failed before Clippy** because tmp capacity was138,395,648B
-below its required startup reserve; no lint process or automatic retry ran.
-[Exact actor evidence and retained failure](m6-c240-queue-boundary.md#first-real-actor-loop-run-and-retained-validation-failure)
-keep public C240 scope B and full candidate validation open. A new stacked
-draft will carry this tested implementation plus documentation; the prior
-hosted and image results below retain their exact original identities.
+This follow-up, branch `codex/fs-completion-accounting`, retains completed
+filesystem provider reports at valid stream retirement (C254) and expands
+optimized-release PR checks to all Rust crates, vendored code and the toolchain
+pin (C255). Runtime source `f12c9d81` passes 41 focused executions, fresh strict
+client Clippy, full formatting and the unchanged actual C244 gate in 9.146 seconds.
+Three earlier failed attempts remain recorded. This publication adds documentation
+and workflow coverage to that frozen runtime source; full hosted workspace,
+M1/M2/M7/M4 and five-platform archive checks remain pending. No owner license
+exception, merge, release publication or deployment is included.
+
+Preceding draft #278 is `a2a6a62a` / actual runner `cf344feb`, same tree
+`6c53ff20`. All three Rust platforms pass required checks and all ten C240
+actor/handler cases; TypeScript and packaging pass. M4 fails its C244 terminal
+observer with two completed exchanges instead of three, while streams and replay
+are zero. Its preceding 300-second framework rotation passes. The final CI run
+completes at 2026-11-01T01:07:24+10:00: 13 jobs pass, including full M7 with
+all ten OG-02 rows, and M4 is the sole failure. C244 acceptance
+is reopened for this candidate; the earlier completions remain historical.
+[Exact failure and source-derived accounting follow-up](m6-fs-ledger-retirement-2026-11-01.md)
+keep C254 regression evidence separate from attribution of the hosted failure.
+The isolated baseline reproduces three completed-report losses while both
+controls pass. Fixed source `f12c9d81` now passes 41 focused test executions,
+strict client Clippy and full workspace formatting with a freshly compiled
+266-test executable. Three earlier failed attempts remain recorded, including
+rejection of a nominal fixed build that reused baseline bytes. The unchanged
+real C244 gate now passes locally; full final-candidate hosted checks remain pending. The
+three-exchange assertion and deadline are unchanged.
+
+C240's earlier local implementation is clean `bf21e353ede811088cf31b64f8b9076d28378f11`
+(tree `2b3aa8f155d65c4ac07b327e835fbf440216de78`): six new real actor tests and
+four handler controls pass, 10/0/0 in 2.78 seconds. Separate full formatting
+passes. Its first overall attempt remains **failed before Clippy** because tmp
+capacity was 138,395,648 bytes below its startup reserve. The new hosted passes
+do not relabel that attempt. [Exact actor evidence](m6-c240-queue-boundary.md#first-real-actor-loop-run-and-retained-validation-failure)
+retains public scope B as open.
+
+The current 2f authority image also passes its first older-backup recovery drill,
+132.38 seconds, under fixture UID 1000. All 13 owned containers and 29 command
+groups are absent afterward; revocations, approval refusals and fresh-session
+recovery pass. [Exact local recovery evidence](m6-fs-ledger-retirement-2026-11-01.md#separate-current-authority-image-recovery)
+does not establish an image rebuilt at #278, default-UID recovery, or live DR.
 
 Latest fully successful hosted baseline [#277](https://github.com/andymac4182/agentuplink/pull/277)
 head `bd93cfbd828a2d23415e5e406120f9a70e9e92c0` and actual runner checkout
@@ -154,8 +185,8 @@ in the [acceptance history](production-acceptance-2026-10-31.md). The earlier
 mixed-binary OG-02 result remains inconclusive. No unchanged retry or narrower
 continuation converts those attempts to passes. C240's expected-green valid
 queue-boundary tests now pass without a runtime change; its broader claim
-remains open. The new C240 actor-loop draft is source-only;
-no actor-level test pass or public-close acceptance is claimed. C244 [real-endpoint fid confirmation](m6-fid-confirmation.md) now passes its
+remains open. C240 actor scope A now passes locally and on all three hosted Rust platforms
+at #278, as recorded above. Public-close scope B remains open. C244 [real-endpoint fid confirmation](m6-fid-confirmation.md) now passes its
 positive and meaningful premature-release controls at source8804, with restored
 source passing again. The invalid first clunk control is retained and excluded.
 These follow-up tests do not change the accepted8c runtime identity; their
