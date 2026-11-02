@@ -565,7 +565,13 @@ async fn restart_keeps_equal_restored_bytes_fenced_until_strictly_newer_record()
         MembershipVersionStateStore::open(directory.state_path(), identity)
             .expect("reopen after joined refusal"),
     );
-    let newer = build_runtime(&source, &authority, &issuer, Arc::clone(&reopened), "boot-c");
+    let newer = build_runtime(
+        &source,
+        &authority,
+        &issuer,
+        Arc::clone(&reopened),
+        "boot-c",
+    );
     let handle = newer.start().await.expect("newer signed round starts");
     assert_eq!(handle.initial_bootstrap_failure(), None);
     assert_eq!(newer.readiness(), MembershipReadiness::Ready);

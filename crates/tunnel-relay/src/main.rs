@@ -1986,7 +1986,8 @@ mod tests {
     #[test]
     fn membership_bootstrap_error_redacts_shutdown_details() {
         let readiness = MembershipReadiness::Unready(MembershipUnreadyReason::CatalogUnavailable);
-        let message = membership_bootstrap_error(&readiness, None, Some(&MembershipRuntimeError::Join));
+        let message =
+            membership_bootstrap_error(&readiness, None, Some(&MembershipRuntimeError::Join));
         assert_eq!(
             message,
             "cluster membership bootstrap did not reach ready: readiness=unready reason=catalog_unavailable category=catalog bootstrap_cause=initial_ok; cleanup=membership_shutdown_failed reason=join"

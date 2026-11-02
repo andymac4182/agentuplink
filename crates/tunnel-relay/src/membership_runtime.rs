@@ -3863,7 +3863,11 @@ mod tests {
                     .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
             );
             let debug = format!("{failure:?}");
-            for secret in ["PRIVATE_TOKEN", "endpoint.example.invalid", "signed-payload"] {
+            for secret in [
+                "PRIVATE_TOKEN",
+                "endpoint.example.invalid",
+                "signed-payload",
+            ] {
                 assert!(!debug.contains(secret));
             }
         }

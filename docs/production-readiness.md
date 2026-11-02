@@ -29,6 +29,14 @@ then [real actor queue acceptance #278](https://github.com/andymac4182/agentupli
 
 ## Current merge and Fly continuation
 
+Latest dated continuation: [#295 delivery and #296 formatting evidence](m6-restart-format-delivery-2026-11-02.md)
+records all three #295 Rust jobs and actual offline archive commands passing,
+while its Fly relay restart still fails and both recoveries are skipped.
+#296 carries the planned-restart correction, but its first Ubuntu formatting
+job fails before the new Rust tests. The isolated formatting successor and
+production startup ownership work remain in progress. Older snapshots below
+remain historical evidence; no result is borrowed across candidates.
+
 The continuous Codex production goal remains active; the owner disabled the
 hourly automation. Main remains `626ba9365b5d3e1faf8265f0b6ff50cc9111b749`.
 Merge authorization covers a fully checked candidate and the normal configured

@@ -1026,11 +1026,13 @@ impl MembershipVerifier {
         let MembershipError::EqualVersionConflict { node_id, version } = error else {
             return false;
         };
-        self.highest_memberships.get(node_id).is_some_and(|retained| {
-            retained.version == *version
-                && retained.signed_bytes.is_none()
-                && retained.verified.is_none()
-        })
+        self.highest_memberships
+            .get(node_id)
+            .is_some_and(|retained| {
+                retained.version == *version
+                    && retained.signed_bytes.is_none()
+                    && retained.verified.is_none()
+            })
     }
 
     /// Restore version fences after a process restart, without accepting any
@@ -2024,7 +2026,11 @@ mod tests {
         assert!(restored.is_restored_membership_floor(&error));
         assert_eq!(restored.version_state(), before);
         assert!(restored.retained_memberships().is_empty());
-        assert!(restored.highest_memberships["node-a"].signed_bytes.is_none());
+        assert!(
+            restored.highest_memberships["node-a"]
+                .signed_bytes
+                .is_none()
+        );
         assert!(restored.highest_memberships["node-a"].verified.is_none());
         assert_eq!(restored.verify_membership(&bytes, now), Err(error.clone()));
 
@@ -2068,7 +2074,10 @@ mod tests {
         let error = verifier
             .verify_membership(&conflicting, now)
             .expect_err("in-process conflict");
-        assert!(matches!(error, MembershipError::EqualVersionConflict { .. }));
+        assert!(matches!(
+            error,
+            MembershipError::EqualVersionConflict { .. }
+        ));
         assert!(!verifier.is_restored_membership_floor(&error));
         verifier
             .restore_version_state(before.clone())
