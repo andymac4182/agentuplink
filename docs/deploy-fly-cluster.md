@@ -121,7 +121,15 @@ image layers, committed configuration or command output.
 
 Relay secrets materialize under `/var/lib/agent-tunnel/secrets`, with the
 validated runtime Redis URL prepended by the entrypoint. The relay's state
-volume is `/var/lib/agent-tunnel/state`. Authority secrets/configuration live
+volume is `/var/lib/agent-tunnel/state`. Its membership filename is
+`membership-version-<digest>.json`, where `digest` is the complete lowercase
+SHA256 of the validated `deployment_incarnation` UTF-8 bytes. The renderer and
+entrypoint independently require that exact path; arbitrary state paths are
+not accepted. A same-incarnation restart retains the same file, while an
+approved new incarnation gets a separate explicitly initialized file. Preserve
+the old file and lock. The recovery fence remains
+`state/recovery-approval-fence.json`, independent of incarnation.
+Authority secrets/configuration live
 under `/var/lib/agentuplink-authority/secrets`, and its whole state directory
 is mounted at `/var/lib/agentuplink-authority/state`. Provision owner-only 0700
 directories and 0600 regular files for UID 10001 (relay) or 10002 (authority)
@@ -171,6 +179,13 @@ required for the `.internal` name to identify that node unambiguously.
 Verify actual Fly private DNS/IPv6 connectivity, every H3 route, certificate
 hostname/pin refusals and readiness-aware public routing. The rendered family
 choices and synthetic container-network proof are not live Fly verification.
+
+Each relay's private metrics listener is fixed to container loopback
+`[::1]:9100`. Neither the Fly services nor the rehearsal's Docker publications
+expose it. A local operator/agent can read it inside the owned machine or
+container; this is not a configured external scraper, alerting system or public
+health endpoint. The rehearsal reads only a bounded, closed readiness projection
+on failure. Real monitoring access, retention and ownership remain to be defined.
 
 ## First start, after explicit deployment authorization
 
@@ -259,6 +274,20 @@ health command. A valid whole-volume rollback cannot be detected using that same
 volume alone; preserve independent approval/high-water custody and remain
 unavailable when reconciliation is missing.
 
+Earlier versions of this profile used the fixed filename
+`membership-version-state.json`. If that profile has already initialized a
+volume, changing the filename for the **same incarnation** is a migration,
+not a reason to run `initialize` again. Stop and independently fence the relay;
+preserve the original file and lock; independently verify the existing
+deployment/incarnation/node identity and all version high-waters. Through a
+separately reviewed offline procedure, create the new deterministic file with
+those exact bytes and owner-private permissions, durably sync the file and
+parent, and verify its contents before startup. Refuse an existing destination
+or uncertain copy; do not overwrite either state. This profile provides no
+automatic migration or runtime migration proof. The entrypoint never renames,
+copies or resets the old file, and the legacy path is refused by the new image.
+Keep the stable recovery fence and authority state/counters unchanged.
+
 Cluster mode intentionally omits `redis_restart_continuity_seconds`; the relay
 refuses that single-relay setting alongside `[cluster]`. After a Redis restart,
 restore or changed run, do not call `rebind-redis-run` and do not create an empty
@@ -270,8 +299,12 @@ once with the existing fence and explicit fencing acknowledgements. An unknown
 result spends that version and needs fresh observation/approval.
 
 While authority is stopped, approve the next inventory revision for the recovered
-incarnation/run, preserving its counters. Start authority, then all relays with
-their preserved state and fresh sessions. Volume snapshots alone do not prove
+incarnation/run, preserving its counters. For each stopped relay, use the new
+rendered configuration to explicitly `initialize` its absent incarnation-specific
+membership file. Preserve the earlier membership files and their locks; never
+call `recovery-initialize` again or replace the stable approval fence. Start
+authority, then all relays with the new approved membership state and fresh
+sessions. Volume snapshots alone do not prove
 catalog freshness or monotonic counter custody. Simultaneous restart and
 older-backup recovery on the intended Fly topology remain required separately
 from source checks and the bounded image rehearsal.

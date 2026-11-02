@@ -29,6 +29,18 @@ then [real actor queue acceptance #278](https://github.com/andymac4182/agentupli
 
 ## Current merge and Fly continuation
 
+Current main remains `626ba936`; the subsequent [draft #287](https://github.com/andymac4182/agentuplink/pull/287)
+is frozen at `753aeb5c`, actual same-tree checkout `e99f2c18`. Its three-OS
+packaging, all five optimized build/native verifier pairs, all three Rust jobs,
+full M3, real M0 and M2 pass; regular CI finishes all 14 jobs, including full
+M7, at 2026-11-02T17:54:59+10:00. Its Fly image rehearsal **fails** the cluster readiness deadline
+after all eight IPv6 bindings and service starts pass. No client/route/rotation
+or recovery acceptance is reached. [Exact failure and successor work](m6-fly-readiness-2026-11-02.md)
+preserve the unknown cause, clean owned-resource cleanup, C262 recovery-path
+correction and C263 diagnostics. The combined successor passes 127 local
+controls and source review; it still needs new hosted/image checks. #287 is not
+eligible to merge.
+
 The owner authorized merging and selected Fly for the initial deployment.
 [#284](https://github.com/andymac4182/agentuplink/pull/284) is now merged as
 `626ba9365b5d3e1faf8265f0b6ff50cc9111b749` at
@@ -60,10 +72,11 @@ images, passes preparation and starts Redis, then fails `published_port_scope`.
 C261 identifies the IPv4 host-publishing request on the IPv6-only fixture network;
 the omitted raw inspect shape remains unknown. All 20 containers, 12 volumes,
 one network and 321 command groups are absent with zero cleanup errors. This
-does not erase #285's five failed log captures. #285 is closed as superseded;
-#286 stays frozen while its other checks finish. The isolated IPv6 loopback
-correction passes 64 local controls and independent review but needs a new
-hosted run. [Current failure and source follow-up](m6-production-followup-2026-11-02.md)
+does not erase #285's five failed log captures. #285 and #286 are closed as
+superseded; #286's ordinary CI completed with all 14 jobs passing. The isolated
+IPv6 loopback correction passes 64 local controls and independent review, and
+#287 now proves all eight actual host bindings before its distinct readiness
+failure. [Preceding failure and source follow-up](m6-production-followup-2026-11-02.md)
 keep authority/relay startup, routing, rotation and recovery unclaimed. The [Fly guide](deploy-fly-cluster.md)
 and [exact preparation/merge report](m6-fly-cluster-preparation-2026-11-02.md)
 record source identities, review corrections, failed precommit scan and remaining
@@ -579,10 +592,13 @@ these completion criteria are evidenced; scheduling is not verification.
 
 ## Deployment-specific work still required
 
-The checked-in Fly configuration is one relay and one Redis in one region,
-with immediate replacement and no automatic failover. It cannot provide
-uninterrupted upgrades or high availability. Do not scale it to two relays
-without cluster configuration and the external authority.
+The legacy Fly configuration is one relay and one Redis. The separate
+[cluster profile](deploy-fly-cluster.md) prepares three stable relay apps,
+an online authority and durable Redis, with five independent volumes in one
+explicit region. Its hosted image rehearsal remains failed; neither profile
+is a verified live deployment. The legacy profile must not be scaled into a
+cluster. The new profile uses immediate replacement and has no automatic
+Redis failover or uninterrupted-upgrade claim.
 
 The configuration still contains an example OIDC issuer. Actual Fly identity,
 deployed image, JWKS, TLS certificates, catalog provisioning, backups and
@@ -607,15 +623,20 @@ lease cleanup and dedicated-guest acceptance.
 
 ## Next action
 
-Settle C253's client license policy and artifact-aware enforcement without
-silently granting exceptions. PR #277 full CI, C252's declared advisory scope,
-and the current authority image's lifecycle/default-UID fixture proofs are
-complete within their stated bounds. C251 retains an unattributed historical
-failure; no further image-pending claim remains. Keep the new six-test C240
-actor-loop draft at source-only status until actual compilation and acceptance;
-public-close proof remains separate. complete M4-47 when its recorded account-security requirement is
-satisfied. Resolve universal-license decisions, actual deployment inventory/
-PKI/OIDC, simultaneous-restart recovery, off-host capacity/soak and operational
-ownership before any deployment claim. Preserve all failed attempts and older
-artifact identities. Keep this goal active while any criterion or deployment
-input remains unresolved.
+Finish the separately reviewed readiness diagnostics and incarnation-specific
+state paths, then require a new source-bound Fly image rehearsal with unchanged
+acceptance assertions. Preserve #287's completed checks, failure and frozen source. The
+new M4-76 authorization-deadline work and actual-image recovery rehearsal need
+their own tests; neither is proved by earlier successes. C240's actor tests
+have local and hosted evidence, while its broader public-close scope remains
+open. C251's historical cause remains unattributed and C256's local quarantine
+remains in force. Do not retry M4-47 without its recorded account-security
+requirement being satisfied.
+
+C253's five client license-policy refusals and universal-license decisions,
+actual Fly inventory/access/PKI/OIDC, simultaneous-restart and older-backup
+recovery, off-host capacity/soak and operational ownership remain required.
+Merge authorization applies only to reviewed, fully checked candidates; it
+does not authorize license exceptions or live deployment. Preserve all failures
+and exact artifact identities. Keep the goal active while any completion
+criterion or required deployment input is unresolved.

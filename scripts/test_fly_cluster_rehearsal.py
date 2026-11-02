@@ -2,6 +2,7 @@
 """Pure/mock and temporary-file controls; no Docker, service or native execution."""
 
 import copy
+import hashlib
 from contextlib import nullcontext, redirect_stdout
 import importlib.util
 import io
@@ -270,6 +271,26 @@ class Validation(unittest.TestCase):
         after["node_id"] = "relay-b"
         self.refused("persisted_identity_changed", rehearsal.check_persisted_version, before, after)
 
+    def test_observer_membership_path_is_exactly_bound_to_rendered_incarnation(self):
+        renderer = rehearsal.load_renderer()
+        inventory = json.loads((rehearsal.ROOT / 'deploy/fly/cluster/inventory.example.json').read_bytes())
+        files = renderer.render(inventory, example=True)
+        for node in rehearsal.NODES:
+            config = rehearsal.tomllib.loads(files[node + '/relay.toml'].decode())
+            expected = 'membership-version-' + hashlib.sha256(inventory['deployment_incarnation'].encode()).hexdigest() + '.json'
+            self.assertEqual(rehearsal.membership_state_file(config, inventory['deployment_incarnation']), expected)
+            for path in ('membership-version-state.json', '../outside', '/other/file',
+                         rehearsal.ROLE_BASE['relay'] + '/state/membership-version-' + '0' * 64 + '.json'):
+                modified = copy.deepcopy(config)
+                modified['cluster']['membership_version_state_path'] = path
+                with self.subTest(path=path), self.assertRaises(rehearsal.Refused):
+                    rehearsal.membership_state_file(modified, inventory['deployment_incarnation'])
+            with self.assertRaises(rehearsal.Refused):
+                rehearsal.membership_state_file(config, 'another-incarnation')
+        for value in ('', '../old', 'x' * 65, None, True):
+            with self.subTest(incarnation=value), self.assertRaises(rehearsal.Refused):
+                rehearsal.membership_state_file({}, value)
+
     def test_resp_exact_decode_and_command_encoding(self):
         self.assertEqual(rehearsal.read_resp(io.BytesIO(b"*3\r\n+OK\r\n:7\r\n$3\r\nabc\r\n")), ["OK", 7, "abc"])
         self.assertEqual(rehearsal.resp_command(["AUTH", "default", "password"]), b"*3\r\n$4\r\nAUTH\r\n$7\r\ndefault\r\n$8\r\npassword\r\n")
@@ -476,6 +497,242 @@ class LoopbackPublication(unittest.TestCase):
             self.assertNotIn(secret, serialized)
             self.assertNotIn("HostIp", serialized)
             self.assertNotIn("HostPort", serialized)
+
+
+class ReadinessDiagnostics(unittest.TestCase):
+    @staticmethod
+    def metrics(state="ready"):
+        return ("tunnel_relay_ready 0\ntunnel_relay_clock_offset_ready 1\n"
+                "tunnel_relay_clock_offset_milliseconds -12\n"
+                "tunnel_relay_clock_offset_measurements_total 3\n"
+                "tunnel_relay_clock_offset_measurement_failures_total 0\n" +
+                "".join(f'tunnel_relay_membership_readiness{{state="{name}"}} {int(name == state)}\n'
+                        for name in rehearsal.MEMBERSHIP_STATES)).encode()
+
+    def fixture(self):
+        fixture = object.__new__(rehearsal.Rehearsal)
+        fixture.event = mock.Mock()
+        fixture.run = rehearsal.Runner(Path("/unused-readiness-test"), fixture.event)
+        fixture.run.stage, fixture.run.operation = "bootstrap", "docker_container_inspect"
+        fixture.run.role, fixture.run.subcommand = "relay-c", "serve-or-inspect"
+        fixture.run.guard = mock.Mock()
+        fixture.consumer_ports = [10001, 10002, 10003]
+        fixture.public_hosts = [node + ".synthetic.invalid" for node in rehearsal.NODES]
+        fixture.public_context = mock.Mock()
+        fixture.relays = [{"role": node} for node in rehearsal.NODES]
+        fixture.docker = mock.Mock()
+        return fixture
+
+    def test_readiness_failure_records_closed_http_observation_and_original_context(self):
+        fixture = self.fixture()
+        def diagnostics():
+            fixture.run.stage, fixture.run.operation = "readiness_diagnostics", "docker_container_exec"
+            raise rehearsal.Refused("command_deadline")
+        fixture.collect_readiness_metrics = mock.Mock(side_effect=diagnostics)
+        def wait(run, predicate, seconds, code):
+            self.assertEqual((seconds, code), (60, "cluster_readiness_deadline"))
+            self.assertFalse(predicate())
+            raise rehearsal.Refused(code)
+        with mock.patch.object(rehearsal, "wait_until", side_effect=wait), \
+                mock.patch.object(rehearsal, "http_request", return_value=(503, b'{"status":"unready"}')):
+            with self.assertRaisesRegex(rehearsal.Refused, "^cluster_readiness_deadline$"):
+                fixture.wait_ready()
+        self.assertEqual((fixture.run.stage, fixture.run.operation, fixture.run.role, fixture.run.subcommand),
+                         ("bootstrap", "https_readiness", "relay-a", "readyz"))
+        fixture.event.assert_called_once()
+        event = fixture.event.call_args
+        self.assertEqual(event.args, ("readiness_observations",))
+        self.assertFalse(event.kwargs["passed"])
+        rows = event.kwargs["nodes"]
+        self.assertEqual(rows[0]["counts"], {"http_503_unready": 1})
+        self.assertEqual(rows[1]["attempts"], 0)
+        self.assertEqual(fixture.run.readiness_diagnostic_failures, [{"code": "command_deadline"}])
+
+    def test_ready_requires_all_three_exact_bodies_without_diagnostic_scrape(self):
+        fixture = self.fixture()
+        fixture.collect_readiness_metrics = mock.Mock()
+        with mock.patch.object(rehearsal, "wait_until", side_effect=lambda run, fn, seconds, code: self.assertTrue(fn())), \
+                mock.patch.object(rehearsal, "http_request", return_value=(200, b'{"status":"ready"}')) as request:
+            fixture.wait_ready()
+        self.assertEqual(request.call_count, 3)
+        self.assertEqual((fixture.run.operation, fixture.run.role, fixture.run.subcommand),
+                         ("https_readiness", "relay-c", "readyz"))
+        self.assertTrue(fixture.event.call_args.kwargs["passed"])
+        fixture.collect_readiness_metrics.assert_not_called()
+
+    def test_wrong_success_body_retains_refusal_without_leaking_body(self):
+        fixture = self.fixture(); fixture.collect_readiness_metrics = mock.Mock()
+        secret = "unrecorded-body-secret"
+        with mock.patch.object(rehearsal, "wait_until", side_effect=lambda run, fn, seconds, code: fn()), \
+                mock.patch.object(rehearsal, "http_request", return_value=(200, json.dumps({"secret": secret}).encode())):
+            with self.assertRaisesRegex(rehearsal.Refused, "^relay_ready_response$"):
+                fixture.wait_ready()
+        self.assertEqual(fixture.event.call_args.kwargs["nodes"][0]["last"]["body_class"], "other_json")
+        self.assertNotIn(secret, json.dumps(fixture.event.call_args.kwargs))
+
+    def test_transport_classes_withhold_messages_and_retry_original_os_errors(self):
+        secret = "unrecorded-PEM-body-or-error-secret"
+        cert = rehearsal.ssl.SSLCertVerificationError(secret); cert.verify_code = 62
+        cases = [(cert, "certificate_verification"), (rehearsal.ssl.SSLError(secret), "tls"),
+                 (ConnectionRefusedError(secret), "connection_refused"), (ConnectionResetError(secret), "connection_reset"),
+                 (TimeoutError(secret), "timeout"), (rehearsal.socket.gaierror(secret), "dns"), (OSError(secret), "os")]
+        for error, kind in cases:
+            with self.subTest(kind=kind):
+                fixture = self.fixture(); fixture.collect_readiness_metrics = mock.Mock()
+                def wait(run, fn, seconds, code):
+                    self.assertFalse(fn()); raise rehearsal.Refused(code)
+                with mock.patch.object(rehearsal, "wait_until", side_effect=wait), \
+                        mock.patch.object(rehearsal, "http_request", side_effect=error):
+                    with self.assertRaisesRegex(rehearsal.Refused, "^cluster_readiness_deadline$"):
+                        fixture.wait_ready()
+                self.assertEqual(fixture.event.call_args.kwargs["nodes"][0]["last"]["kind"], kind)
+                self.assertNotIn(secret, json.dumps(fixture.event.call_args.kwargs))
+        self.assertEqual(rehearsal.readiness_transport_observation(RuntimeError(secret)), {"kind": "unclassified_exception"})
+
+    def test_network_deadline_stays_immediate_primary_failure(self):
+        fixture = self.fixture(); fixture.collect_readiness_metrics = mock.Mock(side_effect=RuntimeError("private-secondary"))
+        with mock.patch.object(rehearsal, "wait_until", side_effect=lambda run, fn, seconds, code: fn()), \
+                mock.patch.object(rehearsal, "http_request", side_effect=rehearsal.Refused("network_request_deadline")):
+            with self.assertRaisesRegex(rehearsal.Refused, "^network_request_deadline$"):
+                fixture.wait_ready()
+        self.assertEqual(fixture.run.readiness_diagnostic_failures, [{"code": "diagnostic_unclassified"}])
+        self.assertNotIn("private-secondary", json.dumps(fixture.run.readiness_diagnostic_failures))
+
+    def test_deep_unready_json_diagnostics_cannot_change_original_retry(self):
+        fixture = self.fixture(); fixture.collect_readiness_metrics = mock.Mock()
+        body = b"[" * 10000 + b"0" + b"]" * 10000
+        def wait(run, fn, seconds, code):
+            self.assertFalse(fn())
+            raise rehearsal.Refused(code)
+        with mock.patch.object(rehearsal, "wait_until", side_effect=wait), \
+                mock.patch.object(rehearsal, "http_request", return_value=(503, body)):
+            with self.assertRaisesRegex(rehearsal.Refused, "^cluster_readiness_deadline$"):
+                fixture.wait_ready()
+        self.assertEqual(fixture.event.call_args.kwargs["nodes"][0]["counts"], {"http_503_invalid_json": 1})
+
+    def test_metrics_series_match_actual_rust_closed_schema(self):
+        source = (rehearsal.ROOT / "crates/tunnel-relay/src/membership_runtime.rs").read_text()
+        block = source.split("pub const CODES: [&'static str; 10] = [", 1)[1].split("];", 1)[0]
+        self.assertEqual(tuple(rehearsal.re.findall(r'"([a-z_]+)"', block)), rehearsal.MEMBERSHIP_STATES)
+        rendered = rehearsal.readiness_metrics(self.metrics())
+        self.assertEqual(rendered, {"ready": False, "authority_ready": None, "clock_ready": True,
+                         "clock_offset_ms": -12, "clock_measurements": 3, "clock_failures": 0, "membership_state": "ready"})
+        self.assertTrue(rehearsal.readiness_metrics(self.metrics() + b"tunnel_relay_authority_ready 1\n")["authority_ready"])
+
+    def test_metrics_duplicates_unknown_selected_labels_and_wrong_one_hot_refused(self):
+        base = self.metrics()
+        bad = [base + b"tunnel_relay_ready 0\n", base + b'tunnel_relay_ready{tenant="secret"} 0\n',
+               base + b" tunnel_relay_ready 0\n", base + b"\ttunnel_relay_clock_offset_measurements_total 4\n",
+               base + b' tunnel_relay_membership_readiness{state="ready"} 1\n',
+               base.replace(b'state="starting"', b'state="private_secret"'),
+               base.replace(b'state="ready"} 1', b'state="ready"} 0'),
+               base.replace(b'state="starting"} 0', b'state="starting"} 1'),
+               base.replace(b'tunnel_relay_ready 0\n', b''), base + b'tunnel_relay_membership_readiness{state="ready"} 1\n']
+        for value in bad:
+            with self.subTest(size=len(value)), self.assertRaises(rehearsal.Refused):
+                rehearsal.readiness_metrics(value)
+
+    def test_metrics_nonfinite_oversize_and_integer_bounds_refused(self):
+        for value in (b"NaN", b"Infinity", b"-Infinity", b"1e0", b"18446744073709551616", b"-1", b"9" * 5000):
+            with self.subTest(value=value[:25]), self.assertRaises(rehearsal.Refused):
+                rehearsal.readiness_metrics(self.metrics().replace(b"measurements_total 3", b"measurements_total " + value))
+        for value in (b"9223372036854775808", b"-9223372036854775809"):
+            with self.assertRaises(rehearsal.Refused):
+                rehearsal.readiness_metrics(self.metrics().replace(b"milliseconds -12", b"milliseconds " + value))
+        for value in (b"", b"x" * (rehearsal.MAX_READINESS_METRICS + 1), b"\xff"):
+            with self.assertRaises(rehearsal.Refused):
+                rehearsal.readiness_metrics(value)
+        self.assertEqual(rehearsal.readiness_metrics(self.metrics().replace(b"measurements_total 3", b"measurements_total 18446744073709551615"))["clock_measurements"], 2**64 - 1)
+
+    def helper(self, *, data=None, error=None, uid=10001, slow=False):
+        namespace = {"__name__": "pure_helper_control"}
+        exec(rehearsal.readiness_metrics_program(), namespace)
+        connection = mock.Mock()
+        response = connection.getresponse.return_value
+        response.status = 200
+        response.read.return_value = self.metrics() if data is None else data
+        handler = []
+        if slow:
+            response.read.side_effect = lambda limit: handler[0](rehearsal.signal.SIGALRM, None)
+        if error is not None:
+            response.read.side_effect = error
+        output = io.StringIO()
+        with mock.patch.object(rehearsal.http.client, "HTTPConnection", return_value=connection) as connect, \
+                mock.patch.object(rehearsal.os, "geteuid", return_value=uid), \
+                mock.patch.object(rehearsal.os, "getegid", return_value=10001), \
+                mock.patch.object(rehearsal.signal, "signal", side_effect=lambda sig, fn: handler.append(fn)), \
+                mock.patch.object(rehearsal.signal, "setitimer") as timer, redirect_stdout(output):
+            namespace["main"]()
+        return json.loads(output.getvalue()), connection, connect, timer, output.getvalue()
+
+    def test_actual_helper_is_non_root_loopback_bounded_and_emits_only_projection(self):
+        secret = "unrecorded-metric-label-secret"
+        value, connection, connect, timer, text = self.helper(data=self.metrics() + f'unknown_metric{{label="{secret}"}} 7\n'.encode())
+        self.assertEqual(value["status"], "ok")
+        connect.assert_called_once_with("::1", 9100, timeout=5)
+        connection.request.assert_called_once_with("GET", "/metrics", headers={"Connection": "close"})
+        connection.getresponse.return_value.read.assert_called_once_with(65537)
+        self.assertEqual(timer.call_args_list, [mock.call(rehearsal.signal.ITIMER_REAL, 5), mock.call(rehearsal.signal.ITIMER_REAL, 0)])
+        connection.close.assert_called_once_with()
+        self.assertNotIn(secret, text)
+        self.assertEqual(rehearsal.readiness_metrics_envelope(text.encode()), value)
+        value, _, connect, _, _ = self.helper(uid=0)
+        self.assertEqual(value, {"status": "failed", "code": "metrics_identity"})
+        connect.assert_not_called()
+
+    def test_slow_body_and_transport_errors_are_closed_secondary_failures(self):
+        for kwargs, code in [({"slow": True}, "metrics_timeout"),
+                             ({"error": OSError("unrecorded-secret")}, "metrics_transport"),
+                             ({"data": b"x" * 65537}, "metrics_body_bound")]:
+            with self.subTest(code=code):
+                value, _, _, _, text = self.helper(**kwargs)
+                self.assertEqual(value, {"status": "failed", "code": code})
+                self.assertNotIn("unrecorded-secret", text)
+
+    def test_metrics_envelope_refuses_extra_fields_duplicates_and_wrong_types(self):
+        valid = {"status": "ok", "metrics": rehearsal.readiness_metrics(self.metrics())}
+        malformed = [{**valid, "secret": "private-value"}, {"status": "failed", "code": "private-value"},
+                     {"status": "ok", "metrics": {**valid["metrics"], "clock_measurements": True}},
+                     {"status": "ok", "metrics": {**valid["metrics"], "clock_offset_ms": float("inf")}}]
+        for value in malformed:
+            with self.assertRaises(rehearsal.Refused):
+                rehearsal.readiness_metrics_envelope(json.dumps(value).encode())
+        with self.assertRaises(rehearsal.Refused):
+            rehearsal.readiness_metrics_envelope(b'{"status":"failed","status":"ok","code":"metrics_timeout"}')
+
+    def test_owned_exec_checks_identity_before_and_after_without_user_or_publish_override(self):
+        run = mock.Mock(); image = "sha256:" + "b" * 64
+        docker = rehearsal.Docker(run, "owner", {"relay": image})
+        item = {"role": "relay-a", "image": image, "id": "a" * 64}
+        docker.inspect = mock.Mock(return_value={"State": {"Running": True}})
+        docker.call = mock.Mock(return_value=rehearsal.canonical({"status": "ok", "metrics": rehearsal.readiness_metrics(self.metrics())}))
+        self.assertEqual(docker.readiness_metrics(item)["status"], "ok")
+        self.assertEqual(docker.inspect.call_args_list, [mock.call(item), mock.call(item)])
+        args = docker.call.call_args.args[0]
+        self.assertEqual(args[:7], ["container", "exec", item["id"], "/usr/bin/python3", "-I", "-c", rehearsal.readiness_metrics_program()])
+        self.assertEqual(docker.call.call_args.kwargs, {"timeout": 10})
+        docker.inspect.side_effect = rehearsal.Refused("foreign-container")
+        docker.call.reset_mock()
+        with self.assertRaises(rehearsal.Refused):
+            docker.readiness_metrics(item)
+        docker.call.assert_not_called()
+
+    def test_diagnostics_share_original_budget_and_stop_after_guard_failure(self):
+        fixture = self.fixture()
+        original = fixture.run.deadline
+        fixture.docker.readiness_metrics.return_value = {"status": "failed", "code": "metrics_timeout"}
+        fixture.collect_readiness_metrics()
+        self.assertEqual(fixture.docker.readiness_metrics.call_count, 3)
+        self.assertEqual(fixture.run.deadline, original)
+        self.assertEqual(len(fixture.run.readiness_diagnostic_failures), 3)
+        self.assertTrue(fixture.event.call_args.kwargs["complete"])
+        fixture = self.fixture()
+        fixture.run.guard.side_effect = rehearsal.Refused("controller_deadline")
+        with self.assertRaisesRegex(rehearsal.Refused, "^controller_deadline$"):
+            fixture.collect_readiness_metrics()
+        fixture.docker.readiness_metrics.assert_not_called()
+        self.assertFalse(fixture.event.call_args.kwargs["complete"])
+        self.assertEqual(fixture.run.readiness_diagnostic_failures[0]["code"], "controller_deadline")
 
 
 class Cleanup(unittest.TestCase):
@@ -901,6 +1158,8 @@ class PassivePublication(unittest.TestCase):
         fixture.authority, fixture.relays = {"id": "authority"}, [{}, {}, {}]
         fixture.authority_inventory, fixture.run_id = self.inventory, self.run_id
         fixture.states = {node: node for node in (*rehearsal.NODES, "authority")}
+        expected_name = 'membership-version-' + hashlib.sha256(self.inventory['deployment_incarnation'].encode()).hexdigest() + '.json'
+        fixture.membership_files = {node: expected_name for node in rehearsal.NODES}
         fixture.checkpoint = mock.Mock(side_effect=AssertionError("active HTTP observer"))
         fixture.event = mock.Mock()
         clock, events = [100.0], []
@@ -918,6 +1177,7 @@ class PassivePublication(unittest.TestCase):
             events.append(("read", volume, max_bytes, fixture.run.deadline))
             if volume == "authority":
                 return {paths[0]: rehearsal.canonical(next(publications))}
+            self.assertEqual(paths, [expected_name])
             if volume == "relay-c":
                 if expire_during_reads:
                     clock[0] = 140

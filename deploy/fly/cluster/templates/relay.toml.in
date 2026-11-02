@@ -1,6 +1,7 @@
 # Nonsecret base: the entrypoint prepends its validated secret redis_url.
 consumer_bind = "[::]:8443"
 device_bind = "[::]:9443"
+metrics_bind = "[::1]:9100"
 oidc_issuer = $issuer
 oidc_audience = $audiences
 oidc_jwks_path = "/var/lib/agent-tunnel/secrets/oidc-jwks.json"
@@ -33,7 +34,7 @@ checkpoint_authority_endpoint = $checkpoint_endpoint
 checkpoint_authority_trust_path = "/var/lib/agent-tunnel/secrets/checkpoint-ca.pem"
 checkpoint_authority_client_cert_chain = "/var/lib/agent-tunnel/secrets/checkpoint-client-chain.pem"
 checkpoint_authority_client_private_key = "/var/lib/agent-tunnel/secrets/checkpoint-client-key.pem"
-membership_version_state_path = "/var/lib/agent-tunnel/state/membership-version-state.json"
+membership_version_state_path = $membership_state_path
 
 [cluster.endpoint_policy]
 allowed_hosts = $hosts

@@ -72,6 +72,55 @@ class FlyClusterTests(unittest.TestCase):
             else:
                 json.loads(data)
 
+    def test_new_incarnation_uses_fresh_membership_path_without_moving_other_state(self):
+        old = self.render()
+        candidate = copy.deepcopy(self.data)
+        candidate['deployment_incarnation'] += '-recovered'
+        candidate['membership']['revision'] += 1
+        new = self.render(candidate)
+        self.assertEqual(old['authority/authority.toml'], new['authority/authority.toml'])
+        for node in renderer.NODES:
+            before = tomllib.loads(old[node + '/relay.toml'].decode())
+            after = tomllib.loads(new[node + '/relay.toml'].decode())
+            self.assertEqual(before['recovery'], after['recovery'])
+            self.assertEqual(tomllib.loads(old[node + '/fly.toml'].decode())['mounts'],
+                             tomllib.loads(new[node + '/fly.toml'].decode())['mounts'])
+            self.assertNotEqual(before['cluster']['membership_version_state_path'],
+                                after['cluster']['membership_version_state_path'])
+            for config, incarnation in ((before, self.data['deployment_incarnation']),
+                                        (after, candidate['deployment_incarnation'])):
+                expected = '/var/lib/agent-tunnel/state/membership-version-' + hashlib.sha256(
+                    incarnation.encode('utf-8')).hexdigest() + '.json'
+                self.assertEqual(config['cluster']['membership_version_state_path'], expected)
+
+    def test_same_incarnation_image_update_keeps_membership_path_and_state_volume(self):
+        before = self.render()
+        update = copy.deepcopy(self.data)
+        update['images']['relay'] = 'sha256:' + 'a' * 64
+        after = self.render(update)
+        for node in renderer.NODES:
+            old = tomllib.loads(before[node + '/relay.toml'].decode())
+            new = tomllib.loads(after[node + '/relay.toml'].decode())
+            self.assertEqual(old['cluster']['membership_version_state_path'],
+                             new['cluster']['membership_version_state_path'])
+            self.assertEqual(old['recovery'], new['recovery'])
+            self.assertEqual(tomllib.loads(before[node + '/fly.toml'].decode())['mounts'],
+                             tomllib.loads(after[node + '/fly.toml'].decode())['mounts'])
+
+    def test_membership_path_derivation_refuses_unvalidated_incarnations(self):
+        for value in ('', '../old', '/outside', 'x' * 65, 'x\n', 'é', None, True, 1):
+            with self.subTest(value=value), self.assertRaises(renderer.ProfileError):
+                renderer.membership_state_path(value)
+
+    def test_readiness_metrics_remain_container_loopback_without_fly_service(self):
+        files = self.render()
+        for node in ('relay-a', 'relay-b', 'relay-c'):
+            config = tomllib.loads(files[node + '/relay.toml'].decode())
+            fly = tomllib.loads(files[node + '/fly.toml'].decode())
+            self.assertEqual(config['metrics_bind'], '[::1]:9100')
+            self.assertEqual({service['internal_port'] for service in fly['services']}, {8443, 9443})
+            self.assertNotIn('9100', files[node + '/fly.toml'].decode())
+
     def test_three_hosts_and_shared_authority_scope_match_without_override_slots(self):
         files = self.render()
         hosts = [r['app'] + '.internal' for r in self.data['relays']]
@@ -141,7 +190,8 @@ class FlyClusterTests(unittest.TestCase):
             self.assertNotIn('AT_REDIS_URL', env)
             config = tomllib.loads(files[node + '/relay.toml'].decode())
             self.assertEqual(config['cluster']['membership_version_state_path'],
-                             '/var/lib/agent-tunnel/state/membership-version-state.json')
+                             '/var/lib/agent-tunnel/state/membership-version-' + hashlib.sha256(
+                                 self.data['deployment_incarnation'].encode('utf-8')).hexdigest() + '.json')
             self.assertEqual(config['recovery']['fence_path'],
                              '/var/lib/agent-tunnel/state/recovery-approval-fence.json')
             self.assertTrue(config['cluster']['checkpoint_authority_client_private_key'].endswith(

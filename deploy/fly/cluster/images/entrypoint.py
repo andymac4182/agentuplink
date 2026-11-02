@@ -239,6 +239,7 @@ def validate_config(role, data, base):
         require(config.get("consumer_bind") in {"0.0.0.0:8443", "[::]:8443"}
                 and config.get("device_bind") in {"0.0.0.0:9443", "[::]:9443"},
                 "relay public listeners refused")
+        require(config.get("metrics_bind") == "[::1]:9100", "relay metrics must use container loopback")
         cluster, recovery = config.get("cluster", {}), config.get("recovery", {})
         require(isinstance(cluster, dict) and isinstance(recovery, dict), "cluster and recovery sections required")
         require(cluster.get("peer_bind") == "[::]:7443", "peer IPv6 listener required")
@@ -255,7 +256,11 @@ def validate_config(role, data, base):
         for section, paths in sections:
             for key, name in paths.items():
                 require(section.get(key) == str(secrets / name), "relay secret path differs from image contract")
-        require(cluster.get("membership_version_state_path") == str(base / "state/membership-version-state.json")
+        incarnation = config.get("deployment_incarnation")
+        require(type(incarnation) is str and re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}", incarnation) is not None,
+                "relay incarnation refused")
+        membership_name = "membership-version-" + hashlib.sha256(incarnation.encode("utf-8")).hexdigest() + ".json"
+        require(cluster.get("membership_version_state_path") == str(base / "state" / membership_name)
                 and recovery.get("fence_path") == str(base / "state/recovery-approval-fence.json"), "relay state paths refused")
         require(set(recovery) == {"fence_path", "trusted_keys_path"}, "recovery credential overrides refused")
         # Additional credential paths/aliases must not bypass materialization.

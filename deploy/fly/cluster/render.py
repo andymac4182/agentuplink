@@ -43,6 +43,12 @@ def number(value, minimum, maximum, label):
     require(type(value) is int and minimum <= value <= maximum, label)
 
 
+def membership_state_path(incarnation):
+    text(incarnation, r'[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}', 'invalid-shared-identity')
+    return RELAY_BASE + '/state/membership-version-' + hashlib.sha256(
+        incarnation.encode('utf-8')).hexdigest() + '.json'
+
+
 def digest(value, label):
     text(value, r'[0-9a-f]{64}', label)
     require(value != '0' * 64, label)
@@ -247,6 +253,7 @@ def render(data, example=False):
                 'namespace': data['redis_namespace'], 'node_id': name,
                 'deployment_id': data['deployment_id'],
                 'incarnation': data['deployment_incarnation'], 'peer_bind': data['peer_bind'],
+                'membership_state_path': membership_state_path(data['deployment_incarnation']),
                 'hosts': hosts, 'checkpoint_endpoint': 'https://' + data['authority']['app']
                     + '.internal:8444/v1/checkpoint'})
             config_path = name + '/relay.toml'

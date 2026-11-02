@@ -110,6 +110,82 @@ class ImageBoundary(unittest.TestCase):
         self.assertEqual(path.read_bytes(), b"new synthetic key bytes")
         self.assertFalse(list((base / "secrets").glob(".materialize-*")))
 
+    def test_new_incarnation_materialization_preserves_old_membership_and_recovery_fence(self):
+        base, env = self.fixture("relay")
+        original = base64.b64decode(env["AT_CLUSTER_CONFIG_B64"])
+        old = tomllib.loads(original.decode())
+        old_name = Path(old["cluster"]["membership_version_state_path"]).name
+        preserved = {old_name: b'{"checkpoint_version":19}', old_name + '.lock': b'',
+                     'recovery-approval-fence.json': b'{"highest_approval_version":7}',
+                     'recovery-approval-fence.json.lock': b''}
+        for name, data in preserved.items():
+            (base / "state" / name).write_bytes(data)
+            (base / "state" / name).chmod(0o600)
+        before = {name: ((base / "state" / name).stat().st_ino, data) for name, data in preserved.items()}
+        candidate = json.loads(json.dumps(self.inventory))
+        candidate['deployment_incarnation'] += '-recovered'
+        candidate['membership']['revision'] += 1
+        rendered = renderer.render(candidate, example=True)
+        data = rendered['relay-a/relay.toml'].replace(str(entry.BASES['relay']).encode(), str(base).encode())
+        env['AT_CLUSTER_CONFIG_B64'] = encoded(data)
+        new_name = Path(tomllib.loads(data.decode())['cluster']['membership_version_state_path']).name
+        self.assertNotEqual(new_name, old_name)
+        for arguments in (['serve'], ['initialize']):
+            argv, _ = self.prepare('relay', base, env, arguments)
+            self.assertEqual(argv[1], arguments[0])
+            self.assertEqual(set(p.name for p in (base / 'state').iterdir()), set(preserved))
+            self.assertFalse((base / 'state' / new_name).exists())
+            for name, (inode, value) in before.items():
+                self.assertEqual((base / 'state' / name).stat().st_ino, inode)
+                self.assertEqual((base / 'state' / name).read_bytes(), value)
+        # Only preparation ran: it never executes Rust or initializes state.
+
+    def test_membership_paths_reject_old_incarnation_legacy_aliases_and_fence_changes(self):
+        base, env = self.fixture('relay')
+        original = base64.b64decode(env['AT_CLUSTER_CONFIG_B64']).decode()
+        config = tomllib.loads(original)
+        path = config['cluster']['membership_version_state_path']
+        old_digest = hashlib.sha256(b'independently-different-incarnation').hexdigest()
+        variants = [str(base / 'state' / ('membership-version-' + old_digest + '.json')),
+                    str(base / 'state/membership-version-state.json'),
+                    str(base / 'state/arbitrary.json'), str(base / 'state/../outside.json'),
+                    str(base / 'state' / ('membership-version-' + '0' * 64 + '.json'))]
+        for replacement in variants:
+            with self.subTest(path=replacement), self.assertRaises(entry.Refusal):
+                entry.validate_config('relay', original.replace(path, replacement).encode(), base)
+        with self.assertRaises(entry.Refusal):
+            entry.validate_config('relay', original.replace('recovery-approval-fence.json', 'new-fence.json').encode(), base)
+        for incarnation in ('', '../old', 'x' * 65, 'é'):
+            data = original.replace(json.dumps(config['deployment_incarnation']), json.dumps(incarnation, ensure_ascii=False))
+            with self.subTest(incarnation=incarnation), self.assertRaises(entry.Refusal):
+                entry.validate_config('relay', data.encode(), base)
+
+    def test_authority_preparation_never_moves_or_resets_allocator_state(self):
+        base, env = self.fixture('authority')
+        preserved = {'authority.json': b'{"membership_high_water":29,"checkpoint_high_water":31}',
+                     'authority.json.lock': b''}
+        for name, value in preserved.items():
+            (base / 'state' / name).write_bytes(value)
+            (base / 'state' / name).chmod(0o600)
+        before = {name: (base / 'state' / name).stat().st_ino for name in preserved}
+        for arguments in (['serve'], ['approve-membership', '--expected-redis-run-id', 'a' * 40, '--expected-revision', '1']):
+            argv, _ = self.prepare('authority', base, env, arguments)
+            self.assertEqual(argv[1], arguments[0])
+            self.assertEqual(set(p.name for p in (base / 'state').iterdir()), set(preserved))
+            for name, value in preserved.items():
+                self.assertEqual((base / 'state' / name).stat().st_ino, before[name])
+                self.assertEqual((base / 'state' / name).read_bytes(), value)
+
+    def test_metrics_require_exact_container_loopback_without_alternate_listener(self):
+        for index, address in enumerate(('[::]:9100', '0.0.0.0:9100', '127.0.0.1:9100', '[::1]:9101', '192.0.2.1:9100')):
+            with self.subTest(address=address):
+                base, env = self.fixture("relay", f"metrics-{index}")
+                config = base64.b64decode(env["AT_CLUSTER_CONFIG_B64"]).decode()
+                self.assertIn('metrics_bind = "[::1]:9100"', config)
+                env["AT_CLUSTER_CONFIG_B64"] = encoded(config.replace('[::1]:9100', address).encode())
+                with self.assertRaisesRegex(entry.Refusal, "relay metrics must use container loopback"):
+                    self.prepare("relay", base, env)
+
     def test_failed_atomic_write_retains_old_file_and_cleans_only_own_temp(self):
         base, env = self.fixture("relay")
         self.prepare("relay", base, env)

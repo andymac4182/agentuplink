@@ -43,12 +43,38 @@ Discover the Redis UID/GID from the exact built image; do not infer its GID from
 another image. The state directory must already exist, be owned by the runtime
 UID and have mode0700. Its ancestors must be real directories. Startup never
 creates, chmods, chowns, removes, resets or repairs state. Preserve the whole
-authority directory for its stable lock and atomic replacements, and both
-relay state/fence files. Never run two writers or replace a volume with an older
+authority directory for its stable lock and atomic replacements, and all
+relay membership files, locks and the recovery fence. Never run two writers or replace a volume with an older
 copy during an image rollback. Preparation must not recursively alter existing
 state; inspect and resolve an unsafe existing volume through a separate operator
 procedure. A read-only root requires an explicit writable ephemeral secrets
 mount with the same ownership; secrets must never be placed on the state volume.
+
+The relay membership path is fixed by the validated incarnation:
+`/var/lib/agent-tunnel/state/membership-version-<digest>.json`, with the full
+lowercase SHA256 of the incarnation's UTF-8 bytes. The entrypoint independently
+checks the exact derived path. It has no arbitrary-path override and creates no
+membership file itself. An approved new incarnation needs an explicit stopped
+`initialize` command for its absent file, preserving all earlier files. A normal
+restart of the same incarnation continues to use the same file and counters.
+The recovery fence is always `state/recovery-approval-fence.json`; the authority
+file is always `state/authority.json`. Neither changes with incarnation.
+
+If an older profile already used `state/membership-version-state.json`, do not
+initialize empty state under the new filename for that same incarnation. The
+new image refuses the legacy path. Stop/fence the relay and use an independently
+reviewed offline migration that preserves the old file/lock, verifies its exact
+identity/high-waters, and creates a private, durably synced, byte-identical new
+file without overwriting an existing destination. Verify that copy before
+startup; keep the recovery fence and authority counters intact. There is no
+automatic migration or claim that such a migration has been exercised. See
+[the cluster upgrade/recovery contract](../../../../docs/deploy-fly-cluster.md#upgrade-rollback-and-redis-recovery).
+
+The relay metrics listener is exactly `[::1]:9100`; alternative or wildcard
+addresses are refused by the entrypoint. No public service/host publication is
+added. Failure diagnostics execute an identity-checked, bounded local helper as
+the relay user and retain only fixed readiness fields; raw metrics/logs remain
+private. This does not configure a production scraper or prove readiness.
 
 All required base64 values are strict, nonempty and at most128KiB decoded;
 configuration is at most32KiB and the membership private key at most4096 bytes.

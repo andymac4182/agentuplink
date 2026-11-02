@@ -15,6 +15,7 @@ import datetime as dt
 import hashlib
 import http.client
 import importlib.util
+import inspect
 import json
 import os
 from pathlib import Path
@@ -45,6 +46,13 @@ MAX_PRIVATE = 256 * 1024 * 1024
 MAX_DOCKER_ERROR = 16 * 1024
 MAX_AUTHORITY_OBSERVATION = 256 * 1024
 MAX_RELAY_OBSERVATION = 16 * 1024
+MAX_READINESS_METRICS = 64 * 1024
+READINESS_METRICS_PORT = 9100
+MEMBERSHIP_STATES = ("starting", "ready", "unknown_authority", "checkpoint_expired", "catalog_unavailable",
+                     "membership_rejected", "missing_local_membership", "missing_local_key", "persistence_unavailable", "cancelled")
+METRICS_FAILURE_CODES = {"metrics_body_bound", "metrics_encoding", "metrics_selected_shape", "metrics_duplicate",
+                         "metrics_missing", "metrics_value", "metrics_membership_state", "metrics_one_hot",
+                         "metrics_identity", "metrics_http_status", "metrics_timeout", "metrics_transport", "metrics_unclassified"}
 NODES = ("relay-a", "relay-b", "relay-c")
 LOG_CONFIG = {"Type": "local", "Config": {"max-size": "2m", "max-file": "1", "compress": "false"}}
 NETWORK_DEADLINE = None  # one sequential controller; all requests share its original budget
@@ -250,6 +258,148 @@ def published_binding_shape(value, port):
             "accepted": count == 1 and address_class == "ipv6_loopback" and valid_port}
 
 
+def readiness_transport_observation(error):
+    """Closed classes only; exception text may contain hostnames or secrets."""
+    if isinstance(error, ssl.SSLCertVerificationError):
+        code = getattr(error, "verify_code", None)
+        return {"kind": "certificate_verification", "verify_code": code if type(code) is int and 0 <= code <= 65535 else None}
+    for kind, exception in (("tls", ssl.SSLError), ("connection_refused", ConnectionRefusedError),
+                            ("connection_reset", ConnectionResetError), ("connection_aborted", ConnectionAbortedError),
+                            ("timeout", TimeoutError), ("dns", socket.gaierror),
+                            ("connection", ConnectionError), ("os", OSError), ("http_protocol", http.client.HTTPException)):
+        if isinstance(error, exception):
+            return {"kind": kind}
+    if isinstance(error, Refused) and str(error) in {"network_request_deadline", "controller_deadline", "http_body_bound"}:
+        return {"kind": str(error)}
+    return {"kind": "unclassified_exception"}
+
+
+def readiness_http_observation(status, body):
+    """Describe the bounded reply without retaining its body or raw fields."""
+    try:
+        value = json.loads(body)
+    except (ValueError, UnicodeError, RecursionError):
+        body_class = "invalid_json"
+    else:
+        body_class = "ready" if value == {"status": "ready"} else ("unready" if value == {"status": "unready"} else "other_json")
+    return {"kind": "http", "status": status if type(status) is int and 100 <= status <= 599 else None,
+            "body_class": body_class}
+
+
+def readiness_metrics(data):
+    """Select only fixed private readiness series; no raw labels escape."""
+    require(isinstance(data, bytes) and 0 < len(data) <= MAX_READINESS_METRICS, "metrics_body_bound")
+    try:
+        text = data.decode("utf-8")
+    except UnicodeError:
+        raise Refused("metrics_encoding") from None
+    names = {"tunnel_relay_ready": "ready", "tunnel_relay_authority_ready": "authority_ready",
+             "tunnel_relay_clock_offset_ready": "clock_ready", "tunnel_relay_clock_offset_milliseconds": "clock_offset_ms",
+             "tunnel_relay_clock_offset_measurements_total": "clock_measurements",
+             "tunnel_relay_clock_offset_measurement_failures_total": "clock_failures"}
+    values, states = {}, {}
+    for line in text.splitlines():
+        match = re.match(r"([a-zA-Z_:][a-zA-Z0-9_:]*)", line.lstrip())
+        if match is None:
+            continue
+        name = match[1]
+        if name == "tunnel_relay_membership_readiness":
+            sample = re.fullmatch(r'tunnel_relay_membership_readiness\{state="([a-z_]+)"\} ([01])', line)
+            require(sample is not None, "metrics_selected_shape")
+            label, number = sample.groups()
+            require(label in MEMBERSHIP_STATES, "metrics_membership_state")
+            require(label not in states, "metrics_duplicate")
+            states[label] = int(number)
+        elif name in names:
+            sample = re.fullmatch(re.escape(name) + r" (-?(?:0|[1-9][0-9]{0,19}))", line)
+            require(sample is not None, "metrics_selected_shape")
+            key, number = names[name], int(sample[1])
+            require(key not in values, "metrics_duplicate")
+            if key in {"ready", "authority_ready", "clock_ready"}:
+                require(number in (0, 1), "metrics_value")
+                values[key] = bool(number)
+            else:
+                lower, upper = (-(2**63), 2**63 - 1) if key == "clock_offset_ms" else (0, 2**64 - 1)
+                require(lower <= number <= upper, "metrics_value")
+                values[key] = number
+    require(set(states) == set(MEMBERSHIP_STATES)
+            and {"ready", "clock_ready", "clock_measurements", "clock_failures"} <= set(values), "metrics_missing")
+    require(sum(states.values()) == 1, "metrics_one_hot")
+    values["membership_state"] = next(state for state in MEMBERSHIP_STATES if states[state] == 1)
+    values.setdefault("authority_ready", None)
+    values.setdefault("clock_offset_ms", None)
+    return values
+
+
+def readiness_metrics_program():
+    # The same pure parser is used by controls and the fixed, non-root exec
+    # helper. No raw metric body or exception is printed by that helper.
+    return ("import http.client,json,os,re,signal\n"
+            "class Refused(Exception): pass\n"
+            "def require(value, code):\n    if not value: raise Refused(code)\n"
+            f"MAX_READINESS_METRICS={MAX_READINESS_METRICS}\nMEMBERSHIP_STATES={MEMBERSHIP_STATES!r}\n"
+            + inspect.getsource(readiness_metrics) + f'''
+def main():
+    connection = None
+    def expired(_signal, _frame):
+        raise TimeoutError()
+    signal.signal(signal.SIGALRM, expired)
+    signal.setitimer(signal.ITIMER_REAL, 5)
+    try:
+        require(os.geteuid() == 10001 and os.getegid() == 10001, "metrics_identity")
+        connection = http.client.HTTPConnection("{HOST_LOOPBACK}", {READINESS_METRICS_PORT}, timeout=5)
+        connection.request("GET", "/metrics", headers={{"Connection": "close"}})
+        response = connection.getresponse()
+        require(response.status == 200, "metrics_http_status")
+        result = {{"status": "ok", "metrics": readiness_metrics(response.read(MAX_READINESS_METRICS + 1))}}
+    except Refused as error:
+        result = {{"status": "failed", "code": str(error)}}
+    except TimeoutError:
+        result = {{"status": "failed", "code": "metrics_timeout"}}
+    except (OSError, http.client.HTTPException):
+        result = {{"status": "failed", "code": "metrics_transport"}}
+    except BaseException:
+        result = {{"status": "failed", "code": "metrics_unclassified"}}
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        if connection is not None:
+            try:
+                connection.close()
+            except BaseException:
+                if result["status"] == "ok":
+                    result = {{"status": "failed", "code": "metrics_unclassified"}}
+    print(json.dumps(result, sort_keys=True))
+if __name__ == "__main__":
+    main()
+''')
+
+
+def readiness_metrics_envelope(data):
+    value = observation_json(data, 4096)
+    require(isinstance(value, dict), "metrics_envelope")
+    if value.get("status") == "failed":
+        require(set(value) == {"status", "code"} and isinstance(value["code"], str)
+                and value["code"] in METRICS_FAILURE_CODES, "metrics_envelope")
+        return value
+    require(set(value) == {"status", "metrics"} and value["status"] == "ok", "metrics_envelope")
+    metrics = value["metrics"]
+    require(isinstance(metrics, dict) and set(metrics) == {"ready", "authority_ready", "clock_ready", "clock_offset_ms",
+            "clock_measurements", "clock_failures", "membership_state"}, "metrics_envelope")
+    require(type(metrics["ready"]) is bool and type(metrics["clock_ready"]) is bool
+            and (metrics["authority_ready"] is None or type(metrics["authority_ready"]) is bool)
+            and (metrics["clock_offset_ms"] is None or type(metrics["clock_offset_ms"]) is int
+                 and -(2**63) <= metrics["clock_offset_ms"] < 2**63)
+            and u64(metrics["clock_measurements"]) and u64(metrics["clock_failures"])
+            and metrics["membership_state"] in MEMBERSHIP_STATES, "metrics_envelope")
+    return value
+
+
+def readiness_diagnostic_code(error):
+    allowed = METRICS_FAILURE_CODES | {"metrics_envelope", "controller_deadline", "controller_interrupted",
+                                      "command_deadline", "command_exit", "command_output_bound", "metrics_container"}
+    return str(error) if isinstance(error, Refused) and str(error) in allowed else "diagnostic_unclassified"
+
+
 def safe_log_receipt(path, *, docker=False):
     size = path.stat().st_size
     if size > MAX_OUTPUT:
@@ -424,6 +574,17 @@ def utc_ns():
     return timestamp_ns(dt.datetime.now(dt.timezone.utc).isoformat())
 
 
+def membership_state_file(config, incarnation):
+    require(type(incarnation) is str and re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}", incarnation) is not None,
+            "membership_state_incarnation")
+    name = "membership-version-" + digest(incarnation.encode("utf-8")) + ".json"
+    require(isinstance(config, dict) and config.get("deployment_incarnation") == incarnation
+            and isinstance(config.get("cluster"), dict)
+            and config["cluster"].get("membership_version_state_path") == ROLE_BASE["relay"] + "/state/" + name,
+            "membership_state_path")
+    return name
+
+
 def publication_observation(raw, inventory, run_id, now, previous=None):
     """Passive equivalent of the native authority_publication_observer.
 
@@ -513,6 +674,7 @@ class Runner:
         self.role = "controller"
         self.subcommand = "none"
         self.stop_requested = False
+        self.readiness_diagnostic_failures = []
 
     @contextmanager
     def budget(self, seconds):
@@ -722,6 +884,16 @@ class Docker:
         self.run.event("published_port_binding", role=item["role"], container_port=port, **shape)
         require(shape["accepted"], "published_port_scope")
         return int(observed["NetworkSettings"]["Ports"][f"{port}/tcp"][0]["HostPort"])
+
+    def readiness_metrics(self, item):
+        require(item["role"] in NODES and item["image"] == self.images["relay"], "metrics_container")
+        before = self.inspect(item)
+        require(before["State"].get("Running") is True, "metrics_container")
+        self.run.subcommand = "readiness-metrics"
+        data = self.call(["container", "exec", item["id"], "/usr/bin/python3", "-I", "-c", readiness_metrics_program()], timeout=10)
+        after = self.inspect(item)
+        require(after["State"].get("Running") is True, "metrics_container")
+        return readiness_metrics_envelope(data)
 
     def setup_volume(self, name, uid, gid, files=None, directories=()):
         payload = {"uid": uid, "gid": gid, "directories": list(directories),
@@ -1052,6 +1224,7 @@ class Rehearsal:
         self.inventory = json.loads((ROOT / "deploy/fly/cluster/inventory.example.json").read_bytes())
         self.pki = PKI(private, run)
         self.relays, self.clients, self.states, self.env = [], [], {}, {}
+        self.membership_files = {}
         self.devices = [str(uuid.uuid4()) for _ in range(3)]
         self.services = [str(uuid.uuid4()) for _ in range(3)]
         self.tenant, self.user = str(uuid.uuid4()), str(uuid.uuid4())
@@ -1122,6 +1295,8 @@ class Rehearsal:
         default_user = "default"
         for i, relay in enumerate(inv["relays"]):
             node = relay["node_id"]
+            self.membership_files[node] = membership_state_file(
+                tomllib.loads((self.rendered / node / "relay.toml").read_text()), inv["deployment_incarnation"])
             env = tomllib.loads((self.rendered / node / "fly.toml").read_text())["env"]
             env["AT_REDIS_URL"] = f"rediss://{default_user}:{self.password}@{self.redis_host}:6379/0"
             inputs = {"AT_DEVICE_TLS_CERT_CHAIN_B64": read(self.server_ids[i][0]), "AT_DEVICE_TLS_KEY_B64": read(self.server_ids[i][1]),
@@ -1303,7 +1478,8 @@ overlap_seconds = 30
             require(utc_ns() < watch.target["expires_ns"], "adoption_target_expired")
             states = {}
             for node in NODES:
-                raw = self.docker.read_volume(self.states[node], ["membership-version-state.json"], max_bytes=MAX_RELAY_OBSERVATION)["membership-version-state.json"]
+                name = self.membership_files[node]
+                raw = self.docker.read_volume(self.states[node], [name], max_bytes=MAX_RELAY_OBSERVATION)[name]
                 self.run.guard()
                 states[node] = relay_observation(raw, self.authority_inventory, node)
             # Recheck both absolute budget and validity after the last read.
@@ -1366,17 +1542,70 @@ overlap_seconds = 30
         self.event("bootstrap", relays_ready=3, authority_fresh_publication=True, redis_tls=True)
 
     def wait_ready(self):
+        observations = [{"node": node, "attempts": 0, "counts": {}, "first": None, "last": None} for node in NODES]
+        def record(index, observation):
+            row = observations[index]
+            row["attempts"] += 1
+            kind = observation["kind"]
+            if kind == "http":
+                kind = f"http_{observation['status']}_{observation['body_class']}" if observation["status"] in (200, 503) else "http_other_status"
+            row["counts"][kind] = row["counts"].get(kind, 0) + 1
+            if row["first"] is None:
+                row["first"] = observation
+            row["last"] = observation
         def ready():
             for i, port in enumerate(self.consumer_ports):
+                self.run.operation, self.run.role, self.run.subcommand = "https_readiness", NODES[i], "readyz"
                 try:
                     status, body = http_request(port, self.public_hosts[i], self.public_context, "/readyz")
-                except (ConnectionError, OSError):
+                except (ConnectionError, OSError) as error:
+                    record(i, readiness_transport_observation(error))
                     return False
+                except BaseException as error:
+                    record(i, readiness_transport_observation(error))
+                    raise
+                record(i, readiness_http_observation(status, body))
                 if status == 503:
                     return False
                 require(status == 200 and json.loads(body) == {"status": "ready"}, "relay_ready_response")
             return True
-        wait_until(self.run, ready, 60, "cluster_readiness_deadline")
+        try:
+            wait_until(self.run, ready, 60, "cluster_readiness_deadline")
+        except BaseException:
+            # Inspect/exec diagnostics must not overwrite the original failed
+            # stage/last-command context or replace its exception.
+            context = (self.run.stage, self.run.operation, self.run.role, self.run.subcommand)
+            try:
+                self.event("readiness_observations", passed=False, nodes=observations)
+                self.collect_readiness_metrics()
+            except BaseException as error:
+                self.run.readiness_diagnostic_failures.append({"code": readiness_diagnostic_code(error)})
+            finally:
+                self.run.stage, self.run.operation, self.run.role, self.run.subcommand = context
+            raise
+        self.event("readiness_observations", passed=True, nodes=observations)
+
+    def collect_readiness_metrics(self):
+        rows = []
+        complete = False
+        self.run.stage = "readiness_diagnostics"
+        try:
+            with self.run.budget(30):
+                for node, item in zip(NODES, self.relays, strict=True):
+                    try:
+                        self.run.guard()
+                        value = self.docker.readiness_metrics(item)
+                        rows.append({"node": node, **value})
+                        if value["status"] == "failed":
+                            self.run.readiness_diagnostic_failures.append({"node": node, "code": value["code"]})
+                    except BaseException as error:
+                        code = readiness_diagnostic_code(error)
+                        rows.append({"node": node, "status": "failed", "code": code})
+                        self.run.readiness_diagnostic_failures.append({"node": node, "code": code})
+                        return
+            complete = True
+        finally:
+            self.event("readiness_metrics", nodes=rows, complete=complete)
 
     def start_client(self, i):
         item = self.docker.create("client-" + str(i), self.docker.images["client"], mounts=[(self.client_volumes[i], "/profile", True)],
@@ -1501,7 +1730,8 @@ overlap_seconds = 30
         # stop alone is not used as a new connection/rotation assertion.
         self.docker.call(["container", "exec", self.clients[0]["id"], "/usr/local/bin/tunnel-client", "disconnect", "--config", "/profile/client.toml", "--json"])
         self.docker.stop(self.clients[0])
-        old_state = json.loads(self.docker.read_volume(self.states["relay-a"], ["membership-version-state.json"])["membership-version-state.json"])
+        membership_file = self.membership_files["relay-a"]
+        old_state = json.loads(self.docker.read_volume(self.states["relay-a"], [membership_file])[membership_file])
         self.docker.stop(self.relays[0])
         self.docker.start(self.relays[0])
         self.consumer_ports[0], self.device_ports[0] = self.docker.port(self.relays[0], 8443), self.docker.port(self.relays[0], 9443)
@@ -1510,7 +1740,7 @@ overlap_seconds = 30
         new_owner = self.owner(0)
         require(new_owner["boot_id"] != old_owner["boot_id"] and new_owner["session_id"] != old_owner["session_id"]
                 and int(new_owner["owner_epoch"]) > int(old_owner["owner_epoch"]), "relay_restart_fresh_owner")
-        new_state = json.loads(self.docker.read_volume(self.states["relay-a"], ["membership-version-state.json"])["membership-version-state.json"])
+        new_state = json.loads(self.docker.read_volume(self.states["relay-a"], [membership_file])[membership_file])
         check_persisted_version(old_state, new_state)
         self.all_routes()
         self.event("relay_restart", stable_node="relay-a", new_boot=True, new_session=True, persisted_version_monotonic=True, revoked_grant_refused=True)
@@ -1619,6 +1849,7 @@ def main(argv=None):
             result["failure_operation"] = interruptions[0]["operation"]
         result.update(first_failure=first_error, cleanup_errors=cleanup_errors, containers=docker.inventory,
                       process_groups=len(run.processes), resource_samples=run.samples,
+                      readiness_diagnostic_failures=run.readiness_diagnostic_failures,
                       interruptions=interruptions,
                       elapsed_seconds=round(time.monotonic() - started, 3))
         if first_error is None and not cleanup_errors and not interruptions:
