@@ -229,21 +229,26 @@ impl Exchange {
             panic!("real host metadata reply");
         };
         assert_eq!(attributes.size, 19);
-        assert!(matches!(
-            self.request(
+        // The capability table refuses missing Write with EPERM before host
+        // dispatch. Keep the exact reply in failure diagnostics.
+        let refusal = self
+            .request(
                 4,
                 NinepMessage::Tmkdir {
                     dfid: 0,
                     name: "refused".to_owned(),
                     mode: 0o700,
                     gid: u32::MAX,
-                }
+                },
             )
-            .await,
+            .await;
+        assert_eq!(
+            refusal,
             NinepMessage::Rlerror {
-                code: tunnel_fs_core::FsErrorCode::Eacces
-            }
-        ));
+                code: tunnel_fs_core::FsErrorCode::Eperm
+            },
+            "actual read-only capability refusal"
+        );
         assert!(!self.root.path().join("refused").exists());
         assert_eq!(self.actor.fs_counters.exchanges, 0, "no seeded ledger");
     }
