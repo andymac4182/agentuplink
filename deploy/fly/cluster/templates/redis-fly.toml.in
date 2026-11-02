@@ -1,0 +1,35 @@
+app = $app
+primary_region = $region
+kill_signal = "SIGTERM"
+kill_timeout = 30
+
+[build]
+image = $image
+
+[env]
+AT_CLUSTER_REDIS_NAMESPACE = $redis_namespace
+AT_CLUSTER_PUBLISHER_USER = $publisher_user
+
+[deploy]
+strategy = "immediate"
+
+[[restart]]
+policy = "on-failure"
+retries = 10
+
+[[vm]]
+cpu_kind = "shared"
+cpus = 1
+memory = $memory_mb
+
+[mounts]
+source = $volume
+destination = $state_dir
+
+# Liveness only; no public services or automatic primary promotion.
+[checks.redis_tls]
+type = "tcp"
+port = 6379
+interval = "30s"
+timeout = "5s"
+grace_period = "10s"

@@ -1,0 +1,14 @@
+schema_version = 1
+bind = $bind
+state_path = "/var/lib/agentuplink-authority/state/authority.json"
+signing_key_path = "/var/lib/agentuplink-authority/secrets/membership.der"
+redis_url_path = "/var/lib/agentuplink-authority/secrets/redis-url"
+redis_ca_path = "/var/lib/agentuplink-authority/secrets/redis-ca.pem"
+tls_cert_chain = "/var/lib/agentuplink-authority/secrets/https-chain.pem"
+tls_private_key = "/var/lib/agentuplink-authority/secrets/https-key.pem"
+tls_client_ca = "/var/lib/agentuplink-authority/secrets/checkpoint-client-ca.pem"
+
+[endpoint_policy]
+allowed_hosts = $hosts
+allowed_server_names = $hosts
+allowed_ports = [7443]

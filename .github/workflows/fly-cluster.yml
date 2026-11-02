@@ -1,0 +1,119 @@
+name: Fly cluster rehearsal
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/fly-cluster.yml'
+      - 'deploy/fly/cluster/**'
+      - 'scripts/fly_cluster_rehearsal.py'
+      - 'scripts/test_fly_cluster*.py'
+      - 'scripts/container_notices.py'
+      - 'scripts/test_container_notices.py'
+      - 'deploy/notices/rust/**'
+      - 'deploy/fly/redis/notices/**'
+      - 'LICENSE'
+      - '.cargo/config.toml'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - 'crates/**'
+      - 'vendor/**'
+      - 'examples/**'
+  pull_request:
+    paths:
+      - '.github/workflows/fly-cluster.yml'
+      - 'deploy/fly/cluster/**'
+      - 'scripts/fly_cluster_rehearsal.py'
+      - 'scripts/test_fly_cluster*.py'
+      - 'scripts/container_notices.py'
+      - 'scripts/test_container_notices.py'
+      - 'deploy/notices/rust/**'
+      - 'deploy/fly/redis/notices/**'
+      - 'LICENSE'
+      - '.cargo/config.toml'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - 'crates/**'
+      - 'vendor/**'
+      - 'examples/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A running rehearsal owns ephemeral state. Do not cancel it for a later push;
+# let its cleanup and result record finish. This never publishes or deploys.
+concurrency:
+  group: fly-cluster-${{ github.event_name }}-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  cluster:
+    name: Three-relay Fly image rehearsal (synthetic Docker)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Check out exact candidate
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Check renderer, entrypoint and rehearsal refusal controls
+        run: python3 -m unittest discover -s scripts -p 'test_fly_cluster*.py' -v
+      - name: Build the four source-bound images
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_sha=$(git rev-parse HEAD)
+          test "$source_sha" = "$GITHUB_SHA"
+          test -z "$(git status --porcelain --untracked-files=all)"
+          build_receipt="$RUNNER_TEMP/fly-cluster-build"
+          mkdir "$build_receipt"
+          python3 - "$build_receipt/source.json" "$source_sha" "$(git rev-parse 'HEAD^{tree}')" <<'PY'
+          import json, pathlib, sys
+          path, commit, tree = sys.argv[1:]
+          with pathlib.Path(path).open('x') as output:
+              json.dump({'commit': commit, 'tree': tree, 'scope': 'image-build-inputs'}, output)
+          PY
+          for role in relay authority redis rehearsal-client; do
+            docker build --build-arg "VCS_REF=$source_sha" \
+              --file "deploy/fly/cluster/images/$role/Dockerfile" \
+              --tag "agentuplink-cluster-$role:proof" .
+            image_id=$(docker image inspect --format '{{.Id}}' "agentuplink-cluster-$role:proof")
+            image_revision=$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "agentuplink-cluster-$role:proof")
+            test "$image_revision" = "$source_sha"
+            python3 - "$build_receipt/$role.json" "$role" "$image_id" "$source_sha" <<'PY'
+          import json, pathlib, re, sys
+          path, role, identity, revision = sys.argv[1:]
+          assert re.fullmatch(r'sha256:[0-9a-f]{64}', identity)
+          with pathlib.Path(path).open('x') as output:
+              json.dump({'role': role, 'image_config_id': identity, 'source_revision': revision}, output)
+          PY
+          done
+      - name: Exercise the rendered three-relay topology
+        shell: bash
+        run: |
+          set -euo pipefail
+          image_id() {
+            docker image inspect --format '{{.Id}}' "agentuplink-cluster-$1:proof"
+          }
+          python3 scripts/fly_cluster_rehearsal.py \
+            --relay-image "$(image_id relay)" \
+            --authority-image "$(image_id authority)" \
+            --redis-image "$(image_id redis)" \
+            --client-image "$(image_id rehearsal-client)" \
+            --output "$RUNNER_TEMP/fly-cluster-proof"
+      - name: Retain sanitized success or failure evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: fly-cluster-rehearsal-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/fly-cluster-build/*.json
+            ${{ runner.temp }}/fly-cluster-proof/result.json
+            ${{ runner.temp }}/fly-cluster-proof/events.jsonl
+            ${{ runner.temp }}/fly-cluster-proof/source.json
+            ${{ runner.temp }}/fly-cluster-proof/images.json
+          if-no-files-found: warn
+          retention-days: 14

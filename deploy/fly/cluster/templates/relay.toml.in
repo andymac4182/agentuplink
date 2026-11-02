@@ -1,0 +1,49 @@
+# Nonsecret base: the entrypoint prepends its validated secret redis_url.
+consumer_bind = "[::]:8443"
+device_bind = "[::]:9443"
+oidc_issuer = $issuer
+oidc_audience = $audiences
+oidc_jwks_path = "/var/lib/agent-tunnel/secrets/oidc-jwks.json"
+redis_namespace = $namespace
+redis_tls_root_ca_path = "/var/lib/agent-tunnel/secrets/redis-ca.pem"
+device_tls_cert_chain = "/var/lib/agent-tunnel/secrets/device-server-chain.pem"
+device_tls_private_key = "/var/lib/agent-tunnel/secrets/device-server-key.pem"
+device_tls_client_ca = "/var/lib/agent-tunnel/secrets/device-client-ca.pem"
+consumer_tls_cert_chain = "/var/lib/agent-tunnel/secrets/consumer-server-chain.pem"
+consumer_tls_private_key = "/var/lib/agent-tunnel/secrets/consumer-server-key.pem"
+node_id = $node_id
+deployment_incarnation = $incarnation
+listener_max_connections = 64
+max_devices_per_user = 16
+max_queue_bytes = 4194304
+
+[rotation]
+interval_seconds = 300
+handshake_timeout_seconds = 10
+overlap_seconds = 30
+
+[cluster]
+deployment_id = $deployment_id
+peer_bind = $peer_bind
+peer_tls_cert_chain = "/var/lib/agent-tunnel/secrets/peer-chain.pem"
+peer_tls_private_key = "/var/lib/agent-tunnel/secrets/peer-key.pem"
+peer_tls_client_ca = "/var/lib/agent-tunnel/secrets/peer-ca.pem"
+membership_signer_trust_path = "/var/lib/agent-tunnel/secrets/membership-signers.json"
+checkpoint_authority_endpoint = $checkpoint_endpoint
+checkpoint_authority_trust_path = "/var/lib/agent-tunnel/secrets/checkpoint-ca.pem"
+checkpoint_authority_client_cert_chain = "/var/lib/agent-tunnel/secrets/checkpoint-client-chain.pem"
+checkpoint_authority_client_private_key = "/var/lib/agent-tunnel/secrets/checkpoint-client-key.pem"
+membership_version_state_path = "/var/lib/agent-tunnel/state/membership-version-state.json"
+
+[cluster.endpoint_policy]
+allowed_hosts = $hosts
+allowed_server_names = $hosts
+allowed_ports = [7443]
+require_private_ip = true
+
+[recovery]
+fence_path = "/var/lib/agent-tunnel/state/recovery-approval-fence.json"
+trusted_keys_path = "/var/lib/agent-tunnel/secrets/recovery-approval-keys.json"
+
+[http_forward]
+profiles = ["mcp-2026-07-28", "mcp-2025-11-25", "acp-http-v1"]

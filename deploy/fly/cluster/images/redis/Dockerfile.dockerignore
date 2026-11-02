@@ -1,0 +1,10 @@
+*
+!deploy/fly/redis/notices/
+!deploy/fly/cluster/images/entrypoint.py
+!deploy/fly/cluster/images/PROVENANCE.md
+**/target
+**/*.pem
+**/*.key
+**/*.der
+**/.env
+**/.env.*
