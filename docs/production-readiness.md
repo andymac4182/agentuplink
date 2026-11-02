@@ -29,6 +29,24 @@ then [real actor queue acceptance #278](https://github.com/andymac4182/agentupli
 
 ## Current merge and Fly continuation
 
+[Draft #288](https://github.com/andymac4182/agentuplink/pull/288) is frozen at
+`0ee715d0a942042c69d6fd4010c62bd4374c3b90`, tree
+`40e3cb34a8883ca0a423874a299e7db31c457f8f`. Its three-OS packaging passes
+at actual checkout `802ee4ac4f3c6e8f2d7a8c67adb7fbe7f897de38`; all three Rust
+OS jobs, full M3 and all five optimized build/native archive verifier pairs also
+pass. Ordinary CI remains active. The Fly runtime fails readiness again: relay-a
+returns 111 verified-TLS HTTP503 unready responses, while all three metrics
+helpers refuse the unsupported effective-GID10001 assertion. The actual group
+ID and underlying unready cause are not retained or inferred. Exact failure and
+clean owned-resource cleanup are [recorded separately](m6-fly-readiness-2026-11-02.md#pr288-hosted-readiness-and-diagnostic-failure). #287 is closed unmerged as superseded;
+its failures remain below. A separate [same-AOF recovery controller](m6-fly-recovery-rehearsal.md)
+passes 62 pure controls and independent review, and is integrated for future
+hosted execution after successful baseline topology. Physical backup recovery
+and actual Fly verification remain distinct and absent.
+The separate [M4-76 authorization correction](m4-authorization-deadlines.md) is
+also integrated after independent v3 review. Its 20 new tests and all changed
+Rust/native checks remain unrun; #288 passes do not verify the new source.
+
 Current main remains `626ba936`; the subsequent [draft #287](https://github.com/andymac4182/agentuplink/pull/287)
 is frozen at `753aeb5c`, actual same-tree checkout `e99f2c18`. Its three-OS
 packaging, all five optimized build/native verifier pairs, all three Rust jobs,

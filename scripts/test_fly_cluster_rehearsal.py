@@ -9,6 +9,7 @@ import io
 import json
 import os
 from pathlib import Path
+import pwd
 import tempfile
 import unittest
 from unittest import mock
@@ -644,7 +645,8 @@ class ReadinessDiagnostics(unittest.TestCase):
                 rehearsal.readiness_metrics(value)
         self.assertEqual(rehearsal.readiness_metrics(self.metrics().replace(b"measurements_total 3", b"measurements_total 18446744073709551615"))["clock_measurements"], 2**64 - 1)
 
-    def helper(self, *, data=None, error=None, uid=10001, slow=False):
+    def helper(self, *, data=None, error=None, uid=10001, gid=10001,
+               account_uid=10001, account_gid=10001, missing_account=False, slow=False):
         namespace = {"__name__": "pure_helper_control"}
         exec(rehearsal.readiness_metrics_program(), namespace)
         connection = mock.Mock()
@@ -657,13 +659,36 @@ class ReadinessDiagnostics(unittest.TestCase):
         if error is not None:
             response.read.side_effect = error
         output = io.StringIO()
+        account = pwd.struct_passwd(("relay", "x", account_uid, account_gid, "", "/nonsecret", "/usr/sbin/nologin"))
         with mock.patch.object(rehearsal.http.client, "HTTPConnection", return_value=connection) as connect, \
                 mock.patch.object(rehearsal.os, "geteuid", return_value=uid), \
-                mock.patch.object(rehearsal.os, "getegid", return_value=10001), \
+                mock.patch.object(rehearsal.os, "getegid", return_value=gid), \
+                mock.patch.object(pwd, "getpwnam", return_value=account,
+                                  side_effect=KeyError("unrecorded-account-secret") if missing_account else None), \
                 mock.patch.object(rehearsal.signal, "signal", side_effect=lambda sig, fn: handler.append(fn)), \
                 mock.patch.object(rehearsal.signal, "setitimer") as timer, redirect_stdout(output):
             namespace["main"]()
         return json.loads(output.getvalue()), connection, connect, timer, output.getvalue()
+
+    def test_helper_binds_named_relay_primary_group_without_uid_gid_parity(self):
+        # Synthetic group numbers exercise the account contract; the failing
+        # hosted run did not retain its numeric effective GID.
+        for gid in (987, 10001):
+            with self.subTest(gid=gid):
+                value, _, connect, _, _ = self.helper(gid=gid, account_gid=gid)
+                self.assertEqual(value["status"], "ok")
+                connect.assert_called_once_with("::1", 9100, timeout=5)
+
+    def test_helper_refuses_root_other_account_mismatched_or_missing_primary_group(self):
+        cases = [{"uid": 0}, {"uid": 10002}, {"account_uid": 10002},
+                 {"gid": 987, "account_gid": 988}, {"gid": 0, "account_gid": 0},
+                 {"missing_account": True}]
+        for values in cases:
+            with self.subTest(values=values):
+                value, _, connect, _, text = self.helper(**values)
+                self.assertEqual(value, {"status": "failed", "code": "metrics_identity"})
+                connect.assert_not_called()
+                self.assertNotIn("unrecorded-account-secret", text)
 
     def test_actual_helper_is_non_root_loopback_bounded_and_emits_only_projection(self):
         secret = "unrecorded-metric-label-secret"

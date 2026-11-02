@@ -38,6 +38,7 @@ impl TestAuthority {
                 revision: REVISION,
                 grant,
                 fresh: true,
+                freshness_failure: tunnel_fs_provider::FreshnessFailure::Invalidated,
             })),
         }
     }

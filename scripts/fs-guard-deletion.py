@@ -1542,7 +1542,7 @@ GATE4_CASES: list[tuple[str, list[Edit]]] = [
                 """        if !live.fresh {
             self.stats.freshness_closures += 1;
             self.close();
-            return vec![Outbound::Close(SessionErrorCode::AuthExpired)];
+            return vec![Outbound::Close(live.freshness_failure.close_code())];
         }
 """,
                 "",

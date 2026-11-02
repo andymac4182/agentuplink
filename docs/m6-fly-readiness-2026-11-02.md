@@ -219,3 +219,118 @@ its clean-status postcondition correctly failed before any source integration.
 Explicit initialization of that new worktree's index corrected it. Other frozen
 sources and all quarantined native/cache resources remain untouched. All eight
 production-readiness criteria remain open and the continuation goal stays active.
+
+## PR288 hosted readiness and diagnostic failure
+
+[PR #288](https://github.com/andymac4182/agentuplink/pull/288) freezes
+`0ee715d0a942042c69d6fd4010c62bd4374c3b90`, tree
+`40e3cb34a8883ca0a423874a299e7db31c457f8f`. Actual checkout
+`802ee4ac4f3c6e8f2d7a8c67adb7fbe7f897de38` has that tree and parents
+`626ba9365b5d3e1faf8265f0b6ff50cc9111b749` plus the candidate head.
+
+[Fly run 41410567831, attempt 1](https://github.com/andymac4182/agentuplink/actions/runs/41410567831)
+(job125162415810) builds all four images and passes their binary/notice checks.
+It fails `cluster_readiness_deadline` at bootstrap, `https_readiness/readyz`.
+The new observation establishes 111 verified-context HTTPS replies from relay-a,
+all HTTP503 with the exact unready body. It records no transport error for those
+requests. Relay-b/c have zero readiness polls because the original short-circuit
+behavior remains unchanged. No client, routes, rotation, revocation or restart
+acceptance is reached. Total 145.873 seconds includes cleanup.
+
+All three metrics helpers return `metrics_identity` before opening their HTTP
+connection. The helper asserted UID10001 and GID10001, but the Dockerfile pins
+only the UID and lets `useradd --system --user-group` allocate the named group.
+That numeric GID assumption is unsupported. The result does not identify which
+identity assertion failed or retain the actual GID; no exact historical GID or
+primary readiness cause is claimed. The previous source review's claim that the
+helper runs as10001:10001 is corrected, with its original review retained.
+Correction receipt SHA256:
+`e6fbbfdebcde348ec2cbc525426e1a9445831418926d723e1104a1ed6397f65a`.
+
+Cleanup verifies all40 containers removed and individually absent, all40 private
+logs captured, all12 volumes removed with a final empty owned inventory, the
+network absent and all541 command groups absent. Every recorded command exits0,
+no OOM/interruptions/cleanup errors are observed, and source/images are unchanged.
+All preceding failures and C256 quarantine remain retained.
+
+Artifact13125538859 is30,308bytes, ZIP SHA256
+`f13a8b3442a817a7947f4ad2f1b04e4ee876d96f96554406756b429125f6d4db`.
+Result SHA256 `87887ba9cd2bf4fc6ab7a12e61b24f89787a2d117682e72ca0d6a56dcdbeaaed`;
+events `bf6081eb3374c9c06dd5d1269c2ed2d5e34bc0dca9ec11a8caa07bfc715186ef`;
+images `0d95a56b8aeb8fa83959aeb56dfe89cdf2beff408342bd44daf5d2d390813010`.
+Independent failure receipt SHA256
+`657b27ddf976742f582364d09a9f336b4830e80b6161c8e7ab84a6aaccd4121e`.
+
+All four images are Linuxamd64 at the actual checkout above. These are Docker
+configuration IDs, not registry manifest digests:
+
+| Role | Docker configuration ID |
+| --- | --- |
+| authority | `sha256:cfe38fd3e3f55e69b7e5c0d83ac64799caaef00825738fdd50af1a8838d53adf` |
+| client | `sha256:6530518bf69745cc17011d5f503308d45c9a919dc6c5f6aa3d2949bf74069171` |
+| redis | `sha256:e2fff915767eb3041607c6f9b244fdac707f57ed18040ad63cad597253f8af36` |
+| relay | `sha256:c308ec83122eafedb30ceee4769fcbdc089f7ad87ca0b3daeb21489ac21eb763` |
+
+The independently verified binary and notice hashes equal the corresponding
+#287 entries above; this identity comparison does not transfer runtime success.
+Three-OS packaging, all three Rust OS jobs, full M3 and all five optimized
+build/native archive verifier pairs pass at #288. Ordinary CI remains active at
+this checkpoint. None waives the Fly failure or verifies later M4-76 source.
+
+### Named-account diagnostic correction
+
+The successor resolves the image's named `relay` account, requires its UID and
+its effective UID to equal10001, and requires the effective primary GID to match
+the account's positive, non-root GID. It adds no user override, image-account
+mutation or permission repair. The timer, private loopback request, strict metric
+projection, byte limits and closed failure output are unchanged.
+
+Two targeted controls first run against the old helper fail three assertions;
+those results remain retained. The corrected helper passes16 focused mocked
+controls, including a synthetic nonmatching UID/GID number and root, foreign,
+mismatched and missing-account refusals before HTTP. Ninety-eight other controller
+functions and79 existing test methods remain unchanged. Source receipt SHA256
+`d481d1bf1d3715f992e9b8b47912dcca96de441bdcafc4f1704b59ddb0964f5c`
+binds patch `dc12ed3a537ea2bf9c4ac158a12ef66f6a964ab34a30d8f50b6b877b0199c63c`.
+Independent review SHA256
+`50548b3bf13ec103c1b7c8a90ac7486d08736caddd16a044895559d79fecea78`
+finds no remaining concrete blocker in this diagnostic correction. It does not
+establish the old runtime GID or repair/diagnose the primary503 readiness cause.
+New hosted image execution is required.
+
+At a later #288 CI observation, M0 passes all21 real gates and21 negative
+witnesses, and M2 completes three actual300-second rotations in903.313751879s.
+Regular CI has13 successful jobs with M7 still running. M0/M2 receipt SHA256:
+`21d6377e446a03763c63c80adec8c872739464f59e799ab8e08d11a57875f602`.
+
+## Combined authorization and recovery successor
+
+The next isolated source combines the reviewed ten-file M4-76 correction,
+C264 same-AOF controller/workflow and named-account metrics fix without editing
+frozen #288. All191 pure/mock/temp Fly controls pass, including the62 recovery
+controls. Five workflow execution controls pass: valid immutable build receipts
+select the exact images, while wrong source, mutable tag, wrong role and missing
+receipt refuse before dispatch. No previous baseline assertion or budget changes.
+Changed Python ASTs, declared-format source scan, whitespace and the unchanged
+evidence guard pass. Receipt SHA256:
+`85a9d2bee429d57d5063868a1cd4de838756d8e9dbebf7bb2615a9d9b7184385`.
+The prior189-control integration remains retained separately as
+`7ad9306b870b509720989032c939dfdc0bb63f5b52875f45aeeb20098815ffc5`.
+
+Two preparation failures remain recorded. A create-only evidence-directory guard
+refuses an accidentally reused output path before any test executes; the prior
+receipt remains unchanged. A source scan then flags two unchanged Redis URL
+f-string placeholders. Exact match hashes, unchanged baseline bytes and AST
+formatted-value bindings establish that these contain source expressions rather
+than credential values. Both matches are explicitly classified, with zero
+unclassified matches in the declared formats; the failed scan receipt
+`8b20ac88fb4d206976e0289996374af6e0d9ddb2a396a4a85ade768c7b4cf680`
+remains failed. No raw credentials, license exception or weakened runtime
+assertion is involved. This limited-format scan is not a universal secrecy proof.
+
+M4-76's20 Rust regressions, fresh formatter/compiler/Clippy/full native acceptance,
+behavioral mutation witnesses and both image rehearsals remain pending. A separate
+hosted witness plan binds nine exact API-preserving mutations and named assertion
+failures; compilation errors, missing matches, zero tests and timeouts cannot
+count as RED. Older physical-backup recovery, actual Fly inventory and live proof
+remain separate. The production goal and hourly automation remain active.

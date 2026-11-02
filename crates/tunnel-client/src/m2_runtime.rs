@@ -1486,6 +1486,9 @@ struct M2Stream {
     service_id: String,
     operation: String,
     auth: AuthContext,
+    /// M4-76: an unanswered refresh never extends the last accepted grant.
+    /// The challenge keeps its own creation anchors and deadline separately.
+    last_confirmed_deadline: Option<DualDeadline>,
     sequence: StreamState,
     pending: VecDeque<BufferedInput>,
     pending_bytes: usize,
@@ -1570,6 +1573,38 @@ fn parse_echo_records(
 }
 
 impl M2Stream {
+    fn authorization_expired_at(&self, now: Instant, wall_now: SystemTime) -> bool {
+        // Do not fold these through DualDeadline::min: that keeps only one
+        // started_wall and would lose another bound's wall-reversal check.
+        self.auth.deadline.expired_at(now, wall_now)
+            || self.auth.operation_deadline.expired_at(now, wall_now)
+            || self
+                .last_confirmed_deadline
+                .is_some_and(|deadline| deadline.expired_at(now, wall_now))
+    }
+
+    fn begin_authorization_refresh(
+        &mut self,
+        challenge_id: String,
+        nonce: String,
+        deadline: DualDeadline,
+    ) -> bool {
+        if self.authorization_expired_at(Instant::now(), SystemTime::now())
+            || self
+                .fs_authority
+                .as_ref()
+                .is_some_and(|authority| !authority.begin_refresh(deadline))
+        {
+            return false;
+        }
+        self.auth.challenge_id = challenge_id;
+        self.auth.nonce = nonce;
+        self.auth.deadline = deadline;
+        self.auth.refresh_in_flight = true;
+        self.auth.confirmed = false;
+        true
+    }
+
     fn is_streaming(&self) -> bool {
         self.operation == "echo_stream"
     }
@@ -4808,6 +4843,7 @@ impl M2Actor {
                 refresh_in_flight: true,
                 invalidated: false,
             },
+            last_confirmed_deadline: None,
             sequence,
             pending: VecDeque::new(),
             pending_bytes: 0,
@@ -4834,9 +4870,11 @@ impl M2Actor {
             // created confirmed, because the OPEN only reaches here after the
             // stream's authorization context was admitted; every later
             // confirmation and every invalidation moves it.
-            let authority = std::sync::Arc::new(crate::fs_export::StreamAuthority::new(
+            let authority = std::sync::Arc::new(crate::fs_export::StreamAuthority::new_until(
                 authorization.grant_revision,
                 granted,
+                auth_deadline,
+                operation_deadline,
             ));
             stream.fs_authority = Some(std::sync::Arc::clone(&authority));
             stream.http = Some(self.start_fs_exchange(
@@ -5076,8 +5114,7 @@ impl M2Actor {
                 && stream.auth.refresh_in_flight
                 && !stream.auth.invalidated
                 && (1..=5_000).contains(&confirmed.remaining_ms)
-                && !stream.auth.deadline.expired_at(now, wall_now)
-                && !stream.auth.operation_deadline.expired_at(now, wall_now);
+                && !stream.authorization_expired_at(now, wall_now);
             if !valid {
                 (VecDeque::new(), 0)
             } else {
@@ -5090,24 +5127,28 @@ impl M2Actor {
                         .remaining_ms
                         .min(self.config.limits.grant_timeout_ms),
                 )) {
-                    Some(deadline) => {
+                    Some(deadline)
+                        if !deadline.expired_at(now, wall_now)
+                            && stream.fs_authority.as_ref().is_none_or(|authority| {
+                                authority.confirm_until(
+                                    stream.auth.grant_revision,
+                                    authority.current_grant(),
+                                    deadline,
+                                    stream.auth.operation_deadline,
+                                )
+                            }) =>
+                    {
                         stream.auth.deadline = deadline;
+                        stream.last_confirmed_deadline = Some(deadline);
                         stream.auth.confirmed = true;
                         stream.auth.refresh_in_flight = false;
                         stream.auth.nonce.clear();
-                        // The provider reads this before every host call, so a
-                        // renewed confirmation reaches it at the same instant
-                        // the actor takes it.
-                        if let Some(authority) = stream.fs_authority.as_ref() {
-                            authority
-                                .confirm(stream.auth.grant_revision, authority.current_grant());
-                        }
                         if let Some(http) = stream.http.as_mut() {
                             http.note_confirmation();
                         }
                         (std::mem::take(&mut stream.pending), stream.pending_bytes)
                     }
-                    None => (VecDeque::new(), 0),
+                    _ => (VecDeque::new(), 0),
                 }
             }
         };
@@ -5149,9 +5190,7 @@ impl M2Actor {
             .streams
             .iter()
             .filter_map(|(&stream_id, stream)| {
-                (!stream.auth.invalidated
-                    && (stream.auth.deadline.expired_at(now, wall_now)
-                        || stream.auth.operation_deadline.expired_at(now, wall_now)))
+                (!stream.auth.invalidated && stream.authorization_expired_at(now, wall_now))
                 .then_some(stream_id)
             })
             .collect();
@@ -5225,6 +5264,10 @@ impl M2Actor {
             {
                 continue;
             }
+            if stream.authorization_expired_at(Instant::now(), SystemTime::now()) {
+                self.expire_stream(stream_id).await?;
+                continue;
+            }
             match self.send_control(
                 ControlMessage::AuthorizationChallenge(challenge.clone()),
                 Some(auth_deadline),
@@ -5233,11 +5276,9 @@ impl M2Actor {
                     let Some(stream) = self.streams.get_mut(&stream_id) else {
                         continue;
                     };
-                    stream.auth.challenge_id = challenge_id;
-                    stream.auth.nonce = nonce;
-                    stream.auth.deadline = auth_deadline;
-                    stream.auth.refresh_in_flight = true;
-                    stream.auth.confirmed = false;
+                    if !stream.begin_authorization_refresh(challenge_id, nonce, auth_deadline) {
+                        self.expire_stream(stream_id).await?;
+                    }
                 }
                 Err(ClientError::QueueLimit) => {
                     self.pending_authorization_refreshes.insert(
@@ -5287,9 +5328,9 @@ impl M2Actor {
             {
                 continue;
             }
-            if stream.auth.deadline.expired_at(now, wall_now)
-                || stream.auth.operation_deadline.expired_at(now, wall_now)
+            if stream.authorization_expired_at(now, wall_now)
                 || pending.auth_deadline.expired_at(now, wall_now)
+                || stream.authorization_expired_at(Instant::now(), SystemTime::now())
             {
                 self.expire_stream(stream_id).await?;
                 continue;
@@ -5302,11 +5343,13 @@ impl M2Actor {
                     let Some(stream) = self.streams.get_mut(&stream_id) else {
                         continue;
                     };
-                    stream.auth.challenge_id = pending.challenge.challenge_id;
-                    stream.auth.nonce = pending.challenge.nonce;
-                    stream.auth.deadline = pending.auth_deadline;
-                    stream.auth.refresh_in_flight = true;
-                    stream.auth.confirmed = false;
+                    if !stream.begin_authorization_refresh(
+                        pending.challenge.challenge_id,
+                        pending.challenge.nonce,
+                        pending.auth_deadline,
+                    ) {
+                        self.expire_stream(stream_id).await?;
+                    }
                 }
                 Err(ClientError::QueueLimit) => {
                     self.pending_authorization_refreshes
@@ -7139,10 +7182,9 @@ impl M2Actor {
         {
             return Ok(());
         }
-        let deadline = stream.auth.deadline.min(stream.auth.operation_deadline);
         let streaming = stream.is_streaming();
         let http = stream.is_http();
-        if deadline.expired() {
+        if stream.authorization_expired_at(Instant::now(), SystemTime::now()) {
             return self.expire_stream(stream_id).await;
         }
         #[cfg(test)]
@@ -9094,7 +9136,11 @@ impl M2Actor {
             // An expired authorization deadline stops filesystem dispatch at
             // the provider too: its next host call closes the session instead.
             if let Some(authority) = stream.fs_authority.as_ref() {
-                authority.invalidate();
+                authority.invalidate_for(if reset_reason == M2_RESET_AUTH_EXPIRED {
+                    tunnel_fs_provider::FreshnessFailure::Invalidated
+                } else {
+                    tunnel_fs_provider::FreshnessFailure::DeadlineElapsed
+                });
             }
             let pending_bytes = stream.pending_bytes;
             stream.pending.clear();
@@ -9643,6 +9689,7 @@ mod tests {
     mod c240_queue_boundary;
     #[cfg(unix)]
     mod fs_report_retirement;
+    mod m4c76_authorization_deadlines;
     use crate::test_hooks;
     use futures_util::{SinkExt, StreamExt};
     use std::sync::{Arc, atomic::AtomicBool};
@@ -11505,6 +11552,7 @@ mod tests {
                 refresh_in_flight: true,
                 invalidated: false,
             },
+            last_confirmed_deadline: None,
             sequence: StreamState::new(1, 1024).expect("test sequence"),
             pending: VecDeque::new(),
             pending_bytes: 0,

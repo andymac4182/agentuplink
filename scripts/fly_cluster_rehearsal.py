@@ -334,7 +334,7 @@ def readiness_metrics(data):
 def readiness_metrics_program():
     # The same pure parser is used by controls and the fixed, non-root exec
     # helper. No raw metric body or exception is printed by that helper.
-    return ("import http.client,json,os,re,signal\n"
+    return ("import http.client,json,os,pwd,re,signal\n"
             "class Refused(Exception): pass\n"
             "def require(value, code):\n    if not value: raise Refused(code)\n"
             f"MAX_READINESS_METRICS={MAX_READINESS_METRICS}\nMEMBERSHIP_STATES={MEMBERSHIP_STATES!r}\n"
@@ -346,7 +346,12 @@ def main():
     signal.signal(signal.SIGALRM, expired)
     signal.setitimer(signal.ITIMER_REAL, 5)
     try:
-        require(os.geteuid() == 10001 and os.getegid() == 10001, "metrics_identity")
+        try:
+            account = pwd.getpwnam("relay")
+        except KeyError:
+            raise Refused("metrics_identity") from None
+        require(os.geteuid() == account.pw_uid == 10001
+                and os.getegid() == account.pw_gid and account.pw_gid > 0, "metrics_identity")
         connection = http.client.HTTPConnection("{HOST_LOOPBACK}", {READINESS_METRICS_PORT}, timeout=5)
         connection.request("GET", "/metrics", headers={{"Connection": "close"}})
         response = connection.getresponse()

@@ -7,6 +7,7 @@ on:
       - '.github/workflows/fly-cluster.yml'
       - 'deploy/fly/cluster/**'
       - 'scripts/fly_cluster_rehearsal.py'
+      - 'scripts/fly_cluster_recovery_rehearsal.py'
       - 'scripts/test_fly_cluster*.py'
       - 'scripts/container_notices.py'
       - 'scripts/test_container_notices.py'
@@ -25,6 +26,7 @@ on:
       - '.github/workflows/fly-cluster.yml'
       - 'deploy/fly/cluster/**'
       - 'scripts/fly_cluster_rehearsal.py'
+      - 'scripts/fly_cluster_recovery_rehearsal.py'
       - 'scripts/test_fly_cluster*.py'
       - 'scripts/container_notices.py'
       - 'scripts/test_container_notices.py'
@@ -104,6 +106,25 @@ jobs:
             --redis-image "$(image_id redis)" \
             --client-image "$(image_id rehearsal-client)" \
             --output "$RUNNER_TEMP/fly-cluster-proof"
+      - name: Exercise explicit same-AOF cluster recovery
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - "$RUNNER_TEMP/fly-cluster-build" "$RUNNER_TEMP/fly-cluster-recovery-proof" <<'PY_RECOVERY'
+          import json, pathlib, re, subprocess, sys
+          build, output = map(pathlib.Path, sys.argv[1:])
+          source = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
+          command = ['python3', 'scripts/fly_cluster_recovery_rehearsal.py',
+                     '--scenario', 'durable-restart', '--output', str(output)]
+          for role, argument in [('relay', 'relay'), ('authority', 'authority'),
+                                 ('redis', 'redis'), ('rehearsal-client', 'client')]:
+              receipt = json.loads((build / (role + '.json')).read_bytes())
+              assert receipt['role'] == role and receipt['source_revision'] == source
+              identity = receipt['image_config_id']
+              assert isinstance(identity, str) and re.fullmatch(r'sha256:[0-9a-f]{64}', identity)
+              command += ['--' + argument + '-image', identity]
+          subprocess.run(command, check=True)
+          PY_RECOVERY
       - name: Retain sanitized success or failure evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -115,5 +136,9 @@ jobs:
             ${{ runner.temp }}/fly-cluster-proof/events.jsonl
             ${{ runner.temp }}/fly-cluster-proof/source.json
             ${{ runner.temp }}/fly-cluster-proof/images.json
+            ${{ runner.temp }}/fly-cluster-recovery-proof/result.json
+            ${{ runner.temp }}/fly-cluster-recovery-proof/events.jsonl
+            ${{ runner.temp }}/fly-cluster-recovery-proof/source.json
+            ${{ runner.temp }}/fly-cluster-recovery-proof/images.json
           if-no-files-found: warn
           retention-days: 14

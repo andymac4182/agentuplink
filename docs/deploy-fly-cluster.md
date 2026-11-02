@@ -309,6 +309,18 @@ catalog freshness or monotonic counter custody. Simultaneous restart and
 older-backup recovery on the intended Fly topology remain required separately
 from source checks and the bounded image rehearsal.
 
+## Synthetic recovery rehearsal
+
+The [same-AOF image rehearsal](m6-fly-recovery-rehearsal.md) exercises explicit
+operator-approved recovery after all relays and the authority stop and the same
+Redis AOF volume restarts. CI runs it after successful baseline topology, with
+immutable image IDs from the exact checkout. It verifies preserved revocations,
+higher approval fences, new incarnation membership files, unchanged authority
+allocators and fresh sessions across three publication/adoption rounds. Source
+controls and review pass; current-image execution is pending. This does not
+replace physical older-backup restoration, independent later-revocation custody
+or execution against actual Fly inventory.
+
 ## Evidence still required
 
 Rendering and static controls do not settle account access, actual app/volume
