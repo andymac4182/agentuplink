@@ -400,8 +400,13 @@ operations = ["echo:invoke"]
         self.event("spare_credential_positive", device_id=self.spare_device, authenticated_ready=True)
 
     def disconnect(self, item):
-        self.docker.call(["container", "exec", item["id"], "/usr/local/bin/tunnel-client", "disconnect", "--config", "/profile/client.toml", "--json"])
-        self.docker.stop(item)
+        if item["role"] == "spare-client-positive":
+            device = self.spare_device
+        else:
+            positions = [i for i, client in enumerate(self.clients) if client is item]
+            require(len(positions) == 1, "recovery_disconnect_target")
+            device = self.devices[positions[0]]
+        self.disconnect_client(item, device)
         self.docker.remove_finished(item)
 
     def setup_revocations(self):

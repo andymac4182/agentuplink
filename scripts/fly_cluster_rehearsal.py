@@ -466,6 +466,8 @@ def check_container(value, expected, owner):
     config, host = value.get("Config", {}), value.get("HostConfig", {})
     require((config.get("Labels") or {}).get(OWNER_LABEL) == owner, "container_owner")
     require((config.get("Labels") or {}).get(OWNER_LABEL + ".role") == expected["role"], "container_role")
+    if "required_user" in expected:
+        require(config.get("User") == expected["required_user"], "container_default_user")
     actual = sorted((m.get("Name"), m.get("Destination"), m.get("RW")) for m in value.get("Mounts", []))
     require(actual == sorted(expected["mounts"]), "container_mounts")
     require(host.get("NetworkMode") == expected["network"], "container_network")
@@ -622,6 +624,34 @@ def checked_status(raw, device):
         require({"phase", "session_id", "epoch", "active_generation", "candidate_generation", "rotations_completed",
                  "recovery_attempt", "recovery_attempt_deadline_ms", "recovery_episode_deadline_ms"} <= set(session), "client_status_missing_fields")
     return result
+
+
+def checked_disconnect(raw, supervisor_pid):
+    value = observation_json(raw, 64 * 1024)
+    require(isinstance(value, dict) and set(value) == {"schema_version", "command", "ok", "result", "error"}
+            and type(value["schema_version"]) is int and value["schema_version"] == 1
+            and value["command"] == "disconnect" and value["ok"] is True and value["error"] is None,
+            "client_disconnect_envelope")
+    result = value["result"]
+    require(type(supervisor_pid) is int and 0 < supervisor_pid < 2**32
+            and isinstance(result, dict) and set(result) == {"pid", "state", "state_at_request", "waited_ms"}
+            and type(result["pid"]) is int and result["pid"] == supervisor_pid
+            and result["state"] == "stopped" and result["state_at_request"] == "ready"
+            and u64(result["waited_ms"]), "client_disconnect_result")
+    return result
+
+
+def client_exit_complete(state):
+    require(isinstance(state, dict) and {"Running", "Status", "Pid", "ExitCode", "OOMKilled", "Error"} <= set(state)
+            and type(state["Running"]) is bool and state["OOMKilled"] is False
+            and type(state["ExitCode"]) is int and state["ExitCode"] == 0
+            and type(state["Pid"]) is int and state["Pid"] >= 0 and state["Error"] == "",
+            "client_disconnect_unclean_exit")
+    if state["Running"]:
+        require(state["Status"] == "running" and state["Pid"] > 0, "client_disconnect_process_state")
+        return False
+    require(state["Status"] == "exited" and state["Pid"] == 0, "client_disconnect_process_state")
+    return True
 
 
 def check_identity_refusal(raw):
@@ -955,7 +985,8 @@ class Docker:
         return name
 
     def create(self, role, image, *, mounts=(), env=None, aliases=(), ports=(), command=(), entrypoint=None,
-               user=None, network=True, memory=256, interactive=False, peer_ipv6=None, name_sequence=None):
+               user=None, network=True, memory=256, interactive=False, peer_ipv6=None, name_sequence=None,
+               required_user=None):
         name = f"{self.owner}-{len(self.containers):03d}-{role}"
         if name_sequence is not None:
             require(u64(name_sequence), "container_name_sequence")
@@ -963,6 +994,10 @@ class Docker:
         net = self.network["id"] if network else "none"
         item = {"id": None, "name": name, "role": role, "image": image, "mounts": list(mounts),
                 "network": net, "memory": memory * 1024**2}
+        if required_user is not None:
+            require(required_user == "client:client" and user is None and image == self.images.get("client"),
+                    "container_required_user")
+            item["required_user"] = required_user
         if role in NODES or peer_ipv6 is not None:
             require(role in NODES and network and image == self.images.get("relay")
                     and self.network is not None and "subnet" in self.network,
@@ -974,7 +1009,7 @@ class Docker:
                     "peer_container_duplicate_address")
             item["peer_ipv6"] = peer_ipv6
         known = {"generate-key", "initialize", "recovery-initialize", "activate-first-incarnation", "provision-catalog",
-                 "add-device", "add-service", "set-grant", "revoke-grant", "initialize-membership", "check-config", "connect"}
+                 "add-device", "add-service", "set-grant", "revoke-grant", "initialize-membership", "check-config", "connect", "disconnect"}
         item["subcommand"] = command[0] if command and command[0] in known else ("python-helper" if entrypoint == "/usr/bin/python3" else "serve-or-inspect")
         self.run.role = role
         self.run.subcommand = item["subcommand"]
@@ -1813,6 +1848,53 @@ overlap_seconds = 30
         raw = self.docker.call(["container", "exec", self.clients[i]["id"], "/usr/local/bin/tunnel-client", "status", "--config", "/profile/client.toml", "--json"])
         return checked_status(raw, self.devices[i])
 
+    def disconnect_client(self, item, device):
+        # The caller must outlive connect/PID1. An exec in that same container
+        # may be terminated before it can report the socket's orderly close.
+        require(any(owned is item for owned in self.docker.containers)
+                and item["image"] == self.docker.images["client"]
+                and item["role"] in {"client-0", "client-1", "client-2", "spare-client-positive"},
+                "client_disconnect_target")
+        mounts = item["mounts"]
+        require(len(mounts) == 1 and len(mounts[0]) == 3 and mounts[0][1] == "/profile"
+                and mounts[0][2] is True and mounts[0][0] in self.docker.volumes,
+                "client_disconnect_profile")
+        observed = self.docker.inspect(item)
+        require(observed["Config"].get("User") == "client:client"
+                and not client_exit_complete(observed["State"]), "client_disconnect_target_not_running")
+        self.run.subcommand = "status"
+        raw = self.docker.call(["container", "exec", item["id"], "/usr/local/bin/tunnel-client",
+                                "status", "--config", "/profile/client.toml", "--json"])
+        observation_json(raw, 64 * 1024)  # refuse duplicate/nonfinite fields before the shared status parser
+        before = checked_status(raw, device)
+        pid = before.get("pid")
+        require(type(pid) is int and 0 < pid < 2**32 and before.get("state") == "ready"
+                and ready_session(before), "client_disconnect_supervisor")
+        self.event("client_disconnect_requested", client_id=item["id"], role=item["role"], supervisor_pid=pid)
+        # Keep the original 30s command budget, including helper setup. The
+        # Runner's existing nine seconds are reserved only for owned cleanup.
+        with self.run.budget(COMMAND_SECONDS + 9):
+            raw = self.docker.one_shot("client-disconnect", self.docker.images["client"], network=False,
+                                      mounts=[(mounts[0][0], "/profile", False)], required_user="client:client",
+                                      command=["disconnect", "--config", "/profile/client.toml", "--json"])
+            result = checked_disconnect(raw, pid)
+        # Observe process exit under the former Docker-stop 25s bound. Never
+        # send a second stop request or use final cleanup to rescue acceptance.
+        with self.run.budget(25 + 9):
+            deadline = time.monotonic() + 25
+            while True:
+                self.run.guard()
+                require(time.monotonic() < deadline, "client_disconnect_exit_deadline")
+                observed = self.docker.inspect(item)
+                require(time.monotonic() < deadline, "client_disconnect_exit_deadline")
+                require(observed["Config"].get("User") == "client:client", "client_disconnect_target_user")
+                if client_exit_complete(observed["State"]):
+                    break
+                time.sleep(min(0.5, max(0, deadline - time.monotonic())))
+        self.event("client_disconnected", client_id=item["id"], role=item["role"], supervisor_pid=pid,
+                   waited_ms=result["waited_ms"], state="stopped", original_exit_code=0,
+                   original_pid=0, oom_killed=False, helper_network="none", profile_readonly=True)
+
     def owner(self, i):
         key = f"tunnel-catalog:{self.inventory['redis_namespace']}:coord:owner:{self.inventory['deployment_incarnation']}:{self.tenant}:{self.devices[i]}"
         values = self.redis.command("HGETALL", key)
@@ -1989,8 +2071,7 @@ overlap_seconds = 30
         old_owner = self.owner(0)
         # The normal CLI's bounded disconnect joins its connector; a successful
         # stop alone is not used as a new connection/rotation assertion.
-        self.docker.call(["container", "exec", self.clients[0]["id"], "/usr/local/bin/tunnel-client", "disconnect", "--config", "/profile/client.toml", "--json"])
-        self.docker.stop(self.clients[0])
+        self.disconnect_client(self.clients[0], self.devices[0])
         membership_file = self.membership_files["relay-a"]
         old_state = json.loads(self.docker.read_volume(self.states["relay-a"], [membership_file])[membership_file])
         self.docker.stop(self.relays[0])

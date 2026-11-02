@@ -34,36 +34,46 @@ hourly automation. Main remains `626ba9365b5d3e1faf8265f0b6ff50cc9111b749`.
 Merge authorization covers a fully checked candidate and the normal configured
 development prerelease; live deployment and license exceptions remain unauthorized.
 
-[Draft #290](https://github.com/andymac4182/agentuplink/pull/290) is frozen at
-`43ff240cc3e9598936445251cd13353b53a3ebae`, actual hosted checkout
-`f599b3da14d8af08764d5a8b1ac41930f7522c2a`, shared tree
-`edd49363032ac79132ea7e68ef6bd832c76f20ec`. All 14 ordinary CI jobs, three-OS
-packaging and all five optimized build/native verifier pairs pass. M4-76 named
-tests pass 20 on Linux/macOS and 19 applicable cases on Windows; the original
-Unix-only provider case is preserved. The separate nine-mutant workflow proves
-20 initial GREEN, 9 compiled mutants/10 intended RED, 20 restored GREEN. These
-checks do not establish the separate original gate4 mutation or Fly recovery.
+[Draft #291](https://github.com/andymac4182/agentuplink/pull/291) is frozen at
+`bad8a26c4eacbe7d25e90c5106d08098c08c5105`, actual hosted checkout
+`3e63fdd12b1dd37f0b0cc43a3992f79c68e75429`, shared tree
+`18ac0514619a83833963496aeabf58145eb79613`. All 14 ordinary CI jobs pass,
+including final M7, at 2026-11-02T12:14:11Z. Three-OS packaging and all five optimized
+build/native archive verifier pairs pass. Named M4-76 tests pass 20 on Linux/macOS
+and 19 applicable cases on Windows. Both fresh authorization workflows pass
+independent review: 20 GREEN / nine compiled mutants / ten intended RED / 20
+restored GREEN, and the exact original gate4 dispatcher GREEN / compiled whole-
+guard-deletion RED / restored GREEN. The latter proves the original mutation
+and unchanged assertion, without claiming the literal broad four-crate CLI.
 
-The Fly image baseline reaches three-relay readiness, nine routes and a configured
-300-second rotation, then fails `authorization_negative_status` after revocation.
-Its actual unexpected status/body remain unknown; same-AOF recovery is skipped.
-Owned cleanup succeeds without erasing the failure. The [exact continuation
-report](m6-fly-revocation-and-backup-2026-11-02.md) retains identities and failures.
+The Fly cluster rehearsal reaches readiness, nine routes and configured
+300-second rotations. It observes one exact insufficient-scope 403 and three
+exact revoked-device 404 responses with the required positive controls. It then
+fails the explicit client disconnect exec with exit 137 and empty output;
+the mechanism remains unknown. The client main's separate exit-0 observation
+and successful owned-resource cleanup do not rescue acceptance. Relay/authority
+restart and same-AOF recovery are unreached; the physical older-backup job is
+skipped. [Exact #291 evidence](m6-fly-disconnect-2026-11-02.md) preserves the
+identities, receipt hashes, cleanup scope and earlier failures.
 
-The successor combines C266's separate exact 403 insufficient-scope and exact 404
-sole-grant revocation contracts, closed response diagnostics, physical older-AOF
-fixture/reconciliation source, and a focused original gate4 controller. All 345
-pure/mock/temp controls pass; its original composition RED remains preserved.
-New hosted baseline/same-AOF/physical-backup and focused mutation execution are
-required. Synthetic catalog custody does not supply production reconciliation
-or independently trusted operator revocation/counter/backup custody. No source,
-controller, platform or license acceptance is silently narrowed.
+The isolated successor helper sends one disconnect request from a distinct
+owned default-user client container, using only the exact profile volume
+read-only and no network. Strict acknowledgement and independent clean original
+container exit are required within unchanged bounds. Independent source review
+and 298 pure/mock controls pass (17 new; all 281 existing methods unchanged).
+The retained baseline RED models a possible exec lifetime schedule; it does
+not reproduce or explain the historical 137. Actual cross-container socket
+access and complete hosted baseline/restart/both-recovery verification remain
+unrun. Synthetic custody still does not supply production reconciliation or
+independently trusted operator revocation/counter/backup custody.
 
 C256's local native/cache quarantine, M4-47's security block, five C253 policy
 refusals, C259 advisory findings, actual Fly inventory/access/PKI, operational
 ownership, capacity/24-hour soak and deployment authorization remain open.
-No production completion criterion is waived. Historical checkpoints below
-remain dated evidence; their pending-status wording does not describe #290.
+No production completion criterion, platform check or license requirement is
+waived. The [#290 report](m6-fly-revocation-and-backup-2026-11-02.md) and earlier
+checkpoints remain dated evidence; their pending wording does not describe
+#291's completed focused proofs.
 
 ### Retained #289 and earlier checkpoints
 
