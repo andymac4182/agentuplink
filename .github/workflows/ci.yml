@@ -186,6 +186,48 @@ jobs:
           fi
           # shellcheck disable=SC2086
           cargo +1.95.0 test --workspace --all-targets --locked --no-fail-fast $exclude
+      - name: Verify portable offline catalog library tests on Windows
+        if: runner.os == 'Windows'
+        timeout-minutes: 10
+        # Keep the workspace exclusion above. Only these two portable library
+        # tests run here; no serving relay, listener or host adapter is started.
+        run: |
+          set -euo pipefail
+          inventory="$RUNNER_TEMP/offline-catalog-windows-inventory.txt"
+          result="$RUNNER_TEMP/offline-catalog-windows-result.txt"
+          cargo +1.95.0 test --locked -p tunnel-relay --lib catalog_reconciliation::tests:: -- --list --color never > "$inventory"
+          python -I - "$inventory" <<'PY'
+          import pathlib
+          import sys
+          expected = {
+              "catalog_reconciliation::tests::offline_arguments_require_each_exact_flag_once_without_echoing_values: test",
+              "catalog_reconciliation::tests::offline_cli_files_fail_closed_on_unsupported_platforms: test",
+          }
+          lines = [line for line in pathlib.Path(sys.argv[1]).read_text().splitlines() if line]
+          assert len(lines) == 3 and lines[-1] == "2 tests, 0 benchmarks", lines
+          assert set(lines[:-1]) == expected, lines
+          print("Windows offline catalog inventory: exactly two portable tests")
+          PY
+          cargo +1.95.0 test --locked -p tunnel-relay --lib catalog_reconciliation::tests:: -- --color never --test-threads=1 | tee "$result"
+          python -I - "$result" <<'PY'
+          import pathlib
+          import re
+          import sys
+          expected = {
+              "test catalog_reconciliation::tests::offline_arguments_require_each_exact_flag_once_without_echoing_values ... ok",
+              "test catalog_reconciliation::tests::offline_cli_files_fail_closed_on_unsupported_platforms ... ok",
+          }
+          lines = pathlib.Path(sys.argv[1]).read_text().splitlines()
+          executed = [line for line in lines if line.startswith("test ") and not line.startswith("test result:")]
+          summaries = [line for line in lines if line.startswith("test result:")]
+          assert lines.count("running 2 tests") == 1, lines
+          assert len(executed) == 2 and set(executed) == expected, executed
+          assert len(summaries) == 1 and re.fullmatch(
+              r"test result: ok\. 2 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out; finished in [0-9]+(?:\.[0-9]+)?s",
+              summaries[0],
+          ), summaries
+          print("Windows offline catalog result: both intended tests passed")
+          PY
       - name: Validate example configurations
         run: |
           set -euo pipefail

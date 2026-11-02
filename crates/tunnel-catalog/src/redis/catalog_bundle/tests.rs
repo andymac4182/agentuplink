@@ -158,7 +158,10 @@ fn complete_bundle_reuses_recovery_digest_and_remains_untrusted() {
     let observed = complete_catalog();
     let snapshot = validate_observed_catalog(PREFIX, &observed).expect("schema");
     let bundle = bundle(&observed);
-    assert_eq!(bundle.snapshot.canonical_bytes(), snapshot.canonical_bytes());
+    assert_eq!(
+        bundle.snapshot.canonical_bytes(),
+        snapshot.canonical_bytes()
+    );
     let summary = serde_json::to_value(bundle.summary()).expect("summary");
     assert_eq!(summary["status"], "schema_valid_only");
     assert_eq!(summary["historical_completeness"], "unproven");
@@ -187,8 +190,16 @@ fn hashes_encoding_identity_and_bounds_fail_closed() {
         format!("{original}\n"),
         original.replacen("\"schema_version\":1", "\"schema_version\":true", 1),
         original.replacen("\"schema_version\":1", "\"schema_version\":1.0", 1),
-        original.replacen("\"schema_version\":1", "\"schema_version\":1,\"schema_version\":1", 1),
-        original.replacen("\"schema_version\":1", "\"unknown\":0,\"schema_version\":1", 1),
+        original.replacen(
+            "\"schema_version\":1",
+            "\"schema_version\":1,\"schema_version\":1",
+            1,
+        ),
+        original.replacen(
+            "\"schema_version\":1",
+            "\"unknown\":0,\"schema_version\":1",
+            1,
+        ),
     ] {
         assert!(matches!(
             CatalogBundle::parse(
@@ -263,7 +274,10 @@ fn generation_metadata_is_not_an_importable_durable_record() {
 fn known_complete_records_cannot_disappear_with_their_indexes() {
     let before = complete_catalog();
     let after = base_catalog();
-    assert_eq!(plan_error(&before, &after), CatalogBundleError::MissingRecord);
+    assert_eq!(
+        plan_error(&before, &after),
+        CatalogBundleError::MissingRecord
+    );
 }
 
 #[test]
@@ -272,7 +286,10 @@ fn unversioned_tenant_membership_and_credential_revocations_are_preserved() {
         let mut before = complete_catalog();
         set_field(&mut before, kind, "active", "0");
         let after = complete_catalog();
-        assert_eq!(plan_error(&before, &after), CatalogBundleError::RevocationRollback);
+        assert_eq!(
+            plan_error(&before, &after),
+            CatalogBundleError::RevocationRollback
+        );
     }
     let mut before = complete_catalog();
     set_field(&mut before, "credential", "active", "0");
@@ -280,7 +297,10 @@ fn unversioned_tenant_membership_and_credential_revocations_are_preserved() {
     for replacement in ["", "501"] {
         let mut after = before.clone();
         set_field(&mut after, "credential", "revoked_at_us", replacement);
-        assert_eq!(plan_error(&before, &after), CatalogBundleError::RevocationRollback);
+        assert_eq!(
+            plan_error(&before, &after),
+            CatalogBundleError::RevocationRollback
+        );
     }
 }
 
@@ -292,7 +312,10 @@ fn increasing_version_cannot_resurrect_a_revoked_grant() {
     set_field(&mut before, "grant", "revoked_at_us", "500");
     let mut after = complete_catalog();
     set_field(&mut after, "grant", "revision", "3");
-    assert_eq!(plan_error(&before, &after), CatalogBundleError::RevocationRollback);
+    assert_eq!(
+        plan_error(&before, &after),
+        CatalogBundleError::RevocationRollback
+    );
 }
 
 #[test]
@@ -306,9 +329,15 @@ fn all_monotonic_counters_compare_exactly_above_floating_point_precision() {
         set_field(&mut before, kind, field, "9007199254740993");
         let mut after = before.clone();
         set_field(&mut after, kind, field, "9007199254740992");
-        assert_eq!(plan_error(&before, &after), CatalogBundleError::CounterRollback);
+        assert_eq!(
+            plan_error(&before, &after),
+            CatalogBundleError::CounterRollback
+        );
         set_field(&mut after, kind, field, &u64::MAX.to_string());
-        assert_eq!(plan_error(&before, &after), CatalogBundleError::CounterExhausted);
+        assert_eq!(
+            plan_error(&before, &after),
+            CatalogBundleError::CounterExhausted
+        );
     }
     let mut before = complete_catalog();
     let epoch = before
@@ -322,7 +351,10 @@ fn all_monotonic_counters_compare_exactly_above_floating_point_precision() {
         .find(|entry| entry.key == key("epoch"))
         .expect("epoch");
     epoch.value = ObservedRedisValue::String("9007199254740992".to_owned());
-    assert_eq!(plan_error(&before, &after), CatalogBundleError::CounterRollback);
+    assert_eq!(
+        plan_error(&before, &after),
+        CatalogBundleError::CounterRollback
+    );
 }
 
 #[test]
@@ -361,7 +393,10 @@ fn last_seen_change_is_informational_without_rewriting_target_bytes_or_digest() 
     );
     assert_ne!(plan.baseline_catalog_digest, plan.target_catalog_digest);
     assert_eq!(target.snapshot.canonical_bytes(), original);
-    assert_eq!(plan.target_catalog_digest, durable_catalog_digest(&original));
+    assert_eq!(
+        plan.target_catalog_digest,
+        durable_catalog_digest(&original)
+    );
 }
 
 #[test]
@@ -431,6 +466,9 @@ fn credential_identity_and_existing_membership_role_changes_are_refused() {
     ] {
         let mut after = before.clone();
         set_field(&mut after, kind, field, value);
-        assert_eq!(plan_error(&before, &after), CatalogBundleError::IdentityChanged);
+        assert_eq!(
+            plan_error(&before, &after),
+            CatalogBundleError::IdentityChanged
+        );
     }
 }

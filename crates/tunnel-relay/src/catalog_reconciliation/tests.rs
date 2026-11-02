@@ -42,7 +42,9 @@ fn offline_arguments_require_each_exact_flag_once_without_echoing_values() {
             "x",
         ]),
     ] {
-        let error = Arguments::parse(&invalid, &required).err().expect("refused");
+        let error = Arguments::parse(&invalid, &required)
+            .err()
+            .expect("refused");
         assert!(!error.to_string().contains("secret-sentinel"));
     }
 }
@@ -153,17 +155,11 @@ mod files {
         args[9] = "0".repeat(64).into();
         assert!(reconcile_plan(&args).is_err());
         assert!(!fixture.0.join("plan").exists());
-        fs::set_permissions(
-            fixture.0.join("bundle"),
-            fs::Permissions::from_mode(0o644),
-        )
-        .expect("mode");
+        fs::set_permissions(fixture.0.join("bundle"), fs::Permissions::from_mode(0o644))
+            .expect("mode");
         assert!(bundle_check(&fixture.check_args()).is_err());
-        fs::set_permissions(
-            fixture.0.join("bundle"),
-            fs::Permissions::from_mode(0o600),
-        )
-        .expect("mode");
+        fs::set_permissions(fixture.0.join("bundle"), fs::Permissions::from_mode(0o600))
+            .expect("mode");
         let foreign = String::from_utf8(CONFIG.to_vec())
             .expect("text")
             .replace("deployment-a", "foreign");

@@ -36,7 +36,10 @@ impl Directory {
         let stderr = self.0.join(format!("{}.stderr", uuid::Uuid::new_v4()));
         let mut child = Command::new(env!("CARGO_BIN_EXE_tunnel-relay"))
             .arg(command)
-            .args(args.iter().flat_map(|(flag, value)| [Path::new(flag), *value]))
+            .args(
+                args.iter()
+                    .flat_map(|(flag, value)| [Path::new(flag), *value]),
+            )
             .stdin(Stdio::null())
             .stdout(private_file(&stdout))
             .stderr(private_file(&stderr))

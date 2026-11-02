@@ -34,6 +34,34 @@ hourly automation. Main remains `626ba9365b5d3e1faf8265f0b6ff50cc9111b749`.
 Merge authorization covers a fully checked candidate and the normal configured
 development prerelease; live deployment and license exceptions remain unauthorized.
 
+[Draft #294](https://github.com/andymac4182/agentuplink/pull/294) is frozen at
+`d55ffcfe0c1357bb4fa95b30ba0e2b45e729204b`, actual hosted checkout
+`475ac05ce9fcf46a203ff2951a99471620fdd95c`, shared tree
+`668827ea79c2e89e8bffda0947b80f9b11734ae0`. At the retained
+2026-11-02T13:58:35.992623Z snapshot, ordinary CI has ten passing jobs, three
+Rust formatting failures and M7 still active. All three formatting logs contain
+24 identical hunks; subsequent Clippy/workspace/example steps in those jobs
+are skipped. M0/M2/M3/M4, three-OS packaging, five optimized build/native archive
+pairs and both fresh authorization mutation workflows pass. The existing
+archive probes do not execute the new offline catalog commands.
+
+The actual Fly helper disconnect passes again, followed by relay-a restart
+exit 1. Combined logs have one closed membership-bootstrap rejection with
+`membership_rejected`; lifecycle attribution is `none`, and the underlying
+variant remains unknown. Both recovery scenarios are skipped. The
+[exact #294 report](m6-offline-catalog-delivery-2026-11-02.md) retains image,
+binary/notice, receipt and cleanup identities without claiming repair.
+
+The separate reviewed successor applies the hosted formatting hunks, adds two
+portable Windows CLI-refusal tests and a bounded optimized-archive semantic
+witness. Existing platforms/checks remain. Thirty-six new pure/mock controls
+and seven existing verifier controls pass after a retained sparse-example
+setup failure; source/static checks pass. Native semantics, actual supervision,
+fresh full Rust checks and successful restart/recovery remain owed. No production
+criterion or restriction is relaxed.
+
+### Retained #293 checkpoint
+
 [Draft #293](https://github.com/andymac4182/agentuplink/pull/293) is frozen at
 `867fd212f814c334c626f57ff8da837fc2a2b9ce`, actual hosted checkout
 `b71a13e228ae46b30e0f3738cbb1da19029f3dba`, shared tree
@@ -767,13 +795,15 @@ lease cleanup and dedicated-guest acceptance.
 
 ## Next action
 
-Publish the reviewed closed relay diagnostics and operator output verifier with
-fresh candidate checks, then require complete source-bound Fly baseline/restart,
-same-AOF and physical older-backup acceptance. Preserve #292's successful actual
-disconnect and unknown relay restart failure, its pinned ordinary-CI snapshot,
-and both fresh authorization mutation receipts. Source/offline verifier evidence
-is not runtime proof; neither output verification nor synthetic custody provides
-production reconciliation or independent operator approval.
+Publish the reviewed formatting/Windows and optimized archive witness successor,
+then require fresh hosted formatting, strict Clippy, workspace/platform tests
+and actual archive-owned offline command acceptance. Preserve #294's three
+formatting failures, successful focused authorization/optimized probes, dated
+M7 status and failed Fly relay restart. Require complete source-bound Fly
+baseline/restart, same-AOF and physical older-backup acceptance without using
+successful cleanup or combined-log observations as a repair claim. Offline
+validation/no-change draft witnesses do not provide production reconciliation,
+apply tooling, independent custody or operator approval.
 
 C240's broader public-close scope, C251's unattributed historical cause and C256's
 local quarantine remain explicit. Do not retry M4-47 without its recorded

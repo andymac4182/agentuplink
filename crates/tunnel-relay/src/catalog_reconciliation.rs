@@ -57,7 +57,9 @@ impl<'a> Arguments<'a> {
         }
         let mut fields = BTreeMap::new();
         for pair in args.chunks_exact(2) {
-            let flag = pair[0].to_str().ok_or("offline catalog option is not UTF-8")?;
+            let flag = pair[0]
+                .to_str()
+                .ok_or("offline catalog option is not UTF-8")?;
             if !required.contains(&flag)
                 || pair[1].is_empty()
                 || pair[1].len() > 4096
@@ -113,10 +115,7 @@ fn read_bundle(
 
 /// Validate a supplied private bundle without opening Redis or authorizing apply.
 pub fn bundle_check(args: &[OsString]) -> Result<String, OfflineCatalogError> {
-    let args = Arguments::parse(
-        args,
-        &["--config", "--bundle", "--expected-bundle-sha256"],
-    )?;
+    let args = Arguments::parse(args, &["--config", "--bundle", "--expected-bundle-sha256"])?;
     let identity = checked_identity(Path::new(args.get("--config")?))?;
     let bundle = read_bundle(
         Path::new(args.get("--bundle")?),

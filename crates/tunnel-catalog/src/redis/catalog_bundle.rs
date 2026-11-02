@@ -166,7 +166,10 @@ pub struct CatalogBundle {
 }
 
 fn lower_hex(value: &str, length: usize) -> bool {
-    value.len() == length && value.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    value.len() == length
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 fn projected_entries(snapshot: &ValidatedCatalogSnapshot) -> Vec<BundleEntry> {
@@ -178,7 +181,11 @@ fn projected_entries(snapshot: &ValidatedCatalogSnapshot) -> Vec<BundleEntry> {
             value: match entry.kind {
                 CanonicalKind::Hash => BundleValue::Hash(entry.fields.clone()),
                 CanonicalKind::Set => BundleValue::Set(
-                    entry.fields.iter().map(|(_, value)| value.clone()).collect(),
+                    entry
+                        .fields
+                        .iter()
+                        .map(|(_, value)| value.clone())
+                        .collect(),
                 ),
                 CanonicalKind::String => BundleValue::String(entry.fields[0].1.clone()),
             },
@@ -325,8 +332,12 @@ impl CatalogReconciliationPlan {
 }
 
 fn counter(before: &str, after: &str) -> Result<bool, CatalogBundleError> {
-    let before = before.parse::<u64>().map_err(|_| CatalogBundleError::Graph)?;
-    let after = after.parse::<u64>().map_err(|_| CatalogBundleError::Graph)?;
+    let before = before
+        .parse::<u64>()
+        .map_err(|_| CatalogBundleError::Graph)?;
+    let after = after
+        .parse::<u64>()
+        .map_err(|_| CatalogBundleError::Graph)?;
     if after < before {
         return Err(CatalogBundleError::CounterRollback);
     }
@@ -376,7 +387,12 @@ fn compare_entry(
                 return Err(CatalogBundleError::RevocationRollback);
             }
             let immutable = if key.starts_with("credential:") {
-                &["spki_fingerprint", "serial", "not_before_us", "expires_at_us"][..]
+                &[
+                    "spki_fingerprint",
+                    "serial",
+                    "not_before_us",
+                    "expires_at_us",
+                ][..]
             } else if key.starts_with("device:") {
                 &["owner_user_id"][..]
             } else if key.starts_with("identity:") {
@@ -419,7 +435,11 @@ fn compare_entry(
         }
         _ => return Err(CatalogBundleError::Graph),
     }
-    Ok(if before == after { "unchanged" } else { "changed" })
+    Ok(if before == after {
+        "unchanged"
+    } else {
+        "changed"
+    })
 }
 
 /// Compare two complete schema-valid inputs. No network, writes, merge or repair.
@@ -444,7 +464,9 @@ pub fn plan_catalog_reconciliation(
         .collect::<BTreeMap<_, _>>();
     let mut differences = Vec::new();
     for (key, before) in &baseline_keys {
-        let after = target_keys.get(key).ok_or(CatalogBundleError::MissingRecord)?;
+        let after = target_keys
+            .get(key)
+            .ok_or(CatalogBundleError::MissingRecord)?;
         let classification = compare_entry(before, after, &baseline.identity.prefix())?;
         if classification != "unchanged" {
             differences.push(PlannedDifference {
