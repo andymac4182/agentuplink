@@ -40,6 +40,11 @@ jobs:
           python3 -m venv "$RUNNER_TEMP/mcp-license-checker"
           "$RUNNER_TEMP/mcp-license-checker/bin/pip" install --require-hashes --only-binary=:all: -r scripts/m3-test-dependency-gate-requirements.txt
           "$RUNNER_TEMP/mcp-license-checker/bin/python" -m unittest discover -s scripts -p test_m3_test_dependency_gate.py -v
+      # C253: seeded artifact/alias refusal controls only. The real 324-node
+      # graph still fails unchanged policy; this is not a licence approval.
+      - name: Exercise client dependency license gate failure controls
+        run: |
+          "$RUNNER_TEMP/mcp-license-checker/bin/python" -m unittest discover -s scripts -p test_client_license_gate.py -v
 
   typescript:
     name: TypeScript client and framework adapters

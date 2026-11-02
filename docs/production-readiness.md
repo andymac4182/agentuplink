@@ -6,7 +6,7 @@ Goal: make Agent Uplink deployable with a repeatable release, verified recovery,
 and evidence for every production blocker. Requested by the owner on 2026-10-31.
 Review baseline: `c749a78432c2d863572a601a7935abf73fa193a2`.
 
-Reviewable changes are stacked draft pull requests, in dependency order:
+The historical stacked PRs incorporated by #284 are, in dependency order:
 [hardening #260](https://github.com/andymac4182/agentuplink/pull/260),
 [offline authority #261](https://github.com/andymac4182/agentuplink/pull/261),
 [authenticated authority transports #263](https://github.com/andymac4182/agentuplink/pull/263),
@@ -29,33 +29,36 @@ then [real actor queue acceptance #278](https://github.com/andymac4182/agentupli
 
 ## Current merge and Fly continuation
 
-The owner has authorized merging and selected Fly for the initial deployment.
-The separate `codex/production-merge-candidate` branch consolidates the complete
-stack ending at [#283](https://github.com/andymac4182/agentuplink/pull/283) and
-adds C257 coverage for notice-only release inputs. Main is still `c749a784` at
-this observation. Merge only the final checked candidate using a merge commit;
-keep its main/base/head/tree identities and post-merge results explicit.
+The owner authorized merging and selected Fly for the initial deployment.
+[#284](https://github.com/andymac4182/agentuplink/pull/284) is now merged as
+`626ba9365b5d3e1faf8265f0b6ff50cc9111b749` at
+2026-11-02T15:40:54+10:00. Its tree `1e985753` exactly matches candidate
+`46a19cce` and actual hosted checkout `5f2053f0`. All 14 PR CI jobs,
+three-OS packaging and five optimized build/native archive verification pairs
+pass. C257's notice-input trigger scope is verified. Post-merge CI and the
+normal development-prerelease pipeline remain separate pending observations.
+Historical #278/#282 failures and C256's local failed/quarantined cleanup remain
+retained; a successful merge does not diagnose them or establish production readiness.
 
-At #283 `8c531ad4` / actual same-tree `b3e011e0`, all three Rust platforms and
-full M4 pass. The actual 300-second framework gate has eight exchanges / 20,480
-bytes and joined cleanup; C244 reaches three exchanges / zero streams / zero
-replay with every original assertion. Thirteen CI jobs pass, with M7 still
-running at this observation. All five optimized builds/native archive verifiers
-and packaging pass. These results do not erase #282's unknown cleanup cause,
-#278's failure or the local C256 Clippy/quarantined-cleanup failure.
-[Consolidation evidence, release effects and open work](m6-merge-candidate-2026-11-02.md)
-bind the exact scope. The new consolidation requires its own hosted checks.
+C258 now supplies a separate three-relay, durable-Redis and online-authority Fly
+profile, four source-bound image recipes and a bounded hosted cluster rehearsal.
+Its 20 renderer, 20 entrypoint and 33 rehearsal controls pass locally; actual new
+image builds and cluster runtime have not yet run. The [Fly guide](deploy-fly-cluster.md)
+and [exact preparation/merge report](m6-fly-cluster-preparation-2026-11-02.md)
+record source identities, review corrections, failed precommit scan and remaining
+runtime/operator scope. The historical single-relay image smoke does not replace
+this cluster proof. Fly account access and actual deployment inventory remain absent.
 
-Main's existing successful-CI workflow publishes an attested development
-prerelease. This merge consequence is explicit; it is not production approval
-or live deployment. License decisions and unresolved notice/provenance scope
-remain open. Fly is the selected target, but the existing single-relay profile
-is only intermediate: C258 retains the three-relay/authority/durable-Redis
-requirements. Fly account access and actual inventory are not available here.
+C253's [artifact-aware checker](m6-client-license-gate.md) verifies all 324 client
+lock entries and seven aliases, but the real gate fails on five policy entries
+and two missing archived notices. Its 55 seeded controls pass; CI now runs these
+controls without claiming full policy enforcement. No license exception, platform
+omission or live deployment authorization has been inferred. The production goal
+and hourly continuation remain active.
 
 ## Retained predecessor evidence
 
-Current published [draft #282](https://github.com/andymac4182/agentuplink/pull/282),
+Earlier published [draft #282](https://github.com/andymac4182/agentuplink/pull/282),
 `cb619ee1` / actual `bdb17f6d`, has a new hosted M4-68 connector cleanup
 failure after expected native rotation/revocation outcomes. The completed
 connector error was discarded, so the cause remains unknown. Final gate
@@ -112,7 +115,7 @@ groups are absent afterward; revocations, approval refusals and fresh-session
 recovery pass. [Exact local recovery evidence](m6-fs-ledger-retirement-2026-11-01.md#separate-current-authority-image-recovery)
 does not establish an image rebuilt at #278, default-UID recovery, or live DR.
 
-Latest fully successful hosted baseline [#277](https://github.com/andymac4182/agentuplink/pull/277)
+Earlier fully successful hosted baseline [#277](https://github.com/andymac4182/agentuplink/pull/277)
 head `bd93cfbd828a2d23415e5e406120f9a70e9e92c0` and actual runner checkout
 `3615d7a2ff4ffb5837a8e0f894f353ea68115ac4` share tree
 `00fcf8d247642d9ace69b6223c7500858385e6d3`.
@@ -269,8 +272,9 @@ provisioning failure. It does not prove readiness or production provisioning.
 The three-relay requirement
 is unchanged. The C131 diagnostic feature remains outside this candidate;
 its [causal evidence](m7-c131-diagnostic-evidence-2026-10-31.md) is separate.
-No changes have been merged or deployed, and release publication/attestation
-were skipped for the draft PR.
+At that earlier observation no changes had been merged or deployed, and release
+publication/attestation were skipped for the draft PR. The authorized #284 merge
+is recorded above; no Fly deployment follows from it.
 
 Existing task IDs in `tasks.md` retain their acceptance criteria. A historical
 green gate is not evidence that the current release is production ready. The

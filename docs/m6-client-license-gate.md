@@ -43,7 +43,10 @@ not promised capacity on another machine.
 `scripts/client-license-gate.py` reuses the existing MCP gate's strict unique-key
 JSON parser and SPDX evaluator, with the same pinned `packaging==26.3` identifier
 catalogue. It does not call that gate's graph collector or advisory commands.
-No MCP scope, lock, license policy, workflow or installed dependency tree changes.
+No MCP scope, lock, license policy or installed dependency tree changes.
+The publication continuation adds the 55 seeded client controls to the existing
+Python-checker CI environment. It does not run or waive the failing real graph
+gate, and therefore does not establish production license enforcement.
 The checker itself performs no npm invocation, installation, package script or
 native execution. It does not scan advisories; existing advisory gates remain
 separate.
