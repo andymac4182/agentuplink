@@ -1,7 +1,7 @@
 //! `tunnel-test-harness mcp-demo-client`: the MCP demo's cloud-side client
 //! (docs/demo/mcp.md).
 //!
-//! It is the pinned official Rust MCP SDK (rmcp 3.4.0) talking to a relay's
+//! It is the pinned official Rust MCP SDK (rmcp 3.11.0) talking to a relay's
 //! public MCP route, exactly as a hosted agent would: HTTPS to the consumer
 //! listener with a bearer token, nothing else.  rmcp has no TLS client
 //! without `reqwest`, which the workspace does not pin, so a byte-copying TLS

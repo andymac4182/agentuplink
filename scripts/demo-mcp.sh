@@ -13,7 +13,7 @@
 # refuses a plaintext catalog), the shipped `tunnel-relay` and `tunnel-client`
 # binaries configured from the shipped examples, the repository's
 # deterministic MCP server (`tunnel-mcp-fixture`) as the device's MCP server,
-# and the pinned official Rust MCP SDK (rmcp 3.4.0, via
+# and the pinned official Rust MCP SDK (rmcp 3.11.0, via
 # `tunnel-test-harness mcp-demo-client`) as the cloud-side client.  Traffic
 # goes client -> relay consumer listener (HTTPS + bearer token) -> device
 # WebSocket (mTLS) -> tunnel-client -> MCP server over stdio.  Nothing
@@ -266,7 +266,7 @@ chmod 600 "$work/consumer-token"
 
 url="https://localhost:$consumer_port/v1/devices/$device_id/services/$service_id/http/mcp"
 say "MCP endpoint: $url"
-say "run the MCP client (tunnel-test-harness mcp-demo-client, rmcp 3.4.0)"
+say "run the MCP client (tunnel-test-harness mcp-demo-client, rmcp 3.11.0)"
 AGENTUPLINK_TOKEN=$(cat "$work/consumer-token") "$bin/tunnel-test-harness" mcp-demo-client \
   --url "$url" --ca "$work/server-ca.pem" --profile "$client_profile"
 say "ok: the device's MCP server answered a real MCP client through the relay"

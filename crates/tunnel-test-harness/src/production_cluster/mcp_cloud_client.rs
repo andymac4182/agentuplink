@@ -1,4 +1,4 @@
-//! M3-03 over the real cluster: the official rmcp 3.4.0 client, as a cloud
+//! M3-03 over the real cluster: the official rmcp 3.11.0 client, as a cloud
 //! consumer with a bearer token, drives both pinned MCP profiles against
 //! both device export kinds through non-owner ingress (relay-c), the peer
 //! HTTP/3 hop, the owner actor (relay-a), the rotating device data

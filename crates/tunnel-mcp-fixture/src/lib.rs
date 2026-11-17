@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 //! A deterministic synthetic MCP server built with the pinned official Rust
-//! SDK (rmcp 3.4.0).  It touches nothing but an optional marker directory
+//! SDK (rmcp 3.11.0).  It touches nothing but an optional marker directory
 //! the test owns.
 //!
 //! Tools:
