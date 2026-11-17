@@ -61,7 +61,15 @@ jobs:
       - run: npm run check
       - name: Verify consuming-root npm override behavior
         run: npm run test:consumer-overrides
-      - run: npm audit --audit-level=high
+      # High and critical advisories fail, except those listed with a reason
+      # in packages/client/audit-exceptions.json; an exception that matches
+      # nothing fails too. See scripts/npm-audit-gate.py.
+      - name: Prove the npm audit gate can still fail
+        working-directory: .
+        run: python3 scripts/npm-audit-gate.py --self-test
+      - name: Run the npm audit gate (high and critical, documented exceptions only)
+        working-directory: .
+        run: python3 scripts/npm-audit-gate.py packages/client
       - name: Audit the pinned MCP conformance dependencies
         working-directory: tests/mcp-sdk-conformance
         run: |

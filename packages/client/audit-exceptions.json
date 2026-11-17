@@ -1,0 +1,7 @@
+[
+  {
+    "id": "GHSA-fc5q-39xc-vjpf",
+    "package": "picomatch",
+    "reason": "ReDoS in picomatch; every released version through 4.0.7 is affected and no fixed release exists. Reached only through @mastra/core and files-sdk, which are dev and peer dependencies of the framework adapters, not runtime dependencies of this package. Accepted by the owner on 2026-11-18; remove when a fixed picomatch is released (docs/tasks.md M6-C294)."
+  }
+]
