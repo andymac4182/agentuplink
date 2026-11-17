@@ -6676,6 +6676,24 @@ impl M2Actor {
                 }
             }
         }
+        if reset_ready
+            && !reset_delivered
+            && let Some(stream) = self.streams.get_mut(&stream_id)
+        {
+            // The relay reset the request direction before this stream's
+            // authorization was confirmed.  Input buffered for that
+            // confirmation is discarded with the reset: the relay may already
+            // have reached the terminal state that lets it send STREAM_FORGET
+            // as soon as this RESET is acknowledged, and its answer to the
+            // outstanding challenge travels on the control socket, so it can
+            // arrive after that FORGET or not at all.  Kept, the input would
+            // be adapter input debt nothing drains, and the FORGET proof
+            // would end the whole session with a protocol error (task rows
+            // M6-C256, M6-C296).  The frames were marked delivered above, so
+            // the sequence evidence both sides compare is unchanged.
+            stream.pending.clear();
+            stream.pending_bytes = 0;
+        }
         if reset_ready && !reset_delivered {
             if http_stream {
                 self.http_abort(stream_id, peer_reset_reason.unwrap_or(M2_RESET_PROTOCOL));
@@ -11381,6 +11399,50 @@ mod tests {
         assert!(
             stream.pending.is_empty() && stream.pending_bytes == 0,
             "an invalidated stream must not retain input nothing can drain"
+        );
+
+        drop(actor);
+        while receiver.recv().await.is_some() {}
+    }
+
+    /// Task row M6-C296 (the cause of the M6-C256 hosted failure): the relay
+    /// can reset a stream whose first challenge is still outstanding, and
+    /// send STREAM_FORGET as soon as the RESET is acknowledged, before or
+    /// without the invalidation that answers the challenge.  Input buffered
+    /// for the confirmation must not survive that RESET as adapter input debt.
+    #[tokio::test]
+    async fn m6c296_a_relay_reset_before_confirmation_discards_buffered_input() {
+        let (mut actor, key, mut receiver, _control_receiver) =
+            test_actor_with_carrier(M2_CARRIER_QUEUE_FRAMES);
+        let mut stream = test_stream();
+        stream.sequence = StreamState::new(7, 1_024).expect("test stream sequence");
+        actor.streams.insert(7, stream);
+        assert!(!actor.streams[&7].auth.confirmed());
+        assert!(!actor.streams[&7].auth.invalidated());
+        actor
+            .handle_frame(key.clone(), Frame::data(1, 1, 7, 1, 0, vec![0x2a]))
+            .await
+            .expect("relay data is buffered for the confirmation");
+        assert_eq!(
+            (
+                actor.streams[&7].pending.len(),
+                actor.streams[&7].pending_bytes
+            ),
+            (1, 1),
+            "the control: unconfirmed input is buffered until the RESET"
+        );
+        actor
+            .handle_frame(
+                key.clone(),
+                Frame::reset(1, 1, 7, 2, 0, tunnel_protocol::reset_reason::CANCELLED),
+            )
+            .await
+            .expect("the relay RESET is accepted");
+        let stream = &actor.streams[&7];
+        assert!(stream.input.reset());
+        assert!(
+            stream.pending.is_empty() && stream.pending_bytes == 0,
+            "input buffered for a confirmation is discarded by the relay's RESET"
         );
 
         drop(actor);
