@@ -11,9 +11,9 @@
 //! **Reconnect budget (M6-C74).**  That reconnect has the full
 //! `REDIS_CONNECT_TIMEOUT` for DNS, TCP, TLS and `AUTH` -- a cold lookup on a
 //! fresh machine alone can exceed the two-second command deadline -- so it
-//! runs as one single-flight task per lane, started by the command that found
-//! the lane without a connection and never holding the lane lock while it
-//! connects.  Every caller, the one that started it included, waits for it at
+//! runs as one single-flight task per lane, started for the command that found
+//! the lane without a connection, and the lane's bookkeeping never waits for
+//! it to connect.  Every caller, the one that started it included, waits for it at
 //! most its own `REDIS_OPERATION_TIMEOUT` and otherwise fails closed with the
 //! ordinary timeout; the task keeps going and installs its connection for the
 //! next command, but only while the lane still has no connection and the
@@ -63,9 +63,10 @@
 //! while a live connection keeps its place.  The probe is never the caller's
 //! command.
 //!
-//! A lane does not serialize its callers.  The lane lock is held only for
-//! bookkeeping: never across the probe that verifies the physical connection
-//! (M6-C95) nor across a reconnect (M6-C74, see above);
+//! A lane does not serialize its callers.  Each lane's connection phase is
+//! owned by one actor task that only does bookkeeping: it performs no I/O, so
+//! it never waits for the probe that verifies the physical connection
+//! (M6-C95) nor for a reconnect (M6-C74, see above);
 //! every caller then runs its own command on a handle to that multiplexed
 //! connection, so concurrent commands pipeline on one socket and the
 //! per-command deadline measures the authority's reply, never the time spent
@@ -76,14 +77,14 @@
 use std::{
     collections::VecDeque,
     sync::{
-        Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard,
+        Arc, OnceLock,
         atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
 
 use redis::{FromRedisValue, RedisError, aio::MultiplexedConnection};
-use tokio::sync::{Mutex, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 
 use super::{
     BOUND_RUN_MARKER, REDIS_CONNECT_TIMEOUT, REDIS_OPERATION_TIMEOUT, bound_run_id,
@@ -95,6 +96,10 @@ use crate::{CatalogConnectionError, CatalogError, UnknownWriteCause};
 /// whose `run_id` differs from the bound identity and the namespace does not
 /// allow the new run to be adopted.
 pub(super) const RUN_ID_CONFLICT: &str = "Redis server run id";
+
+/// Run re-binding was already enabled for this catalog with a different
+/// incarnation or different namespace keys.
+pub(super) const REBIND_SCOPE_CONFLICT: &str = "Redis run re-binding scope";
 
 /// The namespace has no deployment incarnation or no run binding: it was
 /// never activated, or Redis came back without its data (M6-C65).
@@ -126,6 +131,24 @@ const LANE_RECONNECT_BUDGET: Duration = REDIS_CONNECT_TIMEOUT
 
 /// Outcome of one lane reconnect: `None` while in flight.
 type ReconnectOutcome = Option<Result<(), CatalogError>>;
+
+/// Bound of a lane actor's and of the binding actor's command queue.  Neither
+/// actor waits on anything while handling a command, so the queue only
+/// absorbs bursts.  A caller that finds it full waits for room inside its own
+/// command deadline and then fails closed with the ordinary timeout.
+const ACTOR_QUEUE_BOUND: usize = 64;
+
+/// The event is not allowed in the current phase; nothing changed.
+#[derive(Debug, PartialEq, Eq)]
+struct IllegalTransition;
+
+/// The owning actor is not running: its runtime has shut down.
+fn actor_gone(what: &'static str) -> CatalogError {
+    CatalogError::Database(RedisError::from(std::io::Error::new(
+        std::io::ErrorKind::ConnectionAborted,
+        what,
+    )))
+}
 
 /// Most continuity tokens whose write outcome is unknown that a witness keeps
 /// as candidates.  Beyond it the oldest is forgotten, which can only make a
@@ -170,7 +193,7 @@ return {'continuity'}
 /// The keys and incarnation a lane needs to decide a re-binding on its own
 /// connection.  Set only for a single relay (`enable_run_rebinding`); a
 /// catalog without it refuses every other run, as before M6-C65.
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub(super) struct RebindScope {
     pub(super) incarnation: String,
     pub(super) incarnation_key: String,
@@ -190,16 +213,222 @@ struct ContinuityWitness {
     last_ack_ms: Option<u64>,
 }
 
-#[derive(Default)]
-struct BindingState {
+/// How far a catalog's run binding may move.  The witness exists only on top
+/// of a re-binding scope, so a witness without a scope cannot be represented.
+enum BindingMode {
+    /// Never opted in: any run but the bound one is refused.
+    Pinned,
+    /// `enable_run_rebinding`: adopt a run the namespace's stored binding
+    /// already names.
+    Rebindable(RebindScope),
+    /// Rebindable, and a continuity witness may move the stored binding.
+    Witnessed {
+        scope: RebindScope,
+        witness: ContinuityWitness,
+    },
+}
+
+enum BindingEvent {
+    ScopeConfigured(RebindScope),
+    WitnessEnabled(Duration),
+    WitnessDisabled,
+}
+
+impl BindingMode {
+    /// The only place the binding mode changes.  A refused event leaves the
+    /// mode as it was: enabling an enabled witness keeps its tokens, and a
+    /// scope is configured once.
+    fn transition(&mut self, event: BindingEvent) -> Result<(), IllegalTransition> {
+        let (next, result) = match (std::mem::replace(self, Self::Pinned), event) {
+            (Self::Pinned, BindingEvent::ScopeConfigured(scope)) => {
+                (Self::Rebindable(scope), Ok(()))
+            }
+            (Self::Rebindable(scope), BindingEvent::WitnessEnabled(interval)) => (
+                Self::Witnessed {
+                    scope,
+                    witness: ContinuityWitness {
+                        candidates: VecDeque::new(),
+                        interval,
+                        last_ack_ms: None,
+                    },
+                },
+                Ok(()),
+            ),
+            (Self::Witnessed { scope, .. }, BindingEvent::WitnessDisabled) => {
+                (Self::Rebindable(scope), Ok(()))
+            }
+            (unchanged, _) => (unchanged, Err(IllegalTransition)),
+        };
+        *self = next;
+        result
+    }
+
+    fn scope(&self) -> Option<&RebindScope> {
+        match self {
+            Self::Pinned => None,
+            Self::Rebindable(scope) | Self::Witnessed { scope, .. } => Some(scope),
+        }
+    }
+
+    fn witness(&self) -> Option<&ContinuityWitness> {
+        match self {
+            Self::Witnessed { witness, .. } => Some(witness),
+            Self::Pinned | Self::Rebindable(_) => None,
+        }
+    }
+
+    fn witness_mut(&mut self) -> Option<&mut ContinuityWitness> {
+        match self {
+            Self::Witnessed { witness, .. } => Some(witness),
+            Self::Pinned | Self::Rebindable(_) => None,
+        }
+    }
+}
+
+/// The run a catalog is bound to and how often that has moved, published by
+/// the binding actor for callers that cannot wait.
+#[derive(Clone, Default)]
+struct BoundRun {
+    /// The adopted run; meaningful once `rebinds` is not zero.  Until then
+    /// the catalog is bound to the run its first lane connected to.
     run_id: String,
-    scope: Option<RebindScope>,
-    witness: Option<ContinuityWitness>,
+    /// Advanced every time the binding moves to a new run.
+    rebinds: u64,
+}
+
+/// What callers that cannot wait hand to, or read past, the binding actor.
+struct BindingShared {
+    /// The binding's clock origin.
+    origin: Instant,
+    /// Milliseconds since `origin` of the last reply any lane received from
+    /// the bound run.  Updated on every successful command.
+    last_contact_ms: AtomicU64,
+    /// The run the catalog's first lane connected to.  Set once.
+    initial_run: OnceLock<String>,
+    /// The re-binding scope, configured at most once.
+    scope: OnceLock<RebindScope>,
+    /// Advanced by every request to stop the witness.
+    witness_disables: AtomicU64,
+}
+
+impl BindingShared {
+    fn now_ms(&self) -> u64 {
+        u64::try_from(self.origin.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+}
+
+/// What a re-binding decision needs from the binding, read in one step.
+enum RebindPlan {
+    /// The catalog is already bound to that run.
+    AlreadyBound,
+    Decide {
+        keys: Vec<String>,
+        incarnation: String,
+        /// The witness's candidate tokens, when its last acknowledged token
+        /// is fresh enough to re-bind on.
+        candidates: Option<Vec<String>>,
+    },
+}
+
+/// Everything about a catalog's run binding that changes, owned by the
+/// binding actor.
+struct BindingState {
+    shared: Arc<BindingShared>,
+    mode: BindingMode,
+    run: BoundRun,
+    published: watch::Sender<BoundRun>,
+    /// The `witness_disables` value already applied to `mode`.
+    witness_disables_seen: u64,
     /// Runs refused for continuity; they stay refused in this process even if
     /// an operator later re-attests them (M6-C65 review).
     continuity_refused: VecDeque<String>,
-    /// Advanced every time the binding moves to a new run.
-    rebinds: u64,
+}
+
+impl BindingState {
+    /// Apply what callers that cannot wait have asked for since the last
+    /// command: a configured scope and requests to stop the witness.  The
+    /// actor runs this before every command, so each command sees them.
+    fn absorb(&mut self) {
+        if matches!(self.mode, BindingMode::Pinned)
+            && let Some(scope) = self.shared.scope.get()
+        {
+            let _ = self
+                .mode
+                .transition(BindingEvent::ScopeConfigured(scope.clone()));
+        }
+        let disables = self.shared.witness_disables.load(Ordering::Acquire);
+        if disables != self.witness_disables_seen {
+            self.witness_disables_seen = disables;
+            // Refused when no witness is kept: there is nothing to stop.
+            let _ = self.mode.transition(BindingEvent::WitnessDisabled);
+        }
+    }
+
+    fn bound_run_is(&self, run_id: &str) -> bool {
+        if self.run.rebinds == 0 {
+            self.shared
+                .initial_run
+                .get()
+                .is_some_and(|run| run == run_id)
+        } else {
+            self.run.run_id == run_id
+        }
+    }
+
+    fn plan(&self, run_id: &str) -> Result<RebindPlan, CatalogError> {
+        if self.bound_run_is(run_id) {
+            return Ok(RebindPlan::AlreadyBound);
+        }
+        let Some(scope) = self.mode.scope() else {
+            return Err(CatalogError::Conflict(RUN_ID_CONFLICT));
+        };
+        if self.continuity_refused.iter().any(|run| run == run_id) {
+            return Err(CatalogError::Conflict(CONTINUITY_MISMATCH));
+        }
+        let candidates = self.mode.witness().and_then(|witness| {
+            token_is_fresh(
+                witness.last_ack_ms,
+                self.shared.last_contact_ms.load(Ordering::Acquire),
+                witness.interval,
+            )
+            .then(|| witness.candidates.iter().cloned().collect::<Vec<_>>())
+        });
+        Ok(RebindPlan::Decide {
+            keys: vec![
+                scope.incarnation_key.clone(),
+                scope.run_key.clone(),
+                scope.continuity_key.clone(),
+            ],
+            incarnation: scope.incarnation.clone(),
+            candidates,
+        })
+    }
+
+    fn adopt(&mut self, run_id: &str) {
+        if !self.bound_run_is(run_id) {
+            run_id.clone_into(&mut self.run.run_id);
+            self.run.rebinds += 1;
+            self.published.send_replace(self.run.clone());
+        }
+    }
+
+    fn refuse_for_continuity(&mut self, run_id: &str) {
+        if !self.continuity_refused.iter().any(|run| run == run_id) {
+            self.continuity_refused.push_back(run_id.to_owned());
+            while self.continuity_refused.len() > MAX_CONTINUITY_REFUSED_RUNS {
+                self.continuity_refused.pop_front();
+            }
+        }
+    }
+}
+
+type BindingCommand = Box<dyn FnOnce(&mut BindingState) + Send>;
+
+async fn run_binding(mut state: BindingState, mut commands: mpsc::Receiver<BindingCommand>) {
+    while let Some(command) = commands.recv().await {
+        state.absorb();
+        command(&mut state);
+    }
 }
 
 /// Whether a token re-binding is still sound: the last acknowledged token
@@ -245,135 +474,174 @@ pub(super) async fn persistence_verified(connection: &mut MultiplexedConnection)
 }
 
 /// The Redis server run a catalog is bound to, shared by all of its lanes.
+///
+/// Everything that changes is owned by one actor task, started on the Tokio
+/// runtime the binding is created on; the binding must not outlive that
+/// runtime, after which re-binding fails closed.  Callers that cannot wait
+/// read the published bound run, and hand the actor a scope (once) or a
+/// request to stop the witness, which it applies before its next command.
 pub(super) struct RunBinding {
-    state: RwLock<BindingState>,
-    /// The binding's clock origin.
-    origin: Instant,
-    /// Milliseconds since `origin` of the last reply any lane received from
-    /// the bound run.  Updated lock-free on every successful command.
-    last_contact_ms: AtomicU64,
+    shared: Arc<BindingShared>,
+    bound: watch::Receiver<BoundRun>,
+    commands: mpsc::Sender<BindingCommand>,
 }
 
 impl Default for RunBinding {
+    /// Must be called inside a Tokio runtime.
     fn default() -> Self {
-        Self {
-            state: RwLock::default(),
+        let shared = Arc::new(BindingShared {
             origin: Instant::now(),
             last_contact_ms: AtomicU64::new(0),
+            initial_run: OnceLock::new(),
+            scope: OnceLock::new(),
+            witness_disables: AtomicU64::new(0),
+        });
+        let (published, bound) = watch::channel(BoundRun::default());
+        let (commands, queue) = mpsc::channel(ACTOR_QUEUE_BOUND);
+        tokio::spawn(run_binding(
+            BindingState {
+                shared: Arc::clone(&shared),
+                mode: BindingMode::Pinned,
+                run: BoundRun::default(),
+                published,
+                witness_disables_seen: 0,
+                continuity_refused: VecDeque::new(),
+            },
+            queue,
+        ));
+        Self {
+            shared,
+            bound,
+            commands,
         }
     }
 }
 
 impl RunBinding {
-    fn read(&self) -> RwLockReadGuard<'_, BindingState> {
-        self.state.read().unwrap_or_else(PoisonError::into_inner)
-    }
-
-    fn write(&self) -> RwLockWriteGuard<'_, BindingState> {
-        self.state.write().unwrap_or_else(PoisonError::into_inner)
-    }
-
-    fn now_ms(&self) -> u64 {
-        u64::try_from(self.origin.elapsed().as_millis()).unwrap_or(u64::MAX)
+    /// Run `operation` on the binding actor and return its result, or `None`
+    /// when the actor is no longer running.
+    async fn ask<T: Send + 'static>(
+        &self,
+        operation: impl FnOnce(&mut BindingState) -> T + Send + 'static,
+    ) -> Option<T> {
+        let (reply, answer) = oneshot::channel();
+        self.commands
+            .send(Box::new(move |state| {
+                let _ = reply.send(operation(state));
+            }))
+            .await
+            .ok()?;
+        answer.await.ok()
     }
 
     /// A lane received a reply from the bound run.
     pub(super) fn contact(&self) {
-        self.last_contact_ms
-            .fetch_max(self.now_ms(), Ordering::AcqRel);
+        self.shared
+            .last_contact_ms
+            .fetch_max(self.shared.now_ms(), Ordering::AcqRel);
     }
 
     /// The run the catalog is currently bound to.
     pub(super) fn run_id(&self) -> String {
-        self.read().run_id.clone()
+        let bound = self.bound.borrow();
+        if bound.rebinds == 0 {
+            self.shared.initial_run.get().cloned().unwrap_or_default()
+        } else {
+            bound.run_id.clone()
+        }
     }
 
     /// How many times the binding has moved to a new run in this process.
     pub(super) fn rebinds(&self) -> u64 {
-        self.read().rebinds
+        self.bound.borrow().rebinds
     }
 
     fn initialize(&self, run_id: &str) {
-        let mut state = self.write();
-        if state.run_id.is_empty() {
-            run_id.clone_into(&mut state.run_id);
-        }
+        let _ = self.shared.initial_run.set(run_id.to_owned());
     }
 
-    pub(super) fn set_scope(&self, scope: RebindScope) {
-        self.write().scope = Some(scope);
+    /// Configure the re-binding scope.  It is derived from the catalog's
+    /// namespace and incarnation and is set once: a later call with the same
+    /// scope changes nothing, and one with a different scope is refused and
+    /// keeps the first.
+    pub(super) fn set_scope(&self, scope: RebindScope) -> Result<(), CatalogError> {
+        match self.shared.scope.set(scope) {
+            Ok(()) => Ok(()),
+            Err(scope) if self.shared.scope.get() == Some(&scope) => Ok(()),
+            Err(_) => Err(CatalogError::Conflict(REBIND_SCOPE_CONFLICT)),
+        }
     }
 
     pub(super) fn has_scope(&self) -> bool {
-        self.read().scope.is_some()
+        self.shared.scope.get().is_some()
     }
 
-    /// Start keeping a continuity witness.  Idempotent.
-    pub(super) fn enable_witness(&self, interval: Duration) {
-        let mut state = self.write();
-        if state.witness.is_none() {
-            state.witness = Some(ContinuityWitness {
-                candidates: VecDeque::new(),
-                interval,
-                last_ack_ms: None,
-            });
-        }
+    /// Start keeping a continuity witness.  Idempotent.  A request to stop
+    /// the witness made after this call began wins, even if the actor reaches
+    /// this call's command later: the witness then stays off.
+    pub(super) async fn enable_witness(&self, interval: Duration) {
+        let disables = self.shared.witness_disables.load(Ordering::Acquire);
+        self.ask(move |state| {
+            if state.shared.witness_disables.load(Ordering::Acquire) == disables {
+                let _ = state
+                    .mode
+                    .transition(BindingEvent::WitnessEnabled(interval));
+            }
+        })
+        .await;
     }
 
     /// Stop re-binding on tokens: the token loop is gone (M6-C65 review).
+    /// Takes effect before the binding's next command.
     pub(super) fn disable_witness(&self) {
-        self.write().witness = None;
+        self.shared.witness_disables.fetch_add(1, Ordering::AcqRel);
     }
 
-    pub(super) fn witness_enabled(&self) -> bool {
-        self.read().witness.is_some()
+    pub(super) async fn witness_enabled(&self) -> bool {
+        self.ask(|state| state.mode.witness().is_some())
+            .await
+            .unwrap_or(false)
     }
 
     /// Record a token about to be written, before it is dispatched, so a
     /// re-binding that races the write still recognizes it.
-    pub(super) fn continuity_dispatching(&self, token: &str) {
-        if let Some(witness) = self.write().witness.as_mut() {
-            witness.candidates.push_back(token.to_owned());
-            while witness.candidates.len() > MAX_CONTINUITY_CANDIDATES {
-                witness.candidates.pop_front();
+    pub(super) async fn continuity_dispatching(&self, token: &str) {
+        let token = token.to_owned();
+        self.ask(move |state| {
+            if let Some(witness) = state.mode.witness_mut() {
+                witness.candidates.push_back(token);
+                while witness.candidates.len() > MAX_CONTINUITY_CANDIDATES {
+                    witness.candidates.pop_front();
+                }
             }
-        }
+        })
+        .await;
     }
 
     /// Redis acknowledged `token`: it is now the only candidate.
-    pub(super) fn continuity_acknowledged(&self, token: &str) {
-        let now = self.now_ms();
+    pub(super) async fn continuity_acknowledged(&self, token: &str) {
+        let now = self.shared.now_ms();
         self.contact();
-        if let Some(witness) = self.write().witness.as_mut() {
-            witness.candidates.clear();
-            witness.candidates.push_back(token.to_owned());
-            witness.last_ack_ms = Some(now);
-        }
+        let token = token.to_owned();
+        self.ask(move |state| {
+            if let Some(witness) = state.mode.witness_mut() {
+                witness.candidates.clear();
+                witness.candidates.push_back(token);
+                witness.last_ack_ms = Some(now);
+            }
+        })
+        .await;
     }
 
     /// The write of `token` definitely did not happen.
-    pub(super) fn continuity_not_written(&self, token: &str) {
-        if let Some(witness) = self.write().witness.as_mut() {
-            witness.candidates.retain(|candidate| candidate != token);
-        }
-    }
-
-    fn adopt(&self, run_id: &str) {
-        let mut state = self.write();
-        if state.run_id != run_id {
-            run_id.clone_into(&mut state.run_id);
-            state.rebinds += 1;
-        }
-    }
-
-    fn refuse_for_continuity(&self, run_id: &str) {
-        let mut state = self.write();
-        if !state.continuity_refused.iter().any(|run| run == run_id) {
-            state.continuity_refused.push_back(run_id.to_owned());
-            while state.continuity_refused.len() > MAX_CONTINUITY_REFUSED_RUNS {
-                state.continuity_refused.pop_front();
+    pub(super) async fn continuity_not_written(&self, token: &str) {
+        let token = token.to_owned();
+        self.ask(move |state| {
+            if let Some(witness) = state.mode.witness_mut() {
+                witness.candidates.retain(|candidate| *candidate != token);
             }
-        }
+        })
+        .await;
     }
 
     /// Decide on `connection`, already verified to be Redis run `run_id`,
@@ -383,36 +651,21 @@ impl RunBinding {
         connection: &mut MultiplexedConnection,
         run_id: &str,
     ) -> Result<(), CatalogError> {
-        // Decide, under the lock, whether a token re-binding is even
-        // possible; the persistence read happens after it is released.
-        let (keys, incarnation, candidates) = {
-            let state = self.read();
-            if state.run_id == run_id {
-                return Ok(());
-            }
-            let Some(scope) = state.scope.as_ref() else {
-                return Err(CatalogError::Conflict(RUN_ID_CONFLICT));
-            };
-            if state.continuity_refused.iter().any(|run| run == run_id) {
-                return Err(CatalogError::Conflict(CONTINUITY_MISMATCH));
-            }
-            let candidates = state.witness.as_ref().and_then(|witness| {
-                token_is_fresh(
-                    witness.last_ack_ms,
-                    self.last_contact_ms.load(Ordering::Acquire),
-                    witness.interval,
-                )
-                .then(|| witness.candidates.iter().cloned().collect::<Vec<_>>())
-            });
-            (
-                vec![
-                    scope.incarnation_key.clone(),
-                    scope.run_key.clone(),
-                    scope.continuity_key.clone(),
-                ],
-                scope.incarnation.clone(),
+        const GONE: &str = "Redis run binding is not running";
+        // Decide, in one step on the actor, whether a token re-binding is
+        // even possible; the persistence read happens after it.
+        let planned = run_id.to_owned();
+        let (keys, incarnation, candidates) = match self
+            .ask(move |state| state.plan(&planned))
+            .await
+            .ok_or_else(|| actor_gone(GONE))??
+        {
+            RebindPlan::AlreadyBound => return Ok(()),
+            RebindPlan::Decide {
+                keys,
+                incarnation,
                 candidates,
-            )
+            } => (keys, incarnation, candidates),
         };
         let mut persistence_unsound = false;
         let candidates = match candidates {
@@ -437,12 +690,16 @@ impl RunBinding {
             .map_err(CatalogError::Database)?;
         match reply.first().map(String::as_str) {
             Some("ok" | "rebound") => {
-                self.adopt(run_id);
-                Ok(())
+                let adopted = run_id.to_owned();
+                self.ask(move |state| state.adopt(&adopted))
+                    .await
+                    .ok_or_else(|| actor_gone(GONE))
             }
             Some("unbound") => Err(CatalogError::Conflict(NAMESPACE_UNBOUND)),
             Some("continuity") => {
-                self.refuse_for_continuity(run_id);
+                let refused = run_id.to_owned();
+                self.ask(move |state| state.refuse_for_continuity(&refused))
+                    .await;
                 Err(CatalogError::Conflict(CONTINUITY_MISMATCH))
             }
             Some("incarnation") => Err(CatalogError::Conflict(
@@ -471,38 +728,128 @@ impl LaneGroup {
     }
 }
 
-struct LaneState {
-    connection: Option<MultiplexedConnection>,
-    /// The Redis run the current connection was verified against.
-    verified_run_id: String,
-    /// The group loss generation this connection was last verified against.
-    verified_generation: u64,
-    /// Advanced whenever the connection slot is cleared or replaced, so a
-    /// caller that observed a loss on an older connection cannot release one
-    /// that a sibling caller has since re-established.
-    connection_generation: u64,
-    /// The reconnect in flight, if any: at most one per lane (M6-C74).
-    reconnect: Option<ReconnectAttempt>,
-    /// Numbers reconnect attempts, so a finishing attempt installs its
-    /// connection only while it is still the lane's current one.
-    reconnect_epoch: u64,
+/// One lane's connection phase.  `C` is the connection handle; it is a type
+/// parameter only so the transition table can be tested without a socket.
+enum LanePhase<C> {
+    /// The lane holds a connection verified against a Redis run.
+    Connected {
+        connection: C,
+        /// The Redis run the connection was verified against.
+        verified_run_id: String,
+        /// The group loss generation it was last verified against.
+        verified_generation: u64,
+    },
+    /// No connection and no reconnect: the next command starts one.
+    Disconnected,
+    /// No connection, and the lane's single reconnect is in flight (M6-C74).
+    Reconnecting(ReconnectAttempt<C>),
 }
 
-/// One single-flight lane reconnect running outside the lane lock.
-struct ReconnectAttempt {
-    epoch: u64,
+/// One single-flight lane reconnect, running as its own task while the lane
+/// actor keeps answering callers.
+struct ReconnectAttempt<C> {
+    task: tokio::task::JoinHandle<Result<(C, String), CatalogError>>,
     /// `None` while in flight; the attempt's outcome once it has finished
-    /// and, on success, installed its connection.
-    outcome: watch::Receiver<ReconnectOutcome>,
-    abort: tokio::task::AbortHandle,
+    /// and, on success, the lane holds its connection.
+    outcome: watch::Sender<ReconnectOutcome>,
+    /// The group loss generation current when the attempt started: a loss
+    /// observed since then makes the next command probe its connection.
+    loss_generation: u64,
 }
 
-/// What [`AuthorityLane::verify`] found.
+enum LaneEvent<C> {
+    /// A command found the lane disconnected and started its reconnect.
+    ReconnectStarted(ReconnectAttempt<C>),
+    ReconnectSucceeded {
+        connection: C,
+        run_id: String,
+    },
+    ReconnectFailed,
+    /// A command or a probe observed a transport loss on the connection.
+    ConnectionLost,
+    /// The connection answered a probe for this group loss generation.
+    ProbePassed {
+        loss_generation: u64,
+    },
+}
+
+struct LaneState<C> {
+    phase: LanePhase<C>,
+    /// Advanced whenever a connection is released or installed, so a caller
+    /// that observed a loss on an older connection cannot release one that a
+    /// sibling caller has since re-established.
+    connection_generation: u64,
+}
+
+impl<C> LaneState<C> {
+    /// The only place the lane's connection phase changes.  Returns the
+    /// reconnect attempt the event ended, whose outcome the caller publishes.
+    fn transition(
+        &mut self,
+        event: LaneEvent<C>,
+    ) -> Result<Option<ReconnectAttempt<C>>, IllegalTransition> {
+        let (next, result) = match (
+            std::mem::replace(&mut self.phase, LanePhase::Disconnected),
+            event,
+        ) {
+            (LanePhase::Disconnected, LaneEvent::ReconnectStarted(attempt)) => {
+                (LanePhase::Reconnecting(attempt), Ok(None))
+            }
+            (
+                LanePhase::Reconnecting(attempt),
+                LaneEvent::ReconnectSucceeded { connection, run_id },
+            ) => {
+                self.connection_generation += 1;
+                (
+                    LanePhase::Connected {
+                        connection,
+                        verified_run_id: run_id,
+                        verified_generation: attempt.loss_generation,
+                    },
+                    Ok(Some(attempt)),
+                )
+            }
+            (LanePhase::Reconnecting(attempt), LaneEvent::ReconnectFailed) => {
+                (LanePhase::Disconnected, Ok(Some(attempt)))
+            }
+            (LanePhase::Connected { .. }, LaneEvent::ConnectionLost) => {
+                self.connection_generation += 1;
+                (LanePhase::Disconnected, Ok(None))
+            }
+            (
+                LanePhase::Connected {
+                    connection,
+                    verified_run_id,
+                    ..
+                },
+                LaneEvent::ProbePassed { loss_generation },
+            ) => (
+                LanePhase::Connected {
+                    connection,
+                    verified_run_id,
+                    verified_generation: loss_generation,
+                },
+                Ok(None),
+            ),
+            (unchanged, _) => (unchanged, Err(IllegalTransition)),
+        };
+        self.phase = next;
+        result
+    }
+
+    /// Whether the lane still holds the connection a caller was handed.
+    fn holds(&self, connection_generation: u64) -> bool {
+        self.connection_generation == connection_generation
+            && matches!(self.phase, LanePhase::Connected { .. })
+    }
+}
+
+/// What the lane actor tells a caller to do next.
 enum Verified {
     Ready(Admitted),
     /// A sibling lane observed a transport loss since this connection was
-    /// last verified: probe this handle, outside the lane lock, before the
-    /// caller's command (M6-C95).
+    /// last verified: probe this handle, away from the lane actor, before
+    /// the caller's command (M6-C95).
     Probe {
         connection: MultiplexedConnection,
         connection_generation: u64,
@@ -512,27 +859,211 @@ enum Verified {
     Reconnecting(watch::Receiver<ReconnectOutcome>),
 }
 
-pub(super) struct AuthorityLane {
+/// What a caller's probe of a connection found.
+struct ProbeReport {
+    connection_generation: u64,
+    loss_generation: u64,
+    passed: bool,
+}
+
+enum LaneCommand {
+    /// Record the caller's probe, if it made one, and decide what it does
+    /// next.
+    Admit {
+        probed: Option<ProbeReport>,
+        reply: oneshot::Sender<Verified>,
+    },
+    /// The caller observed a transport loss on the connection it was handed.
+    ReleaseLost {
+        connection_generation: u64,
+        done: oneshot::Sender<()>,
+    },
+    #[cfg(test)]
+    Inspect(oneshot::Sender<LaneSnapshot>),
+}
+
+/// The lane's bookkeeping as a test reads it.
+#[cfg(test)]
+struct LaneSnapshot {
+    connected: bool,
+    reconnecting: bool,
+    connection_generation: u64,
+    /// Of the connection the lane holds, if it holds one.
+    verified_generation: Option<u64>,
+    verified_run_id: Option<String>,
+}
+
+/// Everything a lane's actor owns.
+struct LaneActor {
     client: redis::Client,
     /// The redis-rs configuration a reconnect uses: production is
     /// `connection_config(REDIS_CONNECT_TIMEOUT)`.
     connect_config: redis::AsyncConnectionConfig,
     group: Arc<LaneGroup>,
-    state: Arc<Mutex<LaneState>>,
+    state: LaneState<MultiplexedConnection>,
 }
 
-impl Drop for AuthorityLane {
-    /// A dropped lane abandons its in-flight reconnect instead of leaving a
-    /// task to finish a connection nobody will use.  The task only takes the
-    /// lock briefly, so `try_lock` almost always succeeds; if it does not,
-    /// the task still ends within [`LANE_RECONNECT_BUDGET`].
-    fn drop(&mut self) {
-        if let Ok(state) = self.state.try_lock()
-            && let Some(attempt) = state.reconnect.as_ref()
-        {
-            attempt.abort.abort();
+impl LaneActor {
+    /// The lane's owning task.  It performs no I/O: it answers callers, and
+    /// records the end of the reconnect it started.  When the lane is dropped
+    /// it abandons an in-flight reconnect instead of leaving a task to finish
+    /// a connection nobody will use.
+    async fn run(mut self, mut commands: mpsc::Receiver<LaneCommand>) {
+        loop {
+            tokio::select! {
+                command = commands.recv() => match command {
+                    Some(command) => self.handle(command),
+                    None => break,
+                },
+                finished = reconnect_finished(&mut self.state) => self.reconnected(finished),
+            }
+        }
+        if let LanePhase::Reconnecting(attempt) = &self.state.phase {
+            attempt.task.abort();
         }
     }
+
+    fn handle(&mut self, command: LaneCommand) {
+        match command {
+            LaneCommand::Admit { probed, reply } => {
+                // Record the result only for the connection it probed: a
+                // sibling caller may have released or replaced it since.
+                if let Some(report) = probed
+                    && self.state.holds(report.connection_generation)
+                {
+                    let _ = self.state.transition(if report.passed {
+                        LaneEvent::ProbePassed {
+                            loss_generation: report.loss_generation,
+                        }
+                    } else {
+                        LaneEvent::ConnectionLost
+                    });
+                }
+                let _ = reply.send(self.verify());
+            }
+            LaneCommand::ReleaseLost {
+                connection_generation,
+                done,
+            } => {
+                // Only the first observer of one loss releases the connection
+                // and advances the group loss generation; a connection a
+                // sibling caller already released or replaced is left alone.
+                if self.state.holds(connection_generation)
+                    && self.state.transition(LaneEvent::ConnectionLost).is_ok()
+                {
+                    self.group.loss_generation.fetch_add(1, Ordering::AcqRel);
+                }
+                let _ = done.send(());
+            }
+            #[cfg(test)]
+            LaneCommand::Inspect(reply) => {
+                let (verified_generation, verified_run_id) = match &self.state.phase {
+                    LanePhase::Connected {
+                        verified_generation,
+                        verified_run_id,
+                        ..
+                    } => (Some(*verified_generation), Some(verified_run_id.clone())),
+                    _ => (None, None),
+                };
+                let _ = reply.send(LaneSnapshot {
+                    connected: matches!(self.state.phase, LanePhase::Connected { .. }),
+                    reconnecting: matches!(self.state.phase, LanePhase::Reconnecting(_)),
+                    connection_generation: self.state.connection_generation,
+                    verified_generation,
+                    verified_run_id,
+                });
+            }
+        }
+    }
+
+    /// Decide, without I/O, what the caller does next.
+    fn verify(&mut self) -> Verified {
+        let loss_generation = self.group.loss_generation.load(Ordering::Acquire);
+        match &self.state.phase {
+            LanePhase::Connected {
+                connection,
+                verified_generation,
+                ..
+            } if *verified_generation != loss_generation => {
+                // A sibling lane observed a transport loss since this
+                // connection was last verified.  Probe before the caller's
+                // command so a connection severed by the same event
+                // reconnects here instead of failing this caller closed.
+                Verified::Probe {
+                    connection: connection.clone(),
+                    connection_generation: self.state.connection_generation,
+                    loss_generation,
+                }
+            }
+            LanePhase::Connected {
+                connection,
+                verified_run_id,
+                ..
+            } => Verified::Ready(Admitted {
+                connection: connection.clone(),
+                connection_generation: self.state.connection_generation,
+                run_id: verified_run_id.clone(),
+            }),
+            LanePhase::Reconnecting(attempt) => Verified::Reconnecting(attempt.outcome.subscribe()),
+            LanePhase::Disconnected => {
+                let attempt = self.start_reconnect(loss_generation);
+                let outcome = attempt.outcome.subscribe();
+                let _ = self.state.transition(LaneEvent::ReconnectStarted(attempt));
+                Verified::Reconnecting(outcome)
+            }
+        }
+    }
+
+    /// Start the lane's single reconnect with the full connect budget
+    /// (M6-C74).  It runs as its own task, bounded by
+    /// [`LANE_RECONNECT_BUDGET`]; the actor learns its result in
+    /// [`Self::reconnected`].
+    fn start_reconnect(&self, loss_generation: u64) -> ReconnectAttempt<MultiplexedConnection> {
+        let client = self.client.clone();
+        let config = self.connect_config.clone();
+        let group = Arc::clone(&self.group);
+        let task = tokio::spawn(async move {
+            tokio::time::timeout(LANE_RECONNECT_BUDGET, reconnect(&client, &config, &group))
+                .await
+                .unwrap_or_else(|_| Err(CatalogError::Database(redis_timeout())))
+        });
+        ReconnectAttempt {
+            task,
+            outcome: watch::channel(None).0,
+            loss_generation,
+        }
+    }
+
+    /// The lane's reconnect ended: install its connection, then publish the
+    /// outcome so waiting callers verify the lane as it now is.
+    fn reconnected(&mut self, finished: Result<(MultiplexedConnection, String), CatalogError>) {
+        let (event, outcome) = match finished {
+            Ok((connection, run_id)) => {
+                (LaneEvent::ReconnectSucceeded { connection, run_id }, Ok(()))
+            }
+            Err(error) => (LaneEvent::ReconnectFailed, Err(error)),
+        };
+        if let Ok(Some(attempt)) = self.state.transition(event) {
+            attempt.outcome.send_replace(Some(outcome));
+        }
+    }
+}
+
+/// Resolves when the lane's in-flight reconnect has ended; never while the
+/// lane has none.  The lane actor applies the result at once, so a finished
+/// task is never polled again.
+async fn reconnect_finished<C>(state: &mut LaneState<C>) -> Result<(C, String), CatalogError> {
+    match &mut state.phase {
+        LanePhase::Reconnecting(attempt) => (&mut attempt.task)
+            .await
+            .unwrap_or_else(|_| Err(actor_gone("Redis authority lane reconnect abandoned"))),
+        LanePhase::Connected { .. } | LanePhase::Disconnected => std::future::pending().await,
+    }
+}
+
+pub(super) struct AuthorityLane {
+    group: Arc<LaneGroup>,
+    commands: mpsc::Sender<LaneCommand>,
 }
 
 /// A verified connection handed to one caller, and the run it belongs to.
@@ -543,35 +1074,63 @@ struct Admitted {
 }
 
 impl AuthorityLane {
+    /// Start the lane's owning actor around a verified startup connection.
+    /// Must be called inside a Tokio runtime, which the lane must not
+    /// outlive: afterwards every command fails closed.
     pub(super) fn new(
         client: redis::Client,
         connection: MultiplexedConnection,
         verified_run_id: String,
         group: Arc<LaneGroup>,
     ) -> Self {
-        group.binding.initialize(&verified_run_id);
-        let verified_generation = group.loss_generation.load(Ordering::Acquire);
-        Self {
+        Self::with_connect_config(
             client,
-            connect_config: connection_config(REDIS_CONNECT_TIMEOUT),
+            connection,
+            verified_run_id,
             group,
-            state: Arc::new(Mutex::new(LaneState {
-                connection: Some(connection),
-                verified_run_id,
-                verified_generation,
-                connection_generation: 0,
-                reconnect: None,
-                reconnect_epoch: 0,
-            })),
-        }
+            connection_config(REDIS_CONNECT_TIMEOUT),
+        )
     }
 
-    /// Reconnect with `config` instead of the production configuration, for
-    /// example with a slow resolver.
+    /// [`Self::new`], reconnecting with `connect_config` instead of the
+    /// production configuration, for example with a slow resolver.
+    fn with_connect_config(
+        client: redis::Client,
+        connection: MultiplexedConnection,
+        verified_run_id: String,
+        group: Arc<LaneGroup>,
+        connect_config: redis::AsyncConnectionConfig,
+    ) -> Self {
+        group.binding.initialize(&verified_run_id);
+        let verified_generation = group.loss_generation.load(Ordering::Acquire);
+        let (commands, queue) = mpsc::channel(ACTOR_QUEUE_BOUND);
+        tokio::spawn(
+            LaneActor {
+                client,
+                connect_config,
+                group: Arc::clone(&group),
+                state: LaneState {
+                    phase: LanePhase::Connected {
+                        connection,
+                        verified_run_id,
+                        verified_generation,
+                    },
+                    connection_generation: 0,
+                },
+            }
+            .run(queue),
+        );
+        Self { group, commands }
+    }
+
     #[cfg(test)]
-    fn with_connect_config(mut self, config: redis::AsyncConnectionConfig) -> Self {
-        self.connect_config = config;
-        self
+    async fn inspect(&self) -> LaneSnapshot {
+        let (reply, snapshot) = oneshot::channel();
+        self.commands
+            .send(LaneCommand::Inspect(reply))
+            .await
+            .expect("lane actor is running");
+        snapshot.await.expect("lane actor answered")
     }
 
     /// Run one bounded command on this lane.
@@ -691,8 +1250,8 @@ impl AuthorityLane {
             connection_generation,
             run_id,
         } = self.admit().await?;
-        // The lane lock is no longer held: this deadline covers only the
-        // authority's handling of the caller's own command.  From here on the
+        // Admission is over: this deadline covers only the authority's
+        // handling of the caller's own command.  From here on the
         // command may have reached the authority, so `dispatched` decides
         // how a lost reply is reported.
         match tokio::time::timeout(REDIS_OPERATION_TIMEOUT, operation(&mut connection, &run_id))
@@ -736,218 +1295,100 @@ impl AuthorityLane {
     /// Hand out a handle to this lane's verified physical connection.
     ///
     /// The caller has [`REDIS_OPERATION_TIMEOUT`] in total, from its arrival:
-    /// for the lane lock, the sibling-loss probe and waiting on a reconnect
-    /// in flight.  The lock is held only for bookkeeping -- never across the
-    /// probe (M6-C95) or a reconnect (M6-C74) -- so a caller never queues
-    /// behind another caller's probe; concurrent callers each probe the same
-    /// multiplexed connection under their own deadline.  A probe that
-    /// exceeds it leaves the lane state as it found it, and a reconnect that
-    /// exceeds it keeps running for the next command; a caller's command
-    /// that times out releases the connection (see [`Self::execute`]).
+    /// for the lane actor's answers, the sibling-loss probe and waiting on a
+    /// reconnect in flight.  The actor only does bookkeeping -- the probe
+    /// (M6-C95) and the reconnect (M6-C74) run away from it -- so a caller
+    /// never queues behind another caller's probe; concurrent callers each
+    /// probe the same multiplexed connection under their own deadline.  A
+    /// probe that exceeds it leaves the lane state as it found it, and a
+    /// reconnect that exceeds it keeps running for the next command; a
+    /// caller's command that times out releases the connection (see
+    /// [`Self::execute`]).
     async fn admit(&self) -> Result<Admitted, CatalogError> {
         let deadline = tokio::time::Instant::now() + REDIS_OPERATION_TIMEOUT;
         let timed_out = |_| CatalogError::Database(redis_timeout());
-        let mut state = tokio::time::timeout_at(deadline, self.state.lock())
-            .await
-            .map_err(timed_out)?;
+        let mut probed = None;
         loop {
-            let mut outcome = match self.verify(&mut state)? {
+            let verified = tokio::time::timeout_at(deadline, self.verify(probed.take()))
+                .await
+                .map_err(timed_out)??;
+            let mut outcome = match verified {
                 Verified::Ready(admitted) => return Ok(admitted),
                 Verified::Probe {
                     mut connection,
                     connection_generation,
                     loss_generation,
                 } => {
-                    // Never hold the lane lock while the probe waits for the
-                    // authority's reply.
-                    drop(state);
-                    let probed = tokio::time::timeout_at(
+                    // The lane actor is not involved while the probe waits
+                    // for the authority's reply.
+                    let passed = match tokio::time::timeout_at(
                         deadline,
                         redis::cmd("PING").query_async::<String>(&mut connection),
                     )
                     .await
-                    .map_err(timed_out)?;
-                    state = tokio::time::timeout_at(deadline, self.state.lock())
-                        .await
-                        .map_err(timed_out)?;
-                    // Record the result only for the connection it probed: a
-                    // sibling caller may have released or replaced it since.
-                    let current = state.connection_generation == connection_generation
-                        && state.connection.is_some();
-                    match probed {
-                        Ok(_) => {
-                            if current {
-                                state.verified_generation = loss_generation;
-                            }
-                        }
-                        Err(error) if lane_lost(&error) => {
-                            if current {
-                                state.connection = None;
-                                state.connection_generation += 1;
-                            }
-                        }
+                    .map_err(timed_out)?
+                    {
+                        Ok(_) => true,
+                        Err(error) if lane_lost(&error) => false,
                         Err(error) => return Err(CatalogError::Database(error)),
-                    }
+                    };
+                    probed = Some(ProbeReport {
+                        connection_generation,
+                        loss_generation,
+                        passed,
+                    });
                     continue;
                 }
                 Verified::Reconnecting(outcome) => outcome,
             };
-            // Never hold the lane lock while a reconnect connects.
-            drop(state);
+            // The lane actor keeps answering while the reconnect connects.
             let finished: Result<(), CatalogError> =
                 match tokio::time::timeout_at(deadline, outcome.wait_for(Option::is_some)).await {
                     Err(elapsed) => Err(timed_out(elapsed)),
-                    // The task ended without an outcome: the lane was dropped.
-                    Ok(Err(_)) => Err(CatalogError::Database(RedisError::from(
-                        std::io::Error::new(
-                            std::io::ErrorKind::ConnectionAborted,
-                            "Redis authority lane reconnect abandoned",
-                        ),
-                    ))),
+                    // The attempt ended without an outcome: the lane is gone.
+                    Ok(Err(_)) => Err(actor_gone("Redis authority lane reconnect abandoned")),
                     Ok(Ok(outcome)) => outcome.clone().unwrap_or(Ok(())),
                 };
             finished?;
             // The reconnect installed its connection: verify again, which
             // normally hands it out at once.
-            state = tokio::time::timeout_at(deadline, self.state.lock())
-                .await
-                .map_err(timed_out)?;
         }
     }
 
-    /// Decide, under the lane lock and without I/O, what the caller does
-    /// next.
-    fn verify(&self, state: &mut LaneState) -> Result<Verified, CatalogError> {
-        let loss_generation = self.group.loss_generation.load(Ordering::Acquire);
-        if state.verified_generation != loss_generation
-            && let Some(connection) = state.connection.as_ref()
-        {
-            // A sibling lane observed a transport loss since this
-            // connection was last verified.  Probe before the caller's
-            // command so a connection severed by the same event
-            // reconnects here instead of failing this caller closed.
-            return Ok(Verified::Probe {
-                connection: connection.clone(),
-                connection_generation: state.connection_generation,
-                loss_generation,
-            });
-        }
-        if state.connection.is_none() {
-            let outcome = match state.reconnect.as_ref() {
-                Some(attempt) => attempt.outcome.clone(),
-                None => self.start_reconnect(state, loss_generation),
-            };
-            return Ok(Verified::Reconnecting(outcome));
-        }
-        state.verified_generation = loss_generation;
-        let connection = state
-            .connection
-            .clone()
-            .ok_or(CatalogError::Conflict("Redis authority lane"))?;
-        Ok(Verified::Ready(Admitted {
-            connection,
-            connection_generation: state.connection_generation,
-            run_id: state.verified_run_id.clone(),
-        }))
-    }
-
-    /// Start the lane's single reconnect, outside the lane lock.  The caller
-    /// holds the lock, so the task cannot finish before it is recorded.
-    fn start_reconnect(
-        &self,
-        state: &mut LaneState,
-        loss_generation: u64,
-    ) -> watch::Receiver<ReconnectOutcome> {
-        state.reconnect_epoch += 1;
-        let epoch = state.reconnect_epoch;
-        let (sender, outcome) = watch::channel(None);
-        let task = tokio::spawn(run_reconnect(
-            ReconnectTarget {
-                client: self.client.clone(),
-                config: self.connect_config.clone(),
-                group: Arc::clone(&self.group),
-                state: Arc::clone(&self.state),
-            },
-            epoch,
-            loss_generation,
-            sender,
-        ));
-        state.reconnect = Some(ReconnectAttempt {
-            epoch,
-            outcome: outcome.clone(),
-            abort: task.abort_handle(),
-        });
-        outcome
+    /// Ask the lane actor what this caller does next, reporting the probe it
+    /// just made, if any.
+    async fn verify(&self, probed: Option<ProbeReport>) -> Result<Verified, CatalogError> {
+        const GONE: &str = "Redis authority lane is not running";
+        let (reply, verified) = oneshot::channel();
+        self.commands
+            .send(LaneCommand::Admit { probed, reply })
+            .await
+            .map_err(|_| actor_gone(GONE))?;
+        verified.await.map_err(|_| actor_gone(GONE))
     }
 
     /// Release the connection a caller observed a transport loss on, unless a
     /// sibling caller already released or replaced it.  Only the first
-    /// observer of one loss advances the group loss generation.
+    /// observer of one loss advances the group loss generation.  Returns once
+    /// the lane has recorded it.
     async fn release_lost(&self, connection_generation: u64) {
-        let mut state = self.state.lock().await;
-        if state.connection_generation == connection_generation && state.connection.is_some() {
-            state.connection = None;
-            state.connection_generation += 1;
-            self.group.loss_generation.fetch_add(1, Ordering::AcqRel);
+        let (done, released) = oneshot::channel();
+        if self
+            .commands
+            .send(LaneCommand::ReleaseLost {
+                connection_generation,
+                done,
+            })
+            .await
+            .is_ok()
+        {
+            let _ = released.await;
         }
     }
 }
 
-/// Everything a lane reconnect task needs from its lane.
-struct ReconnectTarget {
-    client: redis::Client,
-    config: redis::AsyncConnectionConfig,
-    group: Arc<LaneGroup>,
-    state: Arc<Mutex<LaneState>>,
-}
-
-/// One lane reconnect with the full connect budget, run as the lane's
-/// single-flight task (M6-C74).  Its connection is installed only while the
-/// lane still has none and this attempt is still the lane's current one, so
-/// it never clobbers a newer connection; otherwise it is dropped.  The
-/// outcome is published after the lane lock is released.
-async fn run_reconnect(
-    target: ReconnectTarget,
-    epoch: u64,
-    loss_generation: u64,
-    outcome: watch::Sender<ReconnectOutcome>,
-) {
-    let result = tokio::time::timeout(
-        LANE_RECONNECT_BUDGET,
-        reconnect(&target.client, &target.config, &target.group),
-    )
-    .await
-    .unwrap_or_else(|_| Err(CatalogError::Database(redis_timeout())));
-    let finished = {
-        let mut state = target.state.lock().await;
-        let current = state
-            .reconnect
-            .as_ref()
-            .is_some_and(|attempt| attempt.epoch == epoch);
-        if current {
-            state.reconnect = None;
-        }
-        match result {
-            Ok((connection, run_id)) => {
-                if current && state.connection.is_none() {
-                    state.connection = Some(connection);
-                    state.verified_run_id = run_id;
-                    // Verified against the loss generation current when the
-                    // attempt started: a loss observed since then makes the
-                    // next command probe this connection.
-                    state.verified_generation = loss_generation;
-                    state.connection_generation += 1;
-                }
-                // Otherwise the lane moved on: drop this connection and let
-                // the waiters verify the lane as it now is.
-                Ok(())
-            }
-            Err(error) => Err(error),
-        }
-    };
-    outcome.send_replace(Some(finished));
-}
-
+/// Open and verify one replacement connection, and decide whether the
+/// catalog may be bound to the run it reached.
 async fn reconnect(
     client: &redis::Client,
     config: &redis::AsyncConnectionConfig,
@@ -1014,16 +1455,12 @@ mod tests {
     use super::*;
     use std::{
         collections::VecDeque,
-        sync::{
-            Mutex as StdMutex,
-            atomic::{AtomicUsize, Ordering},
-        },
+        sync::atomic::{AtomicUsize, Ordering},
         time::Duration,
     };
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::{TcpListener, TcpStream},
-        sync::{Mutex as AsyncMutex, oneshot},
         task::JoinSet,
     };
 
@@ -1044,16 +1481,27 @@ mod tests {
     /// accepted connection while keeping its listener.
     struct FakeAuthority {
         port: u16,
-        run_id: Arc<AsyncMutex<String>>,
+        /// The `run_id` every later `INFO` reply reports.
+        run_id: watch::Sender<String>,
         /// Delay applied to every reply, measured from the command's arrival.
         /// Replies stay in command order but are delayed concurrently, like a
         /// network path that adds latency to each reply rather than a server
         /// that spends that long on each command.
         reply_delay_ms: Arc<AtomicU64>,
-        severs: Arc<StdMutex<Vec<Option<oneshot::Sender<()>>>>>,
+        /// Connections accepted so far.
+        accepted: Arc<AtomicUsize>,
+        /// Sever requests for the accept task, which owns the connections.
+        severs: mpsc::Sender<Sever>,
         active: Arc<AtomicUsize>,
         shutdown: Option<oneshot::Sender<()>>,
         task: Option<tokio::task::JoinHandle<()>>,
+    }
+
+    /// Which accepted connections to sever.  The reply says whether the
+    /// request named connections that could be severed.
+    enum Sever {
+        One(usize, oneshot::Sender<bool>),
+        All(oneshot::Sender<bool>),
     }
 
     impl FakeAuthority {
@@ -1069,18 +1517,20 @@ mod tests {
                 .local_addr()
                 .expect("fake authority address")
                 .port();
-            let run_id = Arc::new(AsyncMutex::new(run_id.to_owned()));
+            let (run_id, served_run_id) = watch::channel(run_id.to_owned());
             let reply_delay_ms = Arc::new(AtomicU64::new(
                 u64::try_from(reply_delay.as_millis()).expect("bounded reply delay"),
             ));
-            let severs = Arc::new(StdMutex::new(Vec::new()));
+            let accepted = Arc::new(AtomicUsize::new(0));
+            let (severs, sever_requests) = mpsc::channel(8);
             let active = Arc::new(AtomicUsize::new(0));
             let (shutdown_tx, shutdown_rx) = oneshot::channel();
             let task = tokio::spawn(run_fake_authority(
                 listener,
-                Arc::clone(&run_id),
+                served_run_id,
                 Arc::clone(&reply_delay_ms),
-                Arc::clone(&severs),
+                Arc::clone(&accepted),
+                sever_requests,
                 Arc::clone(&active),
                 shutdown_rx,
             ));
@@ -1088,6 +1538,7 @@ mod tests {
                 port,
                 run_id,
                 reply_delay_ms,
+                accepted,
                 severs,
                 active,
                 shutdown: Some(shutdown_tx),
@@ -1108,40 +1559,37 @@ mod tests {
 
         /// Connections accepted so far, in accept order.
         fn accepted(&self) -> usize {
-            self.severs.lock().expect("sever registry").len()
+            self.accepted.load(Ordering::Acquire)
         }
 
         async fn set_run_id(&self, run_id: &str) {
-            *self.run_id.lock().await = run_id.to_owned();
+            self.run_id.send_replace(run_id.to_owned());
         }
 
         /// Sever the connection with this accept index and wait until the
         /// server has dropped it.  The listener keeps accepting.
         async fn sever(&self, index: usize) {
             let before = self.active.load(Ordering::Acquire);
-            let sender = self
-                .severs
-                .lock()
-                .expect("sever registry")
-                .get_mut(index)
-                .and_then(Option::take)
-                .expect("connection index was accepted and not yet severed");
-            sender.send(()).expect("connection task is live");
+            let (reply, severed) = oneshot::channel();
+            self.severs
+                .send(Sever::One(index, reply))
+                .await
+                .expect("fake authority is running");
+            assert!(
+                severed.await.expect("fake authority answered"),
+                "connection index was accepted, not yet severed, and its task is live"
+            );
             self.wait_active(before - 1).await;
         }
 
         /// Sever every live connection and wait until all are dropped.
         async fn sever_all(&self) {
-            let senders: Vec<_> = self
-                .severs
-                .lock()
-                .expect("sever registry")
-                .iter_mut()
-                .filter_map(Option::take)
-                .collect();
-            for sender in senders {
-                let _ = sender.send(());
-            }
+            let (reply, severed) = oneshot::channel();
+            self.severs
+                .send(Sever::All(reply))
+                .await
+                .expect("fake authority is running");
+            severed.await.expect("fake authority answered");
             self.wait_active(0).await;
         }
 
@@ -1171,13 +1619,16 @@ mod tests {
 
     async fn run_fake_authority(
         listener: TcpListener,
-        run_id: Arc<AsyncMutex<String>>,
+        run_id: watch::Receiver<String>,
         reply_delay_ms: Arc<AtomicU64>,
-        severs: Arc<StdMutex<Vec<Option<oneshot::Sender<()>>>>>,
+        accepted: Arc<AtomicUsize>,
+        mut sever_requests: mpsc::Receiver<Sever>,
         active: Arc<AtomicUsize>,
         mut shutdown: oneshot::Receiver<()>,
     ) {
         let mut connections = JoinSet::new();
+        // One sever handle per accepted connection, in accept order.
+        let mut severs: Vec<Option<oneshot::Sender<()>>> = Vec::new();
         loop {
             tokio::select! {
                 _ = &mut shutdown => {
@@ -1189,15 +1640,32 @@ mod tests {
                     let Ok((stream, _)) = accepted_stream else { return; };
                     let (sever_tx, sever_rx) = oneshot::channel();
                     active.fetch_add(1, Ordering::AcqRel);
-                    severs.lock().expect("sever registry").push(Some(sever_tx));
+                    severs.push(Some(sever_tx));
+                    accepted.store(severs.len(), Ordering::Release);
                     connections.spawn(serve_fake_connection(
                         stream,
-                        Arc::clone(&run_id),
+                        run_id.clone(),
                         Arc::clone(&reply_delay_ms),
                         sever_rx,
                         Arc::clone(&active),
                     ));
                 }
+                Some(request) = sever_requests.recv() => match request {
+                    Sever::One(index, reply) => {
+                        let severed = severs
+                            .get_mut(index)
+                            .and_then(Option::take)
+                            .is_some_and(|sever| sever.send(()).is_ok());
+                        let _ = reply.send(severed);
+                    }
+                    Sever::All(reply) => {
+                        let mut severed = false;
+                        for sever in severs.iter_mut().filter_map(Option::take) {
+                            severed |= sever.send(()).is_ok();
+                        }
+                        let _ = reply.send(severed);
+                    }
+                },
                 Some(_) = connections.join_next() => {}
             }
         }
@@ -1205,7 +1673,7 @@ mod tests {
 
     async fn serve_fake_connection(
         mut stream: TcpStream,
-        run_id: Arc<AsyncMutex<String>>,
+        run_id: watch::Receiver<String>,
         reply_delay_ms: Arc<AtomicU64>,
         mut sever: oneshot::Receiver<()>,
         active: Arc<AtomicUsize>,
@@ -1238,7 +1706,7 @@ mod tests {
                             "PING" => b"+PONG\r\n".to_vec(),
                             "INFO" => {
                                 let body =
-                                    format!("# Server\r\nrun_id:{}\r\n", run_id.lock().await);
+                                    format!("# Server\r\nrun_id:{}\r\n", *run_id.borrow());
                                 format!("${}\r\n{body}\r\n", body.len()).into_bytes()
                             }
                             _ => b"-ERR unsupported fake authority command\r\n".to_vec(),
@@ -1422,7 +1890,7 @@ mod tests {
             "{context}: the timed-out command must release the lane's connection"
         );
         assert!(
-            lane.state.lock().await.connection.is_none(),
+            !lane.inspect().await.connected,
             "{context}: the lane kept a connection that still owes the stalled reply"
         );
         assert_eq!(
@@ -1660,6 +2128,338 @@ mod tests {
         server.shutdown().await;
     }
 
+    fn attempt(loss_generation: u64) -> ReconnectAttempt<&'static str> {
+        ReconnectAttempt {
+            task: tokio::spawn(std::future::pending()),
+            outcome: watch::channel(None).0,
+            loss_generation,
+        }
+    }
+
+    fn connected(verified_generation: u64) -> LaneState<&'static str> {
+        LaneState {
+            phase: LanePhase::Connected {
+                connection: "startup",
+                verified_run_id: "run-a".to_owned(),
+                verified_generation,
+            },
+            connection_generation: 0,
+        }
+    }
+
+    /// Every lane event against every lane phase: the legal transitions do
+    /// exactly what the lane relies on, and every other pair is refused and
+    /// changes nothing.
+    #[tokio::test]
+    async fn lane_phase_allows_exactly_its_transition_table() {
+        // Connected -> Connected: a passed probe records its generation and
+        // keeps the connection and its generation.
+        let mut lane = connected(3);
+        assert!(matches!(
+            lane.transition(LaneEvent::ProbePassed { loss_generation: 5 }),
+            Ok(None)
+        ));
+        assert!(matches!(
+            lane.phase,
+            LanePhase::Connected {
+                connection: "startup",
+                verified_generation: 5,
+                ..
+            }
+        ));
+        assert_eq!(lane.connection_generation, 0);
+        assert!(lane.holds(0));
+
+        // Connected refuses every reconnect event.
+        for event in [
+            LaneEvent::ReconnectStarted(attempt(0)),
+            LaneEvent::ReconnectSucceeded {
+                connection: "other",
+                run_id: "run-b".to_owned(),
+            },
+            LaneEvent::ReconnectFailed,
+        ] {
+            assert!(matches!(lane.transition(event), Err(IllegalTransition)));
+            assert!(matches!(
+                lane.phase,
+                LanePhase::Connected {
+                    connection: "startup",
+                    verified_generation: 5,
+                    ..
+                }
+            ));
+            assert_eq!(lane.connection_generation, 0);
+        }
+
+        // Connected -> Disconnected: the connection slot changed.
+        assert!(matches!(
+            lane.transition(LaneEvent::ConnectionLost),
+            Ok(None)
+        ));
+        assert!(matches!(lane.phase, LanePhase::Disconnected));
+        assert_eq!(lane.connection_generation, 1);
+        assert!(!lane.holds(0) && !lane.holds(1));
+
+        // Disconnected refuses everything but the start of a reconnect.
+        for event in [
+            LaneEvent::ConnectionLost,
+            LaneEvent::ProbePassed { loss_generation: 9 },
+            LaneEvent::ReconnectSucceeded {
+                connection: "other",
+                run_id: "run-b".to_owned(),
+            },
+            LaneEvent::ReconnectFailed,
+        ] {
+            assert!(matches!(lane.transition(event), Err(IllegalTransition)));
+            assert!(matches!(lane.phase, LanePhase::Disconnected));
+            assert_eq!(lane.connection_generation, 1);
+        }
+
+        // Disconnected -> Reconnecting -> Disconnected: a failed attempt is
+        // handed back for its outcome and installs nothing.
+        assert!(matches!(
+            lane.transition(LaneEvent::ReconnectStarted(attempt(7))),
+            Ok(None)
+        ));
+        assert!(matches!(lane.phase, LanePhase::Reconnecting(_)));
+        // Reconnecting refuses a second attempt, a loss and a probe result.
+        for event in [
+            LaneEvent::ReconnectStarted(attempt(8)),
+            LaneEvent::ConnectionLost,
+            LaneEvent::ProbePassed { loss_generation: 9 },
+        ] {
+            assert!(matches!(lane.transition(event), Err(IllegalTransition)));
+            assert!(matches!(
+                &lane.phase,
+                LanePhase::Reconnecting(current) if current.loss_generation == 7
+            ));
+            assert_eq!(lane.connection_generation, 1);
+        }
+        let ended = lane
+            .transition(LaneEvent::ReconnectFailed)
+            .expect("a reconnect in flight may fail")
+            .expect("the failed attempt is handed back");
+        assert_eq!(ended.loss_generation, 7);
+        assert!(matches!(lane.phase, LanePhase::Disconnected));
+        assert_eq!(lane.connection_generation, 1);
+
+        // Disconnected -> Reconnecting -> Connected: the connection is
+        // verified against the generation current when the attempt started,
+        // and the slot changed once more.
+        lane.transition(LaneEvent::ReconnectStarted(attempt(11)))
+            .expect("a disconnected lane may reconnect");
+        let ended = lane
+            .transition(LaneEvent::ReconnectSucceeded {
+                connection: "replacement",
+                run_id: "run-b".to_owned(),
+            })
+            .expect("a reconnect in flight may succeed")
+            .expect("the finished attempt is handed back");
+        assert_eq!(ended.loss_generation, 11);
+        assert!(matches!(
+            &lane.phase,
+            LanePhase::Connected {
+                connection: "replacement",
+                verified_run_id,
+                verified_generation: 11,
+            } if verified_run_id == "run-b"
+        ));
+        assert_eq!(lane.connection_generation, 2);
+        assert!(lane.holds(2) && !lane.holds(1));
+    }
+
+    fn scope(incarnation: &str) -> RebindScope {
+        RebindScope {
+            incarnation: incarnation.to_owned(),
+            incarnation_key: "incarnation-key".to_owned(),
+            run_key: "run-key".to_owned(),
+            continuity_key: "continuity-key".to_owned(),
+        }
+    }
+
+    /// Every binding event against every binding mode.
+    #[test]
+    fn binding_mode_allows_exactly_its_transition_table() {
+        let interval = Duration::from_secs(5);
+        let events = || {
+            [
+                BindingEvent::ScopeConfigured(scope("other")),
+                BindingEvent::WitnessEnabled(interval),
+                BindingEvent::WitnessDisabled,
+            ]
+        };
+
+        // Pinned: only a scope is accepted; a witness needs one.
+        let mut mode = BindingMode::Pinned;
+        for event in events().into_iter().skip(1) {
+            assert_eq!(mode.transition(event), Err(IllegalTransition));
+            assert!(matches!(mode, BindingMode::Pinned));
+            assert!(mode.scope().is_none() && mode.witness().is_none());
+        }
+        assert_eq!(
+            mode.transition(BindingEvent::ScopeConfigured(scope("first"))),
+            Ok(())
+        );
+
+        // Rebindable: the scope is set once; there is no witness to stop.
+        for event in [
+            BindingEvent::ScopeConfigured(scope("other")),
+            BindingEvent::WitnessDisabled,
+        ] {
+            assert_eq!(mode.transition(event), Err(IllegalTransition));
+            assert!(matches!(mode, BindingMode::Rebindable(_)));
+            assert_eq!(mode.scope().expect("scope").incarnation, "first");
+            assert!(mode.witness().is_none());
+        }
+        assert_eq!(
+            mode.transition(BindingEvent::WitnessEnabled(interval)),
+            Ok(())
+        );
+        let witness = mode.witness().expect("a fresh witness");
+        assert!(witness.candidates.is_empty() && witness.last_ack_ms.is_none());
+        assert_eq!(witness.interval, interval);
+
+        // Witnessed: enabling again keeps the witness and its tokens.
+        let witness = mode.witness_mut().expect("witness");
+        witness.candidates.push_back("token".to_owned());
+        witness.last_ack_ms = Some(42);
+        for event in [
+            BindingEvent::ScopeConfigured(scope("other")),
+            BindingEvent::WitnessEnabled(Duration::from_secs(1)),
+        ] {
+            assert_eq!(mode.transition(event), Err(IllegalTransition));
+            let witness = mode.witness().expect("the witness is kept");
+            assert_eq!(witness.candidates, ["token"]);
+            assert_eq!(witness.last_ack_ms, Some(42));
+            assert_eq!(witness.interval, interval);
+            assert_eq!(mode.scope().expect("scope").incarnation, "first");
+        }
+
+        // Witnessed -> Rebindable keeps the scope; a later witness is fresh.
+        assert_eq!(mode.transition(BindingEvent::WitnessDisabled), Ok(()));
+        assert!(matches!(mode, BindingMode::Rebindable(_)));
+        assert_eq!(mode.scope().expect("scope").incarnation, "first");
+        assert_eq!(
+            mode.transition(BindingEvent::WitnessEnabled(interval)),
+            Ok(())
+        );
+        let witness = mode.witness().expect("a fresh witness");
+        assert!(witness.candidates.is_empty() && witness.last_ack_ms.is_none());
+    }
+
+    /// A request to stop the witness that arrives after an enable was queued
+    /// but before the actor reached it is the last request, so the witness
+    /// ends up off.
+    #[tokio::test]
+    async fn a_witness_stop_after_a_queued_enable_wins() {
+        let binding = RunBinding::default();
+        binding.initialize("run-a");
+        assert!(binding.set_scope(scope("first")).is_ok());
+
+        // Queue the enable: on this single-threaded runtime the actor cannot
+        // run until the test yields, so the command stays queued.
+        let mut enable = std::pin::pin!(binding.enable_witness(Duration::from_secs(5)));
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(enable.as_mut().poll(&mut context).is_pending());
+        binding.disable_witness();
+        enable.await;
+        assert!(!binding.witness_enabled().await, "the stop came last");
+
+        // An enable requested after the stop is honoured.
+        binding.enable_witness(Duration::from_secs(5)).await;
+        assert!(binding.witness_enabled().await);
+    }
+
+    /// The binding's callers that cannot wait -- configuring the scope and
+    /// stopping the witness -- are applied before the binding's next
+    /// command, in the order the old single critical section gave.
+    #[tokio::test]
+    async fn binding_applies_scope_and_witness_stops_before_its_next_command() {
+        let binding = RunBinding::default();
+        binding.initialize("run-a");
+        binding.initialize("run-b");
+        assert_eq!(binding.run_id(), "run-a", "the first lane's run is kept");
+        assert_eq!(binding.rebinds(), 0);
+
+        // Without a scope a witness cannot be kept and no other run is
+        // accepted.
+        binding.enable_witness(Duration::from_secs(5)).await;
+        assert!(!binding.witness_enabled().await);
+        assert!(matches!(
+            binding.ask(|state| state.plan("run-b")).await,
+            Some(Err(CatalogError::Conflict(RUN_ID_CONFLICT)))
+        ));
+        assert!(matches!(
+            binding.ask(|state| state.plan("run-a")).await,
+            Some(Ok(RebindPlan::AlreadyBound))
+        ));
+
+        assert!(!binding.has_scope());
+        assert!(binding.set_scope(scope("first")).is_ok());
+        // The same scope again changes nothing; a different one is refused
+        // and the first is kept (asserted below through the plan).
+        assert!(binding.set_scope(scope("first")).is_ok());
+        assert!(matches!(
+            binding.set_scope(scope("second")),
+            Err(CatalogError::Conflict(REBIND_SCOPE_CONFLICT))
+        ));
+        assert!(binding.has_scope());
+        binding.enable_witness(Duration::from_secs(5)).await;
+        assert!(binding.witness_enabled().await);
+
+        // A token dispatched and acknowledged is the candidate a re-binding
+        // offers, under the first scope.
+        binding.continuity_dispatching("token-1").await;
+        binding.continuity_dispatching("token-2").await;
+        binding.continuity_not_written("token-2").await;
+        binding.continuity_acknowledged("token-1").await;
+        match binding.ask(|state| state.plan("run-b")).await {
+            Some(Ok(RebindPlan::Decide {
+                incarnation,
+                candidates,
+                ..
+            })) => {
+                assert_eq!(incarnation, "first");
+                assert_eq!(candidates, Some(vec!["token-1".to_owned()]));
+            }
+            _ => panic!("a fresh witness offers its acknowledged token"),
+        }
+
+        // Stopping the witness cannot wait, and still precedes the next
+        // command: the token is no longer offered, and a witness enabled
+        // afterwards starts without it.
+        binding.disable_witness();
+        assert!(!binding.witness_enabled().await);
+        binding.continuity_acknowledged("token-3").await;
+        binding.disable_witness();
+        binding.enable_witness(Duration::from_secs(5)).await;
+        assert!(binding.witness_enabled().await);
+        assert!(matches!(
+            binding.ask(|state| state.plan("run-b")).await,
+            Some(Ok(RebindPlan::Decide {
+                candidates: None,
+                ..
+            }))
+        ));
+
+        // Adoption moves the published run once per new run; a run refused
+        // for continuity stays refused.
+        binding.ask(|state| state.adopt("run-b")).await;
+        binding.ask(|state| state.adopt("run-b")).await;
+        assert_eq!(binding.run_id(), "run-b");
+        assert_eq!(binding.rebinds(), 1);
+        binding
+            .ask(|state| state.refuse_for_continuity("run-c"))
+            .await;
+        assert!(matches!(
+            binding.ask(|state| state.plan("run-c")).await,
+            Some(Err(CatalogError::Conflict(CONTINUITY_MISMATCH)))
+        ));
+        binding.ask(|state| state.adopt("run-a")).await;
+        assert_eq!(binding.run_id(), "run-a");
+        assert_eq!(binding.rebinds(), 2);
+    }
+
     #[test]
     fn lane_loss_classification_is_transport_only() {
         assert!(lane_lost(&RedisError::from(std::io::Error::from(
@@ -1827,7 +2627,7 @@ mod tests {
     /// reconnect runs, and the next command uses its connection at once.
     ///
     /// Before the fix `admit` cancelled the reconnect at two seconds while
-    /// holding the lane lock, so the siblings queued one full deadline each
+    /// keeping the lane to itself, so the siblings queued one full deadline each
     /// and the lane never reconnected at all.
     #[tokio::test]
     async fn m6c74_slow_lane_reconnect_completes_while_callers_stay_bounded() {
@@ -1851,16 +2651,19 @@ mod tests {
             address: std::net::SocketAddr::from(([127, 0, 0, 1], server.port)),
             lookups: Arc::clone(&lookups),
         });
-        let lane = Arc::new(
-            AuthorityLane::new(slow_client, connection, run_id, Arc::clone(&group))
-                .with_connect_config(config),
-        );
+        let lane = Arc::new(AuthorityLane::with_connect_config(
+            slow_client,
+            connection,
+            run_id,
+            Arc::clone(&group),
+            config,
+        ));
         assert_eq!(ping(&lane).await.expect("healthy lane"), "PONG");
         assert_eq!(server.accepted(), 1);
 
         server.sever_all().await;
         assert_lost(ping(&lane).await, "severed lane");
-        let generation_after_loss = lane.state.lock().await.connection_generation;
+        let generation_after_loss = lane.inspect().await.connection_generation;
         assert_eq!(
             lookups.load(Ordering::Acquire),
             0,
@@ -1907,21 +2710,18 @@ mod tests {
         // deadline), is the lookup answered (M6-C117).
         tokio::time::sleep_until(reconnect_started + SLOW_RECONNECT).await;
         {
-            let state = lane.state.lock().await;
+            let state = lane.inspect().await;
             assert!(
-                state.connection.is_none(),
+                !state.connected,
                 "nothing installed before the lookup answers"
             );
-            assert!(
-                state.reconnect.is_some(),
-                "the reconnect is still in flight"
-            );
+            assert!(state.reconnecting, "the reconnect is still in flight");
         }
         release_resolver.send_replace(true);
 
         // The reconnect then completes and is installed.
         loop {
-            if lane.state.lock().await.connection.is_some() {
+            if lane.inspect().await.connected {
                 break;
             }
             assert!(
@@ -1936,8 +2736,8 @@ mod tests {
             "the resolver delay applied"
         );
         {
-            let state = lane.state.lock().await;
-            assert!(state.reconnect.is_none(), "the finished attempt is cleared");
+            let state = lane.inspect().await;
+            assert!(!state.reconnecting, "the finished attempt is cleared");
             assert_eq!(
                 state.connection_generation,
                 generation_after_loss + 1,
@@ -1945,9 +2745,9 @@ mod tests {
             );
             assert_eq!(
                 state.verified_generation,
-                group.loss_generation.load(Ordering::Acquire)
+                Some(group.loss_generation.load(Ordering::Acquire))
             );
-            assert_eq!(state.verified_run_id, "lane-run-a");
+            assert_eq!(state.verified_run_id.as_deref(), Some("lane-run-a"));
         }
         assert_eq!(server.accepted(), 2, "exactly one reconnect connection");
 
@@ -1966,8 +2766,8 @@ mod tests {
     /// the next callers probe this lane's connection before their commands.
     /// With the authority stalled past the command deadline, two concurrent
     /// callers must each fail closed with a timeout within their own
-    /// deadline.  Before the fix the probe ran under the lane lock and the
-    /// second caller's deadline started only once it had the lock, so it
+    /// deadline.  Before the fix the probe kept the lane to itself and the
+    /// second caller's deadline started only once it had the lane, so it
     /// took about two deadlines.  The stall then clears and the lane keeps
     /// serving on the connection it probed.
     #[tokio::test]
@@ -2007,8 +2807,8 @@ mod tests {
         assert_eq!(ping(&lane).await.expect("the probed lane serves"), "PONG");
         assert_eq!(server.accepted(), 1, "no reconnect for a stalled probe");
         assert_eq!(
-            lane.state.lock().await.verified_generation,
-            group.loss_generation.load(Ordering::Acquire),
+            lane.inspect().await.verified_generation,
+            Some(group.loss_generation.load(Ordering::Acquire)),
             "the passed probe is recorded"
         );
         server.shutdown().await;

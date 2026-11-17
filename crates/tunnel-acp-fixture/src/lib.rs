@@ -43,7 +43,7 @@ use std::sync::Arc;
 
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot};
 
 /// The argv verb that runs the agent on stdio.
 pub const AGENT_MODE: &str = "agent";
@@ -104,7 +104,16 @@ pub const SETSID_MARKER: &str = "setsid";
 /// immediately afterwards.
 pub const SIDE_EFFECT_LEDGER: &str = "side-effects.log";
 
-type Waiters = Arc<Mutex<HashMap<String, oneshot::Sender<Value>>>>;
+/// One pending permission answer: the response id it is keyed by, and where
+/// the response goes.
+type Waiter = (String, oneshot::Sender<Value>);
+
+/// How many waiter registrations may be queued for the read loop.
+///
+/// The read loop is the only owner of the waiter map; a directive task
+/// registers by sending here. When the queue is full the directive task waits,
+/// which only delays the permission request it has not sent yet.
+const WAITER_QUEUE: usize = 64;
 
 /// Run the synthetic agent on stdin/stdout until stdin closes.
 pub async fn run_agent() {
@@ -122,11 +131,30 @@ pub async fn run_agent() {
     });
     // A raw sink for the lines that must NOT go through JSON serialization:
     // an oversized run of filler and a line that is not JSON at all.
-    let waiters: Waiters = Arc::new(Mutex::new(HashMap::new()));
+    //
+    // The waiter map belongs to this read loop and to nothing else. Both it
+    // and the registration queue outlive the loop on purpose: a directive
+    // still waiting for an answer when stdin closes keeps waiting, exactly as
+    // it did when the map was shared, rather than seeing its waiter dropped
+    // and reporting an outcome nobody sent.
+    let mut waiters: HashMap<String, oneshot::Sender<Value>> = HashMap::new();
+    let (register, mut registrations) = mpsc::channel::<Waiter>(WAITER_QUEUE);
     let mut sessions = 0u64;
 
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
-    while let Ok(Some(line)) = lines.next_line().await {
+    loop {
+        // Registrations first, and a line only when none is queued, so the
+        // queue cannot fill while stdin is quiet. `next_line` is cancellation
+        // safe: a line that loses the race is read on the next turn.
+        let line = tokio::select! {
+            biased;
+            Some((key, sender)) = registrations.recv() => {
+                waiters.insert(key, sender);
+                continue;
+            }
+            line = lines.next_line() => line,
+        };
+        let Ok(Some(line)) = line else { break };
         let Ok(message) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
@@ -178,7 +206,7 @@ pub async fn run_agent() {
                     session,
                     id,
                     out.clone(),
-                    Arc::clone(&waiters),
+                    register.clone(),
                 ));
             }
             Some("session/cancel") => {}
@@ -187,7 +215,14 @@ pub async fn run_agent() {
                 let Some(key) = message.get("id").map(id_key) else {
                     continue;
                 };
-                if let Some(sender) = waiters.lock().await.remove(&key) {
+                // A directive registers its waiter before it sends the
+                // request this is the answer to, so the registration is
+                // already queued by the time the answer can arrive. Take
+                // everything queued before looking the id up.
+                while let Ok((queued, sender)) = registrations.try_recv() {
+                    waiters.insert(queued, sender);
+                }
+                if let Some(sender) = waiters.remove(&key) {
                     let _ = sender.send(message);
                 }
             }
@@ -212,7 +247,7 @@ async fn run_directive(
     session: String,
     id: Value,
     out: mpsc::Sender<String>,
-    waiters: Waiters,
+    register: mpsc::Sender<Waiter>,
 ) {
     let (verb, argument) = match directive.split_once(':') {
         Some((verb, argument)) => (verb, Some(argument.to_owned())),
@@ -239,10 +274,9 @@ async fn run_directive(
             for index in 0..count {
                 let permission_id = format!("permission-{session}-{index}");
                 let (sender, receiver) = oneshot::channel();
-                waiters
-                    .lock()
-                    .await
-                    .insert(format!("s:{permission_id}"), sender);
+                // Registered before the request is sent. If the read loop has
+                // gone the waiter is simply never answered.
+                let _ = register.send((format!("s:{permission_id}"), sender)).await;
                 let _ = out
                     .send(
                         json!({

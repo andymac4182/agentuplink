@@ -22,7 +22,7 @@ use crate::normalize;
 use crate::progress::{
     self, BudgetClock, PauseSignal, ProgressKind, WaitMark, track_partial_record,
 };
-use crate::pump::{self, PumpError, next_frame};
+use crate::pump::{self, Delivery, DeliveryEvent, Exit, PumpError, next_frame};
 use crate::status::{ExchangeReport, Execution};
 use crate::stream::{Frame, FrameReceiver, FrameSender};
 use crate::{BridgeConfig, Profile};
@@ -139,13 +139,13 @@ where
     let watchdog = async {
         let deadline = tokio::time::sleep_until(deadline_at);
         let finished = async {
-            exchange.request_terminal.cancelled().await;
-            exchange.response_terminal.cancelled().await;
+            exchange.terminal(Dir::Request).await;
+            exchange.terminal(Dir::Response).await;
         };
         tokio::select! {
             biased;
             () = finished => {}
-            () = exchange.stop.cancelled() => {}
+            () = exchange.stopped() => {}
             () = deadline => { exchange.abort(HttpErrorCode::DeadlineExceeded); }
             // M4-71: a handler that never answers is bounded by the head
             // bound; one that has answered streams to the absolute deadline.
@@ -153,7 +153,7 @@ where
                 exchange.abort(HttpErrorCode::DeadlineExceeded);
             }
         }
-        if exchange.stop.is_cancelled() {
+        if exchange.is_stopped() {
             cancel.cancel();
         }
     };
@@ -172,55 +172,51 @@ async fn request_pump(
 ) {
     let mut signal = from_owner.reset_signal();
     let mut dispatch = Some(dispatch);
-    let mut body: Option<BodySender> = None;
-    let mut peer_terminated = false;
+    let mut delivery = Delivery::AwaitHead;
     let pause = exchange.pause.clone();
     let mut first_head = BudgetClock::new(ProgressKind::FirstHead, &exchange.budgets);
     let mut record = BudgetClock::new(ProgressKind::Record, &exchange.budgets);
     let mut fin = BudgetClock::new(ProgressKind::FinAfterEnd, &exchange.budgets);
     let mut record_ordinal = None;
     first_head.arm();
-    'frames: loop {
+    let exit = 'frames: loop {
         let listen_only = exchange.is_complete(Dir::Request);
         let mark = WaitMark::now(&pause);
         let clocks = [first_head, record, fin];
         let frame = tokio::select! {
             biased;
-            () = exchange.stop.cancelled() => break,
-            () = exchange.response_terminal.cancelled(), if listen_only => return,
+            () = exchange.stopped() => break Exit::Local,
+            _ = exchange.terminal(Dir::Response), if listen_only => return,
             frame = from_owner.recv() => frame,
             kind = progress::expired(clocks, mark, pause.clone()), if !listen_only => {
                 exchange.note_progress_expired(kind);
                 exchange.abort(HttpErrorCode::DeadlineExceeded);
-                break;
+                break Exit::Local;
             }
         };
         progress::end_wait(&mut [&mut first_head, &mut record, &mut fin], mark, &pause);
-        if matches!(frame, None | Some(Frame::Reset(_))) {
-            peer_terminated = true;
-        }
         match frame {
             None => {
                 if !listen_only {
                     exchange.abort(HttpErrorCode::StreamInterrupted);
                 }
-                break;
+                break Exit::PeerTerminated;
             }
             Some(Frame::Reset(detail)) => {
                 exchange.abort(detail.code);
-                break;
+                break Exit::PeerTerminated;
             }
             Some(Frame::Fin) => match reader.fin() {
                 Ok(()) => {
                     fin.disarm();
-                    if let Some(sender) = body.take() {
-                        sender.finish();
-                    }
+                    // The reader accepts FIN only after END, where the
+                    // delivery awaits it; the body ends cleanly here.
+                    delivery.transition(DeliveryEvent::Fin);
                     exchange.complete(Dir::Request);
                 }
                 Err(error) => {
                     exchange.abort(error.code());
-                    break;
+                    break Exit::Local;
                 }
             },
             Some(Frame::Data(bytes)) => {
@@ -231,55 +227,64 @@ async fn request_pump(
                         Ok(None) => break,
                         Err(error) => {
                             exchange.abort(error.code());
-                            break 'frames;
+                            break 'frames Exit::Local;
                         }
                     };
                     match event {
                         RequestEvent::Head(head) => match build_request(&head, queue, cancel) {
                             Ok((request, sender)) => {
                                 first_head.disarm();
-                                body = Some(sender);
+                                // The declared length is not tracked here:
+                                // the handler's body starts no FIN-after-END
+                                // budget before END.
+                                delivery.transition(DeliveryEvent::Head {
+                                    sender,
+                                    declared: None,
+                                });
                                 if let Some(dispatch) = dispatch.take() {
                                     let _ = dispatch.send((head.method, request));
                                 }
                             }
                             Err(code) => {
                                 exchange.abort(code);
-                                break 'frames;
+                                break 'frames Exit::Local;
                             }
                         },
                         RequestEvent::Body(slice) => {
-                            let Some(sender) = body.as_ref() else {
+                            let chunk = bytes.slice_ref(slice);
+                            delivery.transition(DeliveryEvent::Body(chunk.len() as u64));
+                            let Some(sender) = delivery.sender() else {
                                 // The handler dropped the body: discard.
                                 continue;
                             };
-                            let chunk = bytes.slice_ref(slice);
-                            tokio::select! {
+                            let sent = tokio::select! {
                                 biased;
-                                () = exchange.stop.cancelled() => break 'frames,
-                                sent = sender.send(chunk) => if sent.is_err() {
-                                    body = None;
-                                },
+                                () = exchange.stopped() => break 'frames Exit::Local,
+                                sent = sender.send(chunk) => sent,
                                 // Any RESET, even one queued behind the
                                 // owner's FIN: this pump cannot reach the
                                 // queue while the handler is not reading.
                                 reset = signal.wait() => {
                                     exchange.abort(reset.detail.code);
-                                    break 'frames;
+                                    break 'frames Exit::Local;
                                 }
+                            };
+                            if sent.is_err() {
+                                delivery.transition(DeliveryEvent::ReaderGone);
                             }
                         }
-                        RequestEvent::End => fin.arm(),
+                        RequestEvent::End => {
+                            delivery.transition(DeliveryEvent::End);
+                            fin.arm();
+                        }
                     }
                 }
                 track_partial_record(reader.partial_record(), &mut record, &mut record_ordinal);
             }
         }
-    }
-    if let Some(sender) = body.take() {
-        sender.fail(exchange.error_code());
-    }
-    if !peer_terminated {
+    };
+    delivery.transition(DeliveryEvent::Stop(exchange.error_code()));
+    if exit == Exit::Local {
         // Bounded by the deadline plus a short grace.
         let _ = tokio::time::timeout_at(discard_until, from_owner.discard_until_terminal()).await;
     }
@@ -298,7 +303,7 @@ async fn response_pump<H, F, B, E>(
 {
     let (method, request) = tokio::select! {
         biased;
-        () = exchange.stop.cancelled() => return,
+        () = exchange.stopped() => return,
         received = dispatch => match received {
             Ok(received) => received,
             Err(_) => return,
@@ -310,7 +315,7 @@ async fn response_pump<H, F, B, E>(
     let mut task = tokio::spawn(async move { handler(request).await });
     let joined = tokio::select! {
         biased;
-        () = exchange.stop.cancelled() => {
+        () = exchange.stopped() => {
             // Wait until the handler future has actually been dropped, so the
             // terminal report never precedes the handler's cancellation.
             task.abort();
@@ -325,7 +330,7 @@ async fn response_pump<H, F, B, E>(
         exchange.abort(HttpErrorCode::StreamInterrupted);
         return;
     };
-    exchange.response_head.cancel();
+    exchange.note_response_head();
     let (parts, body) = response.into_parts();
     let mut body = std::pin::pin!(body);
     let prepared =
@@ -380,7 +385,7 @@ where
     loop {
         let next = tokio::select! {
             biased;
-            () = exchange.stop.cancelled() => return Err(exchange.error_code()),
+            () = exchange.stopped() => return Err(exchange.error_code()),
             next = next_frame(body.as_mut()) => next,
         };
         match next {

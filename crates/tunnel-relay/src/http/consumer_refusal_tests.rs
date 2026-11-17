@@ -21,7 +21,7 @@
 
 use std::{
     io::Write as _,
-    sync::{Arc, Mutex},
+    sync::{Arc, mpsc},
     time::Duration,
 };
 
@@ -86,13 +86,16 @@ impl Signer {
     }
 }
 
-/// A `MakeWriter` collecting the relay's log lines for the assertions below.
-#[derive(Clone, Default)]
-struct Captured(Arc<Mutex<Vec<u8>>>);
+/// A `MakeWriter` sending the relay's log lines to the test's
+/// [`CapturedLog`], which collects them for the assertions below.
+#[derive(Clone)]
+struct Captured(mpsc::Sender<Vec<u8>>);
 
 impl std::io::Write for Captured {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        std::io::Write::write(&mut *self.0.lock().expect("log buffer"), bytes)
+        // The log is gone once the test has finished; the line is then moot.
+        let _ = self.0.send(bytes.to_vec());
+        Ok(bytes.len())
     }
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
@@ -106,9 +109,40 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
     }
 }
 
-impl Captured {
-    fn text(&self) -> String {
-        String::from_utf8_lossy(&self.0.lock().expect("log buffer")).into_owned()
+/// The receiving end of [`Captured`], owned by the test.
+struct CapturedLog {
+    written: mpsc::Receiver<Vec<u8>>,
+    buffer: Vec<u8>,
+}
+
+impl CapturedLog {
+    fn new() -> (Captured, Self) {
+        let (writer, written) = mpsc::channel();
+        (
+            Captured(writer),
+            Self {
+                written,
+                buffer: Vec::new(),
+            },
+        )
+    }
+
+    /// Collect everything written so far.
+    fn drain(&mut self) {
+        for bytes in self.written.try_iter() {
+            self.buffer.extend_from_slice(&bytes);
+        }
+    }
+
+    fn text(&mut self) -> String {
+        self.drain();
+        String::from_utf8_lossy(&self.buffer).into_owned()
+    }
+
+    /// Discard everything written so far.
+    fn clear(&mut self) {
+        self.drain();
+        self.buffer.clear();
     }
 }
 
@@ -298,9 +332,9 @@ async fn every_route_gives_each_refusal_cause_one_status_and_one_truthful_messag
     // and status triple among the lines its own request produced, and the
     // unit tests that call the same functions use a route label no request
     // here uses.
-    let captured = Captured::default();
+    let (writer, mut captured) = CapturedLog::new();
     let subscriber = tracing_subscriber::fmt()
-        .with_writer(captured.clone())
+        .with_writer(writer)
         .with_ansi(false)
         .finish();
     tracing::subscriber::set_global_default(subscriber)
@@ -371,7 +405,7 @@ async fn every_route_gives_each_refusal_cause_one_status_and_one_truthful_messag
             if matches!(route, "devices" | "services") && cause == "wrong scope" {
                 continue;
             }
-            captured.0.lock().expect("log buffer").clear();
+            captured.clear();
             let (got, body, challenges) = send(address, &head, authorization).await;
             let (code, got_message) = code_and_message(&body);
             assert_eq!(got, status, "{route}/{cause}: {body}");
@@ -440,7 +474,7 @@ async fn every_route_gives_each_refusal_cause_one_status_and_one_truthful_messag
     // requests with no token are each refused, and at most the limiter's
     // burst of lines is written for the `bearer` stage in its window (some of
     // which the loop above already used).
-    captured.0.lock().expect("log buffer").clear();
+    captured.clear();
     for _ in 0..60 {
         let (status, _, _) = send(address, "GET /v1/devices HTTP/1.1\r\n", None).await;
         assert_eq!(status, 401);

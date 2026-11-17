@@ -9,13 +9,18 @@ use std::{
     collections::{HashMap, HashSet},
     net::SocketAddr,
     sync::{
-        Arc, Mutex,
+        Arc,
         atomic::{AtomicBool, Ordering},
     },
     time::Duration,
 };
 
-use tokio::{net::UdpSocket, sync::mpsc, task::JoinHandle, time::timeout};
+use tokio::{
+    net::UdpSocket,
+    sync::{mpsc, watch},
+    task::JoinHandle,
+    time::timeout,
+};
 use tokio_util::sync::CancellationToken;
 
 use crate::{HarnessError, Result};
@@ -40,7 +45,7 @@ struct FlowEnded {
 #[derive(Clone)]
 struct FlowDropControl {
     packets: Arc<AtomicBool>,
-    clients: Arc<Mutex<HashSet<SocketAddr>>>,
+    clients: watch::Receiver<HashSet<SocketAddr>>,
 }
 
 impl Drop for Flow {
@@ -55,7 +60,10 @@ impl Drop for Flow {
 pub(crate) struct UdpFaultProxy {
     address: SocketAddr,
     drop_packets: Arc<AtomicBool>,
-    drop_clients: Arc<Mutex<HashSet<SocketAddr>>>,
+    /// The client sources whose packets are dropped.  The scenario that owns
+    /// this proxy is the only writer; the forwarding tasks sample the
+    /// published set per packet without waiting on anything.
+    drop_clients: watch::Sender<HashSet<SocketAddr>>,
     cancel: CancellationToken,
     task: Option<JoinHandle<Result<()>>>,
 }
@@ -79,14 +87,14 @@ impl UdpFaultProxy {
         crate::c11_capture::record_udp_endpoint_sentinel(server_address)?;
         crate::c11_capture::record_udp_endpoint_sentinel(address)?;
         let drop_packets = Arc::new(AtomicBool::new(false));
-        let drop_clients = Arc::new(Mutex::new(HashSet::new()));
+        let (drop_clients, drop_clients_rx) = watch::channel(HashSet::new());
         let cancel = CancellationToken::new();
         let (ended_tx, ended_rx) = mpsc::channel(MAX_CLIENT_FLOWS * 2);
         let task = tokio::spawn(run_proxy(
             socket,
             server_address,
             drop_packets.clone(),
-            drop_clients.clone(),
+            drop_clients_rx,
             cancel.clone(),
             ended_rx,
             ended_tx,
@@ -109,18 +117,22 @@ impl UdpFaultProxy {
     }
 
     pub(crate) fn set_drop_for_client(&self, client: SocketAddr, drop_packets: bool) -> Result<()> {
-        let mut clients = self.drop_clients.lock().map_err(|_| {
-            HarnessError::Process("M7 production UDP proxy client-drop state was poisoned".into())
-        })?;
-        if drop_packets {
-            if clients.len() >= MAX_CLIENT_FLOWS && !clients.contains(&client) {
-                return Err(HarnessError::Process(
-                    "M7 production UDP proxy client-drop bound was exceeded".into(),
-                ));
+        let mut bound_exceeded = false;
+        self.drop_clients.send_modify(|clients| {
+            if drop_packets {
+                if clients.len() >= MAX_CLIENT_FLOWS && !clients.contains(&client) {
+                    bound_exceeded = true;
+                } else {
+                    clients.insert(client);
+                }
+            } else {
+                clients.remove(&client);
             }
-            clients.insert(client);
-        } else {
-            clients.remove(&client);
+        });
+        if bound_exceeded {
+            return Err(HarnessError::Process(
+                "M7 production UDP proxy client-drop bound was exceeded".into(),
+            ));
         }
         Ok(())
     }
@@ -160,7 +172,7 @@ async fn run_proxy(
     socket: Arc<UdpSocket>,
     server_address: SocketAddr,
     drop_packets: Arc<AtomicBool>,
-    drop_clients: Arc<Mutex<HashSet<SocketAddr>>>,
+    drop_clients: watch::Receiver<HashSet<SocketAddr>>,
     cancel: CancellationToken,
     mut ended_rx: mpsc::Receiver<FlowEnded>,
     ended_tx: mpsc::Sender<FlowEnded>,
@@ -311,14 +323,10 @@ async fn run_flow(
 
 fn should_drop(
     drop_packets: &AtomicBool,
-    drop_clients: &Mutex<HashSet<SocketAddr>>,
+    drop_clients: &watch::Receiver<HashSet<SocketAddr>>,
     client: SocketAddr,
 ) -> bool {
-    drop_packets.load(Ordering::Acquire)
-        || drop_clients
-            .lock()
-            .map(|clients| clients.contains(&client))
-            .unwrap_or(true)
+    drop_packets.load(Ordering::Acquire) || drop_clients.borrow().contains(&client)
 }
 
 #[cfg(test)]

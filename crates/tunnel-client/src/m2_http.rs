@@ -28,9 +28,12 @@ use tunnel_http_bridge::{
 use tunnel_protocol::{ResultDetail, ResultStatus};
 
 use super::*;
+#[path = "m2_http_state.rs"]
+mod state;
 use crate::http_forward::{
     DeviceHttpExchangeRecord, DeviceRead, DeviceReader, DeviceWriter, HttpActorRequest, HttpExport,
 };
+use state::{RequestEvent, RequestState, WriterEffect, WriterEvent, WriterState};
 
 /// The OPEN operation name for an HTTP forwarding stream.
 pub(super) const HTTP_FORWARD_OPERATION: &str = "http_forward";
@@ -105,14 +108,13 @@ pub(super) struct DeviceHttpState {
     chunks: VecDeque<Vec<u8>>,
     buffered: usize,
     buffered_high_water: usize,
-    fin_ready: bool,
-    fin_delivered: bool,
-    peer_reset: Option<u16>,
+    /// Request side: FIN progress and the RESET that ended the stream.
+    request: RequestState,
     reader: Option<oneshot::Sender<DeviceRead>>,
     notifier: ResetNotifier,
-    parked: Option<(Vec<u8>, oneshot::Sender<bool>)>,
+    /// Response writer: the parked write and the FIN queued behind it.
+    writer: WriterState,
     parked_high_water: usize,
-    finish_after_parked: Option<oneshot::Sender<bool>>,
     receive_window: u64,
     /// This connector's writer freeze, observed by the bridge's clocks.
     freeze: PauseController,
@@ -146,9 +148,9 @@ impl std::fmt::Debug for DeviceHttpState {
         formatter
             .debug_struct("DeviceHttpState")
             .field("buffered", &self.buffered)
-            .field("fin_ready", &self.fin_ready)
-            .field("peer_reset", &self.peer_reset)
-            .field("parked", &self.parked.as_ref().map(|(data, _)| data.len()))
+            .field("fin_ready", &self.request.fin_received())
+            .field("peer_reset", &self.request.reset_reason())
+            .field("parked", &self.writer.parked_len())
             .finish_non_exhaustive()
     }
 }
@@ -220,14 +222,11 @@ impl DeviceHttpState {
             chunks: VecDeque::new(),
             buffered: 0,
             buffered_high_water: 0,
-            fin_ready: false,
-            fin_delivered: false,
-            peer_reset: None,
+            request: RequestState::Receiving,
             reader: None,
             notifier,
-            parked: None,
+            writer: WriterState::Idle,
             parked_high_water: 0,
-            finish_after_parked: None,
             receive_window,
             freeze,
             request_tracker: RecordTracker::new(),
@@ -268,7 +267,7 @@ impl DeviceHttpState {
 
     pub(super) fn retained_bytes(&self) -> usize {
         self.buffered
-            .saturating_add(self.parked.as_ref().map_or(0, |(data, _)| data.len()))
+            .saturating_add(self.writer.parked_len().unwrap_or(0))
     }
 
     fn wake_reader(&mut self) {
@@ -281,8 +280,8 @@ impl DeviceHttpState {
     /// Accept a peer or local RESET: unread bytes are dropped, the reader
     /// learns of it, and a stalled handler is signalled out of band.
     fn abort(&mut self, reason: u16, after_fin: bool) {
-        if self.peer_reset.is_none() {
-            self.peer_reset = Some(reason);
+        // A second RESET is refused: the first reason and signal stay.
+        if self.request.transition(RequestEvent::Reset(reason)).is_ok() {
             self.notifier.notify(SignaledReset {
                 detail: detail_from_reason(reason),
                 after_fin,
@@ -293,17 +292,21 @@ impl DeviceHttpState {
         if let Some(reader) = self.reader.take() {
             let _ = reader.send(DeviceRead::Reset(reason));
         }
-        if let Some((_, reply)) = self.parked.take() {
-            let _ = reply.send(false);
-        }
-        if let Some(reply) = self.finish_after_parked.take() {
-            let _ = reply.send(false);
+        if let Ok(WriterEffect::Aborted { write, finish }) =
+            self.writer.transition(WriterEvent::Abort)
+        {
+            if let Some(reply) = write {
+                let _ = reply.send(false);
+            }
+            if let Some(reply) = finish {
+                let _ = reply.send(false);
+            }
         }
     }
 
     /// Accept one ordered request payload for the reader.
     fn accept_payload(&mut self, payload: Vec<u8>) {
-        if payload.is_empty() || self.peer_reset.is_some() {
+        if payload.is_empty() || self.request.reset_reason().is_some() {
             return;
         }
         self.request_tracker.observe(&payload);
@@ -315,21 +318,22 @@ impl DeviceHttpState {
 
     /// The request FIN: delivered after every buffered chunk.
     fn accept_fin(&mut self) {
-        self.fin_ready = true;
+        // A repeated FIN, or one after its delivery, changes nothing; after a
+        // RESET it is only recorded as received.
+        let _ = self.request.transition(RequestEvent::Fin);
         self.wake_reader();
     }
 
     /// Decide one read (authorization checks are the actor's).
     fn next_read(&mut self) -> DeviceReadStep {
-        if let Some(reason) = self.peer_reset {
+        if let Some(reason) = self.request.reset_reason() {
             return DeviceReadStep::Reply(DeviceRead::Reset(reason));
         }
         if let Some(chunk) = self.chunks.pop_front() {
             self.buffered = self.buffered.saturating_sub(chunk.len());
             return DeviceReadStep::Chunk(chunk);
         }
-        if self.fin_ready && !self.fin_delivered {
-            self.fin_delivered = true;
+        if self.request.transition(RequestEvent::DeliverFin).is_ok() {
             return DeviceReadStep::Reply(DeviceRead::Fin);
         }
         DeviceReadStep::Park
@@ -344,35 +348,46 @@ impl DeviceHttpState {
     /// Whether a new write may be accepted at all: nothing is parked ahead
     /// of it and the stream was not reset.
     const fn accepts_write(&self) -> bool {
-        self.parked.is_none() && self.finish_after_parked.is_none() && self.peer_reset.is_none()
+        self.writer.is_idle() && self.request.reset_reason().is_none()
     }
 
     fn park_write(&mut self, data: Vec<u8>, reply: oneshot::Sender<bool>) {
         self.parked_high_water = self.parked_high_water.max(data.len());
-        self.parked = Some((data, reply));
+        // The caller checked `accepts_write`; a write behind another parked
+        // write is refused like any unwritable one.
+        if let Err(WriterEvent::Park((_, reply))) =
+            self.writer.transition(WriterEvent::Park((data, reply)))
+        {
+            let _ = reply.send(false);
+        }
     }
 
     fn parked_len(&self) -> Option<usize> {
-        self.parked.as_ref().map(|(data, _)| data.len())
+        self.writer.parked_len()
     }
 
     fn take_parked(&mut self) -> Option<(Vec<u8>, oneshot::Sender<bool>)> {
-        self.parked.take()
+        match self.writer.transition(WriterEvent::TakeParked) {
+            Ok(WriterEffect::Write(write)) => Some(write),
+            Ok(_) | Err(_) => None,
+        }
     }
 
     /// Defer a FIN behind the parked write.  Returns the reply back when no
     /// write is parked, so the caller emits the FIN now.
     fn defer_finish(&mut self, reply: oneshot::Sender<bool>) -> Option<oneshot::Sender<bool>> {
-        if self.parked.is_some() {
-            self.finish_after_parked = Some(reply);
-            None
-        } else {
-            Some(reply)
+        match self.writer.transition(WriterEvent::QueueFinish(reply)) {
+            Ok(_) => None,
+            Err(WriterEvent::QueueFinish(reply)) => Some(reply),
+            Err(_) => None,
         }
     }
 
     fn take_deferred_finish(&mut self) -> Option<oneshot::Sender<bool>> {
-        self.finish_after_parked.take()
+        match self.writer.transition(WriterEvent::TakeFinish) {
+            Ok(WriterEffect::Finish(reply)) => Some(reply),
+            Ok(_) | Err(_) => None,
+        }
     }
 
     /// Publish this connector's writer-freeze state to the exchange task.
@@ -397,7 +412,7 @@ impl M2Stream {
     /// or a full queue: it follows every response byte in order, so the
     /// exchange is settled just the same.
     pub(super) fn http_exchange_settled(&self, response_fin_deferred: bool) -> bool {
-        if !self.is_http() || !(self.output_fin || response_fin_deferred) || self.output_reset {
+        if !self.is_http() || !(self.output.fin() || response_fin_deferred) || self.output.reset() {
             return false;
         }
         let received = self.sequence.direction(Direction::RelayToConnector);
@@ -446,8 +461,9 @@ impl M2Actor {
             sink: sink.clone(),
             stream_id,
         };
-        let body_stats: Arc<std::sync::Mutex<Option<Arc<QueueStats>>>> =
-            Arc::new(std::sync::Mutex::new(None));
+        // Set once: the bridge calls the handler at most once per exchange.
+        let body_stats: Arc<std::sync::OnceLock<Arc<QueueStats>>> =
+            Arc::new(std::sync::OnceLock::new());
         let slot = Arc::clone(&body_stats);
         let handler = Arc::clone(&export.handler);
         let service_id = service_id.to_owned();
@@ -456,7 +472,7 @@ impl M2Actor {
         // absolute deadline.
         let config = export.config;
         let profile = export.profile;
-        let freeze = PauseController::new(self.writes_frozen);
+        let freeze = PauseController::new(self.admission.writes_frozen());
         let pause = freeze.signal();
         let task = tokio::spawn(async move {
             let serving = serve_paused(
@@ -466,10 +482,7 @@ impl M2Actor {
                 response_tx,
                 pause,
                 move |request| {
-                    *slot
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                        Some(request.body().stats());
+                    let _ = slot.set(request.body().stats());
                     handler.call(request)
                 },
             );
@@ -478,11 +491,7 @@ impl M2Actor {
                 pump_outbound(response_rx, writer),
                 pump_inbound(reader, request_tx),
             );
-            let request_body_high_water = body_stats
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .as_ref()
-                .map_or(0, |stats| stats.high_water());
+            let request_body_high_water = body_stats.get().map_or(0, |stats| stats.high_water());
             let record = DeviceHttpExchangeRecord {
                 stream_id,
                 service_id,
@@ -533,7 +542,7 @@ impl M2Actor {
             sink: sink.clone(),
             stream_id,
         };
-        let freeze = PauseController::new(self.writes_frozen);
+        let freeze = PauseController::new(self.admission.writes_frozen());
         let (report_tx, report_rx) = oneshot::channel();
         let accounted = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let report_accounted = Arc::clone(&accounted);
@@ -601,7 +610,7 @@ impl M2Actor {
     pub(super) fn publish_http_freeze(&self) {
         for stream in self.streams.values() {
             if let Some(http) = stream.http.as_ref() {
-                http.publish_freeze(self.writes_frozen);
+                http.publish_freeze(self.admission.writes_frozen());
             }
         }
     }
@@ -658,7 +667,7 @@ impl M2Actor {
                     record.request_bodies = request.bodies;
                     record.request_ends = request.ends;
                     record.request_body_bytes = request.body_bytes;
-                    record.request_fin_received = http.fin_ready;
+                    record.request_fin_received = http.request.fin_received();
                     record.request_framing_invalid = request.invalid;
                     record.cancel_received = http.cancel_received;
                 }
@@ -693,7 +702,7 @@ impl M2Actor {
             "execution": report.execution.as_str(),
             "error": report.error.map(tunnel_http_bridge::HttpErrorCode::as_str),
             "progress_expired": report.progress_expired.map(tunnel_http_bridge::ProgressKind::as_str),
-            "writes_frozen": self.writes_frozen,
+            "writes_frozen": self.admission.writes_frozen(),
             "pending_outputs": self.pending_outputs.len(),
             "pending_output_for_stream":
                 has_pending_output_for_stream(&self.pending_outputs, stream_id),
@@ -703,16 +712,16 @@ impl M2Actor {
             let direction = stream.sequence.direction(Direction::ConnectorToRelay);
             let received = stream.sequence.direction(Direction::RelayToConnector);
             let extra = serde_json::json!({
-                "auth_confirmed": stream.auth.confirmed,
-                "auth_refresh_in_flight": stream.auth.refresh_in_flight,
-                "auth_invalidated": stream.auth.invalidated,
+                "auth_confirmed": stream.auth.confirmed(),
+                "auth_refresh_in_flight": stream.auth.refresh_in_flight(),
+                "auth_invalidated": stream.auth.invalidated(),
                 "buffered_inputs": stream.pending.len(),
                 "buffered_input_bytes": stream.pending_bytes,
-                "input_fin": stream.input_fin,
-                "input_reset": stream.input_reset,
-                "output_fin": stream.output_fin,
-                "output_reset": stream.output_reset,
-                "reset_queued": stream.reset_queued,
+                "input_fin": stream.input.fin(),
+                "input_reset": stream.input.reset(),
+                "output_fin": stream.output.fin(),
+                "output_reset": stream.output.reset(),
+                "reset_queued": stream.output.reset_queued(),
                 "sent_bytes": direction.sent_bytes(),
                 "send_credit": direction.send_credit(),
                 "replay_bytes": direction.replay_bytes(),
@@ -732,12 +741,12 @@ impl M2Actor {
                         "request_heads": request.heads,
                         "request_bodies": request.bodies,
                         "request_ends": request.ends,
-                        "request_fin_ready": http.fin_ready,
-                        "request_fin_delivered": http.fin_delivered,
+                        "request_fin_ready": http.request.fin_received(),
+                        "request_fin_delivered": http.request.fin_delivered(),
                         "receive_buffered": http.buffered,
-                        "parked_bytes": http.parked.as_ref().map_or(0, |(data, _)| data.len()),
+                        "parked_bytes": http.writer.parked_len().unwrap_or(0),
                         "parked_high_water": http.parked_high_water,
-                        "finish_after_parked": http.finish_after_parked.is_some(),
+                        "finish_after_parked": http.writer.finish_queued(),
                         "cancel_received": http.cancel_received,
                     }),
                 );
@@ -758,19 +767,19 @@ impl M2Actor {
             let _ = reply.send(DeviceRead::Closed);
             return Ok(());
         };
-        let expired = stream.auth.confirmed
+        let expired = stream.auth.confirmed()
             && stream
                 .auth
                 .deadline
                 .min(stream.auth.operation_deadline)
                 .expired();
-        let invalidated = stream.auth.invalidated;
-        let input_reset = stream.input_reset;
+        let invalidated = stream.auth.invalidated();
+        let input_reset = stream.input.reset();
         let Some(http) = stream.http.as_mut() else {
             let _ = reply.send(DeviceRead::Closed);
             return Ok(());
         };
-        if let Some(reason) = http.peer_reset {
+        if let Some(reason) = http.request.reset_reason() {
             let _ = reply.send(DeviceRead::Reset(reason));
             return Ok(());
         }
@@ -806,7 +815,7 @@ impl M2Actor {
         let direction = stream.sequence.direction(Direction::ConnectorToRelay);
         let limits = direction.limits();
         Some(WriteRoom {
-            writes_frozen: self.writes_frozen,
+            writes_frozen: self.admission.writes_frozen(),
             pending_output: has_pending_output_for_stream(&self.pending_outputs, stream_id),
             sent_bytes: direction.sent_bytes(),
             send_credit: direction.send_credit(),
@@ -834,9 +843,9 @@ impl M2Actor {
                 .http
                 .as_ref()
                 .is_some_and(DeviceHttpState::accepts_write)
-                && !stream.output_fin
-                && !stream.output_reset
-                && !stream.reset_queued
+                && !stream.output.fin()
+                && !stream.output.reset()
+                && !stream.output.reset_queued()
         });
         if !writable {
             let _ = reply.send(false);
@@ -903,7 +912,7 @@ impl M2Actor {
                 stream
                     .http
                     .as_ref()
-                    .is_some_and(|http| http.parked.is_some())
+                    .is_some_and(|http| http.parked_len().is_some())
             })
             .map(|(stream_id, _)| *stream_id)
             .collect::<Vec<_>>();
@@ -932,7 +941,7 @@ impl M2Actor {
             let _ = reply.send(false);
             return Ok(());
         };
-        if stream.output_fin || stream.output_reset || stream.reset_queued {
+        if stream.output.fin() || stream.output.reset() || stream.output.reset_queued() {
             let _ = reply.send(false);
             return Ok(());
         }
@@ -960,11 +969,11 @@ impl M2Actor {
             return Ok(());
         };
         let operation_id = stream.operation_id.clone();
-        let after_fin = stream.input_fin;
+        let after_fin = stream.input.fin();
         if let Some(http) = stream.http.as_mut() {
             http.abort(reason, after_fin);
         }
-        if stream.output_reset || stream.reset_queued {
+        if stream.output.reset() || stream.output.reset_queued() {
             return Ok(());
         }
         // RESULT_STATUS first, on the control socket, so the owner can
@@ -1000,7 +1009,7 @@ impl M2Actor {
         let Some(stream) = self.streams.get_mut(&stream_id) else {
             return false;
         };
-        let after_fin = stream.input_fin;
+        let after_fin = stream.input.fin();
         let Some(http) = stream.http.as_mut() else {
             return false;
         };
@@ -1023,7 +1032,7 @@ impl M2Actor {
     /// The request FIN half-closes only the request direction.
     pub(super) fn http_dispatch_fin(&mut self, stream_id: u64) {
         if let Some(stream) = self.streams.get_mut(&stream_id) {
-            stream.input_fin = true;
+            stream.input.transition(InputEvent::Fin);
             if let Some(http) = stream.http.as_mut() {
                 http.accept_fin();
             }
@@ -1033,7 +1042,7 @@ impl M2Actor {
     /// Record a peer or local RESET on an HTTP stream.
     pub(super) fn http_abort(&mut self, stream_id: u64, reason: u16) {
         if let Some(stream) = self.streams.get_mut(&stream_id) {
-            let after_fin = stream.input_fin
+            let after_fin = stream.input.fin()
                 || stream
                     .pending
                     .iter()
@@ -1332,20 +1341,21 @@ mod tests {
                 grant_revision: 1,
                 deadline,
                 operation_deadline: deadline,
-                confirmed: true,
-                refresh_in_flight: false,
-                invalidated: false,
+                state: {
+                    let mut state = crate::AuthLifecycle::unconfirmed();
+                    state
+                        .transition(crate::AuthEvent::Confirm)
+                        .expect("a first confirmation");
+                    state
+                },
             },
             sequence: StreamState::new(1, 1024).expect("test sequence"),
             pending: VecDeque::new(),
             pending_bytes: 0,
             record_buffer: Vec::new(),
             record_expected: None,
-            input_fin: false,
-            input_reset: false,
-            output_fin: false,
-            output_reset: false,
-            reset_queued: false,
+            input: InputState::Open,
+            output: OutputState::Open,
             http: state,
             fs_authority: None,
         }
@@ -1369,22 +1379,39 @@ mod tests {
             stream.http_exchange_settled(true),
             "a response FIN retained behind a freeze settles the exchange too"
         );
-        stream.output_fin = true;
+        stream
+            .output
+            .transition(OutputEvent::FinSequenced)
+            .expect("an open response direction accepts its FIN");
         assert!(stream.http_exchange_settled(false));
         let mut upload = http_stream(Some(state().0));
-        upload.output_fin = true;
+        upload
+            .output
+            .transition(OutputEvent::FinSequenced)
+            .expect("an open response direction accepts its FIN");
         assert!(
             !upload.http_exchange_settled(false),
             "the request FIN has not arrived: request bytes may still need authorization"
         );
-        stream.output_reset = true;
+        stream
+            .output
+            .transition(OutputEvent::QueueReset {
+                may_follow_fin: true,
+            })
+            .expect("a raw stream's RESET may follow its FIN");
+        stream
+            .output
+            .transition(OutputEvent::ResetSequenced)
+            .expect("a queued RESET is sequenced");
         assert!(
             !stream.http_exchange_settled(false),
             "a reset exchange is not settled"
         );
 
         let mut echo = http_stream(None);
-        echo.output_fin = true;
+        echo.output
+            .transition(OutputEvent::FinSequenced)
+            .expect("an open response direction accepts its FIN");
         echo.sequence
             .receive_frame(Direction::RelayToConnector, &fin)
             .expect("request FIN");

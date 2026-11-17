@@ -18,7 +18,7 @@ use crate::{
     http::{ECHO_STREAM_SUBPROTOCOL, consumer_router_with_peer_and_barriers},
 };
 use futures_util::StreamExt as _;
-use std::sync::Mutex;
+use std::sync::OnceLock;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -64,12 +64,16 @@ struct TwoRelays {
 
 impl TwoRelays {
     async fn start(label: &str) -> Self {
-        let oidc_slot: Arc<Mutex<Option<Arc<OidcVerifier>>>> = Arc::default();
+        // Set once, by the one handler factory call the fixture makes.
+        let oidc_slot: Arc<OnceLock<Arc<OidcVerifier>>> = Arc::default();
         let slot = Arc::clone(&oidc_slot);
         let fixture = H3PeerFixture::new_with_limits(
             test_limits(),
             move |runtime, handle, catalog, oidc, _device, returned_errors| {
-                *slot.lock().expect("OIDC slot") = Some(Arc::clone(&oidc));
+                assert!(
+                    slot.set(Arc::clone(&oidc)).is_ok(),
+                    "the handler factory runs once"
+                );
                 let production_handler =
                     super::super::super::peer_ingress_handler_with_http_forward(
                         handle,
@@ -86,11 +90,7 @@ impl TwoRelays {
             },
         )
         .await;
-        let oidc = oidc_slot
-            .lock()
-            .expect("OIDC slot")
-            .clone()
-            .expect("the handler factory ran");
+        let oidc = Arc::clone(oidc_slot.get().expect("the handler factory ran"));
         let now = Utc::now();
         // Only the new service and its grant (and the membership below):
         // re-seeding the device would bump its version.

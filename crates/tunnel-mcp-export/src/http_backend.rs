@@ -32,8 +32,8 @@
 //!   DELETE cannot hold a slot for ever.
 
 use std::pin::Pin;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
@@ -44,14 +44,15 @@ use http_body_util::BodyExt;
 use hyper::body::Incoming;
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpStream;
+use tokio::sync::{Notify, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tunnel_http_bridge::ChannelBody;
 use tunnel_mcp::message::{McpRejection, codes, validate_delete, validate_get, validate_post};
 use tunnel_mcp::{McpLimits, McpProfile};
 
 use crate::body::{
-    BoxError, CollectError, ExportBody, StreamFailure, capacity_refusal, collect_limited,
-    local_error, rejection,
+    BodyEffect, BodyEvent, BodyOver, BodyPhase, BoxError, CollectError, ExportBody, StreamFailure,
+    capacity_refusal, collect_limited, local_error, rejection,
 };
 use crate::config::{HttpBackend, McpConfigError};
 use crate::{ExportCounters, ExportError};
@@ -67,12 +68,86 @@ pub const MAX_TRACKED_SESSIONS: usize = 256;
 /// fill the table, and a new `initialize` is refused before the backend is
 /// dialled instead of evicting somebody else's live session.
 pub const MAX_SESSIONS_PER_BINDING: usize = MAX_TRACKED_SESSIONS / 8;
+/// Decisions queued towards the task that owns the session table.  An
+/// exchange waits for room; the task never waits on anything else, so the
+/// queue always drains.
+pub const BINDING_QUEUE: usize = 64;
+
+/// Session-less requests that may be in flight towards the backend with a
+/// reservation at once.  One past it is forwarded without a reservation, and
+/// a session the backend issues to it is refused instead of recorded.
+pub const MAX_PENDING_OPENS: usize = MAX_TRACKED_SESSIONS * 4;
+
+/// A reservation: the request was admitted and may yet be issued a session.
+const RESERVED: u8 = 0;
+/// A recorded session its binding may use.
+const LIVE: u8 = 1;
+/// Ended: revoked, or a reservation whose exchange finished without a
+/// session.  Terminal.
+const ENDED: u8 = 2;
+
+/// Who a session -- or a request that may open one -- belongs to, and whether
+/// it has ended.  This is the part of an entry the revocation path can see.
+///
+/// It is published when the request is **admitted**, before the backend is
+/// dialled, and the session that request opens keeps the same value.  A
+/// revocation therefore always finds it, whether it lands before the session
+/// is recorded (the record is then refused) or after (the entry is dropped
+/// before the next decision).
+#[derive(Debug)]
+struct Bound {
+    binding: Option<String>,
+    /// `RESERVED`, then `LIVE` (set only by the table's task), or `ENDED`.
+    state: AtomicU8,
+}
+
+impl Bound {
+    fn is_ended(&self) -> bool {
+        self.state.load(Ordering::SeqCst) == ENDED
+    }
+
+    /// End it, whatever it was.  Returns whether this call ended a recorded
+    /// session.
+    fn end(&self) -> bool {
+        self.state.swap(ENDED, Ordering::SeqCst) == LIVE
+    }
+
+    /// Turn a reservation into a recorded session.  Refused when a
+    /// revocation ended it first.
+    fn go_live(&self) -> bool {
+        self.state
+            .compare_exchange(RESERVED, LIVE, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+    }
+
+    /// End a reservation that was never recorded.  Returns whether it was
+    /// still one.
+    fn abandon(&self) -> bool {
+        self.state
+            .compare_exchange(RESERVED, ENDED, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+    }
+}
 
 /// One remembered session: who may use it, and when it was last used.
 #[derive(Debug)]
 struct SessionEntry {
-    binding: Option<String>,
+    bound: Arc<Bound>,
     last_used: Instant,
+}
+
+/// What became of a session the backend issued.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Recorded {
+    /// The session is bound to the principal that opened it.
+    Bound,
+    /// The backend reissued an identifier that is already bound to another
+    /// principal.  Nothing was recorded, and the session is not this
+    /// caller's to end.
+    Foreign,
+    /// Not recorded: the principal's authorization was revoked while the
+    /// request was in flight, there is no room, or the table is gone.
+    Refused,
 }
 
 /// Principal bindings for the sessions a Streamable HTTP backend issued
@@ -96,9 +171,21 @@ struct SessionEntry {
 #[derive(Debug, Default)]
 struct SessionBindings {
     bindings: std::collections::HashMap<String, SessionEntry>,
+    /// Admitted session-less requests whose exchange has not finished.
+    reserved: Vec<Arc<Bound>>,
 }
 
 impl SessionBindings {
+    /// Drop every entry a revocation ended and every reservation that ended.
+    /// Called before each decision, so a revoked session is never permitted
+    /// and never holds a slot.  Returns whether anything left.
+    fn prune(&mut self) -> bool {
+        let before = self.bindings.len() + self.reserved.len();
+        self.bindings.retain(|_, entry| !entry.bound.is_ended());
+        self.reserved.retain(|bound| !bound.is_ended());
+        self.bindings.len() + self.reserved.len() != before
+    }
+
     /// Forget every entry unused for `idle`.  Called before each capacity or
     /// permission decision, so the table is never consulted while stale.
     fn expire(&mut self, now: Instant, idle: Duration) {
@@ -106,11 +193,22 @@ impl SessionBindings {
             .retain(|_, entry| now.saturating_duration_since(entry.last_used) < idle);
     }
 
+    /// What the revocation path may see: who each remembered session, and
+    /// each request that may yet open one, belongs to.
+    fn published(&self) -> Published {
+        self.bindings
+            .values()
+            .map(|entry| &entry.bound)
+            .chain(&self.reserved)
+            .cloned()
+            .collect()
+    }
+
     /// Whether `binding` may use `session`, marking it used if so.  An
     /// unknown session is refused.
     fn permits(&mut self, session: &str, binding: Option<&String>, now: Instant) -> bool {
         match self.bindings.get_mut(session) {
-            Some(entry) if entry.binding.as_ref() == binding => {
+            Some(entry) if entry.bound.binding.as_ref() == binding => {
                 entry.last_used = now;
                 true
             }
@@ -121,7 +219,7 @@ impl SessionBindings {
     fn held_by(&self, binding: Option<&String>) -> usize {
         self.bindings
             .values()
-            .filter(|entry| entry.binding.as_ref() == binding)
+            .filter(|entry| entry.bound.binding.as_ref() == binding)
             .count()
     }
 
@@ -131,37 +229,303 @@ impl SessionBindings {
             && self.held_by(binding) < MAX_SESSIONS_PER_BINDING
     }
 
-    /// Record a session the backend issued.  Refuses silently when the table
-    /// or the principal's share is full, which fails closed: the session is
-    /// unusable through this export and the client re-initializes.
-    fn remember(&mut self, session: String, binding: Option<String>, now: Instant) {
-        if self.bindings.contains_key(&session) || !self.has_room_for(binding.as_ref()) {
-            return;
+    /// Reserve for a session-less request of `binding`, so a revocation can
+    /// see it before the backend answers.  `None` past
+    /// [`MAX_PENDING_OPENS`].
+    fn reserve(&mut self, binding: Option<String>) -> Option<Arc<Bound>> {
+        if self.reserved.len() >= MAX_PENDING_OPENS {
+            return None;
+        }
+        let bound = Arc::new(Bound {
+            binding,
+            state: AtomicU8::new(RESERVED),
+        });
+        self.reserved.push(Arc::clone(&bound));
+        Some(bound)
+    }
+
+    /// Record a session the backend issued to the request that holds the
+    /// reservation `bound`.  Refuses when the reservation has ended (its
+    /// binding was revoked), or the table or the principal's share is full;
+    /// the caller fails the exchange closed.
+    fn remember(&mut self, session: String, bound: &Arc<Bound>, now: Instant) -> Recorded {
+        let Some(index) = self
+            .reserved
+            .iter()
+            .position(|reserved| Arc::ptr_eq(reserved, bound))
+        else {
+            return Recorded::Refused;
+        };
+        let bound = self.reserved.swap_remove(index);
+        if let Some(existing) = self.bindings.get(&session) {
+            // The first binding of an identifier stands.
+            // The reissued identifier is usable by this caller exactly when
+            // it already was; a reservation a revocation ended is refused.
+            let same = existing.bound.binding == bound.binding;
+            let unrevoked = bound.abandon();
+            return match (same, unrevoked) {
+                (true, true) => Recorded::Bound,
+                (true, false) => Recorded::Refused,
+                (false, _) => Recorded::Foreign,
+            };
+        }
+        if !self.has_room_for(bound.binding.as_ref()) || !bound.go_live() {
+            let _ = bound.abandon();
+            return Recorded::Refused;
         }
         self.bindings.insert(
             session,
             SessionEntry {
-                binding,
+                bound,
                 last_used: now,
             },
         );
-    }
-
-    /// Forget every session issued to `binding`; returns how many.
-    fn forget_binding(&mut self, binding: &str) -> u64 {
-        let before = self.bindings.len();
-        self.bindings
-            .retain(|_, entry| entry.binding.as_deref() != Some(binding));
-        (before - self.bindings.len()) as u64
+        Recorded::Bound
     }
 
     fn forget(&mut self, session: &str) {
         self.bindings.remove(session);
     }
 
-    #[cfg(test)]
     fn len(&self) -> usize {
         self.bindings.len()
+    }
+}
+
+/// The remembered sessions' owners, as last published by the table's task.
+type Published = Arc<[Arc<Bound>]>;
+
+/// An admitted session-less request's claim on the session it may open.
+///
+/// Dropping it without recording a session ends the reservation, so an
+/// exchange that fails, is cancelled, or is answered without a session leaves
+/// nothing behind.
+#[derive(Debug)]
+struct Reservation {
+    bound: Arc<Bound>,
+    prune: Arc<Notify>,
+}
+
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        if self.bound.abandon() {
+            self.prune.notify_one();
+        }
+    }
+}
+
+/// What the session table decided about one request.
+#[derive(Debug)]
+enum Admission {
+    /// Forward it.  A request naming no session carries the reservation a
+    /// session issued to it must be recorded under.
+    Admitted(Option<Reservation>),
+    /// The request names a session this principal may not use.
+    UnknownSession,
+    /// The request would open a session and there is no room for one.
+    AtCapacity,
+}
+
+/// What an exchange asks of the task that owns the session table.
+enum BindingCommand {
+    /// Decide whether a request may be forwarded.  Expiry, the permission
+    /// check and the capacity check are one decision.
+    Admit {
+        session: Option<String>,
+        binding: Option<String>,
+        /// Whether the request would open a session (a POST naming none).
+        opens: bool,
+        now: Instant,
+        idle: Duration,
+        decided: oneshot::Sender<Admission>,
+    },
+    /// Record a session the backend issued, and say whether it was.
+    Remember {
+        session: String,
+        bound: Arc<Bound>,
+        now: Instant,
+        recorded: oneshot::Sender<Recorded>,
+    },
+    /// The named session is gone.
+    Forget { session: String },
+}
+
+/// The export's handle on the task that owns its session table.
+///
+/// **One task owns the table.**  Exchanges ask it for decisions in order, so
+/// expiry, permission and capacity are decided against one consistent table.
+/// A revocation is synchronous and cannot wait for that task, so it works on
+/// what the task last published: it ends each of the binding's entries -- one
+/// atomic swap per entry, so each session is counted once -- and the task
+/// drops ended entries before every decision it takes.
+///
+/// **A revocation cannot miss a session.**  The value a revocation ends is
+/// published when the opening request is admitted, not when its session is
+/// recorded, and the exchange does not answer until the task has said the
+/// session was recorded.  So a revocation that lands while the request is in
+/// flight ends the reservation and the record is refused; one that lands
+/// after the record ends the session.  There is no window in which the
+/// consumer holds a session identifier the revocation path could not see.
+struct BindingTable {
+    commands: mpsc::Sender<BindingCommand>,
+    published: watch::Receiver<Published>,
+    /// Nudges the owning task to drop entries that ended.
+    prune: Arc<Notify>,
+}
+
+impl BindingTable {
+    /// Start the owning task.  Called from an exchange, so a runtime is
+    /// running.
+    fn start() -> Self {
+        let (commands, inbox) = mpsc::channel(BINDING_QUEUE);
+        let (publish, published) = watch::channel(Published::from(Vec::new()));
+        let prune = Arc::new(Notify::new());
+        tokio::spawn(own_bindings(inbox, publish, Arc::clone(&prune)));
+        Self {
+            commands,
+            published,
+            prune,
+        }
+    }
+
+    /// Ask for a decision.  A table whose task is gone admits nothing.
+    async fn admit(
+        &self,
+        session: Option<String>,
+        binding: Option<String>,
+        opens: bool,
+        idle: Duration,
+    ) -> Admission {
+        let (decided, decision) = oneshot::channel();
+        let command = BindingCommand::Admit {
+            session,
+            binding,
+            opens,
+            now: Instant::now(),
+            idle,
+            decided,
+        };
+        if self.commands.send(command).await.is_err() {
+            return Admission::UnknownSession;
+        }
+        decision.await.unwrap_or(Admission::UnknownSession)
+    }
+
+    /// Record `session` under `reservation` and wait for the table's task to
+    /// say it did.  No reservation, a task that is gone, and a refusal are
+    /// all [`Recorded::Refused`]: the caller must not hand the session out.
+    async fn remember(&self, reservation: Option<Reservation>, session: String) -> Recorded {
+        let Some(reservation) = reservation else {
+            return Recorded::Refused;
+        };
+        let (recorded, answer) = oneshot::channel();
+        let command = BindingCommand::Remember {
+            session,
+            bound: Arc::clone(&reservation.bound),
+            now: Instant::now(),
+            recorded,
+        };
+        if self.commands.send(command).await.is_err() {
+            return Recorded::Refused;
+        }
+        // The reservation is held until the answer, so an exchange dropped
+        // here before the task acted leaves a reservation that ends.
+        let answer = answer.await.unwrap_or(Recorded::Refused);
+        drop(reservation);
+        answer
+    }
+
+    /// End every session issued to `binding`, and every reservation one of
+    /// its requests holds; returns how many sessions this call ended.
+    fn forget_binding(&self, binding: &str) -> u64 {
+        let published = Arc::clone(&self.published.borrow());
+        let mut forgotten = 0;
+        for bound in published.iter() {
+            if bound.binding.as_deref() == Some(binding) && bound.end() {
+                forgotten += 1;
+            }
+        }
+        self.prune.notify_one();
+        forgotten
+    }
+}
+
+/// The session table's task: its only owner and only writer.
+///
+/// It ends when the export that holds the sending half is dropped.
+async fn own_bindings(
+    mut commands: mpsc::Receiver<BindingCommand>,
+    publish: watch::Sender<Published>,
+    prune: Arc<Notify>,
+) {
+    let mut sessions = SessionBindings::default();
+    loop {
+        let command = tokio::select! {
+            command = commands.recv() => match command {
+                Some(command) => Some(command),
+                None => return,
+            },
+            () = prune.notified() => None,
+        };
+        let mut changed = sessions.prune();
+        match command {
+            Some(BindingCommand::Admit {
+                session,
+                binding,
+                opens,
+                now,
+                idle,
+                decided,
+            }) => {
+                let before = sessions.len();
+                sessions.expire(now, idle);
+                changed |= sessions.len() != before;
+                let admission = match &session {
+                    Some(session) if !sessions.permits(session, binding.as_ref(), now) => {
+                        Admission::UnknownSession
+                    }
+                    Some(_) => Admission::Admitted(None),
+                    None if opens && !sessions.has_room_for(binding.as_ref()) => {
+                        Admission::AtCapacity
+                    }
+                    None => Admission::Admitted(sessions.reserve(binding).map(|bound| {
+                        changed = true;
+                        Reservation {
+                            bound,
+                            prune: Arc::clone(&prune),
+                        }
+                    })),
+                };
+                // Published before the decision is answered: a revocation
+                // that follows the answer finds the reservation.
+                if changed {
+                    publish.send_replace(sessions.published());
+                    changed = false;
+                }
+                let _ = decided.send(admission);
+            }
+            Some(BindingCommand::Remember {
+                session,
+                bound,
+                now,
+                recorded,
+            }) => {
+                let answer = sessions.remember(session, &bound, now);
+                // The reservation left the table whatever the answer; when
+                // it was recorded the same value is published as a session.
+                publish.send_replace(sessions.published());
+                let _ = recorded.send(answer);
+            }
+            Some(BindingCommand::Forget { session }) => {
+                let before = sessions.len();
+                sessions.forget(&session);
+                changed |= sessions.len() != before;
+            }
+            None => {}
+        }
+        if changed {
+            publish.send_replace(sessions.published());
+        }
     }
 }
 
@@ -172,7 +536,9 @@ pub struct HttpBackendExport {
     backend: HttpBackend,
     authorization: Option<HeaderValue>,
     counters: Arc<ExportCounters>,
-    sessions: std::sync::Mutex<SessionBindings>,
+    /// The session table.  Started by the first exchange, because an export
+    /// may be built where no runtime is running yet.
+    sessions: OnceLock<BindingTable>,
 }
 
 impl std::fmt::Debug for HttpBackendExport {
@@ -197,10 +563,22 @@ impl Drop for AbortOnDrop {
 struct BackendBody {
     inner: Incoming,
     limit: u64,
-    sent: u64,
-    failed: bool,
+    phase: BodyPhase,
     counter: Arc<AtomicU64>,
     _connection: AbortOnDrop,
+}
+
+impl BackendBody {
+    /// Apply one event and report what to yield for it.
+    fn advance(&mut self, event: BodyEvent) -> BodyEffect {
+        match self.phase.on_event(event, self.limit) {
+            Ok((next, effect)) => {
+                self.phase = next;
+                effect
+            }
+            Err(BodyOver) => BodyEffect::Finish,
+        }
+    }
 }
 
 impl Body for BackendBody {
@@ -211,33 +589,34 @@ impl Body for BackendBody {
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Bytes>, BoxError>>> {
-        if self.failed {
+        if !self.phase.is_streaming() {
             return Poll::Ready(None);
         }
-        match Pin::new(&mut self.inner).poll_frame(cx) {
-            Poll::Pending => Poll::Pending,
-            Poll::Ready(None) => Poll::Ready(None),
-            Poll::Ready(Some(Err(_))) => {
-                self.failed = true;
-                Poll::Ready(Some(Err(Box::new(StreamFailure::Interrupted))))
+        let frame = match Pin::new(&mut self.inner).poll_frame(cx) {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(None) => {
+                let _ = self.advance(BodyEvent::End);
+                return Poll::Ready(None);
             }
-            Poll::Ready(Some(Ok(frame))) => match frame.into_data() {
-                Ok(data) => {
-                    let sent = self.sent.saturating_add(data.len() as u64);
-                    if sent > self.limit {
-                        self.failed = true;
-                        return Poll::Ready(Some(Err(Box::new(StreamFailure::Limit))));
-                    }
-                    self.sent = sent;
+            Poll::Ready(Some(Err(_))) => {
+                let _ = self.advance(BodyEvent::Failure(StreamFailure::Interrupted));
+                return Poll::Ready(Some(Err(Box::new(StreamFailure::Interrupted))));
+            }
+            Poll::Ready(Some(Ok(frame))) => frame,
+        };
+        let event = frame
+            .data_ref()
+            .map_or(BodyEvent::Other, |data| BodyEvent::Data(data.len() as u64));
+        match self.advance(event) {
+            BodyEffect::Fail(failure) => Poll::Ready(Some(Err(Box::new(failure)))),
+            BodyEffect::Forward | BodyEffect::Finish => {
+                if let Some(data) = frame.data_ref() {
                     self.counter.fetch_add(data.len() as u64, Ordering::Relaxed);
-                    Poll::Ready(Some(Ok(Frame::data(data))))
                 }
-                Err(frame) => {
-                    // Non-empty trailers are refused by the bridge; pass the
-                    // frame on so it decides.
-                    Poll::Ready(Some(Ok(frame)))
-                }
-            },
+                // Non-empty trailers are refused by the bridge; the frame is
+                // passed on so it decides.
+                Poll::Ready(Some(Ok(frame)))
+            }
         }
     }
 
@@ -250,9 +629,8 @@ impl HttpBackendExport {
     /// Forget the backend sessions bound to `binding` (M3-16).
     pub(crate) fn forget_binding_sessions(&self, binding: &str) -> u64 {
         self.sessions
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .forget_binding(binding)
+            .get()
+            .map_or(0, |sessions| sessions.forget_binding(binding))
     }
 
     pub(crate) fn new(
@@ -288,14 +666,12 @@ impl HttpBackendExport {
             backend,
             authorization,
             counters,
-            sessions: std::sync::Mutex::new(SessionBindings::default()),
+            sessions: OnceLock::new(),
         })
     }
 
-    fn sessions(&self) -> std::sync::MutexGuard<'_, SessionBindings> {
-        self.sessions
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    fn sessions(&self) -> &BindingTable {
+        self.sessions.get_or_init(BindingTable::start)
     }
 
     fn reject(&self, value: &McpRejection) -> Response<ExportBody> {
@@ -306,6 +682,41 @@ impl HttpBackendExport {
     fn backend_error(&self, status: StatusCode, message: &'static str) -> Response<ExportBody> {
         self.counters.backend_errors.fetch_add(1, Ordering::Relaxed);
         local_error(status, message, None)
+    }
+
+    /// Best effort: ask the backend to end a session it issued that this
+    /// export refused to record.  Bounded by [`CONNECT_TIMEOUT`]; the
+    /// backend's own idle expiry covers a failure.
+    async fn end_backend_session(&self, session: &str) {
+        let mut request = Request::builder()
+            .method(Method::DELETE)
+            .uri(self.backend.path.as_str())
+            .header(http::header::HOST, self.backend.authority.as_str())
+            .header(http::header::ACCEPT_ENCODING, "identity")
+            .header(tunnel_mcp::headers::MCP_SESSION_ID, session)
+            .header(
+                tunnel_mcp::headers::MCP_PROTOCOL_VERSION,
+                tunnel_mcp::PROTOCOL_2025_11_25,
+            );
+        if let Some(authorization) = &self.authorization {
+            request = request.header(http::header::AUTHORIZATION, authorization.clone());
+        }
+        let Ok(request) = request.body(http_body_util::Full::new(Bytes::new())) else {
+            return;
+        };
+        let address = self.backend.address;
+        let _ = tokio::time::timeout(CONNECT_TIMEOUT, async move {
+            let stream = TcpStream::connect(address).await.ok()?;
+            let (mut sender, connection) =
+                hyper::client::conn::http1::handshake(TokioIo::new(stream))
+                    .await
+                    .ok()?;
+            let _connection = AbortOnDrop(tokio::spawn(async move {
+                let _ = connection.await;
+            }));
+            sender.send_request(request).await.ok().map(drop)
+        })
+        .await;
     }
 
     /// Serve one exchange.
@@ -375,14 +786,20 @@ impl HttpBackendExport {
             .get(tunnel_mcp::headers::MCP_SESSION_ID)
             .and_then(|value| value.to_str().ok())
             .map(str::to_owned);
+        let mut reservation = None;
         if self.profile.is_legacy() {
-            let now = Instant::now();
-            let idle = self.backend.session_idle;
-            let mut sessions = self.sessions();
-            sessions.expire(now, idle);
-            match &named_session {
-                Some(session) if !sessions.permits(session, binding.as_ref(), now) => {
-                    drop(sessions);
+            let admission = self
+                .sessions()
+                .admit(
+                    named_session.clone(),
+                    binding.clone(),
+                    parts.method == Method::POST,
+                    self.backend.session_idle,
+                )
+                .await;
+            match admission {
+                Admission::Admitted(reserved) => reservation = reserved,
+                Admission::UnknownSession => {
                     return Ok(self.reject(&McpRejection {
                         status: 404,
                         code: codes::INVALID_REQUEST,
@@ -396,10 +813,7 @@ impl HttpBackendExport {
                 // refuses the newcomer instead of evicting somebody else's
                 // live session, and so the backend never creates a session
                 // this export could not track.
-                None if parts.method == Method::POST
-                    && !sessions.has_room_for(binding.as_ref()) =>
-                {
-                    drop(sessions);
+                Admission::AtCapacity => {
                     // Counted like any other refusal, so diagnostics and the
                     // gate can see an export that is at its session limit.
                     self.counters.rejected.fetch_add(1, Ordering::Relaxed);
@@ -410,7 +824,6 @@ impl HttpBackendExport {
                         Some(serde_json::Value::Null),
                     ));
                 }
-                _ => {}
             }
         }
 
@@ -540,8 +953,28 @@ impl HttpBackendExport {
                 // request cannot bind it to this caller.
                 (None, status) if status.is_success() => {
                     if let Some(session) = issued {
-                        self.sessions()
-                            .remember(session, binding.clone(), Instant::now());
+                        // The table's task has recorded the session before
+                        // the consumer can learn its identifier, under the
+                        // reservation a revocation has been able to see
+                        // since this request was admitted.  Anything else
+                        // fails closed: the identifier is not handed out.
+                        let recorded = self
+                            .sessions()
+                            .remember(reservation.take(), session.clone())
+                            .await;
+                        if recorded != Recorded::Bound {
+                            drop(response);
+                            drop(connection);
+                            if recorded == Recorded::Refused {
+                                // Nobody can use the session through this
+                                // export; do not leave it open upstream.
+                                self.end_backend_session(&session).await;
+                            }
+                            return Ok(self.backend_error(
+                                StatusCode::BAD_GATEWAY,
+                                "the MCP session could not be opened",
+                            ));
+                        }
                     }
                 }
                 // The session this request named is gone: a successful
@@ -552,7 +985,13 @@ impl HttpBackendExport {
                     if (status.is_success() && parts.method == Method::DELETE)
                         || status == StatusCode::NOT_FOUND =>
                 {
-                    self.sessions().forget(session);
+                    let _ = self
+                        .sessions()
+                        .commands
+                        .send(BindingCommand::Forget {
+                            session: session.clone(),
+                        })
+                        .await;
                 }
                 _ => {}
             }
@@ -592,8 +1031,7 @@ impl HttpBackendExport {
             BackendBody {
                 inner: response.into_body(),
                 limit: body_limit,
-                sent: 0,
-                failed: false,
+                phase: BodyPhase::START,
                 counter: Arc::clone(&self.counters.streamed_bytes),
                 _connection: connection,
             }
@@ -619,6 +1057,18 @@ mod tests {
 
     const IDLE: Duration = Duration::from_secs(600);
 
+    /// Reserve for `binding` and record `session` under the reservation, as
+    /// an admitted exchange does.
+    fn remember(
+        sessions: &mut SessionBindings,
+        session: String,
+        binding: Option<String>,
+        now: Instant,
+    ) -> Recorded {
+        let bound = sessions.reserve(binding).expect("room for a reservation");
+        sessions.remember(session, &bound, now)
+    }
+
     /// M3-04 review: opening sessions must never cost another principal its
     /// own.  An earlier revision evicted the oldest entry when the table
     /// filled, so any authorized principal could drop every other
@@ -628,13 +1078,18 @@ mod tests {
         let now = origin();
         let mut sessions = SessionBindings::default();
         let victim = binding("victim");
-        sessions.remember("victim-session".into(), victim.clone(), now);
+        remember(&mut sessions, "victim-session".into(), victim.clone(), now);
         assert!(sessions.permits("victim-session", victim.as_ref(), now));
 
         // The attacker exhausts its own share, then the whole table.
         let attacker = binding("attacker");
         for index in 0..MAX_TRACKED_SESSIONS * 2 {
-            sessions.remember(format!("attacker-{index}"), attacker.clone(), now);
+            remember(
+                &mut sessions,
+                format!("attacker-{index}"),
+                attacker.clone(),
+                now,
+            );
         }
         assert_eq!(
             sessions.held_by(attacker.as_ref()),
@@ -657,13 +1112,23 @@ mod tests {
         for principal in 0..principals {
             let holder = binding(&format!("principal-{principal}"));
             for index in 0..MAX_SESSIONS_PER_BINDING {
-                sessions.remember(format!("s-{principal}-{index}"), holder.clone(), now);
+                remember(
+                    &mut sessions,
+                    format!("s-{principal}-{index}"),
+                    holder.clone(),
+                    now,
+                );
             }
         }
         assert_eq!(sessions.len(), MAX_TRACKED_SESSIONS);
         let newcomer = binding("newcomer");
         assert!(!sessions.has_room_for(newcomer.as_ref()));
-        sessions.remember("newcomer-session".into(), newcomer.clone(), now);
+        remember(
+            &mut sessions,
+            "newcomer-session".into(),
+            newcomer.clone(),
+            now,
+        );
         assert!(!sessions.permits("newcomer-session", newcomer.as_ref(), now));
         assert_eq!(sessions.len(), MAX_TRACKED_SESSIONS);
         // The first principal's sessions all survived.
@@ -681,8 +1146,8 @@ mod tests {
     fn a_session_permits_only_its_own_binding() {
         let now = origin();
         let mut sessions = SessionBindings::default();
-        sessions.remember("bound".into(), binding("alice"), now);
-        sessions.remember("unbound".into(), None, now);
+        remember(&mut sessions, "bound".into(), binding("alice"), now);
+        remember(&mut sessions, "unbound".into(), None, now);
         assert!(sessions.permits("bound", binding("alice").as_ref(), now));
         assert!(!sessions.permits("bound", binding("bob").as_ref(), now));
         assert!(!sessions.permits("bound", None, now));
@@ -705,7 +1170,12 @@ mod tests {
             let now = start + Duration::from_secs(index as u64);
             sessions.expire(now, IDLE);
             assert!(sessions.has_room_for(holder.as_ref()), "restart {index}");
-            sessions.remember(format!("abandoned-{index}"), holder.clone(), now);
+            remember(
+                &mut sessions,
+                format!("abandoned-{index}"),
+                holder.clone(),
+                now,
+            );
         }
         // Without an expiry this principal is now locked out for good.
         let full = start + Duration::from_secs(MAX_SESSIONS_PER_BINDING as u64);
@@ -722,6 +1192,151 @@ mod tests {
         assert!(!sessions.permits("abandoned-0", holder.as_ref(), later));
     }
 
+    /// The review's interleaving: the backend issued a session, the record
+    /// is queued, and the principal's authorization is revoked before the
+    /// table's task acts on it.  The earlier revision answered the consumer
+    /// while the record was only queued, the revocation found nothing
+    /// published, and the task then inserted a session nothing had ended.
+    #[tokio::test]
+    async fn a_revocation_ahead_of_a_queued_record_refuses_it() {
+        let table = BindingTable::start();
+        let who = binding("revoked");
+        let Admission::Admitted(Some(reservation)) =
+            table.admit(None, who.clone(), true, IDLE).await
+        else {
+            panic!("an opening request is admitted with a reservation");
+        };
+        // Queue the record without letting the task run (this test's runtime
+        // has one thread and nothing here yields before the revocation).
+        let (recorded, answer) = oneshot::channel();
+        table
+            .commands
+            .send(BindingCommand::Remember {
+                session: "issued".into(),
+                bound: Arc::clone(&reservation.bound),
+                now: Instant::now(),
+                recorded,
+            })
+            .await
+            .unwrap();
+        // Nothing was a session yet, so nothing is counted ended.
+        assert_eq!(table.forget_binding("revoked"), 0);
+        assert_eq!(answer.await, Ok(Recorded::Refused));
+        assert!(matches!(
+            table.admit(Some("issued".into()), who, false, IDLE).await,
+            Admission::UnknownSession
+        ));
+    }
+
+    /// A revocation while the request is at the backend refuses the record.
+    #[tokio::test]
+    async fn a_revocation_while_the_request_is_in_flight_refuses_the_record() {
+        let table = BindingTable::start();
+        let who = binding("revoked");
+        let Admission::Admitted(reservation) = table.admit(None, who.clone(), true, IDLE).await
+        else {
+            panic!("admitted");
+        };
+        assert_eq!(table.forget_binding("revoked"), 0);
+        assert_eq!(
+            table.remember(reservation, "issued".into()).await,
+            Recorded::Refused
+        );
+        assert!(matches!(
+            table.admit(Some("issued".into()), who, false, IDLE).await,
+            Admission::UnknownSession
+        ));
+    }
+
+    /// A revocation after the record was acknowledged ends the session, and
+    /// only that binding's.
+    #[tokio::test]
+    async fn a_revocation_after_the_record_ends_the_session() {
+        let table = BindingTable::start();
+        for who in ["revoked", "bystander"] {
+            let Admission::Admitted(reservation) =
+                table.admit(None, binding(who), true, IDLE).await
+            else {
+                panic!("admitted");
+            };
+            assert_eq!(
+                table.remember(reservation, format!("{who}-session")).await,
+                Recorded::Bound
+            );
+        }
+        assert_eq!(table.forget_binding("revoked"), 1);
+        assert_eq!(table.forget_binding("revoked"), 0);
+        assert!(matches!(
+            table
+                .admit(
+                    Some("revoked-session".into()),
+                    binding("revoked"),
+                    false,
+                    IDLE
+                )
+                .await,
+            Admission::UnknownSession
+        ));
+        assert!(matches!(
+            table
+                .admit(
+                    Some("bystander-session".into()),
+                    binding("bystander"),
+                    false,
+                    IDLE
+                )
+                .await,
+            Admission::Admitted(None)
+        ));
+    }
+
+    /// A session is never recorded without a reservation, and a reservation
+    /// whose exchange ends without a session leaves nothing published.
+    #[tokio::test]
+    async fn a_reservation_ends_with_its_exchange() {
+        let table = BindingTable::start();
+        assert_eq!(
+            table.remember(None, "unreserved".into()).await,
+            Recorded::Refused
+        );
+        let Admission::Admitted(Some(reservation)) =
+            table.admit(None, binding("gone"), true, IDLE).await
+        else {
+            panic!("admitted with a reservation");
+        };
+        assert_eq!(table.published.borrow().len(), 1);
+        drop(reservation);
+        // The next decision is taken against a pruned table.
+        assert!(matches!(
+            table.admit(Some("none".into()), None, false, IDLE).await,
+            Admission::UnknownSession
+        ));
+        assert_eq!(table.published.borrow().len(), 0);
+    }
+
+    /// A reissued identifier stays with the principal it was first bound to.
+    #[test]
+    fn a_reissued_identifier_is_not_rebound() {
+        let now = origin();
+        let mut sessions = SessionBindings::default();
+        assert_eq!(
+            remember(&mut sessions, "s".into(), binding("alice"), now),
+            Recorded::Bound
+        );
+        assert_eq!(
+            remember(&mut sessions, "s".into(), binding("alice"), now),
+            Recorded::Bound
+        );
+        assert_eq!(
+            remember(&mut sessions, "s".into(), binding("bob"), now),
+            Recorded::Foreign
+        );
+        assert!(sessions.permits("s", binding("alice").as_ref(), now));
+        assert!(!sessions.permits("s", binding("bob").as_ref(), now));
+        assert_eq!(sessions.len(), 1);
+        assert!(sessions.reserved.is_empty());
+    }
+
     /// Use keeps a session alive, and expiry is per entry.
     #[test]
     fn use_keeps_a_session_alive_and_expiry_is_per_entry() {
@@ -729,8 +1344,8 @@ mod tests {
         let mut sessions = SessionBindings::default();
         let alice = binding("alice");
         let bob = binding("bob");
-        sessions.remember("alice-session".into(), alice.clone(), start);
-        sessions.remember("bob-session".into(), bob.clone(), start);
+        remember(&mut sessions, "alice-session".into(), alice.clone(), start);
+        remember(&mut sessions, "bob-session".into(), bob.clone(), start);
         // Alice keeps using hers; Bob never touches his again.
         let mut now = start;
         for _ in 0..4 {

@@ -87,11 +87,8 @@ fn cancel_fixture(
         consumer_expires_at: now + Duration::minutes(1),
         body: Vec::new(),
         created_at: Instant::now(),
-        dispatched: true,
-        authorization_in_flight: false,
-        deferred_authorization: None,
-        freeze_authorization: super::FreezeAuthorization::NotHeld,
-        abandon: super::UnaryAbandon::default(),
+        exchange: crate::actor::UnaryExchange::Dispatched { abandoned_at: None },
+        connector: crate::actor::UnaryConnector::NotAdmitted,
     };
     actor
         .sessions

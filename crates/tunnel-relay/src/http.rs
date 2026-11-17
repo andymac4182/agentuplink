@@ -1,8 +1,8 @@
 use std::{
     collections::HashMap,
     sync::{
-        Arc, Mutex, MutexGuard,
-        atomic::{AtomicU8, AtomicU64, Ordering},
+        Arc, OnceLock,
+        atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -59,6 +59,168 @@ const STREAM_RECORD_LIMIT: ConsumerRecordLimit = ConsumerRecordLimit::new(MAX_BO
 // Includes the record prefix and the largest unmasked WebSocket frame header.
 const MAX_ECHO_WRITE_BYTES: usize = MAX_BODY_BYTES + MAX_ECHO_CANARY_BYTES + 4 + 10;
 
+/// The phase of a one-shot fixture barrier.  Every barrier below is the same
+/// machine: idle -> armed -> held -> released, with a release from armed for
+/// a barrier nothing ever reached.  A barrier is never reusable.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+enum BarrierPhase {
+    Idle = 0,
+    Armed = 1,
+    Held = 2,
+    Released = 3,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BarrierEvent {
+    /// The fixture selects the one request to intercept.
+    Arm,
+    /// The selected handler reached the seam.
+    Hit,
+    /// The fixture (or the handler's own bounded fallback) lets it go.
+    Release,
+}
+
+impl BarrierPhase {
+    const fn from_u8(value: u8) -> Self {
+        match value {
+            0 => Self::Idle,
+            1 => Self::Armed,
+            2 => Self::Held,
+            _ => Self::Released,
+        }
+    }
+
+    /// The transition table.  `None` is a refused event: a second arm, a hit
+    /// on a barrier that is not armed, or a release with nothing to release.
+    const fn on_event(self, event: BarrierEvent) -> Option<Self> {
+        match (self, event) {
+            (Self::Idle, BarrierEvent::Arm) => Some(Self::Armed),
+            (Self::Armed, BarrierEvent::Hit) => Some(Self::Held),
+            (Self::Armed | Self::Held, BarrierEvent::Release) => Some(Self::Released),
+            _ => None,
+        }
+    }
+}
+
+/// The shared state of one one-shot barrier.
+#[derive(Debug)]
+struct BarrierCore {
+    phase: AtomicU8,
+    hits: AtomicU64,
+    reached: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+    /// Whether a release also wakes `wait_reached`, so a fixture waiting for
+    /// a hit that will never come observes the release instead.
+    release_wakes_reached: bool,
+}
+
+impl BarrierCore {
+    fn new(release_wakes_reached: bool) -> Self {
+        Self {
+            phase: AtomicU8::new(BarrierPhase::Idle as u8),
+            hits: AtomicU64::new(0),
+            reached: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+            release_wakes_reached,
+        }
+    }
+
+    fn phase(&self) -> BarrierPhase {
+        BarrierPhase::from_u8(self.phase.load(Ordering::Acquire))
+    }
+
+    /// Apply `event`: the only place the phase changes.  Returns the phase
+    /// entered, or the phase that refused the event.
+    fn apply(&self, event: BarrierEvent) -> Result<BarrierPhase, BarrierPhase> {
+        let mut current = self.phase();
+        loop {
+            let next = current.on_event(event).ok_or(current)?;
+            match self.phase.compare_exchange(
+                current as u8,
+                next as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Ok(next),
+                Err(observed) => current = BarrierPhase::from_u8(observed),
+            }
+        }
+    }
+
+    fn arm(&self) -> bool {
+        self.apply(BarrierEvent::Arm).is_ok()
+    }
+
+    /// The release is sticky, so a cancellation/reordering race cannot strand
+    /// the handler.
+    fn release(&self) {
+        if self.apply(BarrierEvent::Release).is_ok() {
+            if self.release_wakes_reached {
+                self.reached.notify_waiters();
+            }
+            self.release.notify_waiters();
+        }
+    }
+
+    fn hit_count(&self) -> u64 {
+        self.hits.load(Ordering::Acquire)
+    }
+
+    fn is_held(&self) -> bool {
+        self.phase() == BarrierPhase::Held
+    }
+
+    async fn wait_reached(&self) {
+        loop {
+            if self.hit_count() != 0 || self.phase() == BarrierPhase::Released {
+                return;
+            }
+            let notified = self.reached.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.hit_count() != 0
+                || (self.release_wakes_reached && self.phase() == BarrierPhase::Released)
+            {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    /// Count the hit and tell the fixture the seam was reached.
+    fn mark_reached(&self) {
+        self.hits.fetch_add(1, Ordering::AcqRel);
+        self.reached.notify_waiters();
+    }
+
+    /// Hold until released.  Returns `false` if `budget` ran out first, in
+    /// which case the barrier released itself: a bounded fallback prevents a
+    /// fixture bug or shutdown race from holding a handler forever.
+    async fn wait_released(&self, budget: Duration) -> bool {
+        let notified = self.release.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if self.phase() != BarrierPhase::Released
+            && timeout(budget, notified.as_mut()).await.is_err()
+        {
+            self.release();
+            return false;
+        }
+        true
+    }
+
+    /// The pass-through hold shared by the consumer-upgrade and
+    /// control-attach barriers: a barrier that is not armed is not a barrier.
+    async fn hold_if_armed(&self, budget: Duration) {
+        if self.apply(BarrierEvent::Hit).is_err() {
+            return;
+        }
+        self.mark_reached();
+        self.wait_released(budget).await;
+    }
+}
+
 /// One-shot fixture seam immediately after authenticated owner admission and
 /// immediately before Axum constructs the public WebSocket upgrade response.
 /// It is optional and disabled on every ordinary relay path.  The harness can
@@ -67,34 +229,16 @@ const MAX_ECHO_WRITE_BYTES: usize = MAX_BODY_BYTES + MAX_ECHO_CANARY_BYTES + 4 +
 /// whether a 101 response was already written.
 #[derive(Clone, Debug)]
 pub struct ConsumerUpgradeBarrier {
-    state: Arc<ConsumerUpgradeBarrierState>,
+    /// One-shot [`BarrierPhase`] machine.  Rejecting a stale second arm must
+    /// not reset the state of the first request that is already held at the
+    /// upgrade point.
+    state: Arc<BarrierCore>,
 }
-
-#[derive(Debug)]
-struct ConsumerUpgradeBarrierState {
-    /// One-shot state machine: idle -> armed -> held -> released.  A barrier
-    /// is never reusable; rejecting a stale second arm must not reset the
-    /// state of the first request that is already held at the upgrade point.
-    phase: AtomicU8,
-    hits: AtomicU64,
-    reached: tokio::sync::Notify,
-    release: tokio::sync::Notify,
-}
-
-const BARRIER_IDLE: u8 = 0;
-const BARRIER_ARMED: u8 = 1;
-const BARRIER_HELD: u8 = 2;
-const BARRIER_RELEASED: u8 = 3;
 
 impl Default for ConsumerUpgradeBarrier {
     fn default() -> Self {
         Self {
-            state: Arc::new(ConsumerUpgradeBarrierState {
-                phase: AtomicU8::new(BARRIER_IDLE),
-                hits: AtomicU64::new(0),
-                reached: tokio::sync::Notify::new(),
-                release: tokio::sync::Notify::new(),
-            }),
+            state: Arc::new(BarrierCore::new(false)),
         }
     }
 }
@@ -103,64 +247,22 @@ impl ConsumerUpgradeBarrier {
     /// Arm exactly one public upgrade interception.  A second arm is rejected
     /// so stale notifications cannot be mistaken for the selected request.
     pub fn arm(&self) -> bool {
-        self.state
-            .phase
-            .compare_exchange(
-                BARRIER_IDLE,
-                BARRIER_ARMED,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_ok()
+        self.state.arm()
     }
 
     /// Wait until the selected handler reaches the post-admission boundary.
     pub async fn wait_reached(&self) {
-        loop {
-            if self.state.hits.load(Ordering::Acquire) != 0 {
-                return;
-            }
-            if self.state.phase.load(Ordering::Acquire) == BARRIER_RELEASED {
-                return;
-            }
-            let notified = self.state.reached.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            if self.state.hits.load(Ordering::Acquire) != 0 {
-                return;
-            }
-            notified.await;
-        }
+        self.state.wait_reached().await;
     }
 
     /// Release the handler after the client has disconnected.  The release is
     /// sticky, so a cancellation/reordering race cannot strand the handler.
     pub fn release(&self) {
-        let mut phase = self.state.phase.load(Ordering::Acquire);
-        loop {
-            match phase {
-                BARRIER_ARMED | BARRIER_HELD => {
-                    match self.state.phase.compare_exchange(
-                        phase,
-                        BARRIER_RELEASED,
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
-                    ) {
-                        Ok(_) => {
-                            self.state.release.notify_waiters();
-                            return;
-                        }
-                        Err(next) => phase = next,
-                    }
-                }
-                BARRIER_IDLE | BARRIER_RELEASED => return,
-                _ => return,
-            }
-        }
+        self.state.release();
     }
 
     pub fn hit_count(&self) -> u64 {
-        self.state.hits.load(Ordering::Acquire)
+        self.state.hit_count()
     }
 
     /// Report whether the one-shot fixture handler is still holding the
@@ -168,36 +270,13 @@ impl ConsumerUpgradeBarrier {
     /// race tests; production admission still uses `wait_before_upgrade` and
     /// `release` as before.
     pub fn is_held(&self) -> bool {
-        self.state.phase.load(Ordering::Acquire) == BARRIER_HELD
+        self.state.is_held()
     }
 
     async fn wait_before_upgrade(&self, budget: Duration) {
-        if self
-            .state
-            .phase
-            .compare_exchange(
-                BARRIER_ARMED,
-                BARRIER_HELD,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_err()
-        {
-            return;
-        }
-        self.state.hits.fetch_add(1, Ordering::AcqRel);
-        self.state.reached.notify_waiters();
-        let notified = self.state.release.notified();
-        tokio::pin!(notified);
-        notified.as_mut().enable();
-        if self.state.phase.load(Ordering::Acquire) != BARRIER_RELEASED
-            && timeout(budget, notified.as_mut()).await.is_err()
-        {
-            // The harness normally releases after observing the client
-            // disconnect.  A bounded fallback prevents a fixture bug or
-            // shutdown race from holding an HTTP admission task forever.
-            self.release();
-        }
+        // The harness normally releases after observing the client
+        // disconnect; the hold is bounded by `budget` regardless.
+        self.state.hold_if_armed(budget).await;
     }
 }
 
@@ -218,29 +297,16 @@ impl ConsumerUpgradeBarrier {
 /// one control attach it actually intends to race.
 #[derive(Clone, Debug)]
 pub struct ControlAttachBarrier {
-    state: Arc<ControlAttachBarrierState>,
-}
-
-#[derive(Debug)]
-struct ControlAttachBarrierState {
-    /// One-shot state machine: idle -> armed -> held -> released, identical to
-    /// the consumer upgrade barrier so a stale second arm cannot reset the
-    /// state of a request already held between HELLO and WELCOME.
-    phase: AtomicU8,
-    hits: AtomicU64,
-    reached: tokio::sync::Notify,
-    release: tokio::sync::Notify,
+    /// One-shot [`BarrierPhase`] machine, identical to the consumer upgrade
+    /// barrier so a stale second arm cannot reset the state of a request
+    /// already held between HELLO and WELCOME.
+    state: Arc<BarrierCore>,
 }
 
 impl Default for ControlAttachBarrier {
     fn default() -> Self {
         Self {
-            state: Arc::new(ControlAttachBarrierState {
-                phase: AtomicU8::new(BARRIER_IDLE),
-                hits: AtomicU64::new(0),
-                reached: tokio::sync::Notify::new(),
-                release: tokio::sync::Notify::new(),
-            }),
+            state: Arc::new(BarrierCore::new(false)),
         }
     }
 }
@@ -250,99 +316,33 @@ impl ControlAttachBarrier {
     /// rejected so a stale notification cannot be mistaken for the selected
     /// control socket.
     pub fn arm(&self) -> bool {
-        self.state
-            .phase
-            .compare_exchange(
-                BARRIER_IDLE,
-                BARRIER_ARMED,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_ok()
+        self.state.arm()
     }
 
     /// Wait until the selected handler reaches the post-HELLO, pre-WELCOME
     /// boundary.
     pub async fn wait_reached(&self) {
-        loop {
-            if self.state.hits.load(Ordering::Acquire) != 0 {
-                return;
-            }
-            if self.state.phase.load(Ordering::Acquire) == BARRIER_RELEASED {
-                return;
-            }
-            let notified = self.state.reached.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            if self.state.hits.load(Ordering::Acquire) != 0 {
-                return;
-            }
-            notified.await;
-        }
+        self.state.wait_reached().await;
     }
 
     /// Release the held control attach.  The release is sticky, so a
     /// cancellation/reordering race cannot strand the handler.
     pub fn release(&self) {
-        let mut phase = self.state.phase.load(Ordering::Acquire);
-        loop {
-            match phase {
-                BARRIER_ARMED | BARRIER_HELD => {
-                    match self.state.phase.compare_exchange(
-                        phase,
-                        BARRIER_RELEASED,
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
-                    ) {
-                        Ok(_) => {
-                            self.state.release.notify_waiters();
-                            return;
-                        }
-                        Err(next) => phase = next,
-                    }
-                }
-                BARRIER_IDLE | BARRIER_RELEASED => return,
-                _ => return,
-            }
-        }
+        self.state.release();
     }
 
     pub fn hit_count(&self) -> u64 {
-        self.state.hits.load(Ordering::Acquire)
+        self.state.hit_count()
     }
 
     /// Report whether the one-shot fixture handler is still holding the
     /// control attach between HELLO and WELCOME.
     pub fn is_held(&self) -> bool {
-        self.state.phase.load(Ordering::Acquire) == BARRIER_HELD
+        self.state.is_held()
     }
 
     async fn wait_before_control_attach(&self, budget: Duration) {
-        if self
-            .state
-            .phase
-            .compare_exchange(
-                BARRIER_ARMED,
-                BARRIER_HELD,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_err()
-        {
-            return;
-        }
-        self.state.hits.fetch_add(1, Ordering::AcqRel);
-        self.state.reached.notify_waiters();
-        let notified = self.state.release.notified();
-        tokio::pin!(notified);
-        notified.as_mut().enable();
-        if self.state.phase.load(Ordering::Acquire) != BARRIER_RELEASED
-            && timeout(budget, notified.as_mut()).await.is_err()
-        {
-            // A bounded fallback prevents a fixture bug or shutdown race from
-            // holding a device control task forever.
-            self.release();
-        }
+        self.state.hold_if_armed(budget).await;
     }
 }
 
@@ -406,29 +406,23 @@ pub struct PeerAdmissionBarrier {
 
 #[derive(Debug)]
 struct PeerAdmissionBarrierState {
-    phase: AtomicU8,
-    hits: AtomicU64,
-    expected: std::sync::Mutex<Option<PeerAdmissionScope>>,
-    observed: std::sync::Mutex<Option<PeerAdmissionScope>>,
-    reached: tokio::sync::Notify,
-    release: tokio::sync::Notify,
+    core: BarrierCore,
+    /// The scope the barrier was armed with.  It is written exactly once, by
+    /// the arm that then takes the barrier out of `Idle`, so it is present in
+    /// every phase from `Armed` on and absent in `Idle`.
+    expected: OnceLock<PeerAdmissionScope>,
+    /// The scope of the request the barrier held.  Written exactly once, by
+    /// the one handler that took the barrier from `Armed` to `Held`.
+    observed: OnceLock<PeerAdmissionScope>,
 }
-
-const PEER_ADMISSION_IDLE: u8 = 0;
-const PEER_ADMISSION_ARMED: u8 = 1;
-const PEER_ADMISSION_HELD: u8 = 2;
-const PEER_ADMISSION_RELEASED: u8 = 3;
 
 impl Default for PeerAdmissionBarrier {
     fn default() -> Self {
         Self {
             state: Arc::new(PeerAdmissionBarrierState {
-                phase: AtomicU8::new(PEER_ADMISSION_IDLE),
-                hits: AtomicU64::new(0),
-                expected: std::sync::Mutex::new(None),
-                observed: std::sync::Mutex::new(None),
-                reached: tokio::sync::Notify::new(),
-                release: tokio::sync::Notify::new(),
+                core: BarrierCore::new(true),
+                expected: OnceLock::new(),
+                observed: OnceLock::new(),
             }),
         }
     }
@@ -437,87 +431,29 @@ impl Default for PeerAdmissionBarrier {
 impl PeerAdmissionBarrier {
     /// Arm exactly one request with its full owner/service scope.
     pub fn arm(&self, scope: PeerAdmissionScope) -> bool {
-        let mut expected = self
-            .state
-            .expected
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if self.state.phase.load(Ordering::Acquire) != PEER_ADMISSION_IDLE {
-            return false;
-        }
-        let armed = self
-            .state
-            .phase
-            .compare_exchange(
-                PEER_ADMISSION_IDLE,
-                PEER_ADMISSION_ARMED,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_ok();
-        if armed {
-            *expected = Some(scope);
-        }
-        armed
+        // Only an arm leaves `Idle`, and only the arm that recorded its scope
+        // goes on to try: the scope is in place before any handler can
+        // observe `Armed`, and a losing concurrent arm changes nothing.
+        self.state.expected.set(scope).is_ok() && self.state.core.arm()
     }
 
     /// Wait until the selected request reaches the pre-H3-admission seam.
     pub async fn wait_reached(&self) {
-        loop {
-            if self.state.hits.load(Ordering::Acquire) != 0
-                || self.state.phase.load(Ordering::Acquire) == PEER_ADMISSION_RELEASED
-            {
-                return;
-            }
-            let notified = self.state.reached.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            if self.state.hits.load(Ordering::Acquire) != 0
-                || self.state.phase.load(Ordering::Acquire) == PEER_ADMISSION_RELEASED
-            {
-                return;
-            }
-            notified.await;
-        }
+        self.state.core.wait_reached().await;
     }
 
     pub fn release(&self) {
-        let mut phase = self.state.phase.load(Ordering::Acquire);
-        loop {
-            match phase {
-                PEER_ADMISSION_ARMED | PEER_ADMISSION_HELD => {
-                    match self.state.phase.compare_exchange(
-                        phase,
-                        PEER_ADMISSION_RELEASED,
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
-                    ) {
-                        Ok(_) => {
-                            self.state.reached.notify_waiters();
-                            self.state.release.notify_waiters();
-                            return;
-                        }
-                        Err(next) => phase = next,
-                    }
-                }
-                PEER_ADMISSION_IDLE | PEER_ADMISSION_RELEASED => return,
-                _ => return,
-            }
-        }
+        self.state.core.release();
     }
 
     #[must_use]
     pub fn hit_count(&self) -> u64 {
-        self.state.hits.load(Ordering::Acquire)
+        self.state.core.hit_count()
     }
 
     #[must_use]
     pub fn observed_scope(&self) -> Option<PeerAdmissionScope> {
-        self.state
-            .observed
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone()
+        self.state.observed.get().cloned()
     }
 
     pub(crate) async fn wait_before_peer_admission(
@@ -525,43 +461,22 @@ impl PeerAdmissionBarrier {
         scope: PeerAdmissionScope,
         budget: Duration,
     ) -> Result<bool, PeerAdmissionBarrierError> {
-        let phase = self.state.phase.compare_exchange(
-            PEER_ADMISSION_ARMED,
-            PEER_ADMISSION_HELD,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
-        if let Err(phase) = phase {
+        if let Err(phase) = self.state.core.apply(BarrierEvent::Hit) {
             return match phase {
-                PEER_ADMISSION_IDLE => Ok(false),
-                PEER_ADMISSION_RELEASED => Err(PeerAdmissionBarrierError::ReleasedBeforeHit),
-                _ => Err(PeerAdmissionBarrierError::ReleasedBeforeHit),
+                BarrierPhase::Idle => Ok(false),
+                BarrierPhase::Armed | BarrierPhase::Held | BarrierPhase::Released => {
+                    Err(PeerAdmissionBarrierError::ReleasedBeforeHit)
+                }
             };
         }
-        let expected = self
-            .state
-            .expected
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone();
-        if expected.as_ref() != Some(&scope) {
+        if self.state.expected.get() != Some(&scope) {
             self.release();
             return Err(PeerAdmissionBarrierError::ScopeMismatch);
         }
-        *self
-            .state
-            .observed
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(scope);
-        self.state.hits.fetch_add(1, Ordering::AcqRel);
-        self.state.reached.notify_waiters();
-        let notified = self.state.release.notified();
-        tokio::pin!(notified);
-        notified.as_mut().enable();
-        if self.state.phase.load(Ordering::Acquire) != PEER_ADMISSION_RELEASED
-            && timeout(budget, notified.as_mut()).await.is_err()
-        {
-            self.release();
+        // This handler alone took the barrier to `Held`, so the slot is empty.
+        let _ = self.state.observed.set(scope);
+        self.state.core.mark_reached();
+        if !self.state.core.wait_released(budget).await {
             return Err(PeerAdmissionBarrierError::TimedOut);
         }
         Ok(true)
@@ -624,9 +539,39 @@ pub(crate) mod fs;
 ///
 /// A scope entry exists only while it holds at least one permit, so the map is
 /// bounded by the relay-global permit count rather than by the catalog.
+///
+/// The map is owned by one registry task, started by the first reservation on
+/// the runtime that makes it.  A reservation is a request to that task, so
+/// the lookup, the entry creation and the acquisition are one step of one
+/// owner and a concurrent release cannot reclaim an entry a caller is about
+/// to acquire from.  A permit returns its capacity to its scope's semaphore
+/// the moment it is dropped, from any context; the registry reclaims the
+/// idle entries that leaves behind before it serves its next request.
 pub(crate) struct ScopedAdmission {
     permits: usize,
-    scopes: Mutex<HashMap<OwnerScope, Arc<Semaphore>>>,
+    requests: OnceLock<mpsc::Sender<ScopedAdmissionRequest>>,
+    /// Set by a dropped permit: some entry may have become idle.
+    released: Arc<AtomicBool>,
+}
+
+/// Requests queued for the registry task.  Every caller already holds a
+/// relay-global admission permit, and the task answers each request without
+/// waiting on anything, so the queue only absorbs a burst; a caller that
+/// finds it full waits for a slot rather than being refused.
+const SCOPED_ADMISSION_QUEUE: usize = 64;
+
+enum ScopedAdmissionRequest {
+    Acquire {
+        scope: OwnerScope,
+        reply: oneshot::Sender<Option<ScopedAdmissionPermit>>,
+    },
+    #[cfg(test)]
+    InFlight {
+        scope: OwnerScope,
+        reply: oneshot::Sender<usize>,
+    },
+    #[cfg(test)]
+    TrackedScopes { reply: oneshot::Sender<usize> },
 }
 
 impl ScopedAdmission {
@@ -638,7 +583,8 @@ impl ScopedAdmission {
     pub(crate) fn new(per_owner: usize, global: usize) -> Arc<Self> {
         Arc::new(Self {
             permits: per_owner.min(global).max(1),
-            scopes: Mutex::new(HashMap::new()),
+            requests: OnceLock::new(),
+            released: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -648,69 +594,100 @@ impl ScopedAdmission {
         self.permits
     }
 
+    fn requests(&self) -> &mpsc::Sender<ScopedAdmissionRequest> {
+        self.requests.get_or_init(|| {
+            let (requests, queued) = mpsc::channel(SCOPED_ADMISSION_QUEUE);
+            tokio::spawn(run_scoped_admission(
+                queued,
+                self.permits,
+                Arc::clone(&self.released),
+            ));
+            requests
+        })
+    }
+
     /// Reserve one permit for `scope`, or return `None` when this scope already
-    /// holds its full allowance.  The lookup, the entry creation and the
-    /// acquisition all happen under one lock, so a concurrent release cannot
-    /// reclaim an entry a caller is about to acquire from.
-    pub(crate) fn try_acquire(
-        self: &Arc<Self>,
-        scope: OwnerScope,
-    ) -> Option<ScopedAdmissionPermit> {
-        let mut scopes = self.lock();
-        let semaphore = Arc::clone(
-            scopes
-                .entry(scope)
-                .or_insert_with(|| Arc::new(Semaphore::new(self.permits))),
-        );
-        match Arc::clone(&semaphore).try_acquire_owned() {
-            Ok(permit) => Some(ScopedAdmissionPermit {
-                registry: Arc::clone(self),
-                scope,
-                permit: Some(permit),
-            }),
-            Err(_) => {
-                Self::reclaim(&mut scopes, scope, self.permits);
-                None
-            }
-        }
+    /// holds its full allowance.  A caller that stops waiting loses nothing:
+    /// a permit granted to it after it left is released as it is dropped.
+    /// `None` is also the answer if the registry task is gone, which only
+    /// happens while its runtime shuts down.
+    pub(crate) async fn try_acquire(&self, scope: OwnerScope) -> Option<ScopedAdmissionPermit> {
+        let (reply, answer) = oneshot::channel();
+        self.requests()
+            .send(ScopedAdmissionRequest::Acquire { scope, reply })
+            .await
+            .ok()?;
+        answer.await.ok().flatten()
     }
 
     /// Permits currently held for `scope`.
     #[cfg(test)]
-    pub(crate) fn in_flight(&self, scope: OwnerScope) -> usize {
-        self.lock().get(&scope).map_or(0, |semaphore| {
-            self.permits.saturating_sub(semaphore.available_permits())
-        })
+    pub(crate) async fn in_flight(&self, scope: OwnerScope) -> usize {
+        let (reply, answer) = oneshot::channel();
+        self.requests()
+            .send(ScopedAdmissionRequest::InFlight { scope, reply })
+            .await
+            .expect("scoped admission registry");
+        answer.await.expect("scoped admission registry")
     }
 
     /// Scope entries currently tracked.  An entry without a held permit is a
     /// leak, so this is the bound the release path must keep.
     #[cfg(test)]
-    pub(crate) fn tracked_scopes(&self) -> usize {
-        self.lock().len()
+    pub(crate) async fn tracked_scopes(&self) -> usize {
+        let (reply, answer) = oneshot::channel();
+        self.requests()
+            .send(ScopedAdmissionRequest::TrackedScopes { reply })
+            .await
+            .expect("scoped admission registry");
+        answer.await.expect("scoped admission registry")
     }
+}
 
-    fn lock(&self) -> MutexGuard<'_, HashMap<OwnerScope, Arc<Semaphore>>> {
-        // A permit bound must not be lost to a poisoned lock: the map holds no
-        // invariant beyond "an entry exists while it has holders", and every
-        // path below rebuilds that from the semaphore itself.
-        self.scopes
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
-    /// Drop an idle entry.  `strong_count == 1` means only the map still
-    /// references the semaphore, so no outstanding permit can be released into
-    /// an entry that has already been removed.
-    fn reclaim(
-        scopes: &mut HashMap<OwnerScope, Arc<Semaphore>>,
-        scope: OwnerScope,
-        permits: usize,
-    ) {
-        if scopes.get(&scope).is_some_and(|semaphore| {
-            Arc::strong_count(semaphore) == 1 && semaphore.available_permits() >= permits
-        }) {
-            scopes.remove(&scope);
+/// The registry task: the only owner of the scope map.
+async fn run_scoped_admission(
+    mut requests: mpsc::Receiver<ScopedAdmissionRequest>,
+    permits: usize,
+    released: Arc<AtomicBool>,
+) {
+    let mut scopes: HashMap<OwnerScope, Arc<Semaphore>> = HashMap::new();
+    while let Some(request) = requests.recv().await {
+        // Drop idle entries.  Only this task acquires, so an entry with its
+        // full allowance available has no holder and none can appear before
+        // the request below is served.  A permit dropped after the flag was
+        // cleared sets it again, so its entry is reclaimed next time.
+        if released.swap(false, Ordering::AcqRel) {
+            scopes.retain(|_, semaphore| semaphore.available_permits() < permits);
+        }
+        match request {
+            ScopedAdmissionRequest::Acquire { scope, reply } => {
+                let semaphore = Arc::clone(
+                    scopes
+                        .entry(scope)
+                        .or_insert_with(|| Arc::new(Semaphore::new(permits))),
+                );
+                let permit =
+                    semaphore
+                        .try_acquire_owned()
+                        .ok()
+                        .map(|permit| ScopedAdmissionPermit {
+                            released: Arc::clone(&released),
+                            permit: Some(permit),
+                        });
+                // A caller that left drops the permit with the reply, which
+                // releases it and marks its entry for reclaim.
+                let _ = reply.send(permit);
+            }
+            #[cfg(test)]
+            ScopedAdmissionRequest::InFlight { scope, reply } => {
+                let _ = reply.send(scopes.get(&scope).map_or(0, |semaphore| {
+                    permits.saturating_sub(semaphore.available_permits())
+                }));
+            }
+            #[cfg(test)]
+            ScopedAdmissionRequest::TrackedScopes { reply } => {
+                let _ = reply.send(scopes.len());
+            }
         }
     }
 }
@@ -720,8 +697,7 @@ impl ScopedAdmission {
 /// abandoned request drops the handler future, and an abandoned upgrade drops
 /// the guard the upgrade closure captured.
 pub(crate) struct ScopedAdmissionPermit {
-    registry: Arc<ScopedAdmission>,
-    scope: OwnerScope,
+    released: Arc<AtomicBool>,
     permit: Option<OwnedSemaphorePermit>,
 }
 
@@ -729,13 +705,11 @@ impl Drop for ScopedAdmissionPermit {
     fn drop(&mut self) {
         // `take` makes the release idempotent in the type: the owned permit
         // returns its capacity when this statement's temporary is dropped, and
-        // only then is the now-idle entry reclaimed.
+        // only then is the now-idle entry marked for the registry to reclaim.
         if self.permit.take().is_none() {
             return;
         }
-        let permits = self.registry.permits;
-        let mut scopes = self.registry.lock();
-        ScopedAdmission::reclaim(&mut scopes, self.scope, permits);
+        self.released.store(true, Ordering::Release);
     }
 }
 
@@ -1119,6 +1093,7 @@ async fn echo(
     let Some(_scope_permit) = state
         .scoped_admission
         .try_acquire(OwnerScope::new(grant.tenant_id, device_id))
+        .await
     else {
         return admission_limit_response(ADMISSION_LIMIT_RETRY_AFTER_MS);
     };
@@ -1476,6 +1451,7 @@ async fn echo_stream(
     let Some(scope_permit) = state
         .scoped_admission
         .try_acquire(OwnerScope::new(grant.tenant_id, device_id))
+        .await
     else {
         return admission_limit_response(ADMISSION_LIMIT_RETRY_AFTER_MS);
     };
@@ -1989,6 +1965,245 @@ async fn finish_consumer_task(
     }
 }
 
+/// Which side the forwarded consumer loop polls first on its next turn.  It
+/// alternates every turn so neither direction can starve the other.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RemoteConsumerTurn {
+    Remote,
+    Local,
+}
+
+impl RemoteConsumerTurn {
+    const fn flipped(self) -> Self {
+        match self {
+            Self::Remote => Self::Local,
+            Self::Local => Self::Remote,
+        }
+    }
+}
+
+/// How the forwarded consumer loop ended.
+#[derive(Debug, PartialEq)]
+struct RemoteConsumerEnd {
+    /// Whether the request pump already ran to completion inside the loop;
+    /// otherwise it is stopped and awaited after it.
+    forwarder_finished: bool,
+    /// The owner's coded close for an OPEN its connector refused.
+    close: Option<CloseFrame>,
+}
+
+/// The phase of the forwarded consumer loop.  Each live phase is one shape of
+/// the loop's `select!`.
+#[derive(Debug, PartialEq)]
+enum RemoteConsumerPhase {
+    /// No public frame is held outside the pump: the public socket is read.
+    Reading { turn: RemoteConsumerTurn },
+    /// One complete public frame is held outside the pump's channel, waiting
+    /// for a slot.  The public socket is not read meanwhile.
+    Holding {
+        turn: RemoteConsumerTurn,
+        frame: Vec<u8>,
+    },
+    /// The loop is over.
+    Closing(RemoteConsumerEnd),
+}
+
+/// What one turn of the forwarded consumer loop came to.  `S` is the pump
+/// slot a held frame is released into.
+enum RemoteConsumerStep<S> {
+    /// The turn changed nothing about what is held.
+    Continue,
+    /// A public frame was accepted and must be held for the pump.
+    Hold(Vec<u8>),
+    /// The pump has a slot for the held frame.
+    Slot(S),
+    End(RemoteConsumerEnd),
+}
+
+/// A step its phase cannot take.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RemoteConsumerRefused {
+    /// A second frame while one is still held: the public reader is paused.
+    AlreadyHolding,
+    /// A pump slot with no frame held for it.
+    NothingHeld,
+    /// Anything at all after the loop ended.
+    Closed,
+}
+
+/// The phase a step leads to, and the held frame it released with the slot
+/// that frame goes into.
+type RemoteConsumerTransition<S> = (RemoteConsumerPhase, Option<(S, Vec<u8>)>);
+
+impl RemoteConsumerPhase {
+    /// The only place the phase changes.  A released frame is returned with
+    /// the slot it goes into.
+    fn on_step<S>(
+        self,
+        step: RemoteConsumerStep<S>,
+    ) -> Result<RemoteConsumerTransition<S>, RemoteConsumerRefused> {
+        Ok(match (self, step) {
+            (Self::Closing(_), _) => return Err(RemoteConsumerRefused::Closed),
+            (Self::Reading { .. } | Self::Holding { .. }, RemoteConsumerStep::End(end)) => {
+                (Self::Closing(end), None)
+            }
+            (Self::Reading { turn }, RemoteConsumerStep::Continue) => (
+                Self::Reading {
+                    turn: turn.flipped(),
+                },
+                None,
+            ),
+            (Self::Reading { turn }, RemoteConsumerStep::Hold(frame)) => (
+                Self::Holding {
+                    turn: turn.flipped(),
+                    frame,
+                },
+                None,
+            ),
+            (Self::Reading { .. }, RemoteConsumerStep::Slot(_)) => {
+                return Err(RemoteConsumerRefused::NothingHeld);
+            }
+            (Self::Holding { turn, frame }, RemoteConsumerStep::Continue) => (
+                Self::Holding {
+                    turn: turn.flipped(),
+                    frame,
+                },
+                None,
+            ),
+            (Self::Holding { turn, frame }, RemoteConsumerStep::Slot(slot)) => (
+                Self::Reading {
+                    turn: turn.flipped(),
+                },
+                Some((slot, frame)),
+            ),
+            (Self::Holding { .. }, RemoteConsumerStep::Hold(_)) => {
+                return Err(RemoteConsumerRefused::AlreadyHolding);
+            }
+        })
+    }
+}
+
+/// Why the owner side of a forwarded echo stream is ending, as far as the
+/// loop itself has positive evidence.  It decides the terminal cause the
+/// actor records and whether the owner's coded close is told to the ingress.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PeerEchoTermination {
+    /// Nothing typed has been observed: a plain end, expiry or failure.
+    Undetermined,
+    /// The peer's signed membership expired.
+    MembershipExpired,
+    /// The owner's actor closed the stream itself.  It keeps the actor's own
+    /// recorded reason unless the coded close it then owed the ingress failed
+    /// on an expired membership.
+    OwnerClosed { membership_expired: bool },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PeerEchoSignal {
+    /// The stream's registration was closed by the owner's actor.
+    OwnerClosed,
+    /// A typed membership expiry: the admission edge's reason, or a transport
+    /// error that names it.
+    MembershipExpired,
+    /// Weaker evidence of the same cause -- the admission edge's deadline
+    /// sampled at loop exit, or the request's finish failing on it.  It never
+    /// overrides a stream the owner closed itself.
+    MembershipExpiryInferred,
+}
+
+impl PeerEchoTermination {
+    /// The only place the termination changes.
+    const fn on_signal(self, signal: PeerEchoSignal) -> Self {
+        match (self, signal) {
+            (Self::Undetermined, PeerEchoSignal::OwnerClosed) => Self::OwnerClosed {
+                membership_expired: false,
+            },
+            (
+                Self::Undetermined,
+                PeerEchoSignal::MembershipExpired | PeerEchoSignal::MembershipExpiryInferred,
+            ) => Self::MembershipExpired,
+            (
+                Self::MembershipExpired,
+                PeerEchoSignal::MembershipExpired | PeerEchoSignal::MembershipExpiryInferred,
+            ) => Self::MembershipExpired,
+            // The two facts are independent: whichever order they arrive in,
+            // the stream was closed by its owner and the expiry is its cause.
+            (Self::MembershipExpired, PeerEchoSignal::OwnerClosed)
+            | (Self::OwnerClosed { .. }, PeerEchoSignal::MembershipExpired) => Self::OwnerClosed {
+                membership_expired: true,
+            },
+            (
+                closed @ Self::OwnerClosed { .. },
+                PeerEchoSignal::OwnerClosed | PeerEchoSignal::MembershipExpiryInferred,
+            ) => closed,
+        }
+    }
+
+    fn signal(&mut self, signal: PeerEchoSignal) {
+        *self = self.on_signal(signal);
+    }
+
+    /// A transport error is typed evidence only when it names the expiry.
+    fn observe_error(&mut self, error: &PeerRuntimeError) {
+        if matches!(error, PeerRuntimeError::MembershipExpired) {
+            self.signal(PeerEchoSignal::MembershipExpired);
+        }
+    }
+
+    const fn owner_closed(self) -> bool {
+        matches!(self, Self::OwnerClosed { .. })
+    }
+
+    const fn terminal_cause(self) -> Option<StreamTerminalCause> {
+        match self {
+            Self::MembershipExpired
+            | Self::OwnerClosed {
+                membership_expired: true,
+            } => Some(StreamTerminalCause::PeerMembershipExpired),
+            Self::Undetermined
+            | Self::OwnerClosed {
+                membership_expired: false,
+            } => None,
+        }
+    }
+}
+
+/// The single peer event the owner loop may read ahead of a parked actor
+/// write.  `T` is the event: a record, or the request's end.
+#[derive(Debug, Eq, PartialEq)]
+enum PeerEchoLookahead<T> {
+    Empty,
+    Held(T),
+}
+
+/// A second event offered while one is still held.
+#[derive(Debug, Eq, PartialEq)]
+struct PeerEchoLookaheadFull;
+
+impl<T> PeerEchoLookahead<T> {
+    const fn is_held(&self) -> bool {
+        matches!(self, Self::Held(_))
+    }
+
+    /// Retain `event`.  Refused while one is held: the slot is the whole
+    /// bound, and the receive direction is not read while it is occupied.
+    fn hold(&mut self, event: T) -> Result<(), PeerEchoLookaheadFull> {
+        if self.is_held() {
+            return Err(PeerEchoLookaheadFull);
+        }
+        *self = Self::Held(event);
+        Ok(())
+    }
+
+    /// Replay the held event, leaving the slot empty.
+    fn take(&mut self) -> Option<T> {
+        match std::mem::replace(self, Self::Empty) {
+            Self::Held(event) => Some(event),
+            Self::Empty => None,
+        }
+    }
+}
+
 async fn handle_remote_consumer_stream(
     mut socket: WebSocket,
     handle: RelayHandle,
@@ -2062,32 +2277,28 @@ async fn handle_remote_consumer_stream(
         send.cancel();
         Ok(())
     });
-    let mut forwarder_finished = false;
-    let mut prefer_remote = true;
     // Same bounded decision as the owner-local handler, taken on the ingress
     // before any byte is queued for the peer: an over-limit prefix closes the
     // public stream here and is never forwarded.
     let mut cursor = ConsumerRecordCursor::new(STREAM_RECORD_LIMIT);
-    let mut refusal_close = None;
 
-    enum RemoteConsumerEvent<Inbound, Remote> {
+    enum RemoteConsumerEvent<Inbound, Remote, Slot> {
         Expired,
         Inbound(Inbound),
         Remote(Remote),
-        ForwardReady,
-        ForwardClosed,
+        ForwardSlot(Slot),
         ForwardDone(Result<(), (PeerRuntimeError, usize, usize)>),
     }
 
     // At most three complete public frames are retained: one in the pump,
     // one in the channel, and one outside the channel. Keeping the last one
     // outside makes reserve() cancellation-safe: if a response wins the
-    // select, that frame remains available for the next iteration rather
-    // than being dropped with a cancelled send future. The WebSocket reader
-    // is intentionally paused while all three slots are occupied; the pump's
-    // existing transport idle deadline and this exchange's absolute expiry
-    // bound how long Ping/Close can wait without consuming another Binary
-    // frame into an unaccounted queue.
+    // select, that frame remains held by the phase for the next iteration
+    // rather than being dropped with a cancelled send future. The WebSocket
+    // reader is intentionally paused while all three slots are occupied; the
+    // pump's existing transport idle deadline and this exchange's absolute
+    // expiry bound how long Ping/Close can wait without consuming another
+    // Binary frame into an unaccounted queue.
     // The owner response read is bounded by the consumer's absolute
     // deadline, not by the peer transport idle timeout.  A saturated but
     // healthy owner is legitimately silent while it queues this response, so
@@ -2097,66 +2308,71 @@ async fn handle_remote_consumer_stream(
     // GOAWAY, response end and membership loss still end the read promptly,
     // and the QUIC connection idle timeout remains armed underneath for a
     // peer that has actually gone away.
-    let mut pending_forward = None;
-    loop {
-        let event = if pending_forward.is_some() {
-            if prefer_remote {
+    // An exit that leaves the pump to be stopped, with no coded close.
+    fn ended<S>() -> RemoteConsumerStep<S> {
+        RemoteConsumerStep::End(RemoteConsumerEnd {
+            forwarder_finished: false,
+            close: None,
+        })
+    }
+    let mut phase = RemoteConsumerPhase::Reading {
+        turn: RemoteConsumerTurn::Remote,
+    };
+    let end = loop {
+        let event = match &phase {
+            RemoteConsumerPhase::Closing(_) => break phase,
+            RemoteConsumerPhase::Holding {
+                turn: RemoteConsumerTurn::Remote,
+                ..
+            } => {
                 tokio::select! {
                     biased;
                     _ = &mut expires => RemoteConsumerEvent::Expired,
                     forward_done = &mut forwarder => RemoteConsumerEvent::ForwardDone(forward_done),
                     remote = recv.recv_message_until(consumer_deadline) => RemoteConsumerEvent::Remote(remote),
-                    slot = forward_tx.reserve() => {
-                        match slot {
-                            Ok(slot) => {
-                                slot.send(pending_forward.take().expect("pending frame"));
-                                RemoteConsumerEvent::ForwardReady
-                            }
-                            Err(_) => RemoteConsumerEvent::ForwardClosed,
-                        }
-                    }
+                    slot = forward_tx.reserve() => RemoteConsumerEvent::ForwardSlot(slot),
                 }
-            } else {
+            }
+            RemoteConsumerPhase::Holding {
+                turn: RemoteConsumerTurn::Local,
+                ..
+            } => {
                 tokio::select! {
                     biased;
                     _ = &mut expires => RemoteConsumerEvent::Expired,
                     forward_done = &mut forwarder => RemoteConsumerEvent::ForwardDone(forward_done),
-                    slot = forward_tx.reserve() => {
-                        match slot {
-                            Ok(slot) => {
-                                slot.send(pending_forward.take().expect("pending frame"));
-                                RemoteConsumerEvent::ForwardReady
-                            }
-                            Err(_) => RemoteConsumerEvent::ForwardClosed,
-                        }
-                    }
+                    slot = forward_tx.reserve() => RemoteConsumerEvent::ForwardSlot(slot),
                     remote = recv.recv_message_until(consumer_deadline) => RemoteConsumerEvent::Remote(remote),
                 }
             }
-        } else if prefer_remote {
-            tokio::select! {
-                biased;
-                _ = &mut expires => RemoteConsumerEvent::Expired,
-                forward_done = &mut forwarder => RemoteConsumerEvent::ForwardDone(forward_done),
-                remote = recv.recv_message_until(consumer_deadline) => RemoteConsumerEvent::Remote(remote),
-                inbound = socket.next() => RemoteConsumerEvent::Inbound(inbound),
+            RemoteConsumerPhase::Reading {
+                turn: RemoteConsumerTurn::Remote,
+            } => {
+                tokio::select! {
+                    biased;
+                    _ = &mut expires => RemoteConsumerEvent::Expired,
+                    forward_done = &mut forwarder => RemoteConsumerEvent::ForwardDone(forward_done),
+                    remote = recv.recv_message_until(consumer_deadline) => RemoteConsumerEvent::Remote(remote),
+                    inbound = socket.next() => RemoteConsumerEvent::Inbound(inbound),
+                }
             }
-        } else {
-            tokio::select! {
-                biased;
-                _ = &mut expires => RemoteConsumerEvent::Expired,
-                forward_done = &mut forwarder => RemoteConsumerEvent::ForwardDone(forward_done),
-                inbound = socket.next() => RemoteConsumerEvent::Inbound(inbound),
-                remote = recv.recv_message_until(consumer_deadline) => RemoteConsumerEvent::Remote(remote),
+            RemoteConsumerPhase::Reading {
+                turn: RemoteConsumerTurn::Local,
+            } => {
+                tokio::select! {
+                    biased;
+                    _ = &mut expires => RemoteConsumerEvent::Expired,
+                    forward_done = &mut forwarder => RemoteConsumerEvent::ForwardDone(forward_done),
+                    inbound = socket.next() => RemoteConsumerEvent::Inbound(inbound),
+                    remote = recv.recv_message_until(consumer_deadline) => RemoteConsumerEvent::Remote(remote),
+                }
             }
         };
-        prefer_remote = !prefer_remote;
 
-        match event {
-            RemoteConsumerEvent::Expired | RemoteConsumerEvent::ForwardClosed => break,
-            RemoteConsumerEvent::ForwardReady => {}
+        let step = match event {
+            RemoteConsumerEvent::Expired | RemoteConsumerEvent::ForwardSlot(Err(_)) => ended(),
+            RemoteConsumerEvent::ForwardSlot(Ok(slot)) => RemoteConsumerStep::Slot(slot),
             RemoteConsumerEvent::ForwardDone(result) => {
-                forwarder_finished = true;
                 match result {
                     Ok(()) => {}
                     Err((error, body_len, chunk_len)) => {
@@ -2177,78 +2393,40 @@ async fn handle_remote_consumer_stream(
                         );
                     }
                 }
-                break;
+                RemoteConsumerStep::End(RemoteConsumerEnd {
+                    forwarder_finished: true,
+                    close: None,
+                })
             }
-            RemoteConsumerEvent::Inbound(inbound) => {
-                let Some(inbound) = inbound else {
-                    break;
-                };
-                let Ok(message) = inbound else {
-                    break;
-                };
-                match message {
-                    Message::Binary(bytes) => match cursor.forward(&bytes) {
-                        Ok(forwardable) => {
-                            if !forwardable.is_empty() {
-                                pending_forward = Some(forwardable);
-                            }
-                        }
-                        Err(rejection) => {
-                            tracing::debug!(
-                                rejection = ?rejection,
-                                phase = rejection.phase(),
-                                ingress = "forwarded",
-                                "consumer record rejected"
-                            );
-                            break;
-                        }
-                    },
-                    Message::Ping(payload) => {
-                        if !send_socket_until(
-                            &mut socket,
-                            Message::Pong(payload),
-                            consumer_deadline,
-                        )
-                        .await
-                        {
-                            break;
-                        }
-                    }
-                    Message::Close(_) => break,
-                    Message::Pong(_) => {}
-                    Message::Text(_) => break,
-                }
-            }
-            RemoteConsumerEvent::Remote(remote) => {
-                let record = match remote {
-                    Ok(Some(record)) => record,
-                    Ok(None) => {
-                        handle.record_peer_consumer_diagnostic(
-                            &diagnostic_context,
-                            PeerConsumerDiagnosticRole::IngressReceive,
-                            PeerTransportDiagnosticOutcome::Closed,
-                            None,
-                        );
+            RemoteConsumerEvent::Inbound(inbound) => match inbound {
+                None | Some(Err(_)) => ended(),
+                Some(Ok(Message::Binary(bytes))) => match cursor.forward(&bytes) {
+                    Ok(forwardable) if forwardable.is_empty() => RemoteConsumerStep::Continue,
+                    Ok(forwardable) => RemoteConsumerStep::Hold(forwardable),
+                    Err(rejection) => {
                         tracing::debug!(
-                            phase = "consumer_peer_stream_end",
-                            "consumer peer stream ended"
+                            rejection = ?rejection,
+                            phase = rejection.phase(),
+                            ingress = "forwarded",
+                            "consumer record rejected"
                         );
-                        break;
+                        ended()
                     }
-                    Err(error) => {
-                        let (outcome, h3_code) = peer_consumer_diagnostic_outcome(&error);
-                        handle.record_peer_consumer_diagnostic(
-                            &diagnostic_context,
-                            PeerConsumerDiagnosticRole::IngressReceive,
-                            outcome,
-                            h3_code,
-                        );
-                        handle.record_peer_fault(&fault, &error);
-                        tracing::debug!(error = %error, phase = "consumer_peer_receive", "remote consumer receive failed");
-                        break;
+                },
+                Some(Ok(Message::Ping(payload))) => {
+                    if send_socket_until(&mut socket, Message::Pong(payload), consumer_deadline)
+                        .await
+                    {
+                        RemoteConsumerStep::Continue
+                    } else {
+                        ended()
                     }
-                };
-                match record.kind() {
+                }
+                Some(Ok(Message::Pong(_))) => RemoteConsumerStep::Continue,
+                Some(Ok(Message::Close(_) | Message::Text(_))) => ended(),
+            },
+            RemoteConsumerEvent::Remote(remote) => match remote {
+                Ok(Some(record)) => match record.kind() {
                     PeerRecordKind::ConsumerChunk => {
                         let outcome = send_socket_outcome_until(
                             &mut socket,
@@ -2267,38 +2445,84 @@ async fn handle_remote_consumer_stream(
                             )
                             .await;
                         }
-                        if !outcome.is_sent() {
+                        if outcome.is_sent() {
+                            RemoteConsumerStep::Continue
+                        } else {
                             tracing::debug!(
                                 body_len = record.body_len(),
                                 phase = "consumer_public_response_send",
                                 "consumer response forwarding failed"
                             );
-                            break;
+                            ended()
                         }
                     }
-                    PeerRecordKind::Close => {
-                        // The owner's coded close for an OPEN its connector
-                        // refused (task row M6-C213).
-                        refusal_close = forwarded_refusal_close(record.body());
-                        break;
-                    }
-                    _ => break,
+                    // The owner's coded close for an OPEN its connector
+                    // refused (task row M6-C213).
+                    PeerRecordKind::Close => RemoteConsumerStep::End(RemoteConsumerEnd {
+                        forwarder_finished: false,
+                        close: forwarded_refusal_close(record.body()),
+                    }),
+                    _ => ended(),
+                },
+                Ok(None) => {
+                    handle.record_peer_consumer_diagnostic(
+                        &diagnostic_context,
+                        PeerConsumerDiagnosticRole::IngressReceive,
+                        PeerTransportDiagnosticOutcome::Closed,
+                        None,
+                    );
+                    tracing::debug!(
+                        phase = "consumer_peer_stream_end",
+                        "consumer peer stream ended"
+                    );
+                    ended()
                 }
+                Err(error) => {
+                    let (outcome, h3_code) = peer_consumer_diagnostic_outcome(&error);
+                    handle.record_peer_consumer_diagnostic(
+                        &diagnostic_context,
+                        PeerConsumerDiagnosticRole::IngressReceive,
+                        outcome,
+                        h3_code,
+                    );
+                    handle.record_peer_fault(&fault, &error);
+                    tracing::debug!(error = %error, phase = "consumer_peer_receive", "remote consumer receive failed");
+                    ended()
+                }
+            },
+        };
+        phase = match phase.on_step(step) {
+            Ok((next, released)) => {
+                if let Some((slot, frame)) = released {
+                    slot.send(frame);
+                }
+                next
             }
-        }
-    }
+            Err(refused) => {
+                // Each select shape only offers the steps its phase takes, so
+                // this is a defect in this loop, not a peer's doing.
+                tracing::debug!(
+                    refused = ?refused,
+                    phase = "consumer_peer_loop_state",
+                    "forwarded consumer loop refused a step"
+                );
+                RemoteConsumerPhase::Closing(RemoteConsumerEnd {
+                    forwarder_finished: false,
+                    close: None,
+                })
+            }
+        };
+    };
+    let RemoteConsumerPhase::Closing(end) = end else {
+        unreachable!("the loop only leaves from its closing phase")
+    };
     drop(forward_tx);
     let _ = stop_forward_tx.send(());
-    if !forwarder_finished {
+    if !end.forwarder_finished {
         let _ = forwarder.await;
     }
     recv.cancel();
-    let _ = send_socket_until(
-        &mut socket,
-        Message::Close(refusal_close),
-        consumer_deadline,
-    )
-    .await;
+    let _ = send_socket_until(&mut socket, Message::Close(end.close), consumer_deadline).await;
 }
 
 async fn service_and_grant(
@@ -4051,8 +4275,7 @@ async fn handle_peer_consumer_stream(
         admission_context.clone(),
     );
     let mut assembler = ConsumerRecordAssembler::new(STREAM_RECORD_LIMIT);
-    let mut registration_closed = false;
-    let mut terminal_cause = None;
+    let mut termination = PeerEchoTermination::Undetermined;
     // The owner bounds this stream by the consumer's absolute authorization
     // deadline itself; the forwarding relay's own timer is not relied upon.
     let expires_in = (consumer_expires_at - Utc::now())
@@ -4066,12 +4289,10 @@ async fn handle_peer_consumer_stream(
     // event read ahead of the parked write is retained here; it is replayed
     // by the loop below once the write resolves.  Beyond that single bounded
     // slot the transport's own flow control applies, exactly as before.
-    let mut lookahead: Option<Option<PeerRecord>> = None;
+    let mut lookahead: PeerEchoLookahead<Option<PeerRecord>> = PeerEchoLookahead::Empty;
     let result: Result<(), PeerRuntimeError> = async {
         if let Err(error) = send.respond(StatusCode::OK).await {
-            if matches!(error, PeerRuntimeError::MembershipExpired) {
-                terminal_cause = Some(StreamTerminalCause::PeerMembershipExpired);
-            }
+            termination.observe_error(&error);
             let (outcome, h3_code) = peer_consumer_diagnostic_outcome(&error);
             handle.record_peer_consumer_diagnostic(
                 &diagnostic_context,
@@ -4088,12 +4309,12 @@ async fn handle_peer_consumer_stream(
                     if admission_context.as_ref().is_some_and(|admission| {
                         admission.reason() == Some(crate::PeerInvalidationReason::TrustExpired)
                     }) {
-                        terminal_cause = Some(StreamTerminalCause::PeerMembershipExpired);
+                        termination.signal(PeerEchoSignal::MembershipExpired);
                     }
                     break;
                 }
                 _ = registration.closed.cancelled() => {
-                    registration_closed = true;
+                    termination.signal(PeerEchoSignal::OwnerClosed);
                     break;
                 }
                 _ = &mut expires => {
@@ -4120,9 +4341,7 @@ async fn handle_peer_consumer_stream(
                             break;
                         }
                         Err(error) => {
-                            if matches!(error, PeerRuntimeError::MembershipExpired) {
-                                terminal_cause = Some(StreamTerminalCause::PeerMembershipExpired);
-                            }
+                            termination.observe_error(&error);
                             let (outcome, h3_code) = peer_consumer_diagnostic_outcome(&error);
                             handle.record_peer_consumer_diagnostic(
                                 &diagnostic_context,
@@ -4194,7 +4413,7 @@ async fn handle_peer_consumer_stream(
                                     if admission_context.as_ref().is_some_and(|admission| {
                                         admission.reason() == Some(crate::PeerInvalidationReason::TrustExpired)
                                     }) {
-                                        terminal_cause = Some(StreamTerminalCause::PeerMembershipExpired);
+                                        termination.signal(PeerEchoSignal::MembershipExpired);
                                         return Err(PeerRuntimeError::MembershipExpired);
                                     }
                                     return Err(PeerRuntimeError::Closed);
@@ -4204,7 +4423,7 @@ async fn handle_peer_consumer_stream(
                                     &registration.closed,
                                     &mut expires,
                                     async {
-                                        if lookahead.is_some() {
+                                        if lookahead.is_held() {
                                             std::future::pending::<()>().await;
                                         }
                                         recv.recv_message_until(receive_deadline).await
@@ -4213,7 +4432,11 @@ async fn handle_peer_consumer_stream(
                             };
                             match waited {
                                 BoundedStreamWrite::PeerEvent(Ok(inbound)) => {
-                                    lookahead = Some(inbound);
+                                    // The receive future above is parked
+                                    // while the slot is held, so it is empty.
+                                    if lookahead.hold(inbound).is_err() {
+                                        return Err(PeerRuntimeError::Closed);
+                                    }
                                 }
                                 other => break other,
                             }
@@ -4227,7 +4450,7 @@ async fn handle_peer_consumer_stream(
                             BoundedStreamWrite::Completed(Err(_)) | BoundedStreamWrite::StreamClosed
                         ) && registration.open_refusal().is_some()
                         {
-                            registration_closed = true;
+                            termination.signal(PeerEchoSignal::OwnerClosed);
                             break 'peer;
                         }
                         let response = match waited {
@@ -4246,7 +4469,7 @@ async fn handle_peer_consumer_stream(
                                 // record was outstanding.  Its outcome is
                                 // unknown, exactly like a failed actor
                                 // reply, so the same typed error applies.
-                                registration_closed = true;
+                                termination.signal(PeerEchoSignal::OwnerClosed);
                                 tracing::debug!(
                                     body_len,
                                     phase = "consumer_actor_stream_closed",
@@ -4271,9 +4494,7 @@ async fn handle_peer_consumer_stream(
                                 // outcome is unknown, like a closed stream,
                                 // but the receive failure is the typed first
                                 // cause and is recorded as such.
-                                if matches!(error, PeerRuntimeError::MembershipExpired) {
-                                    terminal_cause = Some(StreamTerminalCause::PeerMembershipExpired);
-                                }
+                                termination.observe_error(&error);
                                 let (outcome, h3_code) = peer_consumer_diagnostic_outcome(&error);
                                 handle.record_peer_consumer_diagnostic(
                                     &diagnostic_context,
@@ -4313,9 +4534,7 @@ async fn handle_peer_consumer_stream(
                             if let Err(error) =
                                 send.send_message(PeerRecordKind::ConsumerChunk, chunk).await
                             {
-                                if matches!(error, PeerRuntimeError::MembershipExpired) {
-                                    terminal_cause = Some(StreamTerminalCause::PeerMembershipExpired);
-                                }
+                                termination.observe_error(&error);
                                 let (outcome, h3_code) =
                                     peer_consumer_diagnostic_outcome(&error);
                                 handle.record_peer_consumer_diagnostic(
@@ -4338,13 +4557,11 @@ async fn handle_peer_consumer_stream(
         // ingress built before M6-C213 ends its consumer's socket on any
         // `Close` record with no code, exactly as it does on the request end
         // this replaces, so the record is backward compatible.
-        if registration_closed
+        if termination.owner_closed()
             && let Some(body) = open_refusal_close_record(registration.open_refusal())
             && let Err(error) = send.send_message(PeerRecordKind::Close, &body).await
         {
-            if matches!(error, PeerRuntimeError::MembershipExpired) {
-                terminal_cause = Some(StreamTerminalCause::PeerMembershipExpired);
-            }
+            termination.observe_error(&error);
             let (outcome, h3_code) = peer_consumer_diagnostic_outcome(&error);
             handle.record_peer_consumer_diagnostic(
                 &diagnostic_context,
@@ -4363,20 +4580,18 @@ async fn handle_peer_consumer_stream(
     // admission edge's typed reason or its own passed monotonic deadline is
     // positive evidence of the earlier cause; a stream the actor closed
     // itself keeps the actor's recorded reason.
-    if terminal_cause.is_none()
-        && !registration_closed
-        && admission_context
-            .as_ref()
-            .is_some_and(|admission| admission.trust_expired())
+    if admission_context
+        .as_ref()
+        .is_some_and(|admission| admission.trust_expired())
     {
-        terminal_cause = Some(StreamTerminalCause::PeerMembershipExpired);
+        termination.signal(PeerEchoSignal::MembershipExpiryInferred);
     }
     let result = match result {
         Ok(()) => match send.finish().await {
             Ok(()) => Ok(()),
             Err(error) => {
-                if !registration_closed && matches!(error, PeerRuntimeError::MembershipExpired) {
-                    terminal_cause = Some(StreamTerminalCause::PeerMembershipExpired);
+                if matches!(error, PeerRuntimeError::MembershipExpired) {
+                    termination.signal(PeerEchoSignal::MembershipExpiryInferred);
                 }
                 let (outcome, h3_code) = peer_consumer_diagnostic_outcome(&error);
                 handle.record_peer_consumer_diagnostic(
@@ -4400,7 +4615,12 @@ async fn handle_peer_consumer_stream(
     if matches!(
         timeout(
             Duration::from_secs(5),
-            handle.close_echo_stream_with_cause(key, stream_id, operation_id, terminal_cause,),
+            handle.close_echo_stream_with_cause(
+                key,
+                stream_id,
+                operation_id,
+                termination.terminal_cause(),
+            ),
         )
         .await,
         Ok(true)
@@ -5701,13 +5921,17 @@ mod tests {
     }
 
     use super::{
-        ConsumerUpgradeBarrier, ControlAttachBarrier, PeerAdmissionBarrier,
-        PeerAdmissionBarrierError, PeerAdmissionScope, ROTATION_FREEZE_CODE, control_refusal_close,
-        echo_failure_response, forwarded_bearer_token, forwarded_control_refusal_status,
-        is_no_live_owner, local_consumer_admission_response, method_not_allowed, owner_busy_close,
-        peer_consumer_diagnostic_outcome, peer_failure_response, remote_control_refusal_close,
-        service_resolution_response, stream_limit_response,
+        BarrierCore, BarrierEvent, BarrierPhase, ConsumerUpgradeBarrier, ControlAttachBarrier,
+        PeerAdmissionBarrier, PeerAdmissionBarrierError, PeerAdmissionScope, PeerEchoLookahead,
+        PeerEchoLookaheadFull, PeerEchoSignal, PeerEchoTermination, ROTATION_FREEZE_CODE,
+        RemoteConsumerEnd, RemoteConsumerPhase, RemoteConsumerRefused, RemoteConsumerStep,
+        RemoteConsumerTurn, control_refusal_close, echo_failure_response, forwarded_bearer_token,
+        forwarded_control_refusal_status, is_no_live_owner, local_consumer_admission_response,
+        method_not_allowed, owner_busy_close, peer_consumer_diagnostic_outcome,
+        peer_failure_response, remote_control_refusal_close, service_resolution_response,
+        stream_limit_response,
     };
+    use crate::runtime::StreamTerminalCause;
     use crate::{
         actor::RelayError,
         peer_runtime::PeerRuntimeError,
@@ -5717,6 +5941,7 @@ mod tests {
         extract::ws::Message,
         http::{HeaderMap, HeaderValue, StatusCode, header},
     };
+    use std::sync::{Arc, atomic::Ordering};
     use tunnel_catalog::CatalogError;
     use tunnel_protocol::{CONTROL_OWNER_BUSY_CLOSE_CODE, CONTROL_OWNER_BUSY_CLOSE_REASON};
     use uuid::Uuid;
@@ -5896,10 +6121,10 @@ mod tests {
         let scope = peer_admission_test_scope(70);
         assert!(barrier.arm(scope.clone()));
 
-        let reached = barrier.state.reached.notified();
+        let reached = barrier.state.core.reached.notified();
         tokio::pin!(reached);
         reached.as_mut().enable();
-        let released = barrier.state.release.notified();
+        let released = barrier.state.core.release.notified();
         tokio::pin!(released);
         released.as_mut().enable();
 
@@ -5916,6 +6141,281 @@ mod tests {
                 .await,
             Err(PeerAdmissionBarrierError::ReleasedBeforeHit)
         );
+    }
+
+    /// The one transition table every fixture barrier shares.
+    #[test]
+    fn the_barrier_phase_transition_table_is_exact() {
+        use BarrierEvent::{Arm, Hit, Release};
+        use BarrierPhase::{Armed, Held, Idle, Released};
+        let table = [
+            (Idle, Arm, Some(Armed)),
+            (Idle, Hit, None),
+            (Idle, Release, None),
+            (Armed, Arm, None),
+            (Armed, Hit, Some(Held)),
+            (Armed, Release, Some(Released)),
+            (Held, Arm, None),
+            (Held, Hit, None),
+            (Held, Release, Some(Released)),
+            (Released, Arm, None),
+            (Released, Hit, None),
+            (Released, Release, None),
+        ];
+        for (phase, event, next) in table {
+            assert_eq!(phase.on_event(event), next, "{phase:?} {event:?}");
+            assert_eq!(BarrierPhase::from_u8(phase as u8), phase);
+            // The shared cell applies exactly the table and reports the
+            // phase that refused an event without changing it.
+            let core = BarrierCore::new(false);
+            core.phase.store(phase as u8, Ordering::Release);
+            assert_eq!(core.apply(event), next.ok_or(phase), "{phase:?} {event:?}");
+            assert_eq!(core.phase(), next.unwrap_or(phase));
+        }
+    }
+
+    /// A pass-through barrier holds exactly the one armed handler, is never
+    /// reusable, and its release is sticky.
+    #[tokio::test]
+    async fn a_pass_through_barrier_holds_once_and_is_never_reusable() {
+        let barrier = Arc::new(ConsumerUpgradeBarrier::default());
+        // Not armed: not a barrier.
+        barrier
+            .wait_before_upgrade(std::time::Duration::from_secs(5))
+            .await;
+        assert_eq!(barrier.hit_count(), 0);
+        assert!(barrier.arm());
+        assert!(!barrier.arm(), "a second arm is refused");
+        let held = {
+            let barrier = Arc::clone(&barrier);
+            tokio::spawn(async move {
+                barrier
+                    .wait_before_upgrade(std::time::Duration::from_secs(30))
+                    .await;
+            })
+        };
+        barrier.wait_reached().await;
+        assert!(barrier.is_held());
+        assert_eq!(barrier.hit_count(), 1);
+        assert!(!barrier.arm(), "arming cannot reset a held barrier");
+        assert!(barrier.is_held());
+        barrier.release();
+        held.await.expect("held handler");
+        assert!(!barrier.is_held());
+        assert!(!barrier.arm(), "a released barrier is never reusable");
+        // A later handler passes straight through.
+        barrier
+            .wait_before_upgrade(std::time::Duration::from_secs(5))
+            .await;
+        assert_eq!(barrier.hit_count(), 1);
+
+        // The bounded fallback releases a handler nobody released.
+        let control = ControlAttachBarrier::default();
+        assert!(control.arm());
+        control
+            .wait_before_control_attach(std::time::Duration::from_millis(5))
+            .await;
+        assert_eq!(control.hit_count(), 1);
+        assert!(!control.is_held());
+        control.wait_reached().await;
+    }
+
+    /// The armed scope exists from `Armed` on and the observed scope only
+    /// once a handler was held: neither can be seen in a phase without it.
+    #[tokio::test]
+    async fn the_peer_admission_scopes_exist_only_in_the_phases_that_own_them() {
+        let barrier = PeerAdmissionBarrier::default();
+        assert_eq!(barrier.state.expected.get(), None);
+        assert_eq!(barrier.observed_scope(), None);
+        // An idle barrier is not a barrier.
+        assert_eq!(
+            barrier
+                .wait_before_peer_admission(
+                    peer_admission_test_scope(80),
+                    std::time::Duration::from_secs(1),
+                )
+                .await,
+            Ok(false)
+        );
+        assert_eq!(barrier.observed_scope(), None);
+        let scope = peer_admission_test_scope(81);
+        assert!(barrier.arm(scope.clone()));
+        assert_eq!(barrier.state.expected.get(), Some(&scope));
+        assert_eq!(barrier.observed_scope(), None);
+        // A losing arm changes neither the phase nor the armed scope.
+        assert!(!barrier.arm(peer_admission_test_scope(82)));
+        assert_eq!(barrier.state.expected.get(), Some(&scope));
+        assert_eq!(barrier.state.core.phase(), BarrierPhase::Armed);
+        let held = {
+            let barrier = barrier.clone();
+            let scope = scope.clone();
+            tokio::spawn(async move {
+                barrier
+                    .wait_before_peer_admission(scope, std::time::Duration::from_secs(30))
+                    .await
+            })
+        };
+        barrier.wait_reached().await;
+        assert_eq!(barrier.state.core.phase(), BarrierPhase::Held);
+        assert_eq!(barrier.observed_scope(), Some(scope.clone()));
+        // A second request while the first is held is refused, not held.
+        assert_eq!(
+            barrier
+                .wait_before_peer_admission(scope, std::time::Duration::from_secs(1))
+                .await,
+            Err(PeerAdmissionBarrierError::ReleasedBeforeHit)
+        );
+        barrier.release();
+        assert_eq!(held.await.expect("held request"), Ok(true));
+        assert_eq!(barrier.hit_count(), 1);
+    }
+
+    /// Every step of the forwarded consumer loop: the turn alternates on
+    /// every step, a held frame survives every turn until a slot takes it,
+    /// and steps a phase cannot take are refused.
+    #[test]
+    fn the_remote_consumer_phase_transition_table_is_exact() {
+        use RemoteConsumerTurn::{Local, Remote};
+        type Step = RemoteConsumerStep<&'static str>;
+        let end = || RemoteConsumerEnd {
+            forwarder_finished: true,
+            close: None,
+        };
+        assert_eq!(Remote.flipped(), Local);
+        assert_eq!(Local.flipped(), Remote);
+        for turn in [Remote, Local] {
+            let reading = || RemoteConsumerPhase::Reading { turn };
+            let holding = || RemoteConsumerPhase::Holding {
+                turn,
+                frame: vec![7, 8],
+            };
+            let next = turn.flipped();
+            assert_eq!(
+                reading().on_step(Step::Continue),
+                Ok((RemoteConsumerPhase::Reading { turn: next }, None))
+            );
+            assert_eq!(
+                reading().on_step(Step::Hold(vec![7, 8])),
+                Ok((
+                    RemoteConsumerPhase::Holding {
+                        turn: next,
+                        frame: vec![7, 8]
+                    },
+                    None
+                ))
+            );
+            assert_eq!(
+                reading().on_step(Step::Slot("slot")),
+                Err(RemoteConsumerRefused::NothingHeld)
+            );
+            assert_eq!(
+                reading().on_step(Step::End(end())),
+                Ok((RemoteConsumerPhase::Closing(end()), None))
+            );
+            // The held frame is kept across a turn that did not place it.
+            assert_eq!(
+                holding().on_step(Step::Continue),
+                Ok((
+                    RemoteConsumerPhase::Holding {
+                        turn: next,
+                        frame: vec![7, 8]
+                    },
+                    None
+                ))
+            );
+            // A slot releases exactly the held frame into that slot.
+            assert_eq!(
+                holding().on_step(Step::Slot("slot")),
+                Ok((
+                    RemoteConsumerPhase::Reading { turn: next },
+                    Some(("slot", vec![7, 8]))
+                ))
+            );
+            assert_eq!(
+                holding().on_step(Step::Hold(vec![9])),
+                Err(RemoteConsumerRefused::AlreadyHolding)
+            );
+            assert_eq!(
+                holding().on_step(Step::End(end())),
+                Ok((RemoteConsumerPhase::Closing(end()), None))
+            );
+        }
+        let closing = || RemoteConsumerPhase::Closing(end());
+        for step in [
+            Step::Continue,
+            Step::Hold(vec![1]),
+            Step::Slot("slot"),
+            Step::End(end()),
+        ] {
+            assert_eq!(closing().on_step(step), Err(RemoteConsumerRefused::Closed));
+        }
+    }
+
+    /// Every signal in every termination state of the owner echo loop.
+    #[test]
+    fn the_peer_echo_termination_table_is_exact() {
+        use PeerEchoSignal::{MembershipExpired as Typed, MembershipExpiryInferred, OwnerClosed};
+        use PeerEchoTermination as State;
+        let closed = |membership_expired| State::OwnerClosed { membership_expired };
+        let table = [
+            (State::Undetermined, OwnerClosed, closed(false)),
+            (State::Undetermined, Typed, State::MembershipExpired),
+            (
+                State::Undetermined,
+                MembershipExpiryInferred,
+                State::MembershipExpired,
+            ),
+            (State::MembershipExpired, OwnerClosed, closed(true)),
+            (State::MembershipExpired, Typed, State::MembershipExpired),
+            (
+                State::MembershipExpired,
+                MembershipExpiryInferred,
+                State::MembershipExpired,
+            ),
+            (closed(false), OwnerClosed, closed(false)),
+            // Only typed evidence reaches a stream its owner closed.
+            (closed(false), Typed, closed(true)),
+            (closed(false), MembershipExpiryInferred, closed(false)),
+            (closed(true), OwnerClosed, closed(true)),
+            (closed(true), Typed, closed(true)),
+            (closed(true), MembershipExpiryInferred, closed(true)),
+        ];
+        for (state, signal, next) in table {
+            assert_eq!(state.on_signal(signal), next, "{state:?} {signal:?}");
+        }
+        let expired = Some(StreamTerminalCause::PeerMembershipExpired);
+        for (state, owner_closed, cause) in [
+            (State::Undetermined, false, None),
+            (State::MembershipExpired, false, expired),
+            (closed(false), true, None),
+            (closed(true), true, expired),
+        ] {
+            assert_eq!(state.owner_closed(), owner_closed, "{state:?}");
+            assert_eq!(state.terminal_cause(), cause, "{state:?}");
+        }
+        // Only an error that names the expiry is typed evidence.
+        let mut state = State::Undetermined;
+        state.observe_error(&PeerRuntimeError::Closed);
+        assert_eq!(state, State::Undetermined);
+        state.observe_error(&PeerRuntimeError::MembershipExpired);
+        assert_eq!(state, State::MembershipExpired);
+    }
+
+    /// The owner loop's read-ahead slot holds exactly one event.
+    #[test]
+    fn the_peer_echo_lookahead_holds_exactly_one_event() {
+        let mut lookahead = PeerEchoLookahead::Empty;
+        assert!(!lookahead.is_held());
+        assert_eq!(lookahead.take(), None);
+        assert_eq!(lookahead.hold(Some(1)), Ok(()));
+        assert!(lookahead.is_held());
+        assert_eq!(lookahead.hold(Some(2)), Err(PeerEchoLookaheadFull));
+        assert_eq!(lookahead, PeerEchoLookahead::Held(Some(1)));
+        assert_eq!(lookahead.take(), Some(Some(1)));
+        assert_eq!(lookahead, PeerEchoLookahead::Empty);
+        // The request's end is an event like any other.
+        assert_eq!(lookahead.hold(None), Ok(()));
+        assert_eq!(lookahead.take(), Some(None));
     }
 
     #[test]

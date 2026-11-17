@@ -2,13 +2,13 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use bytes::Bytes;
 use http::{HeaderMap, HeaderName, HeaderValue, Request, Response, StatusCode, header};
 use http_body::Body;
-use tokio::sync::oneshot;
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -22,7 +22,7 @@ use crate::normalize;
 use crate::progress::{
     self, BudgetClock, PauseSignal, ProgressKind, WaitMark, track_partial_record,
 };
-use crate::pump::{self, PumpError};
+use crate::pump::{self, Delivery, DeliveryEffect, DeliveryEvent, Exit, PumpError};
 use crate::status::{
     ExchangeReport, Execution, Origin, Outcome, ResetDetail, gateway_response, gateway_status,
 };
@@ -58,31 +58,118 @@ enum HeadOutcome {
     Failed(Origin, ResetDetail),
 }
 
+/// Who answered the consumer's pending head.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HeadPhase {
+    /// Nothing was sent to the consumer yet.
+    Pending,
+    /// A gateway failure answered it.
+    Failed,
+    /// The response head was handed to the consumer.  A consumer that leaves
+    /// after this released a response body (M3-32).
+    Committed,
+    /// The response head was decided, but the consumer had already dropped
+    /// the pending head: it was never handed a body, so leaving is an
+    /// ordinary pre-head cancellation, not a release (M3-32 review).
+    Unclaimed,
+}
+
+impl HeadPhase {
+    const fn to_u8(self) -> u8 {
+        match self {
+            Self::Pending => 0,
+            Self::Failed => 1,
+            Self::Committed => 2,
+            Self::Unclaimed => 3,
+        }
+    }
+
+    const fn from_u8(value: u8) -> Self {
+        match value {
+            0 => Self::Pending,
+            1 => Self::Failed,
+            2 => Self::Committed,
+            _ => Self::Unclaimed,
+        }
+    }
+}
+
+/// The take-once answer to the consumer's pending head.
+///
+/// The phase is the claim: exactly one caller moves it out of `Pending`, and
+/// only that caller sends.  The queue therefore carries at most one message
+/// ever, and its single slot is never full.
+struct HeadSlot {
+    phase: AtomicU8,
+    tx: mpsc::Sender<HeadOutcome>,
+}
+
+impl HeadSlot {
+    fn new() -> (Self, mpsc::Receiver<HeadOutcome>) {
+        let (tx, rx) = mpsc::channel(1);
+        let slot = Self {
+            phase: AtomicU8::new(HeadPhase::Pending.to_u8()),
+            tx,
+        };
+        (slot, rx)
+    }
+
+    fn phase(&self) -> HeadPhase {
+        HeadPhase::from_u8(self.phase.load(Ordering::SeqCst))
+    }
+
+    /// The only way out of `Pending`: true for the one caller that may send.
+    fn claim(&self, phase: HeadPhase) -> bool {
+        self.phase
+            .compare_exchange(
+                HeadPhase::Pending.to_u8(),
+                phase.to_u8(),
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_ok()
+    }
+
+    /// Answer a still-pending head with a gateway failure.
+    fn fail(&self, origin: Origin, detail: ResetDetail) {
+        if self.claim(HeadPhase::Failed) {
+            let _ = self.tx.try_send(HeadOutcome::Failed(origin, detail));
+        }
+    }
+
+    /// Hand the response head to the consumer.  False if the head was
+    /// already answered.
+    fn commit(&self, response: Response<ChannelBody>) -> bool {
+        // Claimed as `Committed` before the send, because a consumer that
+        // takes the head can release its body at once.  Every `Owner` method
+        // runs on the exchange's one `run` task and nothing here awaits, so
+        // no observer runs between the claim and the correction below.
+        if !self.claim(HeadPhase::Committed) {
+            return false;
+        }
+        if let Err(unsent) = self.tx.try_send(HeadOutcome::Committed(response)) {
+            self.phase
+                .store(HeadPhase::Unclaimed.to_u8(), Ordering::SeqCst);
+            // Dropped after the phase is corrected: an unsent body's drop
+            // cancels the exchange, and that path reads the phase.
+            drop(unsent);
+        }
+        true
+    }
+}
+
 struct Owner {
     exchange: Exchange,
-    head: Mutex<Option<oneshot::Sender<HeadOutcome>>>,
-    /// Set once a response head has been handed to the consumer.  A consumer
-    /// that leaves after this released a response body; before it, it
-    /// abandoned the request (M3-32).
-    committed: AtomicBool,
+    head: HeadSlot,
     consumer: CancellationToken,
 }
 
 impl Owner {
-    fn take_head(&self) -> Option<oneshot::Sender<HeadOutcome>> {
-        self.head
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take()
-    }
-
     /// Abort the exchange; before headers commit, answer with a gateway
     /// response carrying the first failure.
     fn fail(&self, origin: Origin, code: HttpErrorCode) {
-        if let Some(detail) = self.exchange.abort(code)
-            && let Some(head) = self.take_head()
-        {
-            let _ = head.send(HeadOutcome::Failed(origin, detail));
+        if let Some(detail) = self.exchange.abort(code) {
+            self.head.fail(origin, detail);
         }
     }
 
@@ -99,19 +186,9 @@ impl Owner {
     /// released the response body, which is recorded as
     /// [`Outcome::Released`] (M3-32).  Both send the same RESET.
     fn consumer_left(&self) {
-        // Read under the head lock, which `commit` holds from setting
-        // `committed` until it knows whether the consumer took the head, so
-        // an in-between value is never observed.
-        let committed = {
-            let _head = self
-                .head
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            self.committed.load(Ordering::SeqCst)
-        };
-        if committed {
+        if self.head.phase() == HeadPhase::Committed {
             // No gateway response can follow a committed head, so there is
-            // no head sender to answer.
+            // no pending head to answer.
             let _ = self.exchange.release(HttpErrorCode::Cancelled);
         } else {
             self.fail(Origin::Consumer, HttpErrorCode::Cancelled);
@@ -133,29 +210,7 @@ impl Owner {
     }
 
     fn commit(&self, response: Response<ChannelBody>) -> bool {
-        let mut slot = self
-            .head
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some(head) = slot.take() else {
-            return false;
-        };
-        // Marked before the send, because a consumer that takes the head can
-        // release its body at once; cleared again if the consumer had already
-        // dropped the pending head, because then it was never handed a body
-        // and leaving is an ordinary pre-head cancellation, not a release
-        // (M3-32 review).  The lock is held throughout, so `consumer_left`
-        // never sees the transient value.
-        self.committed.store(true, Ordering::SeqCst);
-        let unsent = head.send(HeadOutcome::Committed(response)).err();
-        if unsent.is_some() {
-            self.committed.store(false, Ordering::SeqCst);
-        }
-        drop(slot);
-        // Dropped outside the lock: an unsent body's drop cancels the
-        // exchange, and that path takes the lock again.
-        drop(unsent);
-        true
+        self.head.commit(response)
     }
 }
 
@@ -270,7 +325,7 @@ where
     };
     let method = ingress.head.method;
     let declared = ingress.head.body_length;
-    let (head_tx, head_rx) = oneshot::channel();
+    let (head, mut head_rx) = HeadSlot::new();
     let consumer = CancellationToken::new();
     let owner = Arc::new(Owner {
         exchange: Exchange::new(
@@ -279,8 +334,7 @@ where
             pause,
             config.progress(),
         ),
-        head: Mutex::new(Some(head_tx)),
-        committed: AtomicBool::new(false),
+        head,
         consumer: consumer.clone(),
     });
     let task = tokio::spawn(run(
@@ -301,16 +355,16 @@ where
     // that was never polled still cancels the exchange.
     let guard = consumer.drop_guard();
     let head = async move {
-        let outcome = head_rx.await;
+        let outcome = head_rx.recv().await;
         drop(guard.disarm());
         match outcome {
-            Ok(HeadOutcome::Committed(response)) => response,
-            Ok(HeadOutcome::Failed(origin, detail)) => gateway_response(
+            Some(HeadOutcome::Committed(response)) => response,
+            Some(HeadOutcome::Failed(origin, detail)) => gateway_response(
                 gateway_status(origin, detail.code, detail.execution),
                 detail.code,
                 detail.execution,
             ),
-            Err(_) => {
+            None => {
                 let execution = owner.exchange.execution();
                 gateway_response(
                     gateway_status(
@@ -379,8 +433,8 @@ where
     let watchdog = async {
         let deadline = tokio::time::sleep_until(deadline_at);
         let finished = async {
-            exchange.request_terminal.cancelled().await;
-            exchange.response_terminal.cancelled().await;
+            exchange.terminal(Dir::Request).await;
+            exchange.terminal(Dir::Response).await;
         };
         tokio::select! {
             biased;
@@ -432,53 +486,48 @@ async fn response_pump(
 ) {
     let exchange = &owner.exchange;
     let mut signal = from_device.reset_signal();
-    let mut body: Option<BodySender> = None;
-    let mut peer_terminated = false;
+    let mut delivery = Delivery::AwaitHead;
     let pause = exchange.pause.clone();
     let mut record = BudgetClock::new(ProgressKind::Record, &exchange.budgets);
     let mut fin = BudgetClock::new(ProgressKind::FinAfterEnd, &exchange.budgets);
     let mut record_ordinal = None;
-    let mut declared_remaining: Option<u64> = None;
-    'frames: loop {
+    let exit = 'frames: loop {
         let listen_only = exchange.is_complete(Dir::Response);
         let mark = WaitMark::now(&pause);
         let clocks = [record, fin];
         let frame = tokio::select! {
             biased;
-            () = exchange.stop.cancelled() => break,
-            () = exchange.request_terminal.cancelled(), if listen_only => return,
+            () = exchange.stopped() => break Exit::Local,
+            _ = exchange.terminal(Dir::Request), if listen_only => return,
             frame = from_device.recv() => frame,
             kind = progress::expired(clocks, mark, pause.clone()), if !listen_only => {
                 owner.progress_expired(kind);
-                break;
+                break Exit::Local;
             }
         };
         progress::end_wait(&mut [&mut record, &mut fin], mark, &pause);
-        if matches!(frame, None | Some(Frame::Reset(_))) {
-            peer_terminated = true;
-        }
         match frame {
             None => {
                 if !listen_only {
                     owner.fail(Origin::Upstream, HttpErrorCode::StreamInterrupted);
                 }
-                break;
+                break Exit::PeerTerminated;
             }
             Some(Frame::Reset(detail)) => {
                 owner.peer_reset(detail);
-                break;
+                break Exit::PeerTerminated;
             }
             Some(Frame::Fin) => match reader.fin() {
                 Ok(()) => {
                     fin.disarm();
-                    if let Some(sender) = body.take() {
-                        sender.finish();
-                    }
+                    // The reader accepts FIN only after END, where the
+                    // delivery awaits it; the body ends cleanly here.
+                    delivery.transition(DeliveryEvent::Fin);
                     exchange.complete(Dir::Response);
                 }
                 Err(error) => {
                     owner.fail(Origin::Upstream, error.code());
-                    break;
+                    break Exit::Local;
                 }
             },
             Some(Frame::Data(bytes)) => {
@@ -489,54 +538,59 @@ async fn response_pump(
                         Ok(None) => break,
                         Err(error) => {
                             owner.fail(Origin::Upstream, error.code());
-                            break 'frames;
+                            break 'frames Exit::Local;
                         }
                     };
                     match event {
                         ResponseEvent::Head(head) => {
-                            exchange.response_head.cancel();
-                            declared_remaining = head.body_length;
-                            if declared_remaining == Some(0) {
-                                fin.arm();
-                            }
+                            exchange.note_response_head();
+                            let declared = head.body_length;
                             match build_response(head, method, queue, &owner.consumer) {
                                 Ok((response, sender)) => {
                                     // A response head is only sent after the
                                     // handler returned.
                                     exchange.set_execution(Execution::Dispatched);
-                                    body = Some(sender);
+                                    let event = DeliveryEvent::Head { sender, declared };
+                                    if delivery.transition(event) == DeliveryEffect::ArmFin {
+                                        fin.arm();
+                                    }
                                     if !owner.commit(response) {
-                                        break 'frames;
+                                        break 'frames Exit::Local;
                                     }
                                 }
                                 Err(code) => {
                                     owner.fail(Origin::Upstream, code);
-                                    break 'frames;
+                                    break 'frames Exit::Local;
                                 }
                             }
                         }
                         ResponseEvent::Body(slice) => {
-                            let Some(sender) = body.as_ref() else {
-                                continue;
-                            };
                             let chunk = bytes.slice_ref(slice);
+                            let effect =
+                                delivery.transition(DeliveryEvent::Body(chunk.len() as u64));
                             // After the last declared byte only END and FIN
                             // may follow, so the FIN-after-END budget covers
                             // them from here.  The consumer may already have
                             // released the body at its declared length,
                             // which is not a cancellation (see `ChannelBody`).
-                            if let Some(remaining) = declared_remaining.as_mut() {
-                                *remaining = remaining.saturating_sub(chunk.len() as u64);
-                                if *remaining == 0 {
-                                    fin.arm();
-                                }
+                            if (effect
+                                == DeliveryEffect::Deliver {
+                                    last_declared: true,
+                                })
+                            {
+                                fin.arm();
                             }
+                            // No body is being fed outside the body phase:
+                            // the bytes are dropped.
+                            let Some(sender) = delivery.sender() else {
+                                continue;
+                            };
                             tokio::select! {
                                 biased;
-                                () = exchange.stop.cancelled() => break 'frames,
+                                () = exchange.stopped() => break 'frames Exit::Local,
                                 sent = sender.send(chunk) => if sent.is_err() {
                                     owner.consumer_left();
-                                    break 'frames;
+                                    break 'frames Exit::Local;
                                 },
                                 // Only a RESET before the device's FIN: bytes
                                 // of a response the device completed are
@@ -544,21 +598,22 @@ async fn response_pump(
                                 // order (it then aborts only the upload).
                                 detail = signal.wait_before_fin() => {
                                     owner.peer_reset(detail);
-                                    break 'frames;
+                                    break 'frames Exit::Local;
                                 }
                             }
                         }
-                        ResponseEvent::End => fin.arm(),
+                        ResponseEvent::End => {
+                            delivery.transition(DeliveryEvent::End);
+                            fin.arm();
+                        }
                     }
                 }
                 track_partial_record(reader.partial_record(), &mut record, &mut record_ordinal);
             }
         }
-    }
-    if let Some(sender) = body.take() {
-        sender.fail(exchange.error_code());
-    }
-    if !peer_terminated {
+    };
+    delivery.transition(DeliveryEvent::Stop(exchange.error_code()));
+    if exit == Exit::Local {
         // Bounded by the deadline plus a short grace: a peer that never
         // finishes cannot hold the exchange open, but a deadline abort still
         // gives the peer time to see the RESET instead of a lost receiver.
@@ -570,19 +625,20 @@ async fn response_pump(
 mod tests {
     use super::*;
 
-    fn owner_with_head(head: oneshot::Sender<HeadOutcome>) -> Owner {
+    fn owner() -> (Owner, mpsc::Receiver<HeadOutcome>) {
         let (to_device, _device_rx, _) = crate::stream::channel(64 * 1024);
-        Owner {
+        let (head, head_rx) = HeadSlot::new();
+        let owner = Owner {
             exchange: Exchange::new(
                 to_device,
                 Execution::Dispatched,
                 PauseSignal::never(),
                 BridgeConfig::default().progress(),
             ),
-            head: Mutex::new(Some(head)),
-            committed: AtomicBool::new(false),
+            head,
             consumer: CancellationToken::new(),
-        }
+        };
+        (owner, head_rx)
     }
 
     fn response() -> Response<ChannelBody> {
@@ -595,9 +651,8 @@ mod tests {
     /// committed, so the send fails; leaving then is a pre-head cancellation.
     #[tokio::test]
     async fn a_head_the_consumer_never_took_is_not_a_release() {
-        let (head_tx, head_rx) = oneshot::channel();
+        let (owner, head_rx) = owner();
         drop(head_rx);
-        let owner = owner_with_head(head_tx);
         assert!(owner.commit(response()));
         owner.consumer_left();
         let report = owner.exchange.report();
@@ -609,8 +664,7 @@ mod tests {
     /// later departure a release.
     #[tokio::test]
     async fn a_head_the_consumer_took_makes_leaving_a_release() {
-        let (head_tx, _head_rx) = oneshot::channel();
-        let owner = owner_with_head(head_tx);
+        let (owner, _head_rx) = owner();
         assert!(owner.commit(response()));
         owner.consumer_left();
         assert_eq!(owner.exchange.report().response, Outcome::Released);

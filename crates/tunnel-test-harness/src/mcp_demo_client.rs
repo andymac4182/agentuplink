@@ -19,7 +19,10 @@
 
 use std::{
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 
@@ -276,17 +279,23 @@ impl Sidecar {
 }
 
 /// What the demo client's handler saw arrive from the server.
+///
+/// The scenario only ever asks how many progress and log notifications have
+/// arrived, so those are independent counters. Resource-update URIs are handed
+/// to the scenario over `DemoHandler::updated`, which it drains itself.
 #[derive(Default)]
 struct Seen {
-    progress: Mutex<Vec<f64>>,
-    updated: Mutex<Vec<String>>,
-    logs: Mutex<u64>,
+    progress: AtomicU64,
+    logs: AtomicU64,
     changed: tokio::sync::Notify,
 }
 
 #[derive(Clone)]
 struct DemoHandler {
     seen: Arc<Seen>,
+    /// Resource-update URIs in arrival order. A test recorder: the scenario
+    /// holds the receiver and a demo run delivers a handful of notifications.
+    updated: tokio::sync::mpsc::UnboundedSender<String>,
     protocol: ProtocolVersion,
 }
 
@@ -297,12 +306,10 @@ impl ClientHandler for DemoHandler {
 
     async fn on_progress(
         &self,
-        params: ProgressNotificationParam,
+        _params: ProgressNotificationParam,
         _context: NotificationContext<RoleClient>,
     ) {
-        if let Ok(mut progress) = self.seen.progress.lock() {
-            progress.push(params.progress);
-        }
+        self.seen.progress.fetch_add(1, Ordering::AcqRel);
         self.seen.changed.notify_waiters();
     }
 
@@ -311,10 +318,9 @@ impl ClientHandler for DemoHandler {
         params: ResourceUpdatedNotificationParam,
         _context: NotificationContext<RoleClient>,
     ) {
-        if let Ok(mut updated) = self.seen.updated.lock() {
-            updated.push(params.uri);
-        }
-        self.seen.changed.notify_waiters();
+        // The scenario may already have finished its subscription step and
+        // dropped the receiver; a late update is then simply not observed.
+        let _ = self.updated.send(params.uri);
     }
 
     #[allow(deprecated)]
@@ -323,9 +329,7 @@ impl ClientHandler for DemoHandler {
         _params: rmcp::model::LoggingMessageNotificationParam,
         _context: NotificationContext<RoleClient>,
     ) {
-        if let Ok(mut logs) = self.seen.logs.lock() {
-            *logs += 1;
-        }
+        self.seen.logs.fetch_add(1, Ordering::AcqRel);
         self.seen.changed.notify_waiters();
     }
 }
@@ -423,8 +427,10 @@ pub async fn run(args: DemoArgs) -> Result<()> {
         config,
     );
     let seen = Arc::new(Seen::default());
+    let (updated, mut updated_uris) = tokio::sync::mpsc::unbounded_channel();
     let handler = DemoHandler {
         seen: Arc::clone(&seen),
+        updated,
         protocol: if legacy {
             ProtocolVersion::V_2025_11_25
         } else {
@@ -575,13 +581,17 @@ pub async fn run(args: DemoArgs) -> Result<()> {
             client.call_tool(CallToolRequestParams::new("touch").with_arguments(touch)),
         )
         .await?;
-        let arrived = seen
-            .wait(|seen| {
-                seen.updated
-                    .lock()
-                    .is_ok_and(|updated| updated.iter().any(|value| value == uri))
-            })
-            .await;
+        let arrived = timeout(STEP, async {
+            loop {
+                match updated_uris.recv().await {
+                    Some(value) if value == uri => return true,
+                    Some(_) => {}
+                    None => return false,
+                }
+            }
+        })
+        .await
+        .unwrap_or(false);
         if !arrived {
             return Err(step_error(
                 "resources/subscribe",
@@ -635,12 +645,12 @@ pub async fn run(args: DemoArgs) -> Result<()> {
     )
     .await?;
     let logs_arrived = seen
-        .wait(|seen| seen.logs.lock().is_ok_and(|logs| *logs >= 2))
+        .wait(|seen| seen.logs.load(Ordering::Acquire) >= 2)
         .await;
     println!(
         "mcp-demo: step=notifications logs_received={} progress_received={}",
-        seen.logs.lock().map_or(0, |logs| *logs),
-        seen.progress.lock().map_or(0, |progress| progress.len())
+        seen.logs.load(Ordering::Acquire),
+        seen.progress.load(Ordering::Acquire)
     );
     if !logs_arrived {
         return Err(step_error(

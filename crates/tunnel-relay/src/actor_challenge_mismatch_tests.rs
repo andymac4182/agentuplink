@@ -169,7 +169,6 @@ fn m2_actor(fixture: &Fixture) -> M2Fixture {
         .get_mut(&fixture.key.scope())
         .expect("test session");
     session.profile = super::RuntimeProfile::M2;
-    session.data_tx = Some(data_tx.clone());
     session.active_carrier = Some(DataCarrier {
         context: CarrierContext::new(
             fixture.key.session_id.clone(),
@@ -365,8 +364,8 @@ async fn mismatched_pending_challenge_fails_the_operation_promptly_with_its_type
             actor.sessions[&fixture.key.scope()]
                 .pending
                 .get(&stream_id)
-                .is_some_and(|pending| pending.abandon.abandoned
-                    && !pending.dispatched
+                .is_some_and(|pending| pending.exchange.abandoned()
+                    && !pending.exchange.dispatched()
                     && pending.body.is_empty()),
             "{mismatch:?}: the refused pending operation must be answered and abandoned, \
              never dispatched"

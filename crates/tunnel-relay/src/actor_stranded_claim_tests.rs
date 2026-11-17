@@ -123,12 +123,12 @@ async fn strand_register_resolved(
             ),
             data_connection_id: "stranded-claim-data".into(),
             response,
-            owner_cleanup: handle.claim_handoffs.deposit(Some(guard)),
+            owner_cleanup: handle.deposit_claim_for_test(guard).await,
             result: Box::new(Err(RegisterControlFailure::OwnerBusy)),
         })
         .await
         .expect("park the command");
-    assert_eq!(handle.claim_handoffs.parked(), 1);
+    assert_eq!(handle.parked_claims_for_test(), 1);
     (parked_tx, parked)
 }
 
@@ -170,7 +170,7 @@ async fn a_stranded_register_resolved_releases_its_owner_claim_when_the_actor_en
         "an owner claim stranded behind an ended actor must be released when the actor ends, \
          not left fenced until its lease expires"
     );
-    assert_eq!(handle.claim_handoffs.parked(), 0);
+    assert_eq!(handle.parked_claims_for_test(), 0);
 }
 
 #[tokio::test]
@@ -221,7 +221,7 @@ async fn a_stranded_claim_never_releases_an_owner_that_has_since_changed() {
     let _ = handle.shutdown().await;
 
     assert_eq!(
-        handle.claim_handoffs.parked(),
+        handle.parked_claims_for_test(),
         0,
         "the stranded guard was consumed"
     );
@@ -261,7 +261,7 @@ async fn drop_queued_register_resolved_in_actor_field_order(
             ),
             data_connection_id: "queued-claim-data".into(),
             response,
-            owner_cleanup: handle.claim_handoffs.deposit(Some(guard)),
+            owner_cleanup: handle.deposit_claim_for_test(guard).await,
             result: Box::new(Err(RegisterControlFailure::OwnerBusy)),
         })
         .await
@@ -282,7 +282,7 @@ async fn a_register_resolved_queued_when_the_actor_is_aborted_releases_its_claim
     let handle = relay(&catalog);
     drop_queued_register_resolved_in_actor_field_order(&handle, &catalog, claim.token).await;
     assert_eq!(
-        handle.claim_handoffs.parked(),
+        handle.parked_claims_for_test(),
         1,
         "a dropped command leaves its guard parked rather than dropping it onto a dying worker"
     );
@@ -329,7 +329,7 @@ async fn a_register_resolved_queued_at_shutdown_releases_its_claim() {
 #[tokio::test]
 async fn the_stranded_release_ends_at_its_deadline_and_counts_what_it_left() {
     let catalog = seeded_catalog().await;
-    let handoffs = super::ClaimHandoffs::default();
+    let mut handoffs = super::ClaimHandoffs::default();
     let worker = CleanupWorker::spawn(Arc::new(catalog.clone()) as SharedCatalog);
     let dispatcher = worker.dispatcher();
     let mut parked = Vec::new();
@@ -342,9 +342,11 @@ async fn the_stranded_release_ends_at_its_deadline_and_counts_what_it_left() {
     let started = tokio::time::Instant::now();
     let outcome = tokio::time::timeout(
         Duration::from_secs(2),
-        super::release_parked_until(&handoffs, started + Duration::from_millis(100), |_item| {
-            std::future::pending::<()>()
-        }),
+        super::release_parked_until(
+            &mut handoffs,
+            started + Duration::from_millis(100),
+            |_item| std::future::pending::<()>(),
+        ),
     )
     .await
     .expect("the stranded release must end at its own deadline, not wait on the authority");

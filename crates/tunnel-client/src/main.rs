@@ -1560,7 +1560,7 @@ impl ReconnectState {
 /// `--json` events of the reconnect loop. Identifiers, counters, durations
 /// and the cause's code and bounded message only -- never payloads.
 #[derive(Serialize)]
-struct ReconnectEvent<'a> {
+struct ReconnectEventLine<'a> {
     state: &'static str,
     /// The retry this event belongs to: 1 for the first after a failure.
     attempt: u32,
@@ -1576,6 +1576,275 @@ struct ReconnectEvent<'a> {
     message: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     delay_ms: Option<u64>,
+}
+
+/// One `--json` event of the reconnect loop, carrying exactly the fields its
+/// kind prints. It serialises as the flat [`ReconnectEventLine`].
+#[derive(Clone, Copy, Debug)]
+enum ReconnectEvent<'a> {
+    /// A session (or a connect attempt) ended and will be retried.
+    Disconnected {
+        attempt: u32,
+        sessions: u64,
+        session_id: Option<&'a str>,
+        ready_ms: Option<u64>,
+        code: &'static str,
+        message: &'a str,
+    },
+    /// The supervisor is waiting `delay_ms` before retry `attempt`.
+    Backoff {
+        attempt: u32,
+        sessions: u64,
+        code: &'static str,
+        delay_ms: u64,
+    },
+    /// The wait ended and retry `attempt` is starting.
+    Reconnecting { attempt: u32, sessions: u64 },
+    /// Retry `attempt` produced a ready session.
+    Reconnected {
+        attempt: u32,
+        sessions: u64,
+        session_id: Option<&'a str>,
+    },
+}
+
+impl<'a> ReconnectEvent<'a> {
+    fn line(self) -> ReconnectEventLine<'a> {
+        match self {
+            Self::Disconnected {
+                attempt,
+                sessions,
+                session_id,
+                ready_ms,
+                code,
+                message,
+            } => ReconnectEventLine {
+                state: "disconnected",
+                attempt,
+                sessions,
+                session_id,
+                ready_ms,
+                code: Some(code),
+                message: Some(message),
+                delay_ms: None,
+            },
+            Self::Backoff {
+                attempt,
+                sessions,
+                code,
+                delay_ms,
+            } => ReconnectEventLine {
+                state: "backoff",
+                attempt,
+                sessions,
+                session_id: None,
+                ready_ms: None,
+                code: Some(code),
+                message: None,
+                delay_ms: Some(delay_ms),
+            },
+            Self::Reconnecting { attempt, sessions } => ReconnectEventLine {
+                state: "reconnecting",
+                attempt,
+                sessions,
+                session_id: None,
+                ready_ms: None,
+                code: None,
+                message: None,
+                delay_ms: None,
+            },
+            Self::Reconnected {
+                attempt,
+                sessions,
+                session_id,
+            } => ReconnectEventLine {
+                state: "reconnected",
+                attempt,
+                sessions,
+                session_id,
+                ready_ms: None,
+                code: None,
+                message: None,
+                delay_ms: None,
+            },
+        }
+    }
+}
+
+impl Serialize for ReconnectEvent<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.line().serialize(serializer)
+    }
+}
+
+/// The supervisor's connection phase: what `status` reports as `state`,
+/// with the data that exists only in that phase.
+///
+/// ```text
+/// Starting --> Connecting --> Ready --> SessionStopping --> Backoff --> Connecting
+///                  |            (session snapshots)            ^
+///                  +-------------------------------------------+
+/// any of those --> ShuttingDown (terminal)
+/// ```
+#[derive(Clone, Debug, PartialEq)]
+enum SupervisorPhase {
+    /// The process started; no connect attempt yet.
+    Starting,
+    /// A connect attempt is in progress; `retry` is set when it follows a
+    /// failure.
+    Connecting { retry: Option<u32> },
+    /// A session is ready. `session` is its latest snapshot, absent until
+    /// the first one is published.
+    Ready {
+        retry: Option<u32>,
+        session: Option<Box<tunnel_client::supervisor_ipc::SessionStatus>>,
+    },
+    /// The session is being stopped and joined; its last snapshot stays
+    /// visible.
+    SessionStopping {
+        retry: Option<u32>,
+        session: Option<Box<tunnel_client::supervisor_ipc::SessionStatus>>,
+    },
+    /// Waiting `delay_ms` before retry `attempt`.
+    Backoff { attempt: u32, delay_ms: u64 },
+    /// The supervisor is exiting. It keeps reporting the attempt, and the
+    /// delay of a backoff it interrupted, exactly as they stood.
+    ShuttingDown {
+        attempt: Option<u32>,
+        retry_delay_ms: Option<u64>,
+    },
+}
+
+/// What moves the supervisor from one phase to the next.
+#[derive(Clone, Debug, PartialEq)]
+enum SupervisorEvent {
+    /// A connect attempt starts: the first, or the retry a backoff awaited.
+    ConnectStarted,
+    /// The attempt produced a ready session.
+    SessionReady,
+    /// The ready session published a status snapshot.
+    SessionSnapshot(Box<tunnel_client::supervisor_ipc::SessionStatus>),
+    /// The session ended or was asked to stop, and is being joined.
+    SessionEnding,
+    /// The attempt or session failed and retry `attempt` waits `delay_ms`.
+    BackoffStarted { attempt: u32, delay_ms: u64 },
+    /// The supervisor is exiting.
+    Shutdown,
+}
+
+/// An event the supervisor's current phase does not accept.
+#[derive(Clone, Debug, PartialEq)]
+struct IllegalSupervisorTransition {
+    from: &'static str,
+    event: SupervisorEvent,
+}
+
+impl SupervisorPhase {
+    /// The `state` string `status` reports. `SessionStopping` and
+    /// `ShuttingDown` are both `stopping`.
+    fn state(&self) -> &'static str {
+        match self {
+            Self::Starting => "starting",
+            Self::Connecting { .. } => "connecting",
+            Self::Ready { .. } => "ready",
+            Self::SessionStopping { .. } | Self::ShuttingDown { .. } => "stopping",
+            Self::Backoff { .. } => "backoff",
+        }
+    }
+
+    /// The reconnect attempt in progress or awaited.
+    fn attempt(&self) -> Option<u32> {
+        match self {
+            Self::Starting => None,
+            Self::Connecting { retry }
+            | Self::Ready { retry, .. }
+            | Self::SessionStopping { retry, .. } => *retry,
+            Self::Backoff { attempt, .. } => Some(*attempt),
+            Self::ShuttingDown { attempt, .. } => *attempt,
+        }
+    }
+
+    fn retry_delay_ms(&self) -> Option<u64> {
+        match self {
+            Self::Backoff { delay_ms, .. } => Some(*delay_ms),
+            Self::ShuttingDown { retry_delay_ms, .. } => *retry_delay_ms,
+            Self::Starting
+            | Self::Connecting { .. }
+            | Self::Ready { .. }
+            | Self::SessionStopping { .. } => None,
+        }
+    }
+
+    fn session(&self) -> Option<&tunnel_client::supervisor_ipc::SessionStatus> {
+        match self {
+            Self::Ready { session, .. } | Self::SessionStopping { session, .. } => {
+                session.as_deref()
+            }
+            Self::Starting
+            | Self::Connecting { .. }
+            | Self::Backoff { .. }
+            | Self::ShuttingDown { .. } => None,
+        }
+    }
+
+    /// Write this phase's fields of the published snapshot. The counters and
+    /// identity fields are not part of the phase and are left alone.
+    fn project(&self, status: &mut tunnel_client::supervisor_ipc::SupervisorStatus) {
+        self.state().clone_into(&mut status.state);
+        status.attempt = self.attempt();
+        status.retry_delay_ms = self.retry_delay_ms();
+        status.session = self.session().cloned();
+    }
+
+    /// The only place the supervisor's phase changes.
+    fn on_event(self, event: SupervisorEvent) -> Result<Self, IllegalSupervisorTransition> {
+        let from = self.state();
+        match (self, event) {
+            (Self::Starting, SupervisorEvent::ConnectStarted) => {
+                Ok(Self::Connecting { retry: None })
+            }
+            (Self::Backoff { attempt, .. }, SupervisorEvent::ConnectStarted) => {
+                Ok(Self::Connecting {
+                    retry: Some(attempt),
+                })
+            }
+            (Self::Connecting { retry }, SupervisorEvent::SessionReady) => Ok(Self::Ready {
+                retry,
+                session: None,
+            }),
+            (Self::Ready { retry, .. }, SupervisorEvent::SessionSnapshot(session)) => {
+                Ok(Self::Ready {
+                    retry,
+                    session: Some(session),
+                })
+            }
+            (Self::Connecting { retry }, SupervisorEvent::SessionEnding) => {
+                Ok(Self::SessionStopping {
+                    retry,
+                    session: None,
+                })
+            }
+            (Self::Ready { retry, session }, SupervisorEvent::SessionEnding) => {
+                Ok(Self::SessionStopping { retry, session })
+            }
+            (
+                Self::Connecting { .. } | Self::SessionStopping { .. },
+                SupervisorEvent::BackoffStarted { attempt, delay_ms },
+            ) => Ok(Self::Backoff { attempt, delay_ms }),
+            (
+                phase @ (Self::Starting
+                | Self::Connecting { .. }
+                | Self::Ready { .. }
+                | Self::SessionStopping { .. }
+                | Self::Backoff { .. }),
+                SupervisorEvent::Shutdown,
+            ) => Ok(Self::ShuttingDown {
+                attempt: phase.attempt(),
+                retry_delay_ms: phase.retry_delay_ms(),
+            }),
+            (_, event) => Err(IllegalSupervisorTransition { from, event }),
+        }
+    }
 }
 
 fn millis(duration: std::time::Duration) -> u64 {
@@ -1604,6 +1873,9 @@ fn interrupted_during_backoff(signal: StopSignal, attempt: u32, last: &CliError)
 /// publishes and the server task answering `status` and `doctor`.
 struct SupervisorPublisher {
     status: tokio::sync::watch::Sender<tunnel_client::supervisor_ipc::SupervisorStatus>,
+    /// The phase the published snapshot's `state`, `attempt`,
+    /// `retry_delay_ms` and `session` are projected from.
+    phase: SupervisorPhase,
     server: Option<(CancellationToken, tokio::task::JoinHandle<()>)>,
     /// `disconnect` requests (M0-03), until `run_connect` hands them to the
     /// stop signals.
@@ -1646,7 +1918,6 @@ impl SupervisorPublisher {
         use tunnel_client::supervisor_ipc::{ExportStatus, RotationPolicyStatus, SupervisorStatus};
         let initial = SupervisorStatus {
             pid: std::process::id(),
-            state: "starting".to_owned(),
             device_id: config.device_id.clone(),
             certificate_expires_at_unix: device_certificate_window(config)
                 .map(|(_, not_after)| not_after),
@@ -1668,6 +1939,9 @@ impl SupervisorPublisher {
                 .collect(),
             ..SupervisorStatus::default()
         };
+        let phase = SupervisorPhase::Starting;
+        let mut initial = initial;
+        phase.project(&mut initial);
         let (status, receiver) = tokio::sync::watch::channel(initial);
         let (server, lock) = start_ipc_server(config, receiver)?;
         let (server, disconnect) = match server {
@@ -1676,14 +1950,42 @@ impl SupervisorPublisher {
         };
         Ok(Self {
             status,
+            phase,
             server,
             disconnect,
             _lock: lock,
         })
     }
 
-    fn update(&self, change: impl FnOnce(&mut tunnel_client::supervisor_ipc::SupervisorStatus)) {
-        self.status.send_modify(change);
+    /// Move to the next phase and publish it, with `change` applied to the
+    /// snapshot's counters in the same publication.
+    ///
+    /// An event the current phase does not accept is a defect in the caller:
+    /// the phase and the published snapshot are left as they were.
+    fn advance_with(
+        &mut self,
+        event: SupervisorEvent,
+        change: impl FnOnce(&mut tunnel_client::supervisor_ipc::SupervisorStatus),
+    ) {
+        match self.phase.clone().on_event(event) {
+            Ok(phase) => {
+                self.phase = phase;
+                let phase = &self.phase;
+                self.status.send_modify(|status| {
+                    phase.project(status);
+                    change(status);
+                });
+            }
+            Err(illegal) => debug_assert!(
+                false,
+                "supervisor phase {} does not accept {:?}",
+                illegal.from, illegal.event
+            ),
+        }
+    }
+
+    fn advance(&mut self, event: SupervisorEvent) {
+        self.advance_with(event, |_| {});
     }
 
     /// Stop answering and remove the socket, bounded.
@@ -1749,13 +2051,10 @@ async fn run_connect(path: PathBuf, json: bool, no_reconnect: bool) -> Result<()
     stop.attach_disconnect(publisher.disconnect.take());
     // M0-07: after the profile lock, before the first attempt.
     let result = match pin_credentials(&mut config) {
-        Ok(()) => run_supervised(&config, &mut stop, &publisher, json, no_reconnect).await,
+        Ok(()) => run_supervised(&config, &mut stop, &mut publisher, json, no_reconnect).await,
         Err(error) => Err(error),
     };
-    publisher.update(|status| {
-        status.state = "stopping".to_owned();
-        status.session = None;
-    });
+    publisher.advance(SupervisorEvent::Shutdown);
     publisher.shutdown().await;
     result
 }
@@ -1763,7 +2062,7 @@ async fn run_connect(path: PathBuf, json: bool, no_reconnect: bool) -> Result<()
 async fn run_supervised(
     config: &ConnectConfig,
     stop: &mut StopSignals,
-    publisher: &SupervisorPublisher,
+    publisher: &mut SupervisorPublisher,
     json: bool,
     no_reconnect: bool,
 ) -> Result<(), CliError> {
@@ -1774,12 +2073,7 @@ async fn run_supervised(
     // The retry in progress, if this attempt follows a failure.
     let mut retry: Option<u32> = None;
     loop {
-        publisher.update(|status| {
-            status.state = "connecting".to_owned();
-            status.attempt = retry;
-            status.retry_delay_ms = None;
-            status.session = None;
-        });
+        publisher.advance(SupervisorEvent::ConnectStarted);
         let end = run_one_session(
             &config,
             stop,
@@ -1819,39 +2113,35 @@ async fn run_supervised(
             return Err(error);
         };
         let session_id = ready.as_ref().map(|(id, _)| id.as_str());
-        publisher.update(|status| {
-            status.state = "backoff".to_owned();
-            status.attempt = Some(attempt);
-            status.retry_delay_ms = Some(millis(delay));
-            status.last_error_code = Some(error.code().to_owned());
-            status.sessions = state.sessions;
-            status.session = None;
-        });
+        publisher.advance_with(
+            SupervisorEvent::BackoffStarted {
+                attempt,
+                delay_ms: millis(delay),
+            },
+            |status| {
+                status.last_error_code = Some(error.code().to_owned());
+                status.sessions = state.sessions;
+            },
+        );
         if json {
             print_ok_json(
                 "connect",
-                ReconnectEvent {
-                    state: "disconnected",
+                ReconnectEvent::Disconnected {
                     attempt,
                     sessions: state.sessions,
                     session_id,
                     ready_ms: ready.as_ref().map(|(_, lasted)| millis(*lasted)),
-                    code: Some(error.code()),
-                    message: Some(&error.message),
-                    delay_ms: None,
+                    code: error.code(),
+                    message: &error.message,
                 },
             );
             print_ok_json(
                 "connect",
-                ReconnectEvent {
-                    state: "backoff",
+                ReconnectEvent::Backoff {
                     attempt,
                     sessions: state.sessions,
-                    session_id: None,
-                    ready_ms: None,
-                    code: Some(error.code()),
-                    message: None,
-                    delay_ms: Some(millis(delay)),
+                    code: error.code(),
+                    delay_ms: millis(delay),
                 },
             );
         } else {
@@ -1874,15 +2164,9 @@ async fn run_supervised(
         if json {
             print_ok_json(
                 "connect",
-                ReconnectEvent {
-                    state: "reconnecting",
+                ReconnectEvent::Reconnecting {
                     attempt,
                     sessions: state.sessions,
-                    session_id: None,
-                    ready_ms: None,
-                    code: None,
-                    message: None,
-                    delay_ms: None,
                 },
             );
         }
@@ -1908,7 +2192,7 @@ async fn run_one_session(
     // The retry in progress, if this attempt follows a failure, and the
     // loop's state.
     (retry, state): (Option<u32>, &ReconnectState),
-    publisher: &SupervisorPublisher,
+    publisher: &mut SupervisorPublisher,
 ) -> Result<SessionEnd, CliError> {
     // Configured MCP and ACP exports become in-process http-forward/1
     // handlers; an http-forward export without one is still refused at OPEN.
@@ -1999,28 +2283,20 @@ async fn run_one_session(
             {
                 print_ok_json(
                     "connect",
-                    ReconnectEvent {
-                        state: "reconnected",
+                    ReconnectEvent::Reconnected {
                         attempt,
                         sessions: state.sessions + 1,
                         session_id: session_id.as_deref(),
-                        ready_ms: None,
-                        code: None,
-                        message: None,
-                        delay_ms: None,
                     },
                 );
             }
-            publisher.update(|status| {
-                status.state = "ready".to_owned();
+            publisher.advance_with(SupervisorEvent::SessionReady, |status| {
                 status.sessions = state.sessions + 1;
             });
             run_session(&handle, stop, stop_bound, json, failure_policy, publisher).await
         }
     };
-    publisher.update(|status| {
-        status.state = "stopping".to_owned();
-    });
+    publisher.advance(SupervisorEvent::SessionEnding);
     match outcome {
         Ok(first) => {
             cancellation.cancel();
@@ -2194,7 +2470,7 @@ async fn run_session(
     bound: std::time::Duration,
     json: bool,
     failure_policy: &'static str,
-    publisher: &SupervisorPublisher,
+    publisher: &mut SupervisorPublisher,
 ) -> Result<StopSignal, CliError> {
     let mut readiness = handle.readiness();
     let initial = readiness.borrow_and_update().clone();
@@ -2227,9 +2503,9 @@ async fn run_session(
 
     let mut status = handle.status();
     let last_status = status.borrow().clone();
-    publisher.update(|published| {
-        published.session = Some((&last_status).into());
-    });
+    publisher.advance(SupervisorEvent::SessionSnapshot(Box::new(
+        (&last_status).into(),
+    )));
     if json {
         // Publish the already-ready snapshot once.  A watch receiver cloned
         // after connect observes the current value, so waiting only for
@@ -2246,9 +2522,7 @@ async fn run_session(
         &mut status,
         &mut emitter,
         |current| {
-            publisher.update(|published| {
-                published.session = Some(current.into());
-            });
+            publisher.advance(SupervisorEvent::SessionSnapshot(Box::new(current.into())));
         },
         |current| {
             if json {
@@ -2370,8 +2644,102 @@ const REFUSAL_STATUS_INTERVAL: std::time::Duration = std::time::Duration::from_s
 struct ConnectStatusEmitter {
     last_observed: tunnel_client::ConnectionStatus,
     printed_refusals: tunnel_client::OpenRefusalCounts,
-    last_refusal_event: Option<tokio::time::Instant>,
-    pending: bool,
+    refusal_rate: RefusalRate,
+}
+
+/// Where the refusal-count rate bound stands.
+///
+/// ```text
+/// Unlimited --printed counts--> Cooling --counts held back--> Holding
+/// Holding --printed counts--> Cooling (window restarts)
+/// Holding --printed, or nothing left to hold--> Cooling (window kept)
+/// ```
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RefusalRate {
+    /// No refusal count has been printed yet: the next one prints at once.
+    Unlimited,
+    /// Counts were printed at `printed_at`; nothing is held back.
+    Cooling { printed_at: tokio::time::Instant },
+    /// Newer counts are held back until the window that began at
+    /// `printed_at` ends.
+    Holding { printed_at: tokio::time::Instant },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RefusalRateEvent {
+    /// A status event was printed at `now`; `refusals_changed` says whether
+    /// it carried refusal counts not printed before.
+    Printed {
+        now: tokio::time::Instant,
+        refusals_changed: bool,
+    },
+    /// A snapshot was observed and not printed; `refusals_unprinted` says
+    /// whether it holds refusal counts not printed yet.
+    Withheld { refusals_unprinted: bool },
+}
+
+/// Counts can only be held back inside a window, and a window only exists
+/// once counts have been printed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct HeldWithoutWindow;
+
+impl RefusalRate {
+    /// When refusal counts were last printed.
+    fn printed_at(self) -> Option<tokio::time::Instant> {
+        match self {
+            Self::Unlimited => None,
+            Self::Cooling { printed_at } | Self::Holding { printed_at } => Some(printed_at),
+        }
+    }
+
+    fn holding(self) -> bool {
+        matches!(self, Self::Holding { .. })
+    }
+
+    /// The only place the rate bound's state changes.
+    fn on_event(self, event: RefusalRateEvent) -> Result<Self, HeldWithoutWindow> {
+        match (self, event) {
+            (
+                _,
+                RefusalRateEvent::Printed {
+                    now,
+                    refusals_changed: true,
+                },
+            ) => Ok(Self::Cooling { printed_at: now }),
+            (
+                Self::Unlimited,
+                RefusalRateEvent::Printed {
+                    refusals_changed: false,
+                    ..
+                }
+                | RefusalRateEvent::Withheld {
+                    refusals_unprinted: false,
+                },
+            ) => Ok(Self::Unlimited),
+            (
+                Self::Cooling { printed_at } | Self::Holding { printed_at },
+                RefusalRateEvent::Printed {
+                    refusals_changed: false,
+                    ..
+                }
+                | RefusalRateEvent::Withheld {
+                    refusals_unprinted: false,
+                },
+            ) => Ok(Self::Cooling { printed_at }),
+            (
+                Self::Cooling { printed_at } | Self::Holding { printed_at },
+                RefusalRateEvent::Withheld {
+                    refusals_unprinted: true,
+                },
+            ) => Ok(Self::Holding { printed_at }),
+            (
+                Self::Unlimited,
+                RefusalRateEvent::Withheld {
+                    refusals_unprinted: true,
+                },
+            ) => Err(HeldWithoutWindow),
+        }
+    }
 }
 
 impl ConnectStatusEmitter {
@@ -2380,8 +2748,7 @@ impl ConnectStatusEmitter {
         Self {
             last_observed: printed.clone(),
             printed_refusals: printed.open_refusals_sent,
-            last_refusal_event: None,
-            pending: false,
+            refusal_rate: RefusalRate::Unlimited,
         }
     }
 
@@ -2390,11 +2757,19 @@ impl ConnectStatusEmitter {
     }
 
     fn mark_printed(&mut self, now: tokio::time::Instant, refusals_changed: bool) {
-        if refusals_changed {
-            self.last_refusal_event = Some(now);
-        }
+        self.advance(RefusalRateEvent::Printed {
+            now,
+            refusals_changed,
+        });
         self.printed_refusals = self.last_observed.open_refusals_sent;
-        self.pending = false;
+    }
+
+    fn advance(&mut self, event: RefusalRateEvent) {
+        // Counts are only withheld while a window is open, so the one
+        // refusal cannot arise from `observe`; the state is then kept.
+        if let Ok(next) = self.refusal_rate.on_event(event) {
+            self.refusal_rate = next;
+        }
     }
 
     /// Record `current`; `true` means print it now.
@@ -2408,28 +2783,30 @@ impl ConnectStatusEmitter {
             Self::reportable(current) && current.open_refusals_sent != self.printed_refusals;
         self.last_observed = current.clone();
         let window_open = self
-            .last_refusal_event
+            .refusal_rate
+            .printed_at()
             .is_none_or(|last| now >= last + REFUSAL_STATUS_INTERVAL);
         if other || (refusals && window_open) {
             self.mark_printed(now, refusals);
             return true;
         }
-        self.pending = refusals;
+        self.advance(RefusalRateEvent::Withheld {
+            refusals_unprinted: refusals,
+        });
         false
     }
 
     /// When the held-back refusal counts are due, if any are held back.
     fn trailing_deadline(&self) -> Option<tokio::time::Instant> {
-        if !self.pending {
-            return None;
+        match self.refusal_rate {
+            RefusalRate::Holding { printed_at } => Some(printed_at + REFUSAL_STATUS_INTERVAL),
+            RefusalRate::Unlimited | RefusalRate::Cooling { .. } => None,
         }
-        self.last_refusal_event
-            .map(|last| last + REFUSAL_STATUS_INTERVAL)
     }
 
     /// The trailing event: the latest snapshot, if counts are held back.
     fn fire(&mut self, now: tokio::time::Instant) -> Option<tunnel_client::ConnectionStatus> {
-        if !self.pending {
+        if !self.refusal_rate.holding() {
             return None;
         }
         self.mark_printed(now, true);
@@ -2962,6 +3339,415 @@ backoff, or exits at once with --no-reconnect."
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn snapshot_of(phase: &str) -> Box<tunnel_client::supervisor_ipc::SessionStatus> {
+        Box::new(tunnel_client::supervisor_ipc::SessionStatus {
+            phase: phase.to_owned(),
+            session_id: Some("session".to_owned()),
+            ..tunnel_client::supervisor_ipc::SessionStatus::default()
+        })
+    }
+
+    fn every_supervisor_phase() -> Vec<SupervisorPhase> {
+        vec![
+            SupervisorPhase::Starting,
+            SupervisorPhase::Connecting { retry: Some(3) },
+            SupervisorPhase::Ready {
+                retry: Some(3),
+                session: Some(snapshot_of("active")),
+            },
+            SupervisorPhase::SessionStopping {
+                retry: Some(3),
+                session: Some(snapshot_of("active")),
+            },
+            SupervisorPhase::Backoff {
+                attempt: 4,
+                delay_ms: 250,
+            },
+            SupervisorPhase::ShuttingDown {
+                attempt: Some(4),
+                retry_delay_ms: Some(250),
+            },
+        ]
+    }
+
+    fn every_supervisor_event() -> Vec<SupervisorEvent> {
+        vec![
+            SupervisorEvent::ConnectStarted,
+            SupervisorEvent::SessionReady,
+            SupervisorEvent::SessionSnapshot(snapshot_of("draining")),
+            SupervisorEvent::SessionEnding,
+            SupervisorEvent::BackoffStarted {
+                attempt: 5,
+                delay_ms: 500,
+            },
+            SupervisorEvent::Shutdown,
+        ]
+    }
+
+    /// The supervisor phase's whole transition table: each legal transition
+    /// lands on the stated phase, and every other pair is refused.
+    #[test]
+    fn supervisor_phase_transition_table_is_exact() {
+        let expected = |phase: &SupervisorPhase, event: &SupervisorEvent| match (phase, event) {
+            (SupervisorPhase::Starting, SupervisorEvent::ConnectStarted) => {
+                Some(SupervisorPhase::Connecting { retry: None })
+            }
+            (SupervisorPhase::Backoff { .. }, SupervisorEvent::ConnectStarted) => {
+                Some(SupervisorPhase::Connecting { retry: Some(4) })
+            }
+            (SupervisorPhase::Connecting { .. }, SupervisorEvent::SessionReady) => {
+                Some(SupervisorPhase::Ready {
+                    retry: Some(3),
+                    session: None,
+                })
+            }
+            (SupervisorPhase::Ready { .. }, SupervisorEvent::SessionSnapshot(_)) => {
+                Some(SupervisorPhase::Ready {
+                    retry: Some(3),
+                    session: Some(snapshot_of("draining")),
+                })
+            }
+            (SupervisorPhase::Connecting { .. }, SupervisorEvent::SessionEnding) => {
+                Some(SupervisorPhase::SessionStopping {
+                    retry: Some(3),
+                    session: None,
+                })
+            }
+            (SupervisorPhase::Ready { .. }, SupervisorEvent::SessionEnding) => {
+                Some(SupervisorPhase::SessionStopping {
+                    retry: Some(3),
+                    session: Some(snapshot_of("active")),
+                })
+            }
+            (
+                SupervisorPhase::Connecting { .. } | SupervisorPhase::SessionStopping { .. },
+                SupervisorEvent::BackoffStarted { .. },
+            ) => Some(SupervisorPhase::Backoff {
+                attempt: 5,
+                delay_ms: 500,
+            }),
+            (SupervisorPhase::Starting, SupervisorEvent::Shutdown) => {
+                Some(SupervisorPhase::ShuttingDown {
+                    attempt: None,
+                    retry_delay_ms: None,
+                })
+            }
+            (
+                SupervisorPhase::Connecting { .. }
+                | SupervisorPhase::Ready { .. }
+                | SupervisorPhase::SessionStopping { .. },
+                SupervisorEvent::Shutdown,
+            ) => Some(SupervisorPhase::ShuttingDown {
+                attempt: Some(3),
+                retry_delay_ms: None,
+            }),
+            (SupervisorPhase::Backoff { .. }, SupervisorEvent::Shutdown) => {
+                Some(SupervisorPhase::ShuttingDown {
+                    attempt: Some(4),
+                    retry_delay_ms: Some(250),
+                })
+            }
+            _ => None,
+        };
+        let mut legal = 0;
+        for phase in every_supervisor_phase() {
+            for event in every_supervisor_event() {
+                let outcome = phase.clone().on_event(event.clone());
+                match expected(&phase, &event) {
+                    Some(next) => {
+                        legal += 1;
+                        assert_eq!(outcome, Ok(next), "{phase:?} on {event:?}");
+                    }
+                    None => assert_eq!(
+                        outcome,
+                        Err(IllegalSupervisorTransition {
+                            from: phase.state(),
+                            event: event.clone(),
+                        }),
+                        "{phase:?} must refuse {event:?}"
+                    ),
+                }
+            }
+        }
+        assert_eq!(legal, 13, "the table has exactly thirteen transitions");
+    }
+
+    /// What the supervisor published before the phase was an enum: the
+    /// field assignments each call site made by hand. Kept as the reference
+    /// the projection must reproduce byte for byte.
+    fn legacy_publication(
+        status: &mut tunnel_client::supervisor_ipc::SupervisorStatus,
+        event: &SupervisorEvent,
+    ) {
+        match event {
+            SupervisorEvent::ConnectStarted => {
+                // `retry` was the attempt the previous backoff published.
+                let retry = status.attempt.filter(|_| status.state == "backoff");
+                status.state = "connecting".to_owned();
+                status.attempt = retry;
+                status.retry_delay_ms = None;
+                status.session = None;
+            }
+            SupervisorEvent::SessionReady => status.state = "ready".to_owned(),
+            SupervisorEvent::SessionSnapshot(session) => {
+                status.session = Some((**session).clone());
+            }
+            SupervisorEvent::SessionEnding => status.state = "stopping".to_owned(),
+            SupervisorEvent::BackoffStarted { attempt, delay_ms } => {
+                status.state = "backoff".to_owned();
+                status.attempt = Some(*attempt);
+                status.retry_delay_ms = Some(*delay_ms);
+                status.session = None;
+            }
+            SupervisorEvent::Shutdown => {
+                status.state = "stopping".to_owned();
+                status.session = None;
+            }
+        }
+    }
+
+    /// Every path the supervisor loop can take publishes, after each step,
+    /// exactly the bytes the hand-set fields used to.
+    #[test]
+    fn supervisor_phase_publishes_the_same_status_bytes_as_before() {
+        use SupervisorEvent::{
+            BackoffStarted, ConnectStarted, SessionEnding, SessionReady, SessionSnapshot, Shutdown,
+        };
+        let backoff = |attempt| BackoffStarted {
+            attempt,
+            delay_ms: 125 * u64::from(attempt),
+        };
+        let paths: Vec<Vec<SupervisorEvent>> = vec![
+            // Credentials could not be pinned.
+            vec![Shutdown],
+            // A session, stopped in order.
+            vec![
+                ConnectStarted,
+                SessionReady,
+                SessionSnapshot(snapshot_of("active")),
+                SessionSnapshot(snapshot_of("draining")),
+                SessionEnding,
+                Shutdown,
+            ],
+            // A stop request as the attempt completed.
+            vec![ConnectStarted, SessionEnding, Shutdown],
+            // A session that closed before its first snapshot, then retries
+            // that fail before ready, then a stop during the backoff.
+            vec![
+                ConnectStarted,
+                SessionReady,
+                SessionEnding,
+                backoff(1),
+                ConnectStarted,
+                backoff(2),
+                Shutdown,
+            ],
+            // A lost session, a successful retry, and a terminal failure.
+            vec![
+                ConnectStarted,
+                SessionReady,
+                SessionSnapshot(snapshot_of("active")),
+                SessionEnding,
+                backoff(1),
+                ConnectStarted,
+                SessionReady,
+                SessionSnapshot(snapshot_of("active")),
+                SessionEnding,
+                Shutdown,
+            ],
+            // A terminal failure of the first attempt.
+            vec![ConnectStarted, Shutdown],
+        ];
+        for path in paths {
+            let mut phase = SupervisorPhase::Starting;
+            let mut published = tunnel_client::supervisor_ipc::SupervisorStatus::default();
+            phase.project(&mut published);
+            let mut legacy = tunnel_client::supervisor_ipc::SupervisorStatus {
+                state: "starting".to_owned(),
+                ..tunnel_client::supervisor_ipc::SupervisorStatus::default()
+            };
+            assert_eq!(
+                serde_json::to_string(&published).expect("status"),
+                serde_json::to_string(&legacy).expect("status")
+            );
+            for event in &path {
+                phase = phase
+                    .on_event(event.clone())
+                    .unwrap_or_else(|illegal| panic!("{illegal:?} in {path:?}"));
+                phase.project(&mut published);
+                legacy_publication(&mut legacy, event);
+                assert_eq!(
+                    serde_json::to_string(&published).expect("status"),
+                    serde_json::to_string(&legacy).expect("status"),
+                    "after {event:?} in {path:?}"
+                );
+            }
+        }
+    }
+
+    /// The phase fields of the status answer, pinned as literal JSON.
+    #[test]
+    fn supervisor_phase_status_json_is_pinned() {
+        let published = |phase: &SupervisorPhase| {
+            let mut status = tunnel_client::supervisor_ipc::SupervisorStatus::default();
+            phase.project(&mut status);
+            let value = serde_json::to_value(&status).expect("status");
+            format!(
+                r#"{{"state":{},"attempt":{},"retry_delay_ms":{},"session":{}}}"#,
+                value["state"],
+                value["attempt"],
+                value["retry_delay_ms"],
+                if value["session"].is_null() {
+                    "null".to_owned()
+                } else {
+                    value["session"]["phase"].to_string()
+                }
+            )
+        };
+        let pinned = [
+            r#"{"state":"starting","attempt":null,"retry_delay_ms":null,"session":null}"#,
+            r#"{"state":"connecting","attempt":3,"retry_delay_ms":null,"session":null}"#,
+            r#"{"state":"ready","attempt":3,"retry_delay_ms":null,"session":"active"}"#,
+            r#"{"state":"stopping","attempt":3,"retry_delay_ms":null,"session":"active"}"#,
+            r#"{"state":"backoff","attempt":4,"retry_delay_ms":250,"session":null}"#,
+            r#"{"state":"stopping","attempt":4,"retry_delay_ms":250,"session":null}"#,
+        ];
+        for (phase, pinned) in every_supervisor_phase().iter().zip(pinned) {
+            assert_eq!(published(phase), pinned, "{phase:?}");
+        }
+        let mut status = tunnel_client::supervisor_ipc::SupervisorStatus::default();
+        SupervisorPhase::Backoff {
+            attempt: 4,
+            delay_ms: 250,
+        }
+        .project(&mut status);
+        assert_eq!(
+            serde_json::to_string(&status).expect("status"),
+            concat!(
+                r#"{"pid":0,"state":"backoff","device_id":"","sessions":0,"attempt":4,"#,
+                r#""retry_delay_ms":250,"last_error_code":null,"#,
+                r#""certificate_expires_at_unix":null,"rotation_policy":{"interval_seconds":0,"#,
+                r#""handshake_timeout_seconds":0,"overlap_seconds":0},"exports":[],"#,
+                r#""session":null,"ipc":{"requests_served":0,"peers_refused":0,"#,
+                r#""bad_requests":0,"disconnects_requested":0}}"#
+            )
+        );
+    }
+
+    /// The refusal rate bound's whole transition table.
+    #[test]
+    fn refusal_rate_transition_table_is_exact() {
+        let at = tokio::time::Instant::now();
+        let later = at + std::time::Duration::from_secs(2);
+        let cooling = RefusalRate::Cooling { printed_at: at };
+        let holding = RefusalRate::Holding { printed_at: at };
+        let printed = |refusals_changed| RefusalRateEvent::Printed {
+            now: later,
+            refusals_changed,
+        };
+        let withheld = |refusals_unprinted| RefusalRateEvent::Withheld { refusals_unprinted };
+        let restarted = RefusalRate::Cooling { printed_at: later };
+        let table = [
+            (RefusalRate::Unlimited, printed(true), Ok(restarted)),
+            (
+                RefusalRate::Unlimited,
+                printed(false),
+                Ok(RefusalRate::Unlimited),
+            ),
+            (
+                RefusalRate::Unlimited,
+                withheld(false),
+                Ok(RefusalRate::Unlimited),
+            ),
+            (
+                RefusalRate::Unlimited,
+                withheld(true),
+                Err(HeldWithoutWindow),
+            ),
+            (cooling, printed(true), Ok(restarted)),
+            (cooling, printed(false), Ok(cooling)),
+            (cooling, withheld(false), Ok(cooling)),
+            (cooling, withheld(true), Ok(holding)),
+            (holding, printed(true), Ok(restarted)),
+            (holding, printed(false), Ok(cooling)),
+            (holding, withheld(false), Ok(cooling)),
+            (holding, withheld(true), Ok(holding)),
+        ];
+        for (from, event, expected) in table {
+            assert_eq!(from.on_event(event), expected, "{from:?} on {event:?}");
+        }
+        assert_eq!(RefusalRate::Unlimited.printed_at(), None);
+        assert_eq!(cooling.printed_at(), Some(at));
+        assert_eq!(holding.printed_at(), Some(at));
+        assert!(holding.holding() && !cooling.holding() && !RefusalRate::Unlimited.holding());
+    }
+
+    /// The reconnect loop's `--json` events, pinned as literal JSON.
+    #[test]
+    fn reconnect_events_json_is_pinned() {
+        let line = |event: ReconnectEvent<'_>| serde_json::to_string(&event).expect("event");
+        assert_eq!(
+            line(ReconnectEvent::Disconnected {
+                attempt: 2,
+                sessions: 1,
+                session_id: Some("session"),
+                ready_ms: Some(15),
+                code: "TRANSPORT_ERROR",
+                message: "gone",
+            }),
+            concat!(
+                r#"{"state":"disconnected","attempt":2,"sessions":1,"session_id":"session","#,
+                r#""ready_ms":15,"code":"TRANSPORT_ERROR","message":"gone"}"#
+            )
+        );
+        assert_eq!(
+            line(ReconnectEvent::Disconnected {
+                attempt: 1,
+                sessions: 0,
+                session_id: None,
+                ready_ms: None,
+                code: "TRANSPORT_ERROR",
+                message: "refused",
+            }),
+            concat!(
+                r#"{"state":"disconnected","attempt":1,"sessions":0,"#,
+                r#""code":"TRANSPORT_ERROR","message":"refused"}"#
+            )
+        );
+        assert_eq!(
+            line(ReconnectEvent::Backoff {
+                attempt: 2,
+                sessions: 1,
+                code: "TRANSPORT_ERROR",
+                delay_ms: 250,
+            }),
+            r#"{"state":"backoff","attempt":2,"sessions":1,"code":"TRANSPORT_ERROR","delay_ms":250}"#
+        );
+        assert_eq!(
+            line(ReconnectEvent::Reconnecting {
+                attempt: 2,
+                sessions: 1,
+            }),
+            r#"{"state":"reconnecting","attempt":2,"sessions":1}"#
+        );
+        assert_eq!(
+            line(ReconnectEvent::Reconnected {
+                attempt: 2,
+                sessions: 2,
+                session_id: Some("session"),
+            }),
+            r#"{"state":"reconnected","attempt":2,"sessions":2,"session_id":"session"}"#
+        );
+        assert_eq!(
+            line(ReconnectEvent::Reconnected {
+                attempt: 2,
+                sessions: 2,
+                session_id: None,
+            }),
+            r#"{"state":"reconnected","attempt":2,"sessions":2}"#
+        );
+    }
 
     fn m7c167_ready_status() -> tunnel_client::ConnectionStatus {
         tunnel_client::ConnectionStatus {

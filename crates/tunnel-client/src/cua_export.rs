@@ -48,13 +48,14 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use bytes::Bytes;
 use http::{Request, Response};
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
+use tokio::sync::{mpsc, oneshot};
 use tunnel_http_bridge::{ChannelBody, Profile};
 
 use tunnel_cua::capability::{
@@ -122,6 +123,8 @@ struct Counters {
     answered_locally: AtomicU64,
     unknown_outcomes: AtomicU64,
     point_space_refused: std::sync::atomic::AtomicBool,
+    /// Principal sessions the owner task tracks; written only by that task.
+    sessions: AtomicU64,
 }
 
 /// One registered CUA export. Cheap to clone; clones share one backend.
@@ -134,25 +137,82 @@ impl std::fmt::Debug for CuaExport {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("CuaExport")
-            .field("target", &self.inner.target.as_str())
+            .field("target", &self.inner.shared.target.as_str())
             .field("diagnostics", &self.diagnostics())
             .finish_non_exhaustive()
     }
 }
 
 struct Inner {
+    shared: Arc<Shared>,
+    /// The command queue of the task that owns the supervised backend and
+    /// the session table. Started by the first request, so building an
+    /// export needs no runtime; it ends, dropping (and so killing) the
+    /// backend, when the last clone of this export is dropped.
+    owner: OnceLock<mpsc::Sender<Command>>,
+}
+
+/// Configuration and counters the requests and the owner task both read.
+struct Shared {
     process: BackendProcess,
     local: LocalConfiguration,
     point_space: Option<PointSpace>,
     target: TargetSession,
     limits: CuaLimits,
     state: Arc<DeviceState>,
-    /// The supervised backend once it has been started, probed and
-    /// negotiated; `None` before the first request and after a shutdown.
-    backend: tokio::sync::Mutex<Option<Ready>>,
-    sessions: Mutex<Sessions>,
     counters: Counters,
 }
+
+/// Commands the owner task may hold unread. Every in-flight exchange has at
+/// most one command outstanding and waits for room when the queue is full,
+/// so a full queue delays a request and never drops one.
+const OWNER_QUEUE: usize = MAX_SESSIONS;
+
+/// The lease a binding's session holds after a lease command, or why the
+/// command was refused.
+type LeaseOutcome = Result<Option<LeaseGrant>, tunnel_cua::lease::LeaseRefusal>;
+
+type SessionReply = Result<Arc<SessionFacade>, Box<CuaResponse>>;
+
+enum Command {
+    /// Start, probe and negotiate the backend unless it is already running.
+    Ready(oneshot::Sender<Result<Negotiated, &'static str>>),
+    /// The session for one principal binding, created on first use.
+    Session {
+        binding: String,
+        negotiated: Negotiated,
+        reply: oneshot::Sender<SessionReply>,
+    },
+    /// Take (`acquire`) or give back the input lease for a binding's session
+    /// **and record the result**, as one step of the owner task.
+    ///
+    /// The two are one command because they are one fact: a lease the device
+    /// state holds for a session whose entry says `grant: None` cannot be
+    /// released by anybody until it expires. Done by the requesting exchange
+    /// in two awaits, a cancellation between them left exactly that. The
+    /// owner task is not cancelled with the exchange, so here the record
+    /// always follows the lease.
+    Lease {
+        binding: String,
+        acquire: bool,
+        reply: oneshot::Sender<LeaseOutcome>,
+    },
+    /// Stop the supervised backend.
+    Shutdown(oneshot::Sender<()>),
+}
+
+/// The state only the owner task touches. One task owns both, so the
+/// backend is started at most once at a time and every session-table change
+/// is applied whole, in command order.
+struct Owner {
+    shared: Arc<Shared>,
+    /// The supervised backend once it has been started, probed and
+    /// negotiated; `None` before the first request and after a shutdown.
+    backend: Option<Ready>,
+    sessions: Sessions,
+}
+
+const OWNER_STOPPED: &str = "the cua export's backend owner is not running";
 
 struct Ready {
     supervisor: Supervisor,
@@ -169,6 +229,25 @@ struct Sessions {
 struct SessionEntry {
     facade: Arc<SessionFacade>,
     grant: Option<LeaseGrant>,
+}
+
+impl SessionEntry {
+    /// Take or give back the input lease and record what the session holds
+    /// afterwards. A refusal changes nothing.
+    async fn lease(&mut self, acquire: bool) -> LeaseOutcome {
+        let grant = if acquire {
+            Some(self.facade.acquire_input_lease().await?)
+        } else {
+            let held = self
+                .grant
+                .as_ref()
+                .ok_or(tunnel_cua::lease::LeaseRefusal::NotHeld)?;
+            self.facade.release_input_lease(held).await?;
+            None
+        };
+        self.grant.clone_from(&grant);
+        Ok(grant)
+    }
 }
 
 /// What the backend-startup step hands a request.
@@ -228,16 +307,31 @@ impl CuaExport {
         let target = TargetSession::new(settings.target.as_deref().unwrap_or(DEFAULT_TARGET));
         Ok(Self {
             inner: Arc::new(Inner {
-                process,
-                local,
-                point_space,
-                target,
-                limits: CuaLimits::default(),
-                state: DeviceState::new(),
-                backend: tokio::sync::Mutex::new(None),
-                sessions: Mutex::new(Sessions::default()),
-                counters: Counters::default(),
+                shared: Arc::new(Shared {
+                    process,
+                    local,
+                    point_space,
+                    target,
+                    limits: CuaLimits::default(),
+                    state: DeviceState::new(),
+                    counters: Counters::default(),
+                }),
+                owner: OnceLock::new(),
             }),
+        })
+    }
+
+    /// The owner task's queue, starting the task on first use.
+    fn owner(&self) -> &mpsc::Sender<Command> {
+        self.inner.owner.get_or_init(|| {
+            let (commands, receiver) = mpsc::channel(OWNER_QUEUE);
+            let owner = Owner {
+                shared: Arc::clone(&self.inner.shared),
+                backend: None,
+                sessions: Sessions::default(),
+            };
+            tokio::spawn(owner.run(receiver));
+            commands
         })
     }
 
@@ -248,20 +342,15 @@ impl CuaExport {
     /// Only if the pinned tables are inconsistent.
     pub fn profile_policies(&self) -> Result<Profile, CuaConfigError> {
         CuaProfile::ComputerV1
-            .policies(self.inner.limits)
+            .policies(self.inner.shared.limits)
             .map_err(|_| CuaConfigError("the pinned computer.v1 profile tables are inconsistent"))
     }
 
     /// Payload-free counters.
     #[must_use]
     pub fn diagnostics(&self) -> CuaDiagnostics {
-        let counters = &self.inner.counters;
-        let sessions = self
-            .inner
-            .sessions
-            .lock()
-            .map(|sessions| sessions.by_binding.len() as u64)
-            .unwrap_or_default();
+        let counters = &self.inner.shared.counters;
+        let sessions = counters.sessions.load(Ordering::Relaxed);
         CuaDiagnostics {
             requests: counters.requests.load(Ordering::Relaxed),
             backend_starts: counters.backend_starts.load(Ordering::Relaxed),
@@ -279,9 +368,13 @@ impl CuaExport {
     /// identity held against it. The backend's process group is also killed
     /// when the last clone of this export is dropped.
     pub async fn shutdown(&self) {
-        let mut backend = self.inner.backend.lock().await;
-        if let Some(mut ready) = backend.take() {
-            let _ = ready.supervisor.stop(self.inner.state.as_ref()).await;
+        // An export that never served a request has no backend to stop.
+        let Some(owner) = self.inner.owner.get() else {
+            return;
+        };
+        let (reply, done) = oneshot::channel();
+        if owner.send(Command::Shutdown(reply)).await.is_ok() {
+            let _ = done.await;
         }
     }
 
@@ -291,7 +384,11 @@ impl CuaExport {
     /// the consumer reads the payload, never the status, exactly as this
     /// profile reads the pinned backend's.
     pub async fn handle(&self, request: Request<ChannelBody>) -> Response<HttpBody> {
-        self.inner.counters.requests.fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .shared
+            .counters
+            .requests
+            .fetch_add(1, Ordering::Relaxed);
         let (parts, body) = request.into_parts();
         // **No binding, no session.** The relay ingress always derives one
         // for a `computer-v1` request, so a request without it did not come
@@ -306,6 +403,7 @@ impl CuaExport {
             .map(str::to_owned)
         else {
             self.inner
+                .shared
                 .counters
                 .not_dispatched
                 .fetch_add(1, Ordering::Relaxed);
@@ -316,7 +414,7 @@ impl CuaExport {
                 false,
             ));
         };
-        let Ok(bytes) = collect_limited(body, self.inner.limits.request_body()).await else {
+        let Ok(bytes) = collect_limited(body, self.inner.shared.limits.request_body()).await else {
             return self.reply(&CuaResponse::not_dispatched(
                 "",
                 "request_too_large",
@@ -335,15 +433,15 @@ impl CuaExport {
                 ));
             }
         };
-        let (facade, lease) = match self.session(&binding, &negotiated) {
+        let facade = match self.session(&binding, &name, negotiated).await {
             Ok(session) => session,
             Err(response) => return self.reply(&response),
         };
         if name == LEASE_ACQUIRE || name == LEASE_RELEASE {
-            return self.reply(&self.lease(&binding, &name, &bytes, &facade, lease));
+            return self.reply(&self.lease(&binding, &name, &bytes).await);
         }
         let dispatch = facade
-            .handle(&bytes, self.inner.limits.request_body())
+            .handle(&bytes, self.inner.shared.limits.request_body())
             .await;
         let operation = Operation::parse(&name);
         self.count(&dispatch);
@@ -351,7 +449,7 @@ impl CuaExport {
     }
 
     fn count(&self, dispatch: &Dispatch) {
-        let counters = &self.inner.counters;
+        let counters = &self.inner.shared.counters;
         match dispatch {
             Dispatch::NotDispatched(_) => counters.not_dispatched.fetch_add(1, Ordering::Relaxed),
             Dispatch::AnsweredLocally(_) => {
@@ -377,157 +475,39 @@ impl CuaExport {
 
     /// Start, probe and negotiate the backend once; later requests reuse it.
     async fn ensure_ready(&self) -> Result<Negotiated, &'static str> {
-        let mut backend = self.inner.backend.lock().await;
-        if let Some(ready) = &*backend {
-            return Ok(Negotiated {
-                endpoint: ready.endpoint,
-                permitted: ready.permitted.clone(),
-                epoch: ready.supervisor.lifecycle_epoch(),
-            });
-        }
-        self.inner
-            .counters
-            .backend_starts
-            .fetch_add(1, Ordering::Relaxed);
-        match self.start().await {
-            Ok(ready) => {
-                let negotiated = Negotiated {
-                    endpoint: ready.endpoint,
-                    permitted: ready.permitted.clone(),
-                    epoch: ready.supervisor.lifecycle_epoch(),
-                };
-                *backend = Some(ready);
-                Ok(negotiated)
-            }
-            Err(reason) => {
-                self.inner
-                    .counters
-                    .backend_start_failures
-                    .fetch_add(1, Ordering::Relaxed);
-                Err(reason)
-            }
-        }
-    }
-
-    async fn start(&self) -> Result<Ready, &'static str> {
-        let mut supervisor = Supervisor::new(self.inner.process.clone());
-        let endpoint = supervisor
-            .start()
+        let (reply, ready) = oneshot::channel();
+        self.owner()
+            .send(Command::Ready(reply))
             .await
-            .map_err(|_| "the cua backend did not start or published no loopback address")?;
-
-        // Health: a dispatched, succeeded, read-only, OS-gated probe --
-        // `screen_info`, never a click. Retried while the backend comes up.
-        let probe_body = tunnel_cua_fixture::client::request_body("screen_info", json!({}));
-        let probe_request = validate_request(&probe_body, self.inner.limits.request_body())
-            .map_err(|_| "the startup probe is not a valid computer.v1 request")?;
-        let prober = SessionFacade::new(
-            Arc::clone(&self.inner.state),
-            Dispatcher::new(endpoint, BTreeSet::from([Operation::ScreenInfo])),
-            SessionId::new(0),
-            self.inner.target.clone(),
-        );
-        let deadline = tokio::time::Instant::now() + self.inner.process.startup;
-        let (probe, evidence) = loop {
-            let dispatch = prober
-                .handle(&probe_body, self.inner.limits.request_body())
-                .await;
-            if let Health::Working(evidence) = supervisor.assess(&probe_request, &dispatch) {
-                break (dispatch, evidence);
-            }
-            if tokio::time::Instant::now() >= deadline {
-                let _ = supervisor.stop(self.inner.state.as_ref()).await;
-                return Err("the cua backend never answered its read-only health probe");
-            }
-            tokio::time::sleep(PROBE_RETRY).await;
-        };
-
-        let commands = match read_commands(endpoint).await {
-            Ok(commands) => commands,
-            Err(_) => {
-                let _ = supervisor.stop(self.inner.state.as_ref()).await;
-                return Err("the cua backend's command listing could not be read");
-            }
-        };
-        let authority = CaptureAuthority::from_version_reading(
-            &Dispatcher::new(endpoint, BTreeSet::new())
-                .read_version()
-                .await,
-        );
-        let upstream = UpstreamSupport::new(&commands, evidence, authority);
-        let grant = Operation::ALL
-            .into_iter()
-            .fold(CallerGrant::none(), CallerGrant::with);
-        let permitted = negotiate(&self.inner.local, &upstream, &grant);
-
-        // M5-C19 option (b): declare the point space only if the backend's
-        // own screen-size reading agrees with it.
-        let declared = self
-            .inner
-            .point_space
-            .filter(|space| point_space_agrees(space, &probe));
-        self.inner.counters.point_space_refused.store(
-            self.inner.point_space.is_some() && declared.is_none(),
-            Ordering::Relaxed,
-        );
-        self.inner.state.declare_point_space(declared);
-
-        Ok(Ready {
-            supervisor,
-            endpoint,
-            permitted,
-        })
+            .map_err(|_| OWNER_STOPPED)?;
+        ready.await.map_err(|_| OWNER_STOPPED)?
     }
 
     /// The session for one principal binding, created on first use.
-    fn session(
-        &self,
-        binding: &str,
-        negotiated: &Negotiated,
-    ) -> Result<(Arc<SessionFacade>, Option<LeaseGrant>), Box<CuaResponse>> {
-        let mut sessions = self
-            .inner
-            .sessions
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(entry) = sessions.by_binding.get(binding) {
-            return Ok((Arc::clone(&entry.facade), entry.grant.clone()));
-        }
-        if sessions.by_binding.len() >= MAX_SESSIONS {
-            return Err(Box::new(CuaResponse::not_dispatched(
-                "",
-                "session_capacity",
-                "this export tracks no more principals",
-            )));
-        }
-        sessions.next += 1;
-        let facade = Arc::new(SessionFacade::new(
-            Arc::clone(&self.inner.state),
-            Dispatcher::new(negotiated.endpoint, negotiated.permitted.clone())
-                .watching(negotiated.epoch.clone()),
-            SessionId::new(sessions.next),
-            self.inner.target.clone(),
-        ));
-        sessions.by_binding.insert(
-            binding.to_owned(),
-            SessionEntry {
-                facade: Arc::clone(&facade),
-                grant: None,
-            },
-        );
-        Ok((facade, None))
+    async fn session(&self, binding: &str, name: &str, negotiated: Negotiated) -> SessionReply {
+        let stopped = || {
+            Box::new(CuaResponse::not_dispatched_retryable(
+                name,
+                "backend_unavailable",
+                OWNER_STOPPED,
+                true,
+            ))
+        };
+        let (reply, session) = oneshot::channel();
+        self.owner()
+            .send(Command::Session {
+                binding: binding.to_owned(),
+                negotiated,
+                reply,
+            })
+            .await
+            .map_err(|_| stopped())?;
+        session.await.map_err(|_| stopped())?
     }
 
     /// `acquire_input_lease` / `release_input_lease`, answered from device
     /// state. The envelope is `computer.v1`'s, with empty `params`.
-    fn lease(
-        &self,
-        binding: &str,
-        name: &str,
-        bytes: &[u8],
-        facade: &SessionFacade,
-        held: Option<LeaseGrant>,
-    ) -> CuaResponse {
+    async fn lease(&self, binding: &str, name: &str, bytes: &[u8]) -> CuaResponse {
         if !is_lease_envelope(bytes, name) {
             return CuaResponse::not_dispatched(
                 name,
@@ -535,32 +515,37 @@ impl CuaExport {
                 "a lease request is {version, operation, params: {}} and nothing else",
             );
         }
-        let counters = &self.inner.counters;
-        let outcome = if name == LEASE_ACQUIRE {
-            facade.acquire_input_lease().map(Some)
-        } else {
-            match &held {
-                Some(grant) => facade.release_input_lease(grant).map(|()| None),
-                None => Err(tunnel_cua::lease::LeaseRefusal::NotHeld),
-            }
+        let counters = &self.inner.shared.counters;
+        // Taken or released, and recorded, by the owner task before the
+        // answer is given: the binding's next request sees the lease this one
+        // took or released, and an exchange dropped while it waits here
+        // cannot leave a lease held that the session's entry does not name.
+        let (reply, outcome) = oneshot::channel();
+        let command = Command::Lease {
+            binding: binding.to_owned(),
+            acquire: name == LEASE_ACQUIRE,
+            reply,
+        };
+        let outcome = match self.owner().send(command).await {
+            Ok(()) => outcome.await.ok(),
+            Err(_) => None,
+        };
+        let Some(outcome) = outcome else {
+            counters.not_dispatched.fetch_add(1, Ordering::Relaxed);
+            return CuaResponse::not_dispatched_retryable(
+                name,
+                "backend_unavailable",
+                OWNER_STOPPED,
+                true,
+            );
         };
         match outcome {
             Ok(grant) => {
                 let result = json!({
-                    "target": self.inner.target.as_str(),
+                    "target": self.inner.shared.target.as_str(),
                     "held": grant.is_some(),
                     "lease": grant.as_ref().map(|grant| grant.lease().value()),
                 });
-                if let Some(entry) = self
-                    .inner
-                    .sessions
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .by_binding
-                    .get_mut(binding)
-                {
-                    entry.grant = grant;
-                }
                 counters.answered_locally.fetch_add(1, Ordering::Relaxed);
                 lease_response(name, "answered_locally", Some(result), None)
             }
@@ -577,6 +562,180 @@ impl CuaExport {
                 )
             }
         }
+    }
+}
+
+impl Owner {
+    async fn run(mut self, mut commands: mpsc::Receiver<Command>) {
+        while let Some(command) = commands.recv().await {
+            match command {
+                Command::Ready(reply) => {
+                    let _ = reply.send(self.ensure_ready().await);
+                }
+                Command::Session {
+                    binding,
+                    negotiated,
+                    reply,
+                } => {
+                    let _ = reply.send(self.session(&binding, &negotiated));
+                }
+                Command::Lease {
+                    binding,
+                    acquire,
+                    reply,
+                } => {
+                    // A binding with no session was never admitted; dropping
+                    // `reply` answers it as an owner that is not running.
+                    if let Some(entry) = self.sessions.by_binding.get_mut(&binding) {
+                        let _ = reply.send(entry.lease(acquire).await);
+                    }
+                }
+                Command::Shutdown(reply) => {
+                    if let Some(mut ready) = self.backend.take() {
+                        let _ = ready.supervisor.stop(self.shared.state.as_ref()).await;
+                    }
+                    let _ = reply.send(());
+                }
+            }
+        }
+    }
+
+    /// Start, probe and negotiate the backend once; later requests reuse it.
+    async fn ensure_ready(&mut self) -> Result<Negotiated, &'static str> {
+        if let Some(ready) = &self.backend {
+            return Ok(Negotiated {
+                endpoint: ready.endpoint,
+                permitted: ready.permitted.clone(),
+                epoch: ready.supervisor.lifecycle_epoch(),
+            });
+        }
+        self.shared
+            .counters
+            .backend_starts
+            .fetch_add(1, Ordering::Relaxed);
+        match self.start().await {
+            Ok(ready) => {
+                let negotiated = Negotiated {
+                    endpoint: ready.endpoint,
+                    permitted: ready.permitted.clone(),
+                    epoch: ready.supervisor.lifecycle_epoch(),
+                };
+                self.backend = Some(ready);
+                Ok(negotiated)
+            }
+            Err(reason) => {
+                self.shared
+                    .counters
+                    .backend_start_failures
+                    .fetch_add(1, Ordering::Relaxed);
+                Err(reason)
+            }
+        }
+    }
+
+    async fn start(&self) -> Result<Ready, &'static str> {
+        let mut supervisor = Supervisor::new(self.shared.process.clone());
+        let endpoint = supervisor
+            .start()
+            .await
+            .map_err(|_| "the cua backend did not start or published no loopback address")?;
+
+        // Health: a dispatched, succeeded, read-only, OS-gated probe --
+        // `screen_info`, never a click. Retried while the backend comes up.
+        let probe_body = tunnel_cua_fixture::client::request_body("screen_info", json!({}));
+        let probe_request = validate_request(&probe_body, self.shared.limits.request_body())
+            .map_err(|_| "the startup probe is not a valid computer.v1 request")?;
+        let prober = SessionFacade::new(
+            Arc::clone(&self.shared.state),
+            Dispatcher::new(endpoint, BTreeSet::from([Operation::ScreenInfo])),
+            SessionId::new(0),
+            self.shared.target.clone(),
+        );
+        let deadline = tokio::time::Instant::now() + self.shared.process.startup;
+        let (probe, evidence) = loop {
+            let dispatch = prober
+                .handle(&probe_body, self.shared.limits.request_body())
+                .await;
+            if let Health::Working(evidence) = supervisor.assess(&probe_request, &dispatch) {
+                break (dispatch, evidence);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                let _ = supervisor.stop(self.shared.state.as_ref()).await;
+                return Err("the cua backend never answered its read-only health probe");
+            }
+            tokio::time::sleep(PROBE_RETRY).await;
+        };
+
+        let commands = match read_commands(endpoint).await {
+            Ok(commands) => commands,
+            Err(_) => {
+                let _ = supervisor.stop(self.shared.state.as_ref()).await;
+                return Err("the cua backend's command listing could not be read");
+            }
+        };
+        let authority = CaptureAuthority::from_version_reading(
+            &Dispatcher::new(endpoint, BTreeSet::new())
+                .read_version()
+                .await,
+        );
+        let upstream = UpstreamSupport::new(&commands, evidence, authority);
+        let grant = Operation::ALL
+            .into_iter()
+            .fold(CallerGrant::none(), CallerGrant::with);
+        let permitted = negotiate(&self.shared.local, &upstream, &grant);
+
+        // M5-C19 option (b): declare the point space only if the backend's
+        // own screen-size reading agrees with it.
+        let declared = self
+            .shared
+            .point_space
+            .filter(|space| point_space_agrees(space, &probe));
+        self.shared.counters.point_space_refused.store(
+            self.shared.point_space.is_some() && declared.is_none(),
+            Ordering::Relaxed,
+        );
+        self.shared.state.declare_point_space(declared);
+
+        Ok(Ready {
+            supervisor,
+            endpoint,
+            permitted,
+        })
+    }
+
+    /// The session for one principal binding, created on first use.
+    fn session(&mut self, binding: &str, negotiated: &Negotiated) -> SessionReply {
+        let sessions = &mut self.sessions;
+        if let Some(entry) = sessions.by_binding.get(binding) {
+            return Ok(Arc::clone(&entry.facade));
+        }
+        if sessions.by_binding.len() >= MAX_SESSIONS {
+            return Err(Box::new(CuaResponse::not_dispatched(
+                "",
+                "session_capacity",
+                "this export tracks no more principals",
+            )));
+        }
+        sessions.next += 1;
+        let facade = Arc::new(SessionFacade::new(
+            Arc::clone(&self.shared.state),
+            Dispatcher::new(negotiated.endpoint, negotiated.permitted.clone())
+                .watching(negotiated.epoch.clone()),
+            SessionId::new(sessions.next),
+            self.shared.target.clone(),
+        ));
+        sessions.by_binding.insert(
+            binding.to_owned(),
+            SessionEntry {
+                facade: Arc::clone(&facade),
+                grant: None,
+            },
+        );
+        self.shared
+            .counters
+            .sessions
+            .store(sessions.by_binding.len() as u64, Ordering::Relaxed);
+        Ok(facade)
     }
 }
 

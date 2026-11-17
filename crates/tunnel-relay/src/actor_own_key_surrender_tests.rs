@@ -20,7 +20,7 @@ use std::{
 };
 
 use chrono::{Duration as ChronoDuration, Utc};
-use tokio::{sync::RwLock, time::timeout};
+use tokio::{sync::watch, time::timeout};
 use tokio_util::sync::CancellationToken;
 use tunnel_catalog::{
     ApprovedJwk, Catalog, CatalogFixture, CredentialRecord, FixtureDevice, MembershipRecord,
@@ -81,8 +81,19 @@ struct SignedAuthority {
     omit_node: AtomicBool,
     /// The minimum record version the checkpoint requires of this node.
     minimum_version: AtomicU64,
-    /// Other nodes the checkpoint names, with their minimum versions.
-    others: std::sync::Mutex<BTreeMap<String, u64>>,
+    /// Other nodes the checkpoint names, with their minimum versions.  The
+    /// test is the only writer; each checkpoint samples the latest map.
+    others: watch::Sender<BTreeMap<String, u64>>,
+}
+
+impl SignedAuthority {
+    /// Name `node` in later checkpoints with this minimum version.  Called
+    /// only by the test, the map's one writer.
+    fn name_node(&self, node: &str, minimum: u64) {
+        self.others.send_modify(|others| {
+            others.insert(node.to_owned(), minimum);
+        });
+    }
 }
 
 impl CheckpointAuthority for SignedAuthority {
@@ -108,11 +119,7 @@ impl CheckpointAuthority for SignedAuthority {
                 checkpoint_version: self.next_version.fetch_add(1, Ordering::AcqRel),
                 nonce: request.nonce,
                 minimum_versions: {
-                    let mut minimums = self
-                        .others
-                        .lock()
-                        .expect("other nodes mutex poisoned")
-                        .clone();
+                    let mut minimums = self.others.borrow().clone();
                     if !self.omit_node.load(Ordering::Acquire) {
                         minimums.insert(
                             NODE_ID.to_owned(),
@@ -136,7 +143,9 @@ impl CheckpointAuthority for SignedAuthority {
 
 #[derive(Clone)]
 struct RecordSource {
-    records: Arc<RwLock<Vec<CatalogMembershipRecord>>>,
+    /// The catalog's records.  The test is the only writer; each read
+    /// samples the latest list.
+    records: Arc<watch::Sender<Vec<CatalogMembershipRecord>>>,
     fail: Arc<AtomicBool>,
 }
 
@@ -148,7 +157,7 @@ impl MembershipRecordSource for RecordSource {
             if self.fail.load(Ordering::Acquire) {
                 return Err(MembershipSourceError::Catalog);
             }
-            Ok(self.records.read().await.clone())
+            Ok(self.records.borrow().clone())
         })
     }
 }
@@ -156,7 +165,7 @@ impl MembershipRecordSource for RecordSource {
 struct Fixture {
     /// Another relay's fresh record, re-published unchanged with this
     /// relay's, once [`Fixture::add_peer`] has run.
-    peer_record: std::sync::Mutex<Option<CatalogMembershipRecord>>,
+    peer_record: watch::Sender<Option<CatalogMembershipRecord>>,
     issuer: Arc<MembershipIssuer>,
     authority: Arc<SignedAuthority>,
     source: RecordSource,
@@ -195,10 +204,10 @@ impl Fixture {
             fail_status: AtomicU64::new(0),
             omit_node: AtomicBool::new(false),
             minimum_version: AtomicU64::new(1),
-            others: std::sync::Mutex::new(BTreeMap::new()),
+            others: watch::Sender::new(BTreeMap::new()),
         });
         let source = RecordSource {
-            records: Arc::new(RwLock::new(Vec::new())),
+            records: Arc::new(watch::Sender::new(Vec::new())),
             fail: Arc::new(AtomicBool::new(false)),
         };
         let config = MembershipRuntimeConfig::new(
@@ -247,7 +256,7 @@ impl Fixture {
         let relay = RelayHandle::spawn(options, Arc::new(catalog.clone()));
 
         let fixture = Self {
-            peer_record: std::sync::Mutex::new(None),
+            peer_record: watch::Sender::new(None),
             issuer,
             authority,
             source,
@@ -287,8 +296,8 @@ impl Fixture {
             now + ChronoDuration::seconds(30),
         );
         let mut records = vec![record];
-        records.extend(self.peer_record.lock().expect("peer record").clone());
-        *self.source.records.write().await = records;
+        records.extend(self.peer_record.borrow().clone());
+        self.source.records.send_replace(records);
     }
 
     /// Name another relay in the checkpoint and publish its fresh record
@@ -296,26 +305,22 @@ impl Fixture {
     /// is not the only node with evidence: a gap then concerns this node
     /// alone, not a shared publisher outage (M7-C186).
     async fn add_peer(&self, own_version: u64) {
-        self.authority
-            .others
-            .lock()
-            .expect("other nodes")
-            .insert(PEER_NODE.to_owned(), 1);
+        self.authority.name_node(PEER_NODE, 1);
         let now = Utc::now();
-        *self.peer_record.lock().expect("peer record") = Some(self.signed(
+        self.peer_record.send_replace(Some(self.signed(
             PEER_NODE,
             1,
             OTHER_SPKI,
             now - ChronoDuration::seconds(1),
             now + ChronoDuration::seconds(50),
-        ));
+        )));
         self.publish(own_version, SERVED_SPKI).await;
         self.ready_pass().await;
     }
 
     /// Replace the catalog's records.
     async fn set_records(&self, records: Vec<CatalogMembershipRecord>) {
-        *self.source.records.write().await = records;
+        self.source.records.send_replace(records);
     }
 
     /// A signed record for `node` approving `spki` inside the given window.
@@ -737,7 +742,7 @@ impl Fixture {
     /// local to the catalog's contents -- a malformed record envelope beside
     /// this relay's fresh record -- so it is counted toward M7-C184.
     async fn rejected_pass(&self) {
-        let original = self.source.records.read().await.clone();
+        let original = self.source.records.borrow().clone();
         let mut records = original.clone();
         records.push(CatalogMembershipRecord {
             version: 0,
@@ -784,11 +789,13 @@ impl Fixture {
         assert_eq!(self.membership.readiness(), MembershipReadiness::Ready);
     }
 
-    fn set_bounds(&self, local_record_below_minimum: Duration, prolonged_unready: Duration) {
-        self.membership.set_surrender_bounds(SurrenderBounds {
-            local_record_below_minimum,
-            prolonged_unready,
-        });
+    async fn set_bounds(&self, local_record_below_minimum: Duration, prolonged_unready: Duration) {
+        self.membership
+            .set_surrender_bounds(SurrenderBounds {
+                local_record_below_minimum,
+                prolonged_unready,
+            })
+            .await;
     }
 
     /// Wait a quiet window and assert nothing was surrendered.
@@ -994,7 +1001,7 @@ async fn a_record_below_the_checkpoint_minimum_does_not_surrender_on_two_passes(
 async fn a_record_below_the_minimum_surrenders_once_it_outlasts_the_publish_race_bound() {
     let fixture = Fixture::new().await;
     let mut control = fixture.register().await;
-    fixture.set_bounds(SHORT_BOUND, LONG_BOUND);
+    fixture.set_bounds(SHORT_BOUND, LONG_BOUND).await;
     // Another relay's record stays fresh, so the gap is this node's alone
     // (M7-C186), and this relay's own v2 record stays in the catalog below
     // the new minimum, absent for this node only (M7-C185).
@@ -1036,7 +1043,7 @@ async fn a_record_below_the_minimum_surrenders_once_it_outlasts_the_publish_race
 async fn a_different_conclusion_restarts_the_below_minimum_run() {
     let fixture = Fixture::new().await;
     let _control = fixture.register().await;
-    fixture.set_bounds(SHORT_BOUND, LONG_BOUND);
+    fixture.set_bounds(SHORT_BOUND, LONG_BOUND).await;
     // Another relay's record stays fresh, so the gap is this node's alone
     // (M7-C186), and this relay's own v2 record stays in the catalog below
     // the new minimum, absent for this node only (M7-C185).
@@ -1069,7 +1076,7 @@ async fn a_different_conclusion_restarts_the_below_minimum_run() {
 async fn a_prolonged_unready_relay_with_redis_reachable_surrenders_after_the_bound() {
     let fixture = Fixture::new().await;
     let mut control = fixture.register().await;
-    fixture.set_bounds(LONG_BOUND, SHORT_BOUND);
+    fixture.set_bounds(LONG_BOUND, SHORT_BOUND).await;
 
     fixture.rejected_pass().await;
     tokio::time::sleep(SHORT_BOUND * 5 / 8).await;
@@ -1104,7 +1111,7 @@ async fn a_prolonged_unready_relay_with_redis_reachable_surrenders_after_the_bou
 async fn catalog_unavailable_time_never_counts_toward_the_prolonged_unready_bound() {
     let fixture = Fixture::new().await;
     let _control = fixture.register().await;
-    fixture.set_bounds(LONG_BOUND, SHORT_BOUND);
+    fixture.set_bounds(LONG_BOUND, SHORT_BOUND).await;
     for _ in 0..3 {
         fixture.catalog_unavailable_pass().await;
         tokio::time::sleep(SHORT_BOUND / 2).await;
@@ -1134,7 +1141,7 @@ async fn catalog_unavailable_time_never_counts_toward_the_prolonged_unready_boun
 async fn accrued_unready_time_does_not_surrender_while_the_latest_pass_is_uncounted() {
     let fixture = Fixture::new().await;
     let _control = fixture.register().await;
-    fixture.set_bounds(LONG_BOUND, SHORT_BOUND);
+    fixture.set_bounds(LONG_BOUND, SHORT_BOUND).await;
     fixture.rejected_pass().await;
     tokio::time::sleep(SHORT_BOUND * 5 / 4).await;
     fixture.rejected_pass().await;
@@ -1163,7 +1170,7 @@ async fn accrued_unready_time_does_not_surrender_while_the_latest_pass_is_uncoun
 async fn an_unreachable_checkpoint_authority_never_accrues_toward_surrender() {
     let fixture = Fixture::new().await;
     let _control = fixture.register().await;
-    fixture.set_bounds(LONG_BOUND, SHORT_BOUND);
+    fixture.set_bounds(LONG_BOUND, SHORT_BOUND).await;
     fixture.unknown_authority_pass().await;
     tokio::time::sleep(SHORT_BOUND * 3 / 4).await;
     fixture.unknown_authority_pass().await;
@@ -1185,7 +1192,7 @@ async fn an_unreachable_checkpoint_authority_never_accrues_toward_surrender() {
 async fn a_stopped_publisher_never_accrues_toward_surrender() {
     let fixture = Fixture::new().await;
     let _control = fixture.register().await;
-    fixture.set_bounds(SHORT_BOUND, SHORT_BOUND);
+    fixture.set_bounds(SHORT_BOUND, SHORT_BOUND).await;
     let now = Utc::now();
     fixture
         .set_records(vec![fixture.signed(
@@ -1217,7 +1224,7 @@ async fn a_stopped_publisher_never_accrues_toward_surrender() {
 async fn a_ready_pass_resets_the_prolonged_unready_clock() {
     let fixture = Fixture::new().await;
     let _control = fixture.register().await;
-    fixture.set_bounds(LONG_BOUND, SHORT_BOUND);
+    fixture.set_bounds(LONG_BOUND, SHORT_BOUND).await;
     fixture.rejected_pass().await;
     tokio::time::sleep(SHORT_BOUND * 3 / 4).await;
     fixture.rejected_pass().await;
@@ -1352,12 +1359,7 @@ async fn a_stale_record_for_another_node_leaves_this_relay_ready() {
     fixture.set_records(vec![own.clone(), stale.clone()]).await;
     fixture.ready_pass().await;
     // The checkpoint names relay-b again, at a minimum above its record.
-    fixture
-        .authority
-        .others
-        .lock()
-        .expect("other nodes")
-        .insert(PEER_NODE.to_owned(), 5);
+    fixture.authority.name_node(PEER_NODE, 5);
     fixture.ready_pass().await;
     fixture.assert_kept("a stale record for another node").await;
     fixture.shutdown().await;
@@ -1405,12 +1407,7 @@ async fn an_expired_stale_record_for_another_node_leaves_this_relay_ready() {
 async fn a_named_record_at_its_minimum_that_fails_a_check_stays_fatal() {
     let fixture = Fixture::new().await;
     let _control = fixture.register().await;
-    fixture
-        .authority
-        .others
-        .lock()
-        .expect("other nodes")
-        .insert(PEER_NODE.to_owned(), 1);
+    fixture.authority.name_node(PEER_NODE, 1);
     let (foreign, _private_key) =
         MembershipIssuer::generate(PUBLISHER_KEY_ID).expect("foreign membership issuer");
     let now = Utc::now();
@@ -1471,13 +1468,8 @@ async fn a_named_record_at_its_minimum_that_fails_a_check_stays_fatal() {
 async fn a_lapsed_peer_record_leaves_this_relay_ready_without_a_route_to_that_peer() {
     let fixture = Fixture::new().await;
     let _control = fixture.register().await;
-    fixture.set_bounds(SHORT_BOUND, SHORT_BOUND);
-    fixture
-        .authority
-        .others
-        .lock()
-        .expect("other nodes")
-        .insert(PEER_NODE.to_owned(), 1);
+    fixture.set_bounds(SHORT_BOUND, SHORT_BOUND).await;
+    fixture.authority.name_node(PEER_NODE, 1);
     let now = Utc::now();
     let own = fixture.signed(
         NODE_ID,
@@ -1526,7 +1518,8 @@ async fn a_lapsed_peer_record_leaves_this_relay_ready_without_a_route_to_that_pe
         .membership
         .admit_peer(crate::MembershipPeerIdentity::new(
             PEER_NODE, "boot-b", OTHER_SPKI,
-        ));
+        ))
+        .await;
     assert!(
         matches!(admission, Err(crate::MembershipRuntimeError::PeerRejected)),
         "a lapsed record must admit no peer as relay-b, got {:?}",
@@ -1547,12 +1540,7 @@ async fn a_lapsed_peer_record_leaves_this_relay_ready_without_a_route_to_that_pe
 async fn a_lapsed_peer_record_never_seen_fresh_is_absent_for_that_peer() {
     let fixture = Fixture::new().await;
     let _control = fixture.register().await;
-    fixture
-        .authority
-        .others
-        .lock()
-        .expect("other nodes")
-        .insert(PEER_NODE.to_owned(), 1);
+    fixture.authority.name_node(PEER_NODE, 1);
     let now = Utc::now();
     let own = fixture.signed(
         NODE_ID,
@@ -1651,12 +1639,7 @@ async fn a_lapsed_revision_superseding_a_live_peer_record_stays_fatal() {
 async fn a_lapsed_older_peer_record_beside_a_live_retained_version_is_absent() {
     let fixture = Fixture::new().await;
     let _control = fixture.register().await;
-    fixture
-        .authority
-        .others
-        .lock()
-        .expect("other nodes")
-        .insert(PEER_NODE.to_owned(), 1);
+    fixture.authority.name_node(PEER_NODE, 1);
     let now = Utc::now();
     let own = fixture.signed(
         NODE_ID,
@@ -1706,12 +1689,7 @@ async fn a_lapsed_older_peer_record_beside_a_live_retained_version_is_absent() {
 async fn a_withdrawal_after_the_retained_peer_record_lapsed_is_absent() {
     let fixture = Fixture::new().await;
     let _control = fixture.register().await;
-    fixture
-        .authority
-        .others
-        .lock()
-        .expect("other nodes")
-        .insert(PEER_NODE.to_owned(), 1);
+    fixture.authority.name_node(PEER_NODE, 1);
     let now = Utc::now();
     let own = fixture.signed(
         NODE_ID,
@@ -1777,13 +1755,8 @@ async fn a_withdrawal_after_the_retained_peer_record_lapsed_is_absent() {
 async fn this_relays_own_lapsed_record_stays_fatal_beside_a_fresh_peer() {
     let fixture = Fixture::new().await;
     let _control = fixture.register().await;
-    fixture
-        .authority
-        .others
-        .lock()
-        .expect("other nodes")
-        .insert(PEER_NODE.to_owned(), 1);
-    fixture.set_bounds(LONG_BOUND, SHORT_BOUND);
+    fixture.authority.name_node(PEER_NODE, 1);
+    fixture.set_bounds(LONG_BOUND, SHORT_BOUND).await;
     let now = Utc::now();
     let own_expiry = now + ChronoDuration::seconds(1);
     let own = fixture.signed(
@@ -1846,13 +1819,8 @@ async fn this_relays_own_lapsed_record_stays_fatal_beside_a_fresh_peer() {
 async fn every_named_record_lapsed_is_still_a_publisher_outage() {
     let fixture = Fixture::new().await;
     let _control = fixture.register().await;
-    fixture
-        .authority
-        .others
-        .lock()
-        .expect("other nodes")
-        .insert(PEER_NODE.to_owned(), 1);
-    fixture.set_bounds(SHORT_BOUND, SHORT_BOUND);
+    fixture.authority.name_node(PEER_NODE, 1);
+    fixture.set_bounds(SHORT_BOUND, SHORT_BOUND).await;
     let now = Utc::now();
     let own = fixture.signed(
         NODE_ID,
@@ -1894,7 +1862,7 @@ async fn every_named_record_lapsed_is_still_a_publisher_outage() {
 async fn an_authority_refusing_this_relay_accrues_toward_surrender() {
     let fixture = Fixture::new().await;
     let mut control = fixture.register().await;
-    fixture.set_bounds(LONG_BOUND, SHORT_BOUND);
+    fixture.set_bounds(LONG_BOUND, SHORT_BOUND).await;
     // 403, 404, 401: each interval is shorter than the bound, so the
     // surrender needs every one of them counted, 404 included.
     fixture.authority_status_pass(403).await;
@@ -1923,7 +1891,7 @@ async fn an_authority_refusing_this_relay_accrues_toward_surrender() {
 async fn authority_server_errors_and_throttling_never_accrue_toward_surrender() {
     let fixture = Fixture::new().await;
     let _control = fixture.register().await;
-    fixture.set_bounds(LONG_BOUND, SHORT_BOUND);
+    fixture.set_bounds(LONG_BOUND, SHORT_BOUND).await;
     for status in [503, 500, 429, 408] {
         for pass in 0..4 {
             if pass > 0 {
@@ -1951,7 +1919,7 @@ async fn authority_server_errors_and_throttling_never_accrue_toward_surrender() 
 async fn a_publisher_outage_never_advances_the_below_minimum_run() {
     let fixture = Fixture::new().await;
     let _control = fixture.register().await;
-    fixture.set_bounds(SHORT_BOUND, LONG_BOUND);
+    fixture.set_bounds(SHORT_BOUND, LONG_BOUND).await;
     fixture
         .authority
         .minimum_version
@@ -1977,7 +1945,7 @@ async fn a_publisher_outage_never_advances_the_below_minimum_run() {
 async fn a_record_below_its_minimum_is_not_evidence_the_publisher_is_alive() {
     let fixture = Fixture::new().await;
     let _control = fixture.register().await;
-    fixture.set_bounds(SHORT_BOUND, LONG_BOUND);
+    fixture.set_bounds(SHORT_BOUND, LONG_BOUND).await;
     fixture
         .authority
         .minimum_version
@@ -2002,13 +1970,8 @@ async fn freshness_allows_the_clock_skew() {
     let fixture = Fixture::with_skew(Duration::from_secs(5)).await;
     let _control = fixture.register().await;
     let bound = Duration::from_millis(250);
-    fixture.set_bounds(bound, LONG_BOUND);
-    fixture
-        .authority
-        .others
-        .lock()
-        .expect("other nodes")
-        .insert(PEER_NODE.to_owned(), 1);
+    fixture.set_bounds(bound, LONG_BOUND).await;
+    fixture.authority.name_node(PEER_NODE, 1);
     fixture
         .authority
         .minimum_version

@@ -275,10 +275,7 @@ pub(super) fn log_connector_rejected_with(
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        sync::{Arc, Mutex},
-        time::Instant,
-    };
+    use std::{sync::mpsc, time::Instant};
 
     use tunnel_transport::log_limit::RefusalLogLimiter;
 
@@ -358,9 +355,9 @@ mod tests {
     /// and be reported on the session's next written line.
     #[test]
     fn a_later_budget_refusing_keeps_the_earlier_budgets_suppressed_counts() {
-        let captured = Captured::default();
+        let mut captured = Captured::default();
         let subscriber = tracing_subscriber::fmt()
-            .with_writer(captured.clone())
+            .with_writer(captured.writer())
             .with_env_filter("info")
             .with_ansi(false)
             .finish();
@@ -504,29 +501,58 @@ mod tests {
         assert_eq!(reason_category("\u{1b}[31mpayload"), OTHER);
     }
 
-    /// A `MakeWriter` collecting log lines.
-    #[derive(Clone, Default)]
-    pub(crate) struct Captured(pub(crate) Arc<Mutex<Vec<u8>>>);
+    /// A `MakeWriter` sending every log write to the test's [`Captured`].
+    #[derive(Clone)]
+    pub(crate) struct CapturedWriter(mpsc::Sender<Vec<u8>>);
 
-    impl std::io::Write for Captured {
+    impl std::io::Write for CapturedWriter {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            std::io::Write::write(&mut *self.0.lock().expect("log buffer"), bytes)
+            // A test that has dropped its `Captured` no longer reads the log.
+            let _ = self.0.send(bytes.to_vec());
+            Ok(bytes.len())
         }
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
     }
 
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedWriter {
         type Writer = Self;
         fn make_writer(&'a self) -> Self::Writer {
             self.clone()
         }
     }
 
+    /// The log lines written so far, collected by the one test that reads
+    /// them.
+    pub(crate) struct Captured {
+        writer: CapturedWriter,
+        written: mpsc::Receiver<Vec<u8>>,
+        bytes: Vec<u8>,
+    }
+
+    impl Default for Captured {
+        fn default() -> Self {
+            let (tx, written) = mpsc::channel();
+            Self {
+                writer: CapturedWriter(tx),
+                written,
+                bytes: Vec::new(),
+            }
+        }
+    }
+
     impl Captured {
-        pub(crate) fn text(&self) -> String {
-            String::from_utf8_lossy(&self.0.lock().expect("log buffer")).into_owned()
+        pub(crate) fn writer(&self) -> CapturedWriter {
+            self.writer.clone()
+        }
+
+        /// Everything written so far, in write order.
+        pub(crate) fn text(&mut self) -> String {
+            for chunk in self.written.try_iter() {
+                self.bytes.extend_from_slice(&chunk);
+            }
+            String::from_utf8_lossy(&self.bytes).into_owned()
         }
     }
 }
@@ -561,7 +587,7 @@ mod actor_tests {
     fn capture() -> (Captured, tracing::subscriber::DefaultGuard) {
         let captured = Captured::default();
         let subscriber = tracing_subscriber::fmt()
-            .with_writer(captured.clone())
+            .with_writer(captured.writer())
             .with_env_filter("info")
             .with_ansi(false)
             .finish();
@@ -750,7 +776,7 @@ mod actor_tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn m7c160_connector_rejected_is_logged_with_code_category_and_phase_only() {
-        let (captured, _guard) = capture();
+        let (mut captured, _guard) = capture();
         let mut relay = Relay::new();
         let device = relay.device(0, 0, 2).await;
         let first = &device.streams[0];
@@ -810,7 +836,7 @@ mod actor_tests {
     /// refusal is still logged.
     #[tokio::test(flavor = "current_thread")]
     async fn m7c160_one_session_forging_rejecteds_is_bounded_by_its_session_budget() {
-        let (captured, _guard) = capture();
+        let (mut captured, _guard) = capture();
         let mut relay = Relay::new();
         let flooder = relay.device(1, 0, 0).await;
         let victim = relay.device(2, 0, 1).await;
@@ -839,7 +865,7 @@ mod actor_tests {
     /// another tenant's GOAWAY.
     #[tokio::test(flavor = "current_thread")]
     async fn m7c160_a_tenant_flooding_from_every_device_cannot_silence_another_tenant() {
-        let (captured, _guard) = capture();
+        let (mut captured, _guard) = capture();
         let mut relay = Relay::new();
         let devices = crate::config::RelayLimits::default().max_devices_per_user;
         let per_session = super::SESSION_REJECTED_LOG_BURST as usize + 1;

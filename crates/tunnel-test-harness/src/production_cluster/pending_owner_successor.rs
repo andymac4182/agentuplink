@@ -15,7 +15,9 @@ use hyper_util::rt::TokioIo;
 use rustls::pki_types::{CertificateDer, ServerName};
 
 const SUCCESSOR_MAX_RESPONSE_BYTES: usize = 256 * 1024;
-type SuccessorHttpConnectionSlot = Arc<tokio::sync::Mutex<Option<JoinHandle<()>>>>;
+/// A consumer HTTP connection task that cleanup has yet to join.  The slot is
+/// owned by `SuccessorResources` alone and emptied once the task is joined.
+type SuccessorHttpConnectionSlot = Option<JoinHandle<()>>;
 
 /// Payload-free evidence for a successor owner that is published before its
 /// owner-fence and data carrier are ready.
@@ -144,7 +146,7 @@ impl SuccessorResources {
     async fn cleanup(&mut self) -> Result<()> {
         let deadline = Instant::now() + RESOURCE_CLEANUP_TIMEOUT;
         let mut failure = None;
-        for connection in &self.http_connections {
+        for connection in &mut self.http_connections {
             append_cleanup_result(
                 &mut failure,
                 "successor pending-owner HTTP connection cleanup",
@@ -555,7 +557,7 @@ pub async fn verify() -> Result<SuccessorPendingOwnerEvidence> {
     };
     // Resource cleanup owns one absolute deadline and its own forced
     // abort-and-join pass.  Do not wrap it in another timeout: cancellation
-    // here would drop the remaining Arc<Mutex<JoinHandle>> slots and detach
+    // here would drop the remaining connection task handles and detach
     // the HTTP tasks that the evidence requires us to join.
     let resource_cleanup = resources.cleanup().await;
     let cluster_cleanup = cluster.shutdown().await;
@@ -1322,12 +1324,11 @@ async fn successor_public_echo(
     .await
     .map_err(|_| HarnessError::Timeout("successor consumer HTTP handshake timed out".into()))?
     .map_err(|error| HarnessError::Http(format!("successor consumer HTTP handshake: {error}")))?;
-    let connection_slot = Arc::new(tokio::sync::Mutex::new(Some(tokio::spawn(async move {
-        let _ = connection.await;
-    }))));
     resources
         .http_connections
-        .push(Arc::clone(&connection_slot));
+        .push(Some(tokio::spawn(async move {
+            let _ = connection.await;
+        })));
     let path = format!("/v1/devices/{device_id}/services/{service_id}/echo");
     let request = Request::builder()
         .method("POST")
@@ -1360,22 +1361,19 @@ async fn successor_public_echo(
 }
 
 async fn join_successor_http_connection(
-    slot: &SuccessorHttpConnectionSlot,
+    slot: &mut SuccessorHttpConnectionSlot,
     deadline: Instant,
 ) -> Result<()> {
-    let mut guard = timeout_at(deadline, slot.lock())
-        .await
-        .map_err(|_| HarnessError::Timeout("successor HTTP connection lock timed out".into()))?;
-    let Some(task) = guard.as_mut() else {
+    let Some(task) = slot.as_mut() else {
         return Ok(());
     };
     match timeout_at(deadline, &mut *task).await {
         Ok(Ok(())) => {
-            guard.take();
+            slot.take();
             Ok(())
         }
         Ok(Err(error)) => {
-            guard.take();
+            slot.take();
             Err(HarnessError::Process(format!(
                 "successor HTTP connection task failed: {error}"
             )))
@@ -1384,11 +1382,11 @@ async fn join_successor_http_connection(
             task.abort();
             match timeout(FORCE_JOIN_TIMEOUT, &mut *task).await {
                 Ok(Ok(())) => {
-                    guard.take();
+                    slot.take();
                     Ok(())
                 }
                 Ok(Err(error)) => {
-                    guard.take();
+                    slot.take();
                     Err(HarnessError::Process(format!(
                         "successor HTTP connection abort join failed: {error}"
                     )))

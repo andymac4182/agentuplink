@@ -8,14 +8,14 @@
 //! Redis value as a trust anchor.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     error::Error,
     fmt,
     future::Future,
     net::IpAddr,
     pin::Pin,
     sync::{
-        Arc, Mutex,
+        Arc, Weak,
         atomic::{AtomicBool, AtomicU8, Ordering},
     },
     time::{Duration, Instant},
@@ -32,7 +32,7 @@ use rustls::{ClientConfig, RootCertStore, pki_types::ServerName};
 use serde::{Deserialize, Serialize};
 use tokio::{
     net::TcpStream,
-    sync::{Mutex as AsyncMutex, Notify, RwLock},
+    sync::{Notify, mpsc, oneshot, watch},
     task::JoinHandle,
 };
 use tokio_rustls::TlsConnector;
@@ -47,6 +47,7 @@ use tunnel_cluster::membership::{
 use crate::{
     config::ClusterConfig,
     membership_version_state::{MembershipVersionStateStore, MembershipVersionStateStoreError},
+    owner_task::OwnerTask,
     peer_runtime::peer_readiness::PeerRouteTarget,
     redis_connection::{RedisTlsMaterialKind, read_material},
 };
@@ -433,7 +434,9 @@ impl MembershipRecordSource for CatalogMembershipSource {
 /// sign membership records.
 #[derive(Clone, Default)]
 pub struct StaticMembershipSource {
-    records: Arc<RwLock<Vec<CatalogMembershipRecord>>>,
+    /// The latest record set.  Whoever owns the directory publishes it with
+    /// [`Self::replace`]; every read samples the latest publication whole.
+    records: Arc<watch::Sender<Vec<CatalogMembershipRecord>>>,
 }
 
 impl StaticMembershipSource {
@@ -442,7 +445,7 @@ impl StaticMembershipSource {
             return Err(MembershipSourceError::TooManyRecords);
         }
         Ok(Self {
-            records: Arc::new(RwLock::new(records)),
+            records: Arc::new(watch::Sender::new(records)),
         })
     }
 
@@ -453,7 +456,7 @@ impl StaticMembershipSource {
         if records.len() > MAX_MEMBERSHIP_RECORDS {
             return Err(MembershipSourceError::TooManyRecords);
         }
-        *self.records.write().await = records;
+        self.records.send_replace(records);
         Ok(())
     }
 }
@@ -462,7 +465,7 @@ impl MembershipRecordSource for StaticMembershipSource {
     fn read_signed_memberships<'a>(
         &'a self,
     ) -> MembershipFuture<'a, Result<Vec<CatalogMembershipRecord>, MembershipSourceError>> {
-        Box::pin(async move { Ok(self.records.read().await.clone()) })
+        Box::pin(async move { Ok(self.records.borrow().clone()) })
     }
 }
 
@@ -912,18 +915,34 @@ pub enum PeerInvalidationReason {
 }
 
 impl PeerInvalidationReason {
-    const fn code(self) -> u8 {
-        match self {
-            Self::TrustExpired => 1,
-            Self::MembershipRevoked => 2,
-            Self::MembershipChanged => 3,
-            Self::AuthorityUnknown => 4,
-            Self::PersistenceUnavailable => 5,
-            Self::RuntimeCancelled => 6,
+    /// Every reason, for the conversion tests.
+    #[cfg(test)]
+    const ALL: [Self; 6] = [
+        Self::TrustExpired,
+        Self::MembershipRevoked,
+        Self::MembershipChanged,
+        Self::AuthorityUnknown,
+        Self::PersistenceUnavailable,
+        Self::RuntimeCancelled,
+    ];
+
+    /// The one encoding of a latched reason into the edge's atomic byte;
+    /// `None` (nothing latched) is [`UNCLASSIFIED_REASON`].
+    const fn encode(reason: Option<Self>) -> u8 {
+        match reason {
+            None => UNCLASSIFIED_REASON,
+            Some(Self::TrustExpired) => 1,
+            Some(Self::MembershipRevoked) => 2,
+            Some(Self::MembershipChanged) => 3,
+            Some(Self::AuthorityUnknown) => 4,
+            Some(Self::PersistenceUnavailable) => 5,
+            Some(Self::RuntimeCancelled) => 6,
         }
     }
 
-    const fn from_code(code: u8) -> Option<Self> {
+    /// The inverse of [`Self::encode`]; a byte no reason encodes to cannot
+    /// be stored and reads as unclassified.
+    const fn decode(code: u8) -> Option<Self> {
         match code {
             1 => Some(Self::TrustExpired),
             2 => Some(Self::MembershipRevoked),
@@ -936,6 +955,86 @@ impl PeerInvalidationReason {
     }
 }
 
+/// The byte of an edge on which no reason has been latched.
+const UNCLASSIFIED_REASON: u8 = 0;
+
+/// The state of one admission's invalidation edge.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AdmissionEdgeState {
+    /// Admitted: no reason latched, token live.
+    Live,
+    /// The dispatcher latched its reason and has not cancelled the token
+    /// yet.  The reason is already final.
+    Invalidating(PeerInvalidationReason),
+    /// The token is cancelled.  `None` is an unclassified cancellation: the
+    /// peer was removed, or a holder of the bare token cancelled it.
+    Cancelled(Option<PeerInvalidationReason>),
+}
+
+/// One admission's invalidation edge: the transport-compatible token and the
+/// first reason latched for it, shared by the runtime's active-admission
+/// table and every stream riding the admission.
+#[derive(Clone)]
+struct AdmissionEdge {
+    token: CancellationToken,
+    reason: Arc<AtomicU8>,
+}
+
+impl AdmissionEdge {
+    /// A live edge over `token`.
+    fn live(token: CancellationToken) -> Self {
+        Self {
+            token,
+            reason: Arc::new(AtomicU8::new(UNCLASSIFIED_REASON)),
+        }
+    }
+
+    fn reason(&self) -> Option<PeerInvalidationReason> {
+        PeerInvalidationReason::decode(self.reason.load(Ordering::Acquire))
+    }
+
+    fn state(&self) -> AdmissionEdgeState {
+        // The token is read first: a reason is latched before its token is
+        // cancelled, so a cancelled token read here already has its reason.
+        let cancelled = self.token.is_cancelled();
+        match (cancelled, self.reason()) {
+            (true, reason) => AdmissionEdgeState::Cancelled(reason),
+            (false, Some(reason)) => AdmissionEdgeState::Invalidating(reason),
+            (false, None) => AdmissionEdgeState::Live,
+        }
+    }
+
+    /// Latch `reason` unless one is latched already; the first reason wins
+    /// and is never replaced.
+    fn latch(&self, reason: PeerInvalidationReason) -> bool {
+        self.reason
+            .compare_exchange(
+                UNCLASSIFIED_REASON,
+                PeerInvalidationReason::encode(Some(reason)),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    /// The classified transition, `Live -> Invalidating -> Cancelled`: latch
+    /// the reason, then cancel the token, so no observer of the cancelled
+    /// token misses its reason.  On an edge that already has a reason the
+    /// earlier reason stands.
+    fn invalidate(&self, reason: PeerInvalidationReason) -> AdmissionEdgeState {
+        self.latch(reason);
+        self.token.cancel();
+        self.state()
+    }
+
+    /// The unclassified transition, `Live -> Cancelled(None)`: cancel the
+    /// token and latch nothing.
+    fn close(&self) -> AdmissionEdgeState {
+        self.token.cancel();
+        self.state()
+    }
+}
+
 /// Cancellation state for one authenticated peer admission.  The token
 /// remains compatible with transport cancellation while the bounded reason
 /// lets a caller distinguish signed trust expiry from an unrelated close.
@@ -945,8 +1044,7 @@ impl PeerInvalidationReason {
 /// has not run yet.
 #[derive(Clone)]
 pub struct PeerAdmissionCancellation {
-    token: CancellationToken,
-    reason: Arc<AtomicU8>,
+    edge: AdmissionEdge,
     expires_at: Option<SharedAdmissionExpiry>,
 }
 
@@ -957,19 +1055,20 @@ pub struct PeerAdmissionCancellation {
 /// admission to freshly verified signed evidence (M7-C80); it is never moved
 /// earlier than a boundary already observed and never extended by a cache hit,
 /// a late response or a clock correction.
+///
+/// The runtime's reconcile is its only writer: it publishes the monotonic
+/// deadline and the signed boundary as one value, and every stream samples
+/// the latest pair whole.
 #[derive(Clone, Debug)]
-struct SharedAdmissionExpiry(Arc<Mutex<(Instant, Option<DateTime<Utc>>)>>);
+struct SharedAdmissionExpiry(Arc<watch::Sender<(Instant, Option<DateTime<Utc>>)>>);
 
 impl SharedAdmissionExpiry {
     fn new(expires_at: Instant, trust_expires_at: Option<DateTime<Utc>>) -> Self {
-        Self(Arc::new(Mutex::new((expires_at, trust_expires_at))))
+        Self(Arc::new(watch::Sender::new((expires_at, trust_expires_at))))
     }
 
     fn load(&self) -> (Instant, Option<DateTime<Utc>>) {
-        match self.0.lock() {
-            Ok(guard) => *guard,
-            Err(poisoned) => *poisoned.into_inner(),
-        }
+        *self.0.borrow()
     }
 
     fn get(&self) -> Instant {
@@ -977,11 +1076,7 @@ impl SharedAdmissionExpiry {
     }
 
     fn set(&self, expires_at: Instant, trust_expires_at: DateTime<Utc>) {
-        let value = (expires_at, Some(trust_expires_at));
-        match self.0.lock() {
-            Ok(mut guard) => *guard = value,
-            Err(poisoned) => *poisoned.into_inner() = value,
-        }
+        self.0.send_replace((expires_at, Some(trust_expires_at)));
     }
 }
 
@@ -993,8 +1088,7 @@ impl PeerAdmissionCancellation {
     #[must_use]
     pub fn from_token(token: CancellationToken) -> Self {
         Self {
-            token,
-            reason: Arc::new(AtomicU8::new(0)),
+            edge: AdmissionEdge::live(token),
             expires_at: None,
         }
     }
@@ -1006,8 +1100,7 @@ impl PeerAdmissionCancellation {
     #[must_use]
     pub fn from_token_with_deadline(token: CancellationToken, expires_at: Instant) -> Self {
         Self {
-            token,
-            reason: Arc::new(AtomicU8::new(0)),
+            edge: AdmissionEdge::live(token),
             expires_at: Some(SharedAdmissionExpiry::new(expires_at, None)),
         }
     }
@@ -1016,29 +1109,38 @@ impl PeerAdmissionCancellation {
     /// cancellation. Only receive-path tests may construct this intermediate state.
     #[cfg(test)]
     pub(crate) fn with_reason_for_test(self, reason: PeerInvalidationReason) -> Self {
-        self.reason
-            .compare_exchange(0, reason.code(), Ordering::AcqRel, Ordering::Acquire)
-            .expect("test admission reason is not already latched");
+        assert!(
+            self.edge.latch(reason),
+            "test admission reason is not already latched"
+        );
         self
     }
 
     #[must_use]
     pub fn token(&self) -> CancellationToken {
-        self.token.clone()
+        self.edge.token.clone()
     }
 
     #[must_use]
     pub fn is_cancelled(&self) -> bool {
-        self.token.is_cancelled()
+        self.edge.token.is_cancelled()
     }
 
     pub fn cancelled(&self) -> impl Future<Output = ()> + '_ {
-        self.token.cancelled()
+        self.edge.token.cancelled()
     }
 
+    /// The reason latched for this edge, if any.  It may be read before the
+    /// token is cancelled (see [`AdmissionEdgeState::Invalidating`]).
     #[must_use]
     pub fn reason(&self) -> Option<PeerInvalidationReason> {
-        PeerInvalidationReason::from_code(self.reason.load(Ordering::Acquire))
+        self.edge.reason()
+    }
+
+    /// The edge's state: live, invalidating, or cancelled with its reason.
+    #[must_use]
+    pub(crate) fn state(&self) -> AdmissionEdgeState {
+        self.edge.state()
     }
 
     /// Return the admission's monotonic trust deadline when the provider
@@ -1063,10 +1165,12 @@ impl PeerAdmissionCancellation {
     /// expiry.
     #[must_use]
     pub fn trust_expired(&self) -> bool {
-        match self.reason() {
-            Some(PeerInvalidationReason::TrustExpired) => true,
-            Some(_) => false,
-            None => self
+        match self.state() {
+            AdmissionEdgeState::Invalidating(reason)
+            | AdmissionEdgeState::Cancelled(Some(reason)) => {
+                reason == PeerInvalidationReason::TrustExpired
+            }
+            AdmissionEdgeState::Live | AdmissionEdgeState::Cancelled(None) => self
                 .expires_at()
                 .is_some_and(|deadline| Instant::now() >= deadline),
         }
@@ -1123,8 +1227,7 @@ pub struct PeerAdmission {
     identity: PeerIdentity,
     binding: VerifiedPeerBinding,
     deadline: AdmissionDeadline,
-    invalidation: CancellationToken,
-    invalidation_reason: Arc<AtomicU8>,
+    invalidation: AdmissionEdge,
     expiry: SharedAdmissionExpiry,
 }
 
@@ -1134,7 +1237,7 @@ impl fmt::Debug for PeerAdmission {
             .debug_struct("PeerAdmission")
             .field("identity", &self.identity)
             .field("deadline", &self.deadline)
-            .field("cancelled", &self.invalidation.is_cancelled())
+            .field("cancelled", &self.invalidation.token.is_cancelled())
             .finish_non_exhaustive()
     }
 }
@@ -1166,7 +1269,7 @@ impl PeerAdmission {
 
     #[must_use]
     pub fn cancellation_token(&self) -> CancellationToken {
-        self.invalidation.clone()
+        self.invalidation.token.clone()
     }
 
     /// Return the token, its live invalidation cause, and the admission's
@@ -1174,15 +1277,14 @@ impl PeerAdmission {
     #[must_use]
     pub fn cancellation(&self) -> PeerAdmissionCancellation {
         PeerAdmissionCancellation {
-            token: self.invalidation.clone(),
-            reason: self.invalidation_reason.clone(),
+            edge: self.invalidation.clone(),
             expires_at: Some(self.expiry.clone()),
         }
     }
 
     #[must_use]
     pub fn is_invalidated(&self) -> bool {
-        self.invalidation.is_cancelled()
+        self.invalidation.token.is_cancelled()
     }
 }
 
@@ -1191,15 +1293,83 @@ struct ActivePeer {
     record_version: u64,
 }
 
+/// What a pass that verified a checkpoint records about it, as one value.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct VerifiedCheckpoint {
+    version: u64,
+    expires_at: DateTime<Utc>,
+    verified_at: DateTime<Utc>,
+}
+
+/// The signed trust boundary of a `Ready` pass and its monotonic deadline,
+/// as one value: neither exists without the other.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TrustWindow {
+    expires_at: DateTime<Utc>,
+    deadline: Instant,
+}
+
+/// What the passes so far have verified.  A trust window exists only with
+/// the checkpoint evidence of some pass, so it lives in the variant that has
+/// both.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum VerifiedEvidence {
+    /// No pass has verified a checkpoint.
+    Unverified,
+    /// A pass verified a checkpoint; none has concluded `Ready`.
+    Checkpoint(VerifiedCheckpoint),
+    /// Some pass concluded `Ready`.  `checkpoint` is the last one verified,
+    /// by that pass or by a later one that concluded unready; `trust` is the
+    /// window of the last `Ready` pass.
+    Trusted {
+        checkpoint: VerifiedCheckpoint,
+        trust: TrustWindow,
+    },
+}
+
+impl VerifiedEvidence {
+    /// A pass verified `checkpoint` and concluded unready: the checkpoint
+    /// evidence is replaced and an existing trust window is left as it was.
+    fn checkpoint_verified(self, checkpoint: VerifiedCheckpoint) -> Self {
+        match self {
+            Self::Unverified | Self::Checkpoint(_) => Self::Checkpoint(checkpoint),
+            Self::Trusted { trust, .. } => Self::Trusted { checkpoint, trust },
+        }
+    }
+
+    /// A pass verified `checkpoint` and concluded `Ready` with `trust`.
+    fn ready(self, checkpoint: VerifiedCheckpoint, trust: TrustWindow) -> Self {
+        match self {
+            Self::Unverified | Self::Checkpoint(_) | Self::Trusted { .. } => {
+                Self::Trusted { checkpoint, trust }
+            }
+        }
+    }
+
+    fn checkpoint(self) -> Option<VerifiedCheckpoint> {
+        match self {
+            Self::Unverified => None,
+            Self::Checkpoint(checkpoint) | Self::Trusted { checkpoint, .. } => Some(checkpoint),
+        }
+    }
+
+    fn trust(self) -> Option<TrustWindow> {
+        match self {
+            Self::Unverified | Self::Checkpoint(_) => None,
+            Self::Trusted { trust, .. } => Some(trust),
+        }
+    }
+}
+
+/// The membership state, owned by the one membership task.
 struct RuntimeState {
-    verifier: MembershipVerifier,
+    /// Shared with the published snapshots; replaced, never mutated in
+    /// place, while a snapshot still holds it.
+    verifier: Arc<MembershipVerifier>,
     readiness: MembershipReadiness,
     generation: u64,
-    checkpoint_version: Option<u64>,
-    checkpoint_expires_at: Option<DateTime<Utc>>,
-    trust_expires_at: Option<DateTime<Utc>>,
-    trust_deadline: Option<Instant>,
-    last_verified_at: Option<DateTime<Utc>>,
+    /// The checkpoint and trust-window evidence of the passes so far.
+    evidence: VerifiedEvidence,
     active_peers: BTreeMap<PeerIdentity, ActivePeer>,
     callback: Option<PeerInvalidationCallback>,
     last_persisted_version_state: Option<MembershipVersionState>,
@@ -1226,14 +1396,6 @@ struct RuntimeState {
     /// When the most recent completed pass concluded, if it concluded an
     /// unready reason that counts toward [`Self::prolonged_unready`].
     last_counted_unready_pass: Option<Instant>,
-    /// The local-membership gap the pass in progress concluded, if any. Set
-    /// by the pass, consumed when it is counted (M7-C182).
-    pass_local_gap: Option<LocalMembershipGap>,
-    /// Whether the pass in progress saw the signature of a shared publisher
-    /// outage: a fresh checkpoint, but no record for any node it names still
-    /// inside its signed lifetime (M7-C186). Set by the pass, consumed when
-    /// it is counted.
-    pass_publisher_outage: bool,
     /// The time-based surrender bounds (M7-C182, M7-C184).
     surrender_bounds: SurrenderBounds,
 }
@@ -1281,24 +1443,232 @@ impl MembershipRuntimeHandle {
     }
 }
 
+/// How many commands may wait for the membership owner task.  A caller waits
+/// while the queue is full.
+const MEMBERSHIP_COMMAND_QUEUE: usize = 64;
+
+/// How many reconcile and identity-switch requests the owner holds behind the
+/// reconciliation pass in flight.  At this bound the owner stops taking
+/// commands until that pass completes, so further callers wait in the bounded
+/// command queue instead.
+const MAX_GATED_COMMANDS: usize = 16;
+
 /// Process-local M7 membership state and reconciliation supervisor.
+///
+/// One owning task holds the mutable membership state.  Every mutation is a
+/// command on a bounded queue and is answered only after the owner has
+/// published the immutable snapshot that reflects it, so a caller reads its
+/// own write.  Reads never reach the owner: they sample the latest published
+/// snapshot and compute trust expiry themselves from its deadlines, at the
+/// instant of the read.
 pub struct MembershipRuntime {
+    shared: Arc<Shared>,
+    owner: OwnerTask<Command>,
+    started: AtomicBool,
+}
+
+/// What the runtime handle, its owning task and a reconciliation pass share.
+/// Nothing here is mutable state except the two published values, each of
+/// which only the owning task writes.
+struct Shared {
     config: MembershipRuntimeConfig,
     catalog: Arc<dyn MembershipRecordSource>,
     authority: Arc<dyn CheckpointAuthority>,
     cancellation: CancellationToken,
     wake: Notify,
-    reconcile_gate: AsyncMutex<()>,
-    state: Mutex<RuntimeState>,
     version_store: Option<Arc<MembershipVersionStateStore>>,
-    started: AtomicBool,
     /// The SPKI digest this process currently presents on new peer
     /// handshakes, and therefore the one its readiness is bound to.  Starts
     /// at `config.local_spki_sha256`; only
-    /// [`MembershipRuntime::switch_local_serving_spki`] changes it, under the
-    /// reconcile gate and only to a key the verified record approves now
-    /// (task rows M8-C28, M8-C45).
-    local_serving_spki: Mutex<Option<String>>,
+    /// [`MembershipRuntime::switch_local_serving_spki`] changes it, as a
+    /// command of the owning task that no reconciliation pass overlaps, and
+    /// only to a key the verified record approves now (task rows M8-C28,
+    /// M8-C45).  The owning task is the only writer; readers sample the
+    /// latest published digest.
+    local_serving_spki: watch::Sender<Option<String>>,
+    /// The latest membership state, published by the owning task after every
+    /// change.
+    published: watch::Sender<Arc<PublishedState>>,
+    /// A reader saw, at its own read instant, an expiry the owning task has
+    /// not applied yet.  The owner applies it and dispatches the
+    /// invalidations; the reader has already answered from the deadline.
+    expiry_observed: Arc<Notify>,
+    /// The version fences read from the durable store at construction, which
+    /// the owning task starts from.
+    persisted_at_start: Option<MembershipVersionState>,
+}
+
+/// Whether the task that owns the membership state can still change it.
+///
+/// Carries no payload.  Once it leaves `Live` it never returns: the owning
+/// task is started once per runtime, so a runtime whose owner has ended
+/// answers every later admit, reconcile and identity switch `Cancelled` and
+/// reads not-ready for the rest of the process.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MembershipOwnerState {
+    /// The owning task is running, or no caller has started it yet.
+    Live,
+    /// The owning task was dropped without a panic: its Tokio runtime shut
+    /// down underneath a runtime handle that is still held.
+    Stopped,
+    /// The owning task panicked (an invalidation callback that panics).
+    Failed,
+}
+
+impl MembershipOwnerState {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Live => "live",
+            Self::Stopped => "stopped",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+/// The immutable membership state readers sample.
+struct PublishedState {
+    /// Whether the owning task can still change this state.  Anything but
+    /// `Live` is published together with `Unready(Cancelled)` and no
+    /// admission, and is the last value ever published.
+    owner: MembershipOwnerState,
+    verifier: Arc<MembershipVerifier>,
+    /// The readiness the owning task last installed.  A reader that must
+    /// honour trust expiry uses [`Self::view_at`] instead.
+    readiness: MembershipReadiness,
+    generation: u64,
+    evidence: VerifiedEvidence,
+    /// The monotonic deadline of every active admission.
+    active_peer_deadlines: Vec<Instant>,
+    own_key_missing_passes: u32,
+    node_omitted_passes: u32,
+    below_minimum_since: Option<Instant>,
+    below_minimum_persisted: Duration,
+    prolonged_unready: Duration,
+    last_counted_unready_pass: Option<Instant>,
+    surrender_bounds: SurrenderBounds,
+}
+
+/// A published state as it reads at one instant, with trust expiry applied.
+struct ExpiryView {
+    readiness: MembershipReadiness,
+    active_peer_count: usize,
+    /// Whether the owning task still has to apply what this read saw.
+    owner_must_expire: bool,
+}
+
+impl PublishedState {
+    /// Read this state at `now`, exactly as the owning task's expiry sweep
+    /// would leave it: a passed trust window reads as `CheckpointExpired`
+    /// with no admission, and an admission past its own deadline is not
+    /// counted.  The read never waits for the owning task.
+    fn view_at(&self, now: DateTime<Utc>, monotonic_now: Instant) -> ExpiryView {
+        if trust_window_expired(self.evidence, &self.verifier, now, monotonic_now) {
+            let readiness =
+                MembershipReadiness::Unready(MembershipUnreadyReason::CheckpointExpired);
+            return ExpiryView {
+                owner_must_expire: self.readiness != readiness
+                    || !self.active_peer_deadlines.is_empty(),
+                readiness,
+                active_peer_count: 0,
+            };
+        }
+        let live = self
+            .active_peer_deadlines
+            .iter()
+            .filter(|deadline| **deadline > monotonic_now)
+            .count();
+        ExpiryView {
+            readiness: self.readiness.clone(),
+            active_peer_count: live,
+            owner_must_expire: live != self.active_peer_deadlines.len(),
+        }
+    }
+}
+
+/// Whether the trust window of the last `Ready` pass has ended at this
+/// instant.  Before the first `Ready` pass there is no window to expire.
+/// The owning task's sweep and every reader use this one predicate.
+fn trust_window_expired(
+    evidence: VerifiedEvidence,
+    verifier: &MembershipVerifier,
+    now: DateTime<Utc>,
+    monotonic_now: Instant,
+) -> bool {
+    evidence.trust().is_some_and(|trust| {
+        monotonic_now >= trust.deadline
+            || now >= trust.expires_at
+            || verifier.fresh_checkpoint(now).is_err()
+    })
+}
+
+/// The transport's identity installation, type-erased for the owner's
+/// command queue.  It answers whether the installation succeeded and hands
+/// its typed outcome back to the caller itself.
+type InstallIdentity = Box<dyn FnOnce() -> bool + Send>;
+
+/// The owner's answer to an identity switch.
+enum SwitchAnswer {
+    NotApproved(LocalKeyApproval),
+    InstallFailed,
+    Installed,
+}
+
+type ReconcileReply = oneshot::Sender<Result<MembershipSnapshot, MembershipRuntimeError>>;
+
+/// One request to the membership owner task.
+enum Command {
+    Reconcile {
+        reply: ReconcileReply,
+    },
+    SwitchLocalServingSpki {
+        spki: String,
+        install: InstallIdentity,
+        reply: oneshot::Sender<SwitchAnswer>,
+    },
+    AdmitPeer {
+        identity: PeerIdentity,
+        reply: oneshot::Sender<Result<PeerAdmission, MembershipRuntimeError>>,
+    },
+    RemovePeer {
+        identity: PeerIdentity,
+        reply: oneshot::Sender<()>,
+    },
+    SetInvalidationCallback {
+        callback: Option<PeerInvalidationCallback>,
+        reply: oneshot::Sender<()>,
+    },
+    RestoreVersionState {
+        version_state: MembershipVersionState,
+        reply: oneshot::Sender<Result<(), MembershipRuntimeError>>,
+    },
+    SetSurrenderBounds {
+        bounds: SurrenderBounds,
+        reply: oneshot::Sender<()>,
+    },
+    Cancel {
+        reply: oneshot::Sender<()>,
+    },
+}
+
+/// A command that must not overlap a reconciliation pass, held until the
+/// pass in flight completes.
+enum GatedCommand {
+    Reconcile {
+        reply: ReconcileReply,
+    },
+    SwitchLocalServingSpki {
+        spki: String,
+        install: InstallIdentity,
+        reply: oneshot::Sender<SwitchAnswer>,
+    },
+    /// A pass in flight verifies against a copy of the verifier and installs
+    /// that copy when it concludes.  A restore applied meanwhile would be
+    /// overwritten by it, lowering the fence, so it waits for the pass.
+    RestoreVersionState {
+        version_state: MembershipVersionState,
+        reply: oneshot::Sender<Result<(), MembershipRuntimeError>>,
+    },
 }
 
 /// How the current verified record for this relay treats one of its own
@@ -1354,7 +1724,7 @@ impl fmt::Debug for MembershipRuntime {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("MembershipRuntime")
-            .field("node_id", &self.config.node_id)
+            .field("node_id", &self.shared.config.node_id)
             .field("boot_id", &"<redacted>")
             .field("started", &self.started.load(Ordering::Acquire))
             .finish_non_exhaustive()
@@ -1448,179 +1818,160 @@ impl MembershipRuntime {
                 .restore_version_state(version_state.clone())
                 .map_err(MembershipRuntimeError::Membership)?;
         }
+        // The state the owning task starts from, published before that task
+        // exists: nothing can change it until the first command starts the
+        // task, so the two never disagree.
+        let initial = PublishedState {
+            owner: MembershipOwnerState::Live,
+            verifier: Arc::new(verifier),
+            readiness: MembershipReadiness::Starting,
+            generation: 0,
+            evidence: VerifiedEvidence::Unverified,
+            active_peer_deadlines: Vec::new(),
+            own_key_missing_passes: 0,
+            node_omitted_passes: 0,
+            below_minimum_since: None,
+            below_minimum_persisted: Duration::ZERO,
+            prolonged_unready: Duration::ZERO,
+            last_counted_unready_pass: None,
+            surrender_bounds: SurrenderBounds::derive(
+                config.membership_record_lifetime,
+                config.max_clock_skew,
+            ),
+        };
         Ok(Arc::new(Self {
-            catalog,
-            authority,
-            cancellation: CancellationToken::new(),
-            wake: Notify::new(),
-            reconcile_gate: AsyncMutex::new(()),
-            state: Mutex::new(RuntimeState {
-                verifier,
-                readiness: MembershipReadiness::Starting,
-                generation: 0,
-                checkpoint_version: None,
-                checkpoint_expires_at: None,
-                trust_expires_at: None,
-                trust_deadline: None,
-                last_verified_at: None,
-                active_peers: BTreeMap::new(),
-                callback: None,
-                last_persisted_version_state: persisted_version_state,
-                own_key_missing_passes: 0,
-                node_omitted_passes: 0,
-                below_minimum_since: None,
-                below_minimum_persisted: Duration::ZERO,
-                prolonged_unready: Duration::ZERO,
-                last_counted_unready_pass: None,
-                pass_local_gap: None,
-                pass_publisher_outage: false,
-                surrender_bounds: SurrenderBounds::derive(
-                    config.membership_record_lifetime,
-                    config.max_clock_skew,
-                ),
+            shared: Arc::new(Shared {
+                catalog,
+                authority,
+                cancellation: CancellationToken::new(),
+                wake: Notify::new(),
+                local_serving_spki: watch::Sender::new(config.local_spki_sha256.clone()),
+                published: watch::Sender::new(Arc::new(initial)),
+                expiry_observed: Arc::new(Notify::new()),
+                persisted_at_start: persisted_version_state,
+                config,
+                version_store,
             }),
-            local_serving_spki: Mutex::new(config.local_spki_sha256.clone()),
-            config,
-            version_store,
+            owner: OwnerTask::new(),
             started: AtomicBool::new(false),
         }))
+    }
+
+    /// The latest state the owning task published.
+    fn published(&self) -> Arc<PublishedState> {
+        Arc::clone(&self.shared.published.borrow())
+    }
+
+    /// Send one command to the owning task, starting it on first use, and
+    /// wait for its answer.  `None` means the owning task is gone.
+    async fn request<R>(&self, command: impl FnOnce(oneshot::Sender<R>) -> Command) -> Option<R> {
+        let shared = Arc::clone(&self.shared);
+        self.owner
+            .request(
+                MEMBERSHIP_COMMAND_QUEUE,
+                move |commands| MembershipOwner::new(&shared).run(commands),
+                command,
+            )
+            .await
     }
 
     /// The SPKI digest this process's readiness is currently bound to.
     #[must_use]
     pub fn local_serving_spki(&self) -> Option<String> {
-        self.local_serving_spki
-            .lock()
-            .expect("local serving SPKI mutex poisoned")
-            .clone()
+        self.shared.local_serving_spki()
     }
 
     /// How the current verified record for this node treats `spki` now.
     ///
     /// Reads retained verified state only; it never fetches or verifies
-    /// anything and grants nothing.
+    /// anything and grants nothing.  It answers from the readiness the
+    /// owning task last installed, as it always has: the trust-expiry sweep
+    /// is driven by the readiness, snapshot and binding reads, not by this
+    /// one, and the record, key and checkpoint windows are still checked
+    /// against the clock here.
     #[must_use]
     pub fn local_key_approval(&self, spki: &str) -> LocalKeyApproval {
-        let now = Utc::now();
-        let state = self.state.lock().expect("membership state mutex poisoned");
-        Self::local_key_approval_locked(&state, &self.config.node_id, spki, now)
-    }
-
-    fn local_key_approval_locked(
-        state: &RuntimeState,
-        node_id: &str,
-        spki: &str,
-        now: DateTime<Utc>,
-    ) -> LocalKeyApproval {
-        // `MissingLocalKey` is the one unready state whose retained evidence
-        // is fully verified and current: the pass verified a fresh checkpoint
-        // and every record, and concluded only that the *served* key is not
-        // approved by this node's record. Answering from that evidence lets
-        // a staged successor the same record approves be switched to, which
-        // is the only way out of that state during a rotation whose
-        // predecessor was withdrawn early (M8-C65). Every other unready
-        // reason means the evidence itself is missing, failed or expired.
-        if !matches!(
-            state.readiness,
-            MembershipReadiness::Ready
-                | MembershipReadiness::Unready(MembershipUnreadyReason::MissingLocalKey)
-        ) {
-            return LocalKeyApproval::NotReady;
-        }
-        let Ok(checkpoint) = state.verifier.fresh_checkpoint(now) else {
-            return LocalKeyApproval::NotReady;
-        };
-        let Some(minimum) = checkpoint
-            .checkpoint()
-            .minimum_versions
-            .get(node_id)
-            .copied()
-        else {
-            return LocalKeyApproval::Absent;
-        };
-        let Some(membership) =
-            state
-                .verifier
-                .retained_memberships()
-                .into_iter()
-                .find(|membership| {
-                    membership.node_id() == node_id && membership.record().record_version >= minimum
-                })
-        else {
-            return LocalKeyApproval::Absent;
-        };
-        let mut listed = LocalKeyApproval::Absent;
-        for key in membership
-            .keys()
-            .iter()
-            .filter(|key| key.spki_sha256 == spki)
-        {
-            if key.revoked {
-                return LocalKeyApproval::Revoked;
-            }
-            // M7-C171, option (a): activation within the skew, expiry strict.
-            if membership.key_window_open(key, now) && membership.record().expires_at >= now {
-                return LocalKeyApproval::Approved {
-                    record_version: membership.record().record_version,
-                };
-            }
-            listed = LocalKeyApproval::OutsideWindow;
-        }
-        listed
+        let published = self.published();
+        local_key_approval_at(
+            &published.readiness,
+            &published.verifier,
+            &self.shared.config.node_id,
+            spki,
+            Utc::now(),
+        )
     }
 
     /// Bind readiness to `spki` and run `install` -- which makes the transport
     /// present that identity on new handshakes -- as one step.
     ///
-    /// Holds the reconcile gate, so no reconciliation pass reads the local
-    /// digest half-way through, and refuses unless the current verified
-    /// record approves `spki` at this instant.  `install` runs only after
-    /// that check; if it fails, readiness stays bound to the previous digest.
-    /// Readiness is never satisfied by a *staged* key: only by the one being
-    /// served (task row M8-C45).
-    pub async fn switch_local_serving_spki<E>(
+    /// The step is one command of the owning task and is never taken while a
+    /// reconciliation pass is in flight, so no pass reads the local digest
+    /// half-way through; it is refused unless the current verified record
+    /// approves `spki` at this instant.  `install` runs on the owning task,
+    /// only after that check; if it fails, readiness stays bound to the
+    /// previous digest.  Readiness is never satisfied by a *staged* key: only
+    /// by the one being served (task row M8-C45).
+    pub async fn switch_local_serving_spki<T, E>(
         &self,
         spki: &str,
-        install: impl FnOnce() -> Result<(), E>,
-    ) -> Result<(), LocalServingSwitchError<E>> {
+        install: impl FnOnce() -> Result<T, E> + Send + 'static,
+    ) -> Result<T, LocalServingSwitchError<E>>
+    where
+        T: Send + 'static,
+        E: Send + 'static,
+    {
         if !is_spki_digest(spki) {
             return Err(LocalServingSwitchError::InvalidDigest);
         }
-        let _reconcile_guard = self.reconcile_gate.lock().await;
-        let approval = self.local_key_approval(spki);
-        if !approval.is_approved() {
-            return Err(LocalServingSwitchError::NotApproved(approval));
+        let (outcome, mut installed) = oneshot::channel();
+        let install: InstallIdentity = Box::new(move || {
+            let result = install();
+            let succeeded = result.is_ok();
+            // The receiver is held by the caller across the whole request.
+            let _ = outcome.send(result);
+            succeeded
+        });
+        let answer = self
+            .request(|reply| Command::SwitchLocalServingSpki {
+                spki: spki.to_owned(),
+                install,
+                reply,
+            })
+            .await;
+        match answer {
+            Some(SwitchAnswer::NotApproved(approval)) => {
+                Err(LocalServingSwitchError::NotApproved(approval))
+            }
+            Some(SwitchAnswer::Installed | SwitchAnswer::InstallFailed) => {
+                match installed.try_recv() {
+                    Ok(Ok(value)) => Ok(value),
+                    Ok(Err(error)) => Err(LocalServingSwitchError::Install(error)),
+                    // Unreachable: the owner answers these only after running
+                    // `install`.  Fail closed rather than claim a switch.
+                    Err(_) => Err(LocalServingSwitchError::NotApproved(
+                        LocalKeyApproval::NotReady,
+                    )),
+                }
+            }
+            // The owning task is gone: nothing was installed or bound.
+            None => Err(LocalServingSwitchError::NotApproved(
+                LocalKeyApproval::NotReady,
+            )),
         }
-        install().map_err(LocalServingSwitchError::Install)?;
-        *self
-            .local_serving_spki
-            .lock()
-            .expect("local serving SPKI mutex poisoned") = Some(spki.to_owned());
-        // The own-key passes counted so far judged the key served until now;
-        // they are no evidence about the one served from here on (M8-C65).
-        // Held under the reconcile gate, so no pass is counted half-way
-        // through. A fresh pass is requested so readiness follows the switch
-        // without waiting for the periodic interval.
-        self.state
-            .lock()
-            .expect("membership state mutex poisoned")
-            .own_key_missing_passes = 0;
-        self.wake.notify_one();
-        Ok(())
     }
 
     /// Install or replace the process-local invalidation callback.
-    pub fn set_invalidation_callback(&self, callback: Option<PeerInvalidationCallback>) {
-        if let Ok(mut state) = self.state.lock() {
-            state.callback = callback;
-        }
+    pub async fn set_invalidation_callback(&self, callback: Option<PeerInvalidationCallback>) {
+        let _ = self
+            .request(|reply| Command::SetInvalidationCallback { callback, reply })
+            .await;
     }
 
     /// Trigger a best-effort immediate reconcile.  Periodic reconciliation
     /// remains enabled, so lost pub/sub notifications cannot preserve stale
     /// trust indefinitely.
     pub fn notify_membership_changed(&self) {
-        self.wake.notify_one();
+        self.shared.wake.notify_one();
     }
 
     /// Run one startup/reconciliation pass synchronously.  A caller that
@@ -1640,26 +1991,25 @@ impl MembershipRuntime {
         }
         let _ = self.bootstrap().await;
         let runtime = Arc::clone(self);
-        let cancellation = self.cancellation.clone();
+        let cancellation = self.shared.cancellation.clone();
         let task = tokio::spawn(async move { runtime.run_loop().await });
         Ok(MembershipRuntimeHandle { cancellation, task })
     }
 
     /// Run the supervisor until the runtime cancellation token is set.
     async fn run_loop(self: Arc<Self>) -> Result<(), MembershipRuntimeError> {
-        let mut interval = tokio::time::interval(self.config.membership_reconcile);
+        let mut interval = tokio::time::interval(self.shared.config.membership_reconcile);
         interval.tick().await;
         loop {
             tokio::select! {
-                _ = self.cancellation.cancelled() => {
-                    let invalidations = self.mark_cancelled();
-                    self.dispatch_invalidations(invalidations);
+                _ = self.shared.cancellation.cancelled() => {
+                    let _ = self.request(|reply| Command::Cancel { reply }).await;
                     return Ok(());
                 }
                 _ = interval.tick() => {
                     Self::observe_reconcile(self.reconcile_once().await);
                 }
-                _ = self.wake.notified() => {
+                _ = self.shared.wake.notified() => {
                     Self::observe_reconcile(self.reconcile_once().await);
                 }
             }
@@ -1684,22 +2034,56 @@ impl MembershipRuntime {
         }
     }
 
+    /// Read the published state at this instant with trust expiry applied,
+    /// and tell the owning task if it still has that expiry to apply.
+    ///
+    /// The answer never waits for the owning task: a state past its deadline
+    /// reads as expired here whether or not the owner has run.  The owner
+    /// then makes the same transition in its own state and dispatches the
+    /// invalidations.
+    fn expiry_view(
+        &self,
+        published: &PublishedState,
+        now: DateTime<Utc>,
+        monotonic_now: Instant,
+    ) -> ExpiryView {
+        let view = published.view_at(now, monotonic_now);
+        if view.owner_must_expire {
+            self.shared.expiry_observed.notify_one();
+        }
+        view
+    }
+
     /// Readiness and status are calculated from retained signed evidence.  A
-    /// monotonic expiry check runs even when no timer task has fired yet.
+    /// monotonic expiry check runs on every read, even when no task has
+    /// applied the expiry yet.
     #[must_use]
     pub fn snapshot(&self) -> MembershipSnapshot {
-        let (snapshot, invalidations) = {
-            let mut state = self.state.lock().expect("membership state mutex poisoned");
-            let invalidations = state.expire_if_needed(Utc::now(), Instant::now());
-            (state.snapshot(), invalidations)
-        };
-        self.dispatch_invalidations(invalidations);
-        snapshot
+        let published = self.published();
+        let view = self.expiry_view(&published, Utc::now(), Instant::now());
+        membership_snapshot(
+            &published.verifier,
+            view.readiness,
+            published.generation,
+            published.evidence,
+            view.active_peer_count,
+        )
+    }
+
+    /// Whether the task that owns this runtime's state is still able to
+    /// change it.  `Stopped` and `Failed` are latched: the runtime then reads
+    /// `Unready(Cancelled)`, holds no admission, and answers every later
+    /// admit, reconcile and identity switch `Cancelled`.
+    #[must_use]
+    pub fn owner_state(&self) -> MembershipOwnerState {
+        self.published().owner
     }
 
     #[must_use]
     pub fn readiness(&self) -> MembershipReadiness {
-        self.snapshot().readiness
+        let published = self.published();
+        self.expiry_view(&published, Utc::now(), Instant::now())
+            .readiness
     }
 
     /// Return bounded peer route targets from the current verified signed
@@ -1714,30 +2098,14 @@ impl MembershipRuntime {
     #[must_use]
     pub fn verified_peer_route_targets(&self) -> Vec<PeerRouteTarget> {
         let now = Utc::now();
-        let state = self.state.lock().expect("membership state mutex poisoned");
-        if !matches!(state.readiness, MembershipReadiness::Ready) {
+        let published = self.published();
+        // A trust window that has passed leaves nothing routable, whether or
+        // not the owning task has applied the expiry yet.
+        let view = published.view_at(now, Instant::now());
+        if !matches!(view.readiness, MembershipReadiness::Ready) {
             return Vec::new();
         }
-        Self::route_targets_at(&state, now)
-    }
-
-    fn route_targets_at(state: &RuntimeState, now: DateTime<Utc>) -> Vec<PeerRouteTarget> {
-        let Ok(checkpoint) = state.verifier.fresh_checkpoint(now) else {
-            return Vec::new();
-        };
-        let minimum_versions = checkpoint.checkpoint().minimum_versions.clone();
-        state
-            .verifier
-            .retained_memberships()
-            .into_iter()
-            .filter(|membership| {
-                minimum_versions
-                    .get(membership.node_id())
-                    .is_some_and(|minimum| membership.record().record_version >= *minimum)
-            })
-            .filter_map(|membership| PeerRouteTarget::from_verified_membership(&membership, now))
-            .take(MAX_MEMBERSHIP_RECORDS)
-            .collect()
+        route_targets_at(&published.verifier, now)
     }
 
     /// Return the process's fresh node/boot/SPKI tuple when the caller has
@@ -1746,7 +2114,11 @@ impl MembershipRuntime {
     #[must_use]
     pub fn local_peer_identity(&self) -> Option<PeerIdentity> {
         self.local_serving_spki().map(|spki_sha256| {
-            PeerIdentity::new(&self.config.node_id, &self.config.boot_id, spki_sha256)
+            PeerIdentity::new(
+                &self.shared.config.node_id,
+                &self.shared.config.boot_id,
+                spki_sha256,
+            )
         })
     }
 
@@ -1754,151 +2126,40 @@ impl MembershipRuntime {
     /// persistence.  Restoring these fences never accepts record bytes.
     #[must_use]
     pub fn version_state(&self) -> MembershipVersionState {
-        self.state
-            .lock()
-            .expect("membership state mutex poisoned")
-            .verifier
-            .version_state()
+        self.published().verifier.version_state()
     }
 
-    pub fn restore_version_state(
+    pub async fn restore_version_state(
         &self,
         version_state: MembershipVersionState,
     ) -> Result<(), MembershipRuntimeError> {
-        self.state
-            .lock()
-            .expect("membership state mutex poisoned")
-            .verifier
-            .restore_version_state(version_state)
-            .map_err(MembershipRuntimeError::Membership)
+        self.request(|reply| Command::RestoreVersionState {
+            version_state,
+            reply,
+        })
+        .await
+        .unwrap_or(Err(MembershipRuntimeError::Cancelled))
     }
 
     /// Admit an mTLS-authenticated peer and return a cancellation-bound,
     /// monotonic trust deadline.  The caller must still check the deadline
     /// immediately before each request/dispatch.
-    pub fn admit_peer(
+    pub async fn admit_peer(
         &self,
         identity: PeerIdentity,
     ) -> Result<PeerAdmission, MembershipRuntimeError> {
-        let now_wall = Utc::now();
-        let now_mono = Instant::now();
-        let (result, invalidations) = {
-            let mut state = self.state.lock().expect("membership state mutex poisoned");
-            let mut invalidations = state.expire_if_needed(now_wall, now_mono);
-            let result = (|| {
-                if !matches!(state.readiness, MembershipReadiness::Ready) {
-                    return Err(MembershipRuntimeError::NotReady);
-                }
-                let binding = state
-                    .verifier
-                    .bind_peer(
-                        &identity.node_id,
-                        &identity.boot_id,
-                        &identity.spki_sha256,
-                        now_wall,
-                    )
-                    .map_err(|_| MembershipRuntimeError::PeerRejected)?;
-                let trust_deadline = state
-                    .trust_deadline
-                    .ok_or(MembershipRuntimeError::CheckpointExpired)?;
-                if trust_deadline <= now_mono {
-                    state.readiness =
-                        MembershipReadiness::Unready(MembershipUnreadyReason::CheckpointExpired);
-                    invalidations.extend(
-                        state.invalidate_active(now_wall, PeerInvalidationReason::TrustExpired),
-                    );
-                    return Err(MembershipRuntimeError::CheckpointExpired);
-                }
-                let record_version = state
-                    .verifier
-                    .retained_memberships()
-                    .into_iter()
-                    .find(|membership| membership.node_id() == identity.node_id.as_str())
-                    .map(|membership| membership.record().record_version)
-                    .ok_or(MembershipRuntimeError::PeerRejected)?;
-                let peer_deadline = monotonic_deadline(now_wall, now_mono, binding.valid_until());
-                if peer_deadline <= now_mono {
-                    return Err(MembershipRuntimeError::PeerRejected);
-                }
-                // The wall-clock expiry is the signed trust boundary. Keep
-                // the original monotonic admission deadline on a refresh:
-                // independently converting the same signed expiry from a
-                // later receipt instant can move the resulting Instant
-                // backwards by transport/clock-conversion drift.
-                let admission_trust_expires_at = state
-                    .trust_expires_at
-                    .ok_or(MembershipRuntimeError::CheckpointExpired)?
-                    .min(binding.valid_until());
-                // Forwarded streams on one authenticated peer share one
-                // process-local admission edge. Reusing the active admission
-                // is essential: replacing it for every pooled H3 stream
-                // would cancel the previous stream as a false membership
-                // change. Never reuse after invalidation, expiry, a binding
-                // revision, or a genuinely shortened signed trust boundary.
-                if let Some(previous) = state.active_peers.get(&identity)
-                    && previous.record_version == record_version
-                    && previous.admission.binding() == &binding
-                    && !previous.admission.is_invalidated()
-                    && !previous.admission.deadline.is_expired()
-                    && admission_trust_expires_at >= previous.admission.deadline.trust_expires_at()
-                {
-                    return Ok(previous.admission.clone());
-                }
-                if !state.active_peers.contains_key(&identity)
-                    && state.active_peers.len() >= MAX_MEMBERSHIP_RECORDS
-                {
-                    return Err(MembershipRuntimeError::PeerRejected);
-                }
-                let deadline = AdmissionDeadline {
-                    started_at: now_mono,
-                    expires_at: trust_deadline.min(peer_deadline),
-                    // Retain the wall-clock signed boundary used for reuse
-                    // and revalidation. The monotonic deadline above remains
-                    // anchored to this admission and is never extended by a
-                    // later checkpoint receipt.
-                    trust_expires_at: admission_trust_expires_at,
-                };
-                let admission = PeerAdmission {
-                    identity: identity.clone(),
-                    binding,
-                    deadline,
-                    invalidation: CancellationToken::new(),
-                    invalidation_reason: Arc::new(AtomicU8::new(0)),
-                    expiry: SharedAdmissionExpiry::new(
-                        deadline.expires_at,
-                        Some(deadline.trust_expires_at),
-                    ),
-                };
-                if let Some(previous) = state.active_peers.insert(
-                    identity.clone(),
-                    ActivePeer {
-                        admission: admission.clone(),
-                        record_version,
-                    },
-                ) {
-                    invalidations.push(Invalidation {
-                        identity: identity.clone(),
-                        token: previous.admission.invalidation,
-                        reason_cell: previous.admission.invalidation_reason,
-                        callback: state.callback.clone(),
-                        reason: PeerInvalidationReason::MembershipChanged,
-                    });
-                }
-                Ok(admission)
-            })();
-            (result, invalidations)
-        };
-        self.dispatch_invalidations(invalidations);
-        result
+        self.request(|reply| Command::AdmitPeer { identity, reply })
+            .await
+            // The owning task is gone, so nothing can be admitted.
+            .unwrap_or(Err(MembershipRuntimeError::Cancelled))
     }
 
     /// Remove an active peer after its transport has closed.
-    pub fn remove_peer(&self, identity: &PeerIdentity) {
-        if let Ok(mut state) = self.state.lock()
-            && let Some(peer) = state.active_peers.remove(identity)
-        {
-            peer.admission.invalidation.cancel();
-        }
+    pub async fn remove_peer(&self, identity: &PeerIdentity) {
+        let identity = identity.clone();
+        let _ = self
+            .request(|reply| Command::RemovePeer { identity, reply })
+            .await;
     }
 
     /// Match a peer identity against current verifier state without retaining
@@ -1909,118 +2170,32 @@ impl MembershipRuntime {
         identity: &PeerIdentity,
     ) -> Result<VerifiedPeerBinding, MembershipRuntimeError> {
         let now_wall = Utc::now();
-        let now_mono = Instant::now();
-        let (result, invalidations) = {
-            let mut state = self.state.lock().expect("membership state mutex poisoned");
-            let invalidations = state.expire_if_needed(now_wall, now_mono);
-            let result = if !matches!(state.readiness, MembershipReadiness::Ready) {
-                Err(MembershipRuntimeError::NotReady)
-            } else {
-                state
-                    .verifier
-                    .bind_peer(
-                        &identity.node_id,
-                        &identity.boot_id,
-                        &identity.spki_sha256,
-                        now_wall,
-                    )
-                    .map_err(|_| MembershipRuntimeError::PeerRejected)
-            };
-            (result, invalidations)
-        };
-        self.dispatch_invalidations(invalidations);
-        result
+        let published = self.published();
+        let view = self.expiry_view(&published, now_wall, Instant::now());
+        if !matches!(view.readiness, MembershipReadiness::Ready) {
+            return Err(MembershipRuntimeError::NotReady);
+        }
+        published
+            .verifier
+            .bind_peer(
+                &identity.node_id,
+                &identity.boot_id,
+                &identity.spki_sha256,
+                now_wall,
+            )
+            .map_err(|_| MembershipRuntimeError::PeerRejected)
     }
 
     /// Perform one full nonce/checkpoint/catalog reconciliation pass.
+    ///
+    /// Pub/sub wakeups, the periodic timer, and an operator-triggered
+    /// bootstrap may all race.  The owning task keeps one complete pass in
+    /// flight and starts the next request only when it has concluded, so a
+    /// slower persistence result cannot be overtaken by a later pass.
     pub async fn reconcile_once(&self) -> Result<MembershipSnapshot, MembershipRuntimeError> {
-        // Pub/sub wakeups, the periodic timer, and an operator-triggered
-        // bootstrap may all race.  Keep one complete pass in flight so a
-        // slower persistence result cannot be overtaken by a later pass.
-        let _reconcile_guard = self.reconcile_gate.lock().await;
-        {
-            let mut state = self.state.lock().expect("membership state mutex poisoned");
-            state.pass_local_gap = None;
-            state.pass_publisher_outage = false;
-        }
-        let result = self.reconcile_once_inner().await;
-        if let Err(error) = &result {
-            self.mark_error(error);
-        }
-        self.count_own_key_missing_pass(&result);
-        self.count_surrender_evidence(&result, Instant::now());
-        result
-    }
-
-    /// Record the local-membership gap the pass in progress concluded.
-    fn note_local_gap(&self, gap: LocalMembershipGap) {
-        self.state
-            .lock()
-            .expect("membership state mutex poisoned")
-            .pass_local_gap = Some(gap);
-    }
-
-    /// Count this completed pass toward the local-membership (M7-C182) and
-    /// prolonged-unready (M7-C184) surrenders. Runs under the reconcile gate
-    /// after the pass has installed its readiness, so passes are counted in
-    /// the order they completed.
-    fn count_surrender_evidence(
-        &self,
-        result: &Result<MembershipSnapshot, MembershipRuntimeError>,
-        now: Instant,
-    ) {
-        let mut state = self.state.lock().expect("membership state mutex poisoned");
-        let gap = state.pass_local_gap.take();
-        // M7-C186: a shared control-plane outage -- the checkpoint authority
-        // unreachable, or the publisher no longer re-signing any record --
-        // makes every relay unready alike. Surrendering devices then only
-        // moves them to relays that are just as unready, so such a pass
-        // neither advances the publish-race run nor accrues unready time.
-        let shared_outage = std::mem::take(&mut state.pass_publisher_outage)
-            || matches!(
-                result,
-                Err(MembershipRuntimeError::Authority(error)) if error.is_shared_outage()
-            );
-        let missing_local_membership = state.readiness
-            == MembershipReadiness::Unready(MembershipUnreadyReason::MissingLocalMembership);
-
-        // Case (a): a checkpoint that omits this node, pass-confirmed.
-        state.node_omitted_passes =
-            if missing_local_membership && gap == Some(LocalMembershipGap::NodeOmitted) {
-                state.node_omitted_passes.saturating_add(1)
-            } else {
-                0
-            };
-
-        // Case (b): a record below the checkpoint's minimum, time-confirmed
-        // between the first and the latest pass that each observed it.
-        if missing_local_membership
-            && gap == Some(LocalMembershipGap::BelowMinimum)
-            && !shared_outage
-        {
-            let since = *state.below_minimum_since.get_or_insert(now);
-            state.below_minimum_persisted = now.saturating_duration_since(since);
-        } else {
-            state.below_minimum_since = None;
-            state.below_minimum_persisted = Duration::ZERO;
-        }
-
-        // M7-C184: unready while the catalog is reachable.
-        match state.readiness {
-            MembershipReadiness::Ready | MembershipReadiness::Starting => {
-                state.prolonged_unready = Duration::ZERO;
-                state.last_counted_unready_pass = None;
-            }
-            MembershipReadiness::Unready(reason) => {
-                let counted = reason.counts_toward_prolonged_unready() && !shared_outage;
-                if counted && let Some(previous) = state.last_counted_unready_pass {
-                    state.prolonged_unready = state
-                        .prolonged_unready
-                        .saturating_add(now.saturating_duration_since(previous));
-                }
-                state.last_counted_unready_pass = counted.then_some(now);
-            }
-        }
+        self.request(|reply| Command::Reconcile { reply })
+            .await
+            .unwrap_or(Err(MembershipRuntimeError::Cancelled))
     }
 
     /// Why this relay must surrender the device ownership it holds now, if
@@ -2033,7 +2208,7 @@ impl MembershipRuntime {
     /// answers `Some` here.
     #[must_use]
     pub fn ownership_surrender_cause(&self) -> Option<OwnershipSurrenderCause> {
-        let state = self.state.lock().expect("membership state mutex poisoned");
+        let state = self.published();
         let MembershipReadiness::Unready(reason) = state.readiness else {
             return None;
         };
@@ -2070,54 +2245,23 @@ impl MembershipRuntime {
     /// The time-based surrender bounds in effect.
     #[must_use]
     pub fn surrender_bounds(&self) -> SurrenderBounds {
-        self.state
-            .lock()
-            .expect("membership state mutex poisoned")
-            .surrender_bounds
+        self.published().surrender_bounds
     }
 
     /// Replace the time-based surrender bounds. A test seam: the relay
     /// itself always runs with [`SurrenderBounds::derive`].
     #[doc(hidden)]
-    pub fn set_surrender_bounds(&self, bounds: SurrenderBounds) {
-        self.state
-            .lock()
-            .expect("membership state mutex poisoned")
-            .surrender_bounds = bounds;
-    }
-
-    /// Count this completed pass toward the own-key surrender (M7-C181).
-    ///
-    /// Only a pass that itself reached the `MissingLocalKey` conclusion counts:
-    /// that branch is the one that installs `Unready(MissingLocalKey)` and
-    /// returns `PeerRejected`, and `mark_error` leaves readiness alone for
-    /// `PeerRejected`. Every other outcome -- `Ready`, a checkpoint fetch or
-    /// catalog read failure, a rejected or expired record, a missing local
-    /// record -- resets the count. Runs under the reconcile gate, so passes
-    /// are counted in the order they completed.
-    fn count_own_key_missing_pass(
-        &self,
-        result: &Result<MembershipSnapshot, MembershipRuntimeError>,
-    ) {
-        let mut state = self.state.lock().expect("membership state mutex poisoned");
-        let concluded_missing_key = matches!(result, Err(MembershipRuntimeError::PeerRejected))
-            && state.readiness
-                == MembershipReadiness::Unready(MembershipUnreadyReason::MissingLocalKey);
-        state.own_key_missing_passes = if concluded_missing_key {
-            state.own_key_missing_passes.saturating_add(1)
-        } else {
-            0
-        };
+    pub async fn set_surrender_bounds(&self, bounds: SurrenderBounds) {
+        let _ = self
+            .request(|reply| Command::SetSurrenderBounds { bounds, reply })
+            .await;
     }
 
     /// Consecutive completed reconcile passes that concluded this relay's
     /// served key is not approved by its own verified record.
     #[must_use]
     pub fn own_key_missing_passes(&self) -> u32 {
-        self.state
-            .lock()
-            .expect("membership state mutex poisoned")
-            .own_key_missing_passes
+        self.published().own_key_missing_passes
     }
 
     /// Whether this relay must surrender the device ownership it holds
@@ -2134,8 +2278,156 @@ impl MembershipRuntime {
     pub fn own_key_surrender_required(&self) -> bool {
         self.ownership_surrender_cause() == Some(OwnershipSurrenderCause::OwnKeyRetired)
     }
+}
 
-    async fn reconcile_once_inner(&self) -> Result<MembershipSnapshot, MembershipRuntimeError> {
+fn local_key_approval_at(
+    readiness: &MembershipReadiness,
+    verifier: &MembershipVerifier,
+    node_id: &str,
+    spki: &str,
+    now: DateTime<Utc>,
+) -> LocalKeyApproval {
+    // `MissingLocalKey` is the one unready state whose retained evidence
+    // is fully verified and current: the pass verified a fresh checkpoint
+    // and every record, and concluded only that the *served* key is not
+    // approved by this node's record. Answering from that evidence lets
+    // a staged successor the same record approves be switched to, which
+    // is the only way out of that state during a rotation whose
+    // predecessor was withdrawn early (M8-C65). Every other unready
+    // reason means the evidence itself is missing, failed or expired.
+    if !matches!(
+        readiness,
+        MembershipReadiness::Ready
+            | MembershipReadiness::Unready(MembershipUnreadyReason::MissingLocalKey)
+    ) {
+        return LocalKeyApproval::NotReady;
+    }
+    let Ok(checkpoint) = verifier.fresh_checkpoint(now) else {
+        return LocalKeyApproval::NotReady;
+    };
+    let Some(minimum) = checkpoint
+        .checkpoint()
+        .minimum_versions
+        .get(node_id)
+        .copied()
+    else {
+        return LocalKeyApproval::Absent;
+    };
+    let Some(membership) = verifier
+        .retained_memberships()
+        .into_iter()
+        .find(|membership| {
+            membership.node_id() == node_id && membership.record().record_version >= minimum
+        })
+    else {
+        return LocalKeyApproval::Absent;
+    };
+    let mut listed = LocalKeyApproval::Absent;
+    for key in membership
+        .keys()
+        .iter()
+        .filter(|key| key.spki_sha256 == spki)
+    {
+        if key.revoked {
+            return LocalKeyApproval::Revoked;
+        }
+        // M7-C171, option (a): activation within the skew, expiry strict.
+        if membership.key_window_open(key, now) && membership.record().expires_at >= now {
+            return LocalKeyApproval::Approved {
+                record_version: membership.record().record_version,
+            };
+        }
+        listed = LocalKeyApproval::OutsideWindow;
+    }
+    listed
+}
+
+fn route_targets_at(verifier: &MembershipVerifier, now: DateTime<Utc>) -> Vec<PeerRouteTarget> {
+    let Ok(checkpoint) = verifier.fresh_checkpoint(now) else {
+        return Vec::new();
+    };
+    let minimum_versions = checkpoint.checkpoint().minimum_versions.clone();
+    verifier
+        .retained_memberships()
+        .into_iter()
+        .filter(|membership| {
+            minimum_versions
+                .get(membership.node_id())
+                .is_some_and(|minimum| membership.record().record_version >= *minimum)
+        })
+        .filter_map(|membership| PeerRouteTarget::from_verified_membership(&membership, now))
+        .take(MAX_MEMBERSHIP_RECORDS)
+        .collect()
+}
+
+/// What the checkpoint fetch of one reconciliation pass produced.
+struct FetchedCheckpoint {
+    nonce: String,
+    request_started_wall: DateTime<Utc>,
+    request_started_mono: Instant,
+    response: CheckpointResponse,
+    checkpoint_received_wall: DateTime<Utc>,
+}
+
+/// A candidate that verified a checkpoint and concluded unready.
+struct UnreadyInstall {
+    verifier: MembershipVerifier,
+    reason: MembershipUnreadyReason,
+    checkpoint: VerifiedCheckpoint,
+    invalidation_reason: PeerInvalidationReason,
+}
+
+/// A candidate that concluded `Ready`.
+struct ReadyInstall {
+    verifier: MembershipVerifier,
+    checkpoint: VerifiedCheckpoint,
+    trust: TrustWindow,
+    records_received_wall: DateTime<Utc>,
+    records_received_mono: Instant,
+}
+
+/// How one reconciliation pass concluded.  The pass itself changes no
+/// membership state: the owning task installs its conclusion in one step.
+enum PassConclusion {
+    /// The pass failed before it had a candidate to install.
+    Failed(MembershipRuntimeError),
+    /// The candidate is installed as unready and the pass reports `error`.
+    Unready(Box<UnreadyInstall>, MembershipRuntimeError),
+    /// The candidate is installed as `Ready`.
+    Ready(Box<ReadyInstall>),
+}
+
+/// What a pass observed and persisted besides its conclusion.
+struct PassNotes {
+    /// The version fences last written to the durable store.  Only passes
+    /// write the store, and at most one pass is in flight.
+    last_persisted: Option<MembershipVersionState>,
+    /// The local-membership gap this pass concluded, if any (M7-C182).
+    local_gap: Option<LocalMembershipGap>,
+    /// Whether this pass saw the signature of a shared publisher outage: a
+    /// fresh checkpoint, but no record for any node it names still inside
+    /// its signed lifetime (M7-C186).
+    publisher_outage: bool,
+}
+
+struct PassOutput {
+    conclusion: PassConclusion,
+    notes: PassNotes,
+}
+
+impl Shared {
+    fn local_serving_spki(&self) -> Option<String> {
+        self.local_serving_spki.borrow().clone()
+    }
+
+    /// The first stage of a pass: obtain a fresh nonce-bound checkpoint.  It
+    /// reads no membership state.
+    async fn fetch_stage(self: Arc<Self>) -> FetchStageOutput {
+        let fetched = self.fetch().await;
+        (self, fetched)
+    }
+
+    async fn fetch(&self) -> Result<FetchedCheckpoint, MembershipRuntimeError> {
         let nonce = uuid::Uuid::new_v4().simple().to_string();
         let request = CheckpointRequest {
             deployment_id: self.config.deployment_id.clone(),
@@ -2146,16 +2438,54 @@ impl MembershipRuntime {
         let request_started_mono = Instant::now();
         let response = self.fetch_checkpoint(request).await?;
         let checkpoint_received_wall = Utc::now();
+        Ok(FetchedCheckpoint {
+            nonce,
+            request_started_wall,
+            request_started_mono,
+            response,
+            checkpoint_received_wall,
+        })
+    }
 
-        // Stage all verification against a clone. Existing verified bindings
-        // remain usable while a candidate is being persisted; only the
-        // successful, durable candidate is swapped into live state.
-        let mut candidate_verifier = self
-            .state
-            .lock()
-            .expect("membership state mutex poisoned")
-            .verifier
-            .clone();
+    /// The second stage of a pass: verify the checkpoint and the catalog
+    /// records against `candidate_verifier`, a copy of the live verifier the
+    /// owning task took when the checkpoint arrived, and conclude.
+    ///
+    /// All verification is staged against that copy. Existing verified
+    /// bindings remain usable while a candidate is being persisted; only the
+    /// successful, durable candidate is swapped into live state, by the
+    /// owning task, when this stage returns.
+    async fn verify_stage(
+        self: Arc<Self>,
+        fetched: FetchedCheckpoint,
+        candidate_verifier: MembershipVerifier,
+        last_persisted: Option<MembershipVersionState>,
+    ) -> PassOutput {
+        let mut notes = PassNotes {
+            last_persisted,
+            local_gap: None,
+            publisher_outage: false,
+        };
+        let conclusion = self
+            .conclude(fetched, candidate_verifier, &mut notes)
+            .await
+            .unwrap_or_else(PassConclusion::Failed);
+        PassOutput { conclusion, notes }
+    }
+
+    async fn conclude(
+        &self,
+        fetched: FetchedCheckpoint,
+        mut candidate_verifier: MembershipVerifier,
+        notes: &mut PassNotes,
+    ) -> Result<PassConclusion, MembershipRuntimeError> {
+        let FetchedCheckpoint {
+            nonce,
+            request_started_wall,
+            request_started_mono,
+            response,
+            checkpoint_received_wall,
+        } = fetched;
         let checkpoint = candidate_verifier
             .verify_checkpoint(response.as_bytes(), &nonce, checkpoint_received_wall)
             .map_err(map_checkpoint_error)?;
@@ -2165,7 +2495,7 @@ impl MembershipRuntime {
         // untrusted record bytes are read so a restart cannot replay an
         // already accepted checkpoint.
         let checkpoint_version_state = candidate_verifier.version_state();
-        self.persist_if_changed(checkpoint_version_state, checkpoint_received_wall)
+        self.persist_if_changed(notes, checkpoint_version_state)
             .await?;
 
         let records = self.read_memberships().await?;
@@ -2292,30 +2622,31 @@ impl MembershipRuntime {
         // A publisher outage signature: the checkpoint is fresh but no node
         // it names has a record still inside its lifetime (M7-C186).
         if !fresh_named_record {
-            self.state
-                .lock()
-                .expect("membership state mutex poisoned")
-                .pass_publisher_outage = true;
+            notes.publisher_outage = true;
         }
+        let checkpoint_expiry = checkpoint.checkpoint().expires_at;
+        let verified_checkpoint = VerifiedCheckpoint {
+            version: checkpoint.checkpoint().checkpoint_version,
+            expires_at: checkpoint_expiry,
+            verified_at: checkpoint_received_wall,
+        };
         if let Err(error) = record_result {
             // Persist partially accepted record fences before installing the
             // failed candidate as unready. This also covers a valid
             // checkpoint followed by malformed catalog input.
             let version_state = candidate_verifier.version_state();
-            self.persist_if_changed(version_state, checkpoint_received_wall)
-                .await?;
-            self.install_unready_candidate(
-                candidate_verifier,
-                MembershipUnreadyReason::MembershipRejected,
-                checkpoint.checkpoint().checkpoint_version,
-                checkpoint.checkpoint().expires_at,
-                checkpoint_received_wall,
-                PeerInvalidationReason::MembershipRevoked,
-            );
-            return Err(error);
+            self.persist_if_changed(notes, version_state).await?;
+            return Ok(PassConclusion::Unready(
+                Box::new(UnreadyInstall {
+                    verifier: candidate_verifier,
+                    reason: MembershipUnreadyReason::MembershipRejected,
+                    checkpoint: verified_checkpoint,
+                    invalidation_reason: PeerInvalidationReason::MembershipRevoked,
+                }),
+                error,
+            ));
         }
 
-        let checkpoint_expiry = checkpoint.checkpoint().expires_at;
         let Some(local_minimum_version) = checkpoint
             .checkpoint()
             .minimum_versions
@@ -2323,22 +2654,21 @@ impl MembershipRuntime {
             .copied()
         else {
             let version_state = candidate_verifier.version_state();
-            self.persist_if_changed(version_state, checkpoint_received_wall)
-                .await?;
+            self.persist_if_changed(notes, version_state).await?;
             // A fresh signed checkpoint that does not name this node, and no
             // record for it in the catalog (one would have failed
             // verification as `NodeNotInCheckpoint`): a signed removal
             // (M7-C182, case (a)).
-            self.note_local_gap(LocalMembershipGap::NodeOmitted);
-            self.install_unready_candidate(
-                candidate_verifier,
-                MembershipUnreadyReason::MissingLocalMembership,
-                checkpoint.checkpoint().checkpoint_version,
-                checkpoint_expiry,
-                checkpoint_received_wall,
-                PeerInvalidationReason::MembershipRevoked,
-            );
-            return Err(MembershipRuntimeError::NotReady);
+            notes.local_gap = Some(LocalMembershipGap::NodeOmitted);
+            return Ok(PassConclusion::Unready(
+                Box::new(UnreadyInstall {
+                    verifier: candidate_verifier,
+                    reason: MembershipUnreadyReason::MissingLocalMembership,
+                    checkpoint: verified_checkpoint,
+                    invalidation_reason: PeerInvalidationReason::MembershipRevoked,
+                }),
+                MembershipRuntimeError::NotReady,
+            ));
         };
         let local_membership =
             candidate_verifier
@@ -2358,24 +2688,23 @@ impl MembershipRuntime {
             // local condition; that retention is held, so it withdraws them
             // like every other unready reason today.)
             let version_state = candidate_verifier.version_state();
-            self.persist_if_changed(version_state, checkpoint_received_wall)
-                .await?;
+            self.persist_if_changed(notes, version_state).await?;
             // The node is named, but the catalog holds no record for it and
             // any record retained from an earlier pass is below the minimum:
             // what a publish race produces, or a publisher that stopped
             // writing this node (M7-C182, case (b)). A record that *is* in
             // the catalog below the minimum fails verification above and is
             // `MembershipRejected`, which only M7-C184 bounds.
-            self.note_local_gap(LocalMembershipGap::BelowMinimum);
-            self.install_unready_candidate(
-                candidate_verifier,
-                MembershipUnreadyReason::MissingLocalMembership,
-                checkpoint.checkpoint().checkpoint_version,
-                checkpoint_expiry,
-                checkpoint_received_wall,
-                PeerInvalidationReason::MembershipRevoked,
-            );
-            return Err(MembershipRuntimeError::PeerRejected);
+            notes.local_gap = Some(LocalMembershipGap::BelowMinimum);
+            return Ok(PassConclusion::Unready(
+                Box::new(UnreadyInstall {
+                    verifier: candidate_verifier,
+                    reason: MembershipUnreadyReason::MissingLocalMembership,
+                    checkpoint: verified_checkpoint,
+                    invalidation_reason: PeerInvalidationReason::MembershipRevoked,
+                }),
+                MembershipRuntimeError::PeerRejected,
+            ));
         };
 
         // Select the key for this relay's observed certificate before applying
@@ -2385,9 +2714,9 @@ impl MembershipRuntime {
         // replace the identity proof for this process.  A known, non-revoked
         // local key that has expired is an expiry boundary; a missing,
         // revoked, or not-yet-active local pin remains a membership rejection.
-        // The digest currently served, read under the reconcile gate this
-        // pass holds, so a concurrent identity switch is either wholly before
-        // or wholly after this pass.
+        // The digest currently served: the owning task never switches the
+        // identity while a pass is in flight, so a concurrent identity switch
+        // is either wholly before or wholly after this pass.
         let local_serving_spki = self.local_serving_spki();
         let local_spki = local_serving_spki.as_deref();
         let local_key = local_spki.and_then(|spki| {
@@ -2430,17 +2759,16 @@ impl MembershipRuntime {
                 )
             };
             let version_state = candidate_verifier.version_state();
-            self.persist_if_changed(version_state, checkpoint_received_wall)
-                .await?;
-            self.install_unready_candidate(
-                candidate_verifier,
-                reason,
-                checkpoint.checkpoint().checkpoint_version,
-                checkpoint_expiry,
-                checkpoint_received_wall,
-                invalidation_reason,
-            );
-            return Err(error);
+            self.persist_if_changed(notes, version_state).await?;
+            return Ok(PassConclusion::Unready(
+                Box::new(UnreadyInstall {
+                    verifier: candidate_verifier,
+                    reason,
+                    checkpoint: verified_checkpoint,
+                    invalidation_reason,
+                }),
+                error,
+            ));
         };
 
         let mut trust_wall_expiry = checkpoint_expiry.min(local_membership.record().expires_at);
@@ -2455,46 +2783,36 @@ impl MembershipRuntime {
         if trust_deadline <= records_received_mono || local_key.expires_at <= records_received_wall
         {
             let version_state = candidate_verifier.version_state();
-            self.persist_if_changed(version_state, checkpoint_received_wall)
-                .await?;
-            self.install_unready_candidate(
-                candidate_verifier,
-                MembershipUnreadyReason::CheckpointExpired,
-                checkpoint.checkpoint().checkpoint_version,
-                checkpoint_expiry,
-                checkpoint_received_wall,
-                PeerInvalidationReason::TrustExpired,
-            );
-            return Err(MembershipRuntimeError::CheckpointExpired);
+            self.persist_if_changed(notes, version_state).await?;
+            return Ok(PassConclusion::Unready(
+                Box::new(UnreadyInstall {
+                    verifier: candidate_verifier,
+                    reason: MembershipUnreadyReason::CheckpointExpired,
+                    checkpoint: verified_checkpoint,
+                    invalidation_reason: PeerInvalidationReason::TrustExpired,
+                }),
+                MembershipRuntimeError::CheckpointExpired,
+            ));
         }
 
         let version_state = candidate_verifier.version_state();
 
         // Verification advances the candidate fences before readiness is
-        // exposed. Persist that exact high-water state first, without holding
-        // the synchronous runtime mutex across filesystem I/O. Existing
-        // bindings remain usable until this durable candidate is swapped.
-        self.persist_if_changed(version_state, checkpoint_received_wall)
-            .await?;
-        let mut state = self.state.lock().expect("membership state mutex poisoned");
-
-        state.verifier = candidate_verifier;
-        state.readiness = MembershipReadiness::Ready;
-        state.generation = state.generation.saturating_add(1);
-        state.checkpoint_version = Some(checkpoint.checkpoint().checkpoint_version);
-        state.checkpoint_expires_at = Some(checkpoint_expiry);
-        state.trust_expires_at = Some(trust_wall_expiry);
-        state.trust_deadline = Some(trust_deadline);
-        state.last_verified_at = Some(checkpoint_received_wall);
-        let invalidations = state.revalidate_active(
+        // exposed. Persist that exact high-water state first; the owning task
+        // keeps answering reads and admissions from the previous verified
+        // state meanwhile. Existing bindings remain usable until this durable
+        // candidate is swapped.
+        self.persist_if_changed(notes, version_state).await?;
+        Ok(PassConclusion::Ready(Box::new(ReadyInstall {
+            verifier: candidate_verifier,
+            checkpoint: verified_checkpoint,
+            trust: TrustWindow {
+                expires_at: trust_wall_expiry,
+                deadline: trust_deadline,
+            },
             records_received_wall,
             records_received_mono,
-            PeerInvalidationReason::MembershipChanged,
-        );
-        let snapshot = state.snapshot();
-        drop(state);
-        self.dispatch_invalidations(invalidations);
-        Ok(snapshot)
+        })))
     }
 
     async fn fetch_checkpoint(
@@ -2551,74 +2869,644 @@ impl MembershipRuntime {
             )),
             Err(_) => {
                 // Dropping a JoinHandle does not cancel a blocking task.  Join
-                // it before releasing the reconcile gate so a late write can
-                // never race a subsequent pass that might publish Ready.
+                // it before this pass concludes so a late write can never
+                // race a subsequent pass that might publish Ready.
                 let _ = task.await;
                 Err(MembershipRuntimeError::PersistenceTimeout)
             }
         }
     }
 
+    /// Write `version_state` to the durable store unless it is what the store
+    /// already holds.  A failure ends the pass with a persistence error,
+    /// which the owning task installs as `PersistenceUnavailable` and as the
+    /// invalidation of every admission when the pass returns -- there is no
+    /// await between the failure and that return.
     async fn persist_if_changed(
         &self,
+        notes: &mut PassNotes,
         version_state: MembershipVersionState,
-        now: DateTime<Utc>,
     ) -> Result<(), MembershipRuntimeError> {
         if self.version_store.is_none() {
             return Ok(());
         }
-        {
-            let state = self.state.lock().expect("membership state mutex poisoned");
-            if state.last_persisted_version_state.as_ref() == Some(&version_state) {
-                return Ok(());
-            }
+        if notes.last_persisted.as_ref() == Some(&version_state) {
+            return Ok(());
         }
-        if let Err(error) = self.persist_version_state(version_state.clone()).await {
-            self.mark_persistence_failure(now);
-            return Err(error);
-        }
-        let mut state = self.state.lock().expect("membership state mutex poisoned");
-        state.last_persisted_version_state = Some(version_state);
+        self.persist_version_state(version_state.clone()).await?;
+        notes.last_persisted = Some(version_state);
         Ok(())
     }
+}
 
-    fn mark_persistence_failure(&self, now: DateTime<Utc>) {
-        let invalidations = {
-            let mut state = self.state.lock().expect("membership state mutex poisoned");
-            state.readiness =
-                MembershipReadiness::Unready(MembershipUnreadyReason::PersistenceUnavailable);
-            state.invalidate_active(now, PeerInvalidationReason::PersistenceUnavailable)
+type BoxedStage<T> = Pin<Box<dyn Future<Output = T> + Send>>;
+
+/// The stage the pass in flight has reached.
+enum PassStage {
+    Fetching(BoxedStage<FetchStageOutput>),
+    Verifying(BoxedStage<PassOutput>),
+}
+
+/// The fetch stage hands the shared half it holds on to the next stage, so
+/// a pass in flight holds it without a gap.
+type FetchStageOutput = (
+    Arc<Shared>,
+    Result<FetchedCheckpoint, MembershipRuntimeError>,
+);
+
+/// What a completed stage hands back to the owning task.
+enum StageOutput {
+    Fetched(
+        Arc<Shared>,
+        Result<FetchedCheckpoint, MembershipRuntimeError>,
+    ),
+    Concluded(PassOutput),
+}
+
+/// The one reconciliation pass in flight and the caller waiting for it.
+struct InFlightPass {
+    stage: PassStage,
+    reply: ReconcileReply,
+}
+
+/// Drive the pass in flight to the end of its current stage.  Pending for
+/// ever while there is none.
+async fn drive_pass(pass: &mut Option<InFlightPass>) -> StageOutput {
+    match pass.as_mut().map(|pass| &mut pass.stage) {
+        Some(PassStage::Fetching(stage)) => {
+            let (shared, fetched) = stage.as_mut().await;
+            StageOutput::Fetched(shared, fetched)
+        }
+        Some(PassStage::Verifying(stage)) => StageOutput::Concluded(stage.as_mut().await),
+        None => std::future::pending().await,
+    }
+}
+
+/// The task that owns the membership state.
+///
+/// It holds at most one reconciliation pass, as a child future it polls
+/// between commands, so admissions and the other state commands are answered
+/// while a pass waits on the authority, the catalog or the durable store.
+/// A pass changes no state until it concludes; reconcile and identity-switch
+/// requests that arrive meanwhile wait, in order, for it to conclude.
+///
+/// The task holds the shared half weakly, so dropping the last runtime
+/// handle releases the durable version store at once, as it always has,
+/// rather than when this task is next polled.  Only a pass in flight holds
+/// it strongly, until it concludes.
+struct MembershipOwner {
+    shared: Weak<Shared>,
+    expiry_observed: Arc<Notify>,
+    state: RuntimeState,
+    pass: Option<InFlightPass>,
+    gated: VecDeque<GatedCommand>,
+    /// Set by `Cancel` and never cleared.  A pass that concludes afterwards
+    /// installs `Cancelled`, whatever it concluded, and no later pass starts.
+    cancelled: bool,
+    /// What every publication says of this task; leaves `Live` only in
+    /// `Drop`.
+    liveness: MembershipOwnerState,
+}
+
+impl MembershipOwner {
+    fn new(shared: &Arc<Shared>) -> Self {
+        let initial = Arc::clone(&shared.published.borrow());
+        let state = RuntimeState {
+            verifier: Arc::clone(&initial.verifier),
+            readiness: initial.readiness.clone(),
+            generation: initial.generation,
+            evidence: initial.evidence,
+            active_peers: BTreeMap::new(),
+            callback: None,
+            last_persisted_version_state: shared.persisted_at_start.clone(),
+            own_key_missing_passes: initial.own_key_missing_passes,
+            node_omitted_passes: initial.node_omitted_passes,
+            below_minimum_since: initial.below_minimum_since,
+            below_minimum_persisted: initial.below_minimum_persisted,
+            prolonged_unready: initial.prolonged_unready,
+            last_counted_unready_pass: initial.last_counted_unready_pass,
+            surrender_bounds: initial.surrender_bounds,
         };
-        self.dispatch_invalidations(invalidations);
+        Self {
+            shared: Arc::downgrade(shared),
+            expiry_observed: Arc::clone(&shared.expiry_observed),
+            state,
+            pass: None,
+            gated: VecDeque::new(),
+            cancelled: false,
+            liveness: MembershipOwnerState::Live,
+        }
     }
 
-    fn install_unready_candidate(
-        &self,
-        verifier: MembershipVerifier,
-        reason: MembershipUnreadyReason,
-        checkpoint_version: u64,
-        checkpoint_expires_at: DateTime<Utc>,
-        now: DateTime<Utc>,
-        invalidation_reason: PeerInvalidationReason,
+    async fn run(mut self, mut commands: mpsc::Receiver<Command>) {
+        let mut open = true;
+        // After the last handle is gone a pass still in flight is driven to
+        // its conclusion, so a durable write it started is joined.
+        while open || self.pass.is_some() {
+            tokio::select! {
+                command = commands.recv(), if open && self.gated.len() < MAX_GATED_COMMANDS => {
+                    match command {
+                        Some(command) => self.on_command(command),
+                        None => open = false,
+                    }
+                }
+                output = drive_pass(&mut self.pass), if self.pass.is_some() => {
+                    self.on_stage(output);
+                }
+                () = self.expiry_observed.notified() => self.expire(),
+            }
+        }
+    }
+
+    /// Publish the state as it is now.  Every command is answered after this.
+    fn publish(&self) {
+        // With no runtime handle left there is no reader to publish to.
+        if let Some(shared) = self.shared.upgrade() {
+            shared
+                .published
+                .send_replace(Arc::new(self.state.published(self.liveness)));
+        }
+    }
+
+    fn on_command(&mut self, command: Command) {
+        match command {
+            Command::Reconcile { reply } => self.gate(GatedCommand::Reconcile { reply }),
+            Command::SwitchLocalServingSpki {
+                spki,
+                install,
+                reply,
+            } => self.gate(GatedCommand::SwitchLocalServingSpki {
+                spki,
+                install,
+                reply,
+            }),
+            Command::AdmitPeer { identity, reply } => {
+                let (result, invalidations) =
+                    self.state.admit_peer(identity, Utc::now(), Instant::now());
+                self.publish();
+                dispatch_invalidations(invalidations);
+                let _ = reply.send(result);
+            }
+            Command::RemovePeer { identity, reply } => {
+                if let Some(peer) = self.state.active_peers.remove(&identity) {
+                    peer.admission.invalidation.close();
+                }
+                self.publish();
+                let _ = reply.send(());
+            }
+            Command::SetInvalidationCallback { callback, reply } => {
+                self.state.callback = callback;
+                let _ = reply.send(());
+            }
+            Command::RestoreVersionState {
+                version_state,
+                reply,
+            } => self.gate(GatedCommand::RestoreVersionState {
+                version_state,
+                reply,
+            }),
+            Command::SetSurrenderBounds { bounds, reply } => {
+                self.state.surrender_bounds = bounds;
+                self.publish();
+                let _ = reply.send(());
+            }
+            Command::Cancel { reply } => {
+                self.cancelled = true;
+                self.state.readiness =
+                    MembershipReadiness::Unready(MembershipUnreadyReason::Cancelled);
+                let invalidations = self
+                    .state
+                    .invalidate_active(Utc::now(), PeerInvalidationReason::RuntimeCancelled);
+                self.publish();
+                dispatch_invalidations(invalidations);
+                let _ = reply.send(());
+            }
+        }
+    }
+
+    /// Apply the expiry a reader observed: the same transition the reader
+    /// already answered from, made in the owned state, then its
+    /// invalidations.
+    fn expire(&mut self) {
+        let invalidations = self.state.expire_if_needed(Utc::now(), Instant::now());
+        self.publish();
+        dispatch_invalidations(invalidations);
+    }
+
+    /// Run a command that must not overlap a pass now, or hold it behind the
+    /// pass in flight and whatever is already waiting.
+    fn gate(&mut self, command: GatedCommand) {
+        if self.pass.is_some() || !self.gated.is_empty() {
+            self.gated.push_back(command);
+        } else {
+            self.run_gated(command);
+        }
+    }
+
+    fn run_gated(&mut self, command: GatedCommand) {
+        match command {
+            GatedCommand::RestoreVersionState {
+                version_state,
+                reply,
+            } => {
+                let result = Arc::make_mut(&mut self.state.verifier)
+                    .restore_version_state(version_state)
+                    .map_err(MembershipRuntimeError::Membership);
+                self.publish();
+                let _ = reply.send(result);
+            }
+            GatedCommand::Reconcile { reply } if self.cancelled => {
+                // Cancellation is final: no pass starts after it.
+                let _ = reply.send(Err(MembershipRuntimeError::Cancelled));
+            }
+            GatedCommand::Reconcile { reply } => {
+                // With no runtime handle left nobody waits for a pass; the
+                // dropped reply reads as cancelled.
+                if let Some(shared) = self.shared.upgrade() {
+                    self.pass = Some(InFlightPass {
+                        stage: PassStage::Fetching(Box::pin(shared.fetch_stage())),
+                        reply,
+                    });
+                }
+            }
+            GatedCommand::SwitchLocalServingSpki {
+                spki,
+                install,
+                reply,
+            } => {
+                let _ = reply.send(self.switch_local_serving_spki(spki, install));
+            }
+        }
+    }
+
+    fn switch_local_serving_spki(
+        &mut self,
+        spki: String,
+        install: InstallIdentity,
+    ) -> SwitchAnswer {
+        let Some(shared) = self.shared.upgrade() else {
+            return SwitchAnswer::NotApproved(LocalKeyApproval::NotReady);
+        };
+        let approval = local_key_approval_at(
+            &self.state.readiness,
+            &self.state.verifier,
+            &shared.config.node_id,
+            &spki,
+            Utc::now(),
+        );
+        if !approval.is_approved() {
+            return SwitchAnswer::NotApproved(approval);
+        }
+        if !install() {
+            return SwitchAnswer::InstallFailed;
+        }
+        shared.local_serving_spki.send_replace(Some(spki));
+        // The own-key passes counted so far judged the key served until now;
+        // they are no evidence about the one served from here on (M8-C65).
+        // No pass is in flight, so none is counted half-way through. A fresh
+        // pass is requested so readiness follows the switch without waiting
+        // for the periodic interval.
+        self.state.own_key_missing_passes = 0;
+        self.publish();
+        shared.wake.notify_one();
+        SwitchAnswer::Installed
+    }
+
+    fn on_stage(&mut self, output: StageOutput) {
+        match output {
+            StageOutput::Fetched(shared, Ok(fetched)) => {
+                // The candidate is a copy of the live verifier as it is when
+                // the checkpoint arrives.
+                let candidate = MembershipVerifier::clone(&self.state.verifier);
+                let last_persisted = self.state.last_persisted_version_state.clone();
+                if let Some(pass) = self.pass.as_mut() {
+                    pass.stage = PassStage::Verifying(Box::pin(shared.verify_stage(
+                        fetched,
+                        candidate,
+                        last_persisted,
+                    )));
+                }
+            }
+            StageOutput::Fetched(_, Err(error)) => self.conclude_pass(PassOutput {
+                conclusion: PassConclusion::Failed(error),
+                notes: PassNotes {
+                    last_persisted: self.state.last_persisted_version_state.clone(),
+                    local_gap: None,
+                    publisher_outage: false,
+                },
+            }),
+            StageOutput::Concluded(output) => self.conclude_pass(output),
+        }
+    }
+
+    /// Install what the pass concluded, count it, publish, dispatch its
+    /// invalidations, answer its caller, and start whatever waited for it.
+    fn conclude_pass(&mut self, output: PassOutput) {
+        let PassOutput { conclusion, notes } = output;
+        self.state.last_persisted_version_state = notes.last_persisted;
+        let mut invalidations = Vec::new();
+        let result = match conclusion {
+            // Cancelled while this pass was in flight: it installs
+            // `Cancelled` (through `mark_error` below), never the readiness
+            // it concluded.  Its verifier is kept, because the pass has
+            // already written that verifier's fences to the durable store
+            // and the in-memory fences must not read lower than those.
+            PassConclusion::Unready(install, _) if self.cancelled => {
+                self.state.verifier = Arc::new(install.verifier);
+                Err(MembershipRuntimeError::Cancelled)
+            }
+            PassConclusion::Ready(install) if self.cancelled => {
+                self.state.verifier = Arc::new(install.verifier);
+                Err(MembershipRuntimeError::Cancelled)
+            }
+            PassConclusion::Failed(_) if self.cancelled => Err(MembershipRuntimeError::Cancelled),
+            PassConclusion::Failed(error) => Err(error),
+            PassConclusion::Unready(install, error) => {
+                invalidations.extend(self.state.install_unready(*install));
+                Err(error)
+            }
+            PassConclusion::Ready(install) => {
+                let (snapshot, revalidated) = self.state.install_ready(*install);
+                invalidations.extend(revalidated);
+                Ok(snapshot)
+            }
+        };
+        if let Err(error) = &result {
+            invalidations.extend(self.state.mark_error(error));
+        }
+        // Passes are counted in the order they completed, each as one step
+        // with the readiness it installed.
+        self.state.count_own_key_missing_pass(&result);
+        self.state.count_surrender_evidence(
+            &result,
+            notes.local_gap,
+            notes.publisher_outage,
+            Instant::now(),
+        );
+        self.publish();
+        dispatch_invalidations(invalidations);
+        if let Some(pass) = self.pass.take() {
+            let _ = pass.reply.send(result);
+        }
+        while self.pass.is_none() {
+            let Some(command) = self.gated.pop_front() else {
+                break;
+            };
+            self.run_gated(command);
+        }
+    }
+}
+
+impl Drop for MembershipOwner {
+    /// However the owning task ends, the last state it publishes fails
+    /// closed: `Unready(Cancelled)`, no admission, every active admission's
+    /// edge cancelled, and an owner state other than `Live`.  Nothing can
+    /// change the published state afterwards, so a `Ready` left behind would
+    /// stay `Ready` with nobody to expire or revoke it.
+    ///
+    /// The task ends in three ways: its last runtime handle was dropped
+    /// (nobody is left to read the publication, the edges are still
+    /// cancelled); its Tokio runtime shut down under a live handle
+    /// (`Stopped`); or it panicked, which only an invalidation callback can
+    /// make it do (`Failed`).  Callbacks are not run from here: one may be
+    /// the panic being unwound.
+    fn drop(&mut self) {
+        self.liveness = if std::thread::panicking() {
+            MembershipOwnerState::Failed
+        } else {
+            MembershipOwnerState::Stopped
+        };
+        self.cancelled = true;
+        self.state.readiness = MembershipReadiness::Unready(MembershipUnreadyReason::Cancelled);
+        let invalidations = self
+            .state
+            .invalidate_active(Utc::now(), PeerInvalidationReason::RuntimeCancelled);
+        let revoked = invalidations.len();
+        self.publish();
+        for invalidation in invalidations {
+            invalidation.edge.invalidate(invalidation.reason);
+        }
+        // Dropped once, so logged once.
+        if self.liveness == MembershipOwnerState::Failed {
+            tracing::error!(
+                revoked_admissions = revoked,
+                "membership owner task panicked; the runtime is unready and \
+                 refuses every admission until the process restarts"
+            );
+        }
+    }
+}
+
+/// Cancel every admission first, then tell the callbacks.  A callback that
+/// panics takes the owning task down with it; by then no admission in this
+/// batch is still live, and the task's `Drop` revokes the rest.
+fn dispatch_invalidations(invalidations: Vec<Invalidation>) {
+    for invalidation in &invalidations {
+        invalidation.edge.invalidate(invalidation.reason);
+    }
+    for invalidation in invalidations {
+        if let Some(callback) = invalidation.callback {
+            callback(invalidation.identity, invalidation.reason);
+        }
+    }
+}
+
+struct Invalidation {
+    identity: PeerIdentity,
+    edge: AdmissionEdge,
+    callback: Option<PeerInvalidationCallback>,
+    reason: PeerInvalidationReason,
+}
+
+impl RuntimeState {
+    /// The signed wall-clock trust boundary of the last `Ready` pass.
+    fn trust_expires_at(&self) -> Option<DateTime<Utc>> {
+        self.evidence.trust().map(|trust| trust.expires_at)
+    }
+
+    /// The monotonic deadline of the last `Ready` pass.
+    fn trust_deadline(&self) -> Option<Instant> {
+        self.evidence.trust().map(|trust| trust.deadline)
+    }
+
+    fn snapshot(&self) -> MembershipSnapshot {
+        membership_snapshot(
+            &self.verifier,
+            self.readiness.clone(),
+            self.generation,
+            self.evidence,
+            self.active_peers.len(),
+        )
+    }
+
+    /// The immutable copy of this state that readers sample.
+    fn published(&self, owner: MembershipOwnerState) -> PublishedState {
+        PublishedState {
+            owner,
+            verifier: Arc::clone(&self.verifier),
+            readiness: self.readiness.clone(),
+            generation: self.generation,
+            evidence: self.evidence,
+            active_peer_deadlines: self
+                .active_peers
+                .values()
+                .map(|peer| peer.admission.deadline.expires_at)
+                .collect(),
+            own_key_missing_passes: self.own_key_missing_passes,
+            node_omitted_passes: self.node_omitted_passes,
+            below_minimum_since: self.below_minimum_since,
+            below_minimum_persisted: self.below_minimum_persisted,
+            prolonged_unready: self.prolonged_unready,
+            last_counted_unready_pass: self.last_counted_unready_pass,
+            surrender_bounds: self.surrender_bounds,
+        }
+    }
+
+    /// Admit an mTLS-authenticated peer against the live verified state.
+    fn admit_peer(
+        &mut self,
+        identity: PeerIdentity,
+        now_wall: DateTime<Utc>,
+        now_mono: Instant,
+    ) -> (
+        Result<PeerAdmission, MembershipRuntimeError>,
+        Vec<Invalidation>,
     ) {
-        let invalidations = {
-            let mut state = self.state.lock().expect("membership state mutex poisoned");
-            state.verifier = verifier;
-            state.readiness = MembershipReadiness::Unready(reason);
-            state.checkpoint_version = Some(checkpoint_version);
-            state.checkpoint_expires_at = Some(checkpoint_expires_at);
-            state.last_verified_at = Some(now);
-            state.invalidate_active(now, invalidation_reason)
-        };
-        self.dispatch_invalidations(invalidations);
+        let state = self;
+        let mut invalidations = state.expire_if_needed(now_wall, now_mono);
+        let result = (|| {
+            if !matches!(state.readiness, MembershipReadiness::Ready) {
+                return Err(MembershipRuntimeError::NotReady);
+            }
+            let binding = state
+                .verifier
+                .bind_peer(
+                    &identity.node_id,
+                    &identity.boot_id,
+                    &identity.spki_sha256,
+                    now_wall,
+                )
+                .map_err(|_| MembershipRuntimeError::PeerRejected)?;
+            let trust_deadline = state
+                .trust_deadline()
+                .ok_or(MembershipRuntimeError::CheckpointExpired)?;
+            if trust_deadline <= now_mono {
+                state.readiness =
+                    MembershipReadiness::Unready(MembershipUnreadyReason::CheckpointExpired);
+                invalidations.extend(
+                    state.invalidate_active(now_wall, PeerInvalidationReason::TrustExpired),
+                );
+                return Err(MembershipRuntimeError::CheckpointExpired);
+            }
+            let record_version = state
+                .verifier
+                .retained_memberships()
+                .into_iter()
+                .find(|membership| membership.node_id() == identity.node_id.as_str())
+                .map(|membership| membership.record().record_version)
+                .ok_or(MembershipRuntimeError::PeerRejected)?;
+            let peer_deadline = monotonic_deadline(now_wall, now_mono, binding.valid_until());
+            if peer_deadline <= now_mono {
+                return Err(MembershipRuntimeError::PeerRejected);
+            }
+            // The wall-clock expiry is the signed trust boundary. Keep
+            // the original monotonic admission deadline on a refresh:
+            // independently converting the same signed expiry from a
+            // later receipt instant can move the resulting Instant
+            // backwards by transport/clock-conversion drift.
+            let admission_trust_expires_at = state
+                .trust_expires_at()
+                .ok_or(MembershipRuntimeError::CheckpointExpired)?
+                .min(binding.valid_until());
+            // Forwarded streams on one authenticated peer share one
+            // process-local admission edge. Reusing the active admission
+            // is essential: replacing it for every pooled H3 stream
+            // would cancel the previous stream as a false membership
+            // change. Never reuse after invalidation, expiry, a binding
+            // revision, or a genuinely shortened signed trust boundary.
+            if let Some(previous) = state.active_peers.get(&identity)
+                && previous.record_version == record_version
+                && previous.admission.binding() == &binding
+                && !previous.admission.is_invalidated()
+                && !previous.admission.deadline.is_expired()
+                && admission_trust_expires_at >= previous.admission.deadline.trust_expires_at()
+            {
+                return Ok(previous.admission.clone());
+            }
+            if !state.active_peers.contains_key(&identity)
+                && state.active_peers.len() >= MAX_MEMBERSHIP_RECORDS
+            {
+                return Err(MembershipRuntimeError::PeerRejected);
+            }
+            let deadline = AdmissionDeadline {
+                started_at: now_mono,
+                expires_at: trust_deadline.min(peer_deadline),
+                // Retain the wall-clock signed boundary used for reuse
+                // and revalidation. The monotonic deadline above remains
+                // anchored to this admission and is never extended by a
+                // later checkpoint receipt.
+                trust_expires_at: admission_trust_expires_at,
+            };
+            let admission = PeerAdmission {
+                identity: identity.clone(),
+                binding,
+                deadline,
+                invalidation: AdmissionEdge::live(CancellationToken::new()),
+                expiry: SharedAdmissionExpiry::new(
+                    deadline.expires_at,
+                    Some(deadline.trust_expires_at),
+                ),
+            };
+            if let Some(previous) = state.active_peers.insert(
+                identity.clone(),
+                ActivePeer {
+                    admission: admission.clone(),
+                    record_version,
+                },
+            ) {
+                invalidations.push(Invalidation {
+                    identity: identity.clone(),
+                    edge: previous.admission.invalidation,
+                    callback: state.callback.clone(),
+                    reason: PeerInvalidationReason::MembershipChanged,
+                });
+            }
+            Ok(admission)
+        })();
+        (result, invalidations)
     }
 
-    fn mark_error(&self, error: &MembershipRuntimeError) {
+    /// Install a candidate that verified a checkpoint and concluded unready.
+    fn install_unready(&mut self, install: UnreadyInstall) -> Vec<Invalidation> {
+        self.verifier = Arc::new(install.verifier);
+        self.readiness = MembershipReadiness::Unready(install.reason);
+        self.evidence = self.evidence.checkpoint_verified(install.checkpoint);
+        self.invalidate_active(install.checkpoint.verified_at, install.invalidation_reason)
+    }
+
+    /// Install a candidate that concluded `Ready` and re-check every active
+    /// admission against it.
+    fn install_ready(&mut self, install: ReadyInstall) -> (MembershipSnapshot, Vec<Invalidation>) {
+        self.verifier = Arc::new(install.verifier);
+        self.readiness = MembershipReadiness::Ready;
+        self.generation = self.generation.saturating_add(1);
+        self.evidence = self.evidence.ready(install.checkpoint, install.trust);
+        let invalidations = self.revalidate_active(
+            install.records_received_wall,
+            install.records_received_mono,
+            PeerInvalidationReason::MembershipChanged,
+        );
+        (self.snapshot(), invalidations)
+    }
+
+    /// Install the unready reason a failed pass maps to, and invalidate the
+    /// active admissions where that reason withdraws them.
+    fn mark_error(&mut self, error: &MembershipRuntimeError) -> Vec<Invalidation> {
         if matches!(
             error,
             MembershipRuntimeError::NotReady | MembershipRuntimeError::PeerRejected
         ) {
-            return;
+            return Vec::new();
         }
         let reason = match error {
             MembershipRuntimeError::Authority(_) => MembershipUnreadyReason::UnknownAuthority,
@@ -2648,129 +3536,126 @@ impl MembershipRuntime {
                 MembershipUnreadyReason::UnknownAuthority
             }
         };
-        let invalidations = {
-            let mut state = self.state.lock().expect("membership state mutex poisoned");
-            state.readiness = MembershipReadiness::Unready(reason);
-            match reason {
-                MembershipUnreadyReason::UnknownAuthority => {
-                    state.invalidate_active(Utc::now(), PeerInvalidationReason::AuthorityUnknown)
-                }
-                MembershipUnreadyReason::MembershipRejected => {
-                    state.invalidate_active(Utc::now(), PeerInvalidationReason::MembershipRevoked)
-                }
-                MembershipUnreadyReason::CheckpointExpired => {
-                    state.invalidate_active(Utc::now(), PeerInvalidationReason::TrustExpired)
-                }
-                MembershipUnreadyReason::PersistenceUnavailable => state
-                    .invalidate_active(Utc::now(), PeerInvalidationReason::PersistenceUnavailable),
-                MembershipUnreadyReason::Cancelled => {
-                    state.invalidate_active(Utc::now(), PeerInvalidationReason::RuntimeCancelled)
-                }
-                _ => Vec::new(),
+        self.readiness = MembershipReadiness::Unready(reason);
+        match reason {
+            MembershipUnreadyReason::UnknownAuthority => {
+                self.invalidate_active(Utc::now(), PeerInvalidationReason::AuthorityUnknown)
             }
+            MembershipUnreadyReason::MembershipRejected => {
+                self.invalidate_active(Utc::now(), PeerInvalidationReason::MembershipRevoked)
+            }
+            MembershipUnreadyReason::CheckpointExpired => {
+                self.invalidate_active(Utc::now(), PeerInvalidationReason::TrustExpired)
+            }
+            MembershipUnreadyReason::PersistenceUnavailable => {
+                self.invalidate_active(Utc::now(), PeerInvalidationReason::PersistenceUnavailable)
+            }
+            MembershipUnreadyReason::Cancelled => {
+                self.invalidate_active(Utc::now(), PeerInvalidationReason::RuntimeCancelled)
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// Count this completed pass toward the own-key surrender (M7-C181).
+    ///
+    /// Only a pass that itself reached the `MissingLocalKey` conclusion counts:
+    /// that branch is the one that installs `Unready(MissingLocalKey)` and
+    /// returns `PeerRejected`, and `mark_error` leaves readiness alone for
+    /// `PeerRejected`. Every other outcome -- `Ready`, a checkpoint fetch or
+    /// catalog read failure, a rejected or expired record, a missing local
+    /// record -- resets the count. The owning task counts each pass as it
+    /// concludes, so passes are counted in the order they completed.
+    fn count_own_key_missing_pass(
+        &mut self,
+        result: &Result<MembershipSnapshot, MembershipRuntimeError>,
+    ) {
+        let concluded_missing_key = matches!(result, Err(MembershipRuntimeError::PeerRejected))
+            && self.readiness
+                == MembershipReadiness::Unready(MembershipUnreadyReason::MissingLocalKey);
+        self.own_key_missing_passes = if concluded_missing_key {
+            self.own_key_missing_passes.saturating_add(1)
+        } else {
+            0
         };
-        self.dispatch_invalidations(invalidations);
     }
 
-    fn mark_cancelled(&self) -> Vec<Invalidation> {
-        let mut state = self.state.lock().expect("membership state mutex poisoned");
-        state.readiness = MembershipReadiness::Unready(MembershipUnreadyReason::Cancelled);
-        state.invalidate_active(Utc::now(), PeerInvalidationReason::RuntimeCancelled)
-    }
-
-    fn dispatch_invalidations(&self, invalidations: Vec<Invalidation>) {
-        for invalidation in invalidations {
-            let _ = invalidation.reason_cell.compare_exchange(
-                0,
-                invalidation.reason.code(),
-                Ordering::AcqRel,
-                Ordering::Acquire,
+    /// Count this completed pass toward the local-membership (M7-C182) and
+    /// prolonged-unready (M7-C184) surrenders. The owning task counts each
+    /// pass after installing its readiness, so passes are counted in the
+    /// order they completed.
+    fn count_surrender_evidence(
+        &mut self,
+        result: &Result<MembershipSnapshot, MembershipRuntimeError>,
+        gap: Option<LocalMembershipGap>,
+        publisher_outage: bool,
+        now: Instant,
+    ) {
+        let state = self;
+        // M7-C186: a shared control-plane outage -- the checkpoint authority
+        // unreachable, or the publisher no longer re-signing any record --
+        // makes every relay unready alike. Surrendering devices then only
+        // moves them to relays that are just as unready, so such a pass
+        // neither advances the publish-race run nor accrues unready time.
+        let shared_outage = publisher_outage
+            || matches!(
+                result,
+                Err(MembershipRuntimeError::Authority(error)) if error.is_shared_outage()
             );
-            invalidation.token.cancel();
-            if let Some(callback) = invalidation.callback {
-                callback(invalidation.identity, invalidation.reason);
+        let missing_local_membership = state.readiness
+            == MembershipReadiness::Unready(MembershipUnreadyReason::MissingLocalMembership);
+
+        // Case (a): a checkpoint that omits this node, pass-confirmed.
+        state.node_omitted_passes =
+            if missing_local_membership && gap == Some(LocalMembershipGap::NodeOmitted) {
+                state.node_omitted_passes.saturating_add(1)
+            } else {
+                0
+            };
+
+        // Case (b): a record below the checkpoint's minimum, time-confirmed
+        // between the first and the latest pass that each observed it.
+        if missing_local_membership
+            && gap == Some(LocalMembershipGap::BelowMinimum)
+            && !shared_outage
+        {
+            let since = *state.below_minimum_since.get_or_insert(now);
+            state.below_minimum_persisted = now.saturating_duration_since(since);
+        } else {
+            state.below_minimum_since = None;
+            state.below_minimum_persisted = Duration::ZERO;
+        }
+
+        // M7-C184: unready while the catalog is reachable.
+        match state.readiness {
+            MembershipReadiness::Ready | MembershipReadiness::Starting => {
+                state.prolonged_unready = Duration::ZERO;
+                state.last_counted_unready_pass = None;
+            }
+            MembershipReadiness::Unready(reason) => {
+                let counted = reason.counts_toward_prolonged_unready() && !shared_outage;
+                if counted && let Some(previous) = state.last_counted_unready_pass {
+                    state.prolonged_unready = state
+                        .prolonged_unready
+                        .saturating_add(now.saturating_duration_since(previous));
+                }
+                state.last_counted_unready_pass = counted.then_some(now);
             }
         }
     }
-}
 
-struct Invalidation {
-    identity: PeerIdentity,
-    token: CancellationToken,
-    reason_cell: Arc<AtomicU8>,
-    callback: Option<PeerInvalidationCallback>,
-    reason: PeerInvalidationReason,
-}
-
-impl RuntimeState {
-    fn snapshot(&self) -> MembershipSnapshot {
-        let mut memberships = self
-            .verifier
-            .retained_memberships()
-            .into_iter()
-            .filter_map(|membership| self.redacted_membership(membership))
-            .collect::<Vec<_>>();
-        memberships.sort_by(|left, right| left.node_id.cmp(&right.node_id));
-        memberships.truncate(MAX_MEMBERSHIP_RECORDS);
-        MembershipSnapshot {
-            readiness: self.readiness.clone(),
-            generation: self.generation,
-            checkpoint_version: self.checkpoint_version,
-            checkpoint_expires_at: self.checkpoint_expires_at,
-            trust_expires_at: self.trust_expires_at,
-            trust_deadline_ms: self.trust_deadline.map(crate::runtime::monotonic_millis_at),
-            last_verified_at: self.last_verified_at,
-            membership_count: memberships.len(),
-            active_peer_count: self.active_peers.len(),
-            memberships,
-        }
-    }
-
-    fn redacted_membership(
-        &self,
-        membership: VerifiedMembership,
-    ) -> Option<RedactedMembershipSnapshot> {
-        let checkpoint = self.verifier.fresh_checkpoint(Utc::now()).ok()?;
-        let minimum = checkpoint
-            .checkpoint()
-            .minimum_versions
-            .get(membership.node_id())
-            .copied()?;
-        if membership.record().record_version < minimum {
-            return None;
-        }
-        Some(RedactedMembershipSnapshot {
-            node_id: membership.node_id().to_owned(),
-            record_version: membership.record().record_version,
-            publisher_key_id: membership.publisher_key_id().to_owned(),
-            key_ids: membership
-                .keys()
-                .iter()
-                .map(|key| key.key_id.clone())
-                .collect(),
-            spki_sha256: membership
-                .keys()
-                .iter()
-                .map(|key| key.spki_sha256.clone())
-                .collect(),
-            valid_until: membership.record().expires_at,
-        })
-    }
-
+    /// Apply trust expiry to the owned state: a passed trust window makes
+    /// the runtime `CheckpointExpired` and invalidates every admission, and
+    /// otherwise each admission past its own deadline is invalidated.
+    /// Readers compute the same transition for themselves from the published
+    /// deadlines ([`PublishedState::view_at`]); this is where it becomes
+    /// state and where its invalidations are produced.
     fn expire_if_needed(
         &mut self,
         now: DateTime<Utc>,
         monotonic_now: Instant,
     ) -> Vec<Invalidation> {
-        let monotonic_expired = self
-            .trust_deadline
-            .is_some_and(|deadline| monotonic_now >= deadline);
-        let wall_clock_invalid = self.trust_deadline.is_some()
-            && (self
-                .trust_expires_at
-                .is_some_and(|expires_at| now >= expires_at)
-                || self.verifier.fresh_checkpoint(now).is_err());
-        if monotonic_expired || wall_clock_invalid {
+        if trust_window_expired(self.evidence, &self.verifier, now, monotonic_now) {
             self.readiness =
                 MembershipReadiness::Unready(MembershipUnreadyReason::CheckpointExpired);
             return self.invalidate_active(now, PeerInvalidationReason::TrustExpired);
@@ -2790,8 +3675,7 @@ impl RuntimeState {
             })
             .map(|(identity, peer)| Invalidation {
                 identity,
-                token: peer.admission.invalidation,
-                reason_cell: peer.admission.invalidation_reason,
+                edge: peer.admission.invalidation,
                 callback: self.callback.clone(),
                 reason: PeerInvalidationReason::TrustExpired,
             })
@@ -2808,8 +3692,7 @@ impl RuntimeState {
             .into_iter()
             .map(|(identity, peer)| Invalidation {
                 identity,
-                token: peer.admission.invalidation,
-                reason_cell: peer.admission.invalidation_reason,
+                edge: peer.admission.invalidation,
                 callback: self.callback.clone(),
                 reason,
             })
@@ -2861,7 +3744,7 @@ impl RuntimeState {
             // monotonic deadline from each refresh receipt is not a valid
             // shrink test and can spuriously revoke an unchanged admission.
             let trust_deadline_shrank = self
-                .trust_expires_at
+                .trust_expires_at()
                 .zip(current.as_ref().ok())
                 .is_none_or(|(expires_at, binding)| {
                     expires_at.min(binding.valid_until())
@@ -2882,7 +3765,7 @@ impl RuntimeState {
             match current {
                 Ok(binding) if permitted => {
                     let signed_boundary = self
-                        .trust_expires_at
+                        .trust_expires_at()
                         .map_or(binding.valid_until(), |expires_at| {
                             expires_at.min(binding.valid_until())
                         });
@@ -2896,7 +3779,7 @@ impl RuntimeState {
                     let renewed = renewed_deadline(
                         peer.admission.deadline.expires_at,
                         signed_boundary > peer.admission.deadline.trust_expires_at(),
-                        self.trust_deadline,
+                        self.trust_deadline(),
                         monotonic_deadline(now, now_mono, binding.valid_until()),
                     );
                     peer.admission.deadline = AdmissionDeadline {
@@ -2914,8 +3797,7 @@ impl RuntimeState {
                 current => {
                     invalidations.push(Invalidation {
                         identity,
-                        token: peer.admission.invalidation,
-                        reason_cell: peer.admission.invalidation_reason,
+                        edge: peer.admission.invalidation,
                         callback: self.callback.clone(),
                         reason: if deadline_expired {
                             PeerInvalidationReason::TrustExpired
@@ -2930,6 +3812,67 @@ impl RuntimeState {
         }
         invalidations
     }
+}
+
+fn membership_snapshot(
+    verifier: &MembershipVerifier,
+    readiness: MembershipReadiness,
+    generation: u64,
+    evidence: VerifiedEvidence,
+    active_peer_count: usize,
+) -> MembershipSnapshot {
+    let mut memberships = verifier
+        .retained_memberships()
+        .into_iter()
+        .filter_map(|membership| redacted_membership(verifier, membership))
+        .collect::<Vec<_>>();
+    memberships.sort_by(|left, right| left.node_id.cmp(&right.node_id));
+    memberships.truncate(MAX_MEMBERSHIP_RECORDS);
+    let checkpoint = evidence.checkpoint();
+    let trust = evidence.trust();
+    MembershipSnapshot {
+        readiness,
+        generation,
+        checkpoint_version: checkpoint.map(|checkpoint| checkpoint.version),
+        checkpoint_expires_at: checkpoint.map(|checkpoint| checkpoint.expires_at),
+        trust_expires_at: trust.map(|trust| trust.expires_at),
+        trust_deadline_ms: trust.map(|trust| crate::runtime::monotonic_millis_at(trust.deadline)),
+        last_verified_at: checkpoint.map(|checkpoint| checkpoint.verified_at),
+        membership_count: memberships.len(),
+        active_peer_count,
+        memberships,
+    }
+}
+
+fn redacted_membership(
+    verifier: &MembershipVerifier,
+    membership: VerifiedMembership,
+) -> Option<RedactedMembershipSnapshot> {
+    let checkpoint = verifier.fresh_checkpoint(Utc::now()).ok()?;
+    let minimum = checkpoint
+        .checkpoint()
+        .minimum_versions
+        .get(membership.node_id())
+        .copied()?;
+    if membership.record().record_version < minimum {
+        return None;
+    }
+    Some(RedactedMembershipSnapshot {
+        node_id: membership.node_id().to_owned(),
+        record_version: membership.record().record_version,
+        publisher_key_id: membership.publisher_key_id().to_owned(),
+        key_ids: membership
+            .keys()
+            .iter()
+            .map(|key| key.key_id.clone())
+            .collect(),
+        spki_sha256: membership
+            .keys()
+            .iter()
+            .map(|key| key.spki_sha256.clone())
+            .collect(),
+        valid_until: membership.record().expires_at,
+    })
 }
 
 /// The facts one re-bind decision rests on (M7-C80).
@@ -3516,20 +4459,16 @@ mod tests {
 
     #[test]
     fn invalidation_dispatcher_keeps_first_trust_expiry_reason() {
-        let runtime = dispatcher_test_runtime();
         let identity = PeerIdentity::new("peer-a", "boot-a", "test-spki");
-        let token = CancellationToken::new();
-        let reason_cell = Arc::new(AtomicU8::new(0));
+        let edge = AdmissionEdge::live(CancellationToken::new());
         let cancellation = PeerAdmissionCancellation {
-            token: token.clone(),
-            reason: reason_cell.clone(),
+            edge: edge.clone(),
             expires_at: None,
         };
 
-        runtime.dispatch_invalidations(vec![Invalidation {
+        dispatch_invalidations(vec![Invalidation {
             identity: identity.clone(),
-            token: token.clone(),
-            reason_cell: reason_cell.clone(),
+            edge: edge.clone(),
             callback: None,
             reason: PeerInvalidationReason::TrustExpired,
         }]);
@@ -3539,10 +4478,9 @@ mod tests {
             Some(PeerInvalidationReason::TrustExpired)
         );
 
-        runtime.dispatch_invalidations(vec![Invalidation {
+        dispatch_invalidations(vec![Invalidation {
             identity,
-            token,
-            reason_cell,
+            edge,
             callback: None,
             reason: PeerInvalidationReason::MembershipChanged,
         }]);
@@ -3552,40 +4490,433 @@ mod tests {
         );
     }
 
+    /// A mutator is answered only after the snapshot that reflects it is
+    /// published, so the caller's next read sees its own write; and nothing
+    /// is admitted, and nothing reads as Ready, before a pass has verified
+    /// signed evidence.
+    #[tokio::test]
+    async fn a_mutator_is_answered_after_its_snapshot_is_published() {
+        let runtime = dispatcher_test_runtime();
+        assert_eq!(runtime.readiness(), MembershipReadiness::Starting);
+
+        let bounds = SurrenderBounds {
+            local_record_below_minimum: Duration::from_secs(3),
+            prolonged_unready: Duration::from_secs(7),
+        };
+        runtime.set_surrender_bounds(bounds).await;
+        assert_eq!(runtime.surrender_bounds(), bounds);
+
+        let refused = runtime
+            .admit_peer(PeerIdentity::new("peer-a", "boot-a", "test-spki"))
+            .await;
+        assert!(matches!(refused, Err(MembershipRuntimeError::NotReady)));
+
+        // The test authority refuses every fetch: the pass fails closed and
+        // the reply follows the published unready state.
+        let failed = runtime.reconcile_once().await;
+        assert!(matches!(failed, Err(MembershipRuntimeError::Authority(_))));
+        assert_eq!(
+            runtime.readiness(),
+            MembershipReadiness::Unready(MembershipUnreadyReason::UnknownAuthority)
+        );
+        assert_eq!(runtime.snapshot().active_peer_count, 0);
+        assert_eq!(runtime.surrender_bounds(), bounds);
+    }
+
+    /// The anti-rollback fences are restored by the owning task and are in
+    /// the published state when the caller is answered; a fence is never
+    /// lowered by a later restore.
+    #[tokio::test]
+    async fn restored_version_fences_are_published_and_never_lowered() {
+        let runtime = dispatcher_test_runtime();
+        let mut fences = runtime.version_state();
+        fences.checkpoint_version = Some(9);
+        runtime
+            .restore_version_state(fences.clone())
+            .await
+            .expect("a higher fence is restored");
+        assert_eq!(runtime.version_state(), fences);
+
+        let mut lower = fences.clone();
+        lower.checkpoint_version = Some(3);
+        let _ = runtime.restore_version_state(lower).await;
+        assert_eq!(
+            runtime.version_state().checkpoint_version,
+            Some(9),
+            "a restore lowered the checkpoint version fence"
+        );
+    }
+
+    /// The readiness the owning task last published, without the read-time
+    /// expiry the public readers apply on top of it.
+    fn latched(runtime: &MembershipRuntime) -> MembershipReadiness {
+        runtime.published().readiness.clone()
+    }
+
+    fn live_invalidation(
+        peer: &str,
+        callback: Option<PeerInvalidationCallback>,
+    ) -> (PeerAdmissionCancellation, Invalidation) {
+        let edge = AdmissionEdge::live(CancellationToken::new());
+        (
+            PeerAdmissionCancellation {
+                edge: edge.clone(),
+                expires_at: None,
+            },
+            Invalidation {
+                identity: PeerIdentity::new(peer, "boot-a", "test-spki"),
+                edge,
+                callback,
+                reason: PeerInvalidationReason::MembershipRevoked,
+            },
+        )
+    }
+
+    /// A `Ready` conclusion for `owner`, verified against a copy of its
+    /// verifier as it is now.
+    fn ready_conclusion(owner: &MembershipOwner) -> PassOutput {
+        let now = Utc::now();
+        PassOutput {
+            conclusion: PassConclusion::Ready(Box::new(ReadyInstall {
+                verifier: MembershipVerifier::clone(&owner.state.verifier),
+                checkpoint: VerifiedCheckpoint {
+                    version: 1,
+                    expires_at: now + ChronoDuration::seconds(60),
+                    verified_at: now,
+                },
+                trust: TrustWindow {
+                    expires_at: now + ChronoDuration::seconds(60),
+                    deadline: Instant::now() + Duration::from_secs(60),
+                },
+                records_received_wall: now,
+                records_received_mono: Instant::now(),
+            })),
+            notes: PassNotes {
+                last_persisted: None,
+                local_gap: None,
+                publisher_outage: false,
+            },
+        }
+    }
+
+    /// A callback that panics on the first admission of a batch must not
+    /// leave the later ones live, and the owning task it takes down must be
+    /// visible through the runtime handle, reading fail-closed.
+    #[tokio::test]
+    async fn a_panicking_callback_leaves_no_admission_live_and_latches_owner_failure() {
+        let runtime = dispatcher_test_runtime();
+        let mut owner = MembershipOwner::new(&runtime.shared);
+        // Control: the owner can publish Ready, so the assertions below can
+        // fail.
+        owner.conclude_pass(ready_conclusion(&owner));
+        assert_eq!(latched(&runtime), MembershipReadiness::Ready);
+        assert_eq!(runtime.owner_state(), MembershipOwnerState::Live);
+
+        let called = Arc::new(AtomicBool::new(false));
+        let panicking: PeerInvalidationCallback = {
+            let called = Arc::clone(&called);
+            Arc::new(move |_: PeerIdentity, _: PeerInvalidationReason| {
+                called.store(true, Ordering::Release);
+                panic!("synthetic callback panic");
+            })
+        };
+        let (first, first_invalidation) = live_invalidation("peer-a", Some(panicking));
+        let (second, second_invalidation) = live_invalidation("peer-b", None);
+        let (third, third_invalidation) = live_invalidation("peer-c", None);
+        let task = tokio::spawn(async move {
+            let _owner = owner;
+            dispatch_invalidations(vec![
+                first_invalidation,
+                second_invalidation,
+                third_invalidation,
+            ]);
+        });
+        let joined = task.await;
+        assert!(
+            joined.is_err_and(|error| error.is_panic()),
+            "the callback did not panic the owning task"
+        );
+        assert!(called.load(Ordering::Acquire));
+        for (name, cancellation) in [("first", &first), ("second", &second), ("third", &third)] {
+            assert!(
+                cancellation.is_cancelled(),
+                "the {name} admission stayed live after the callback panicked"
+            );
+            assert_eq!(
+                cancellation.reason(),
+                Some(PeerInvalidationReason::MembershipRevoked)
+            );
+        }
+        assert_eq!(runtime.owner_state(), MembershipOwnerState::Failed);
+        assert_eq!(
+            latched(&runtime),
+            MembershipReadiness::Unready(MembershipUnreadyReason::Cancelled)
+        );
+        assert_eq!(runtime.snapshot().active_peer_count, 0);
+        assert!(runtime.verified_peer_route_targets().is_empty());
+    }
+
+    /// An owning task dropped without a panic (its Tokio runtime shut down)
+    /// while it had published `Ready` leaves the runtime reading not-ready.
+    #[test]
+    fn a_dropped_owner_leaves_readers_failed_closed() {
+        let tokio_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        let runtime = dispatcher_test_runtime();
+        let stand_in = tokio_runtime.block_on(async {
+            // Start the real owning task, then publish `Ready` the only way
+            // these tests can: through a stand-in owner's concluded pass.
+            let bounds = runtime.surrender_bounds();
+            runtime.set_surrender_bounds(bounds).await;
+            let mut owner = MembershipOwner::new(&runtime.shared);
+            owner.conclude_pass(ready_conclusion(&owner));
+            owner
+        });
+        assert_eq!(latched(&runtime), MembershipReadiness::Ready);
+        assert_eq!(runtime.owner_state(), MembershipOwnerState::Live);
+
+        // The real owning task is dropped, not panicking, with the runtime
+        // handle still held.
+        drop(tokio_runtime);
+        assert_eq!(runtime.owner_state(), MembershipOwnerState::Stopped);
+        assert_eq!(
+            latched(&runtime),
+            MembershipReadiness::Unready(MembershipUnreadyReason::Cancelled)
+        );
+        assert_ne!(runtime.readiness(), MembershipReadiness::Ready);
+        assert_eq!(
+            runtime.local_key_approval("test-spki"),
+            LocalKeyApproval::NotReady
+        );
+        assert!(runtime.verified_peer_route_targets().is_empty());
+
+        // Later commands are refused rather than hanging.
+        let later = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        let refused = later.block_on(runtime.reconcile_once());
+        assert!(matches!(refused, Err(MembershipRuntimeError::Cancelled)));
+        drop(stand_in);
+        assert_eq!(
+            latched(&runtime),
+            MembershipReadiness::Unready(MembershipUnreadyReason::Cancelled)
+        );
+    }
+
+    /// `Cancel` that arrives while a pass is in flight is final: the pass
+    /// concludes `Ready` afterwards and the runtime stays cancelled.
+    #[tokio::test]
+    async fn a_pass_that_concludes_after_cancel_stays_cancelled() {
+        let runtime = dispatcher_test_runtime();
+        let mut owner = MembershipOwner::new(&runtime.shared);
+        let (reply, mut answer) = oneshot::channel();
+        owner.pass = Some(InFlightPass {
+            stage: PassStage::Fetching(Box::pin(std::future::pending())),
+            reply,
+        });
+        let conclusion = ready_conclusion(&owner);
+
+        let (cancelled, _) = oneshot::channel();
+        owner.on_command(Command::Cancel { reply: cancelled });
+        owner.conclude_pass(conclusion);
+
+        assert!(matches!(
+            answer.try_recv(),
+            Ok(Err(MembershipRuntimeError::Cancelled))
+        ));
+        assert_eq!(
+            latched(&runtime),
+            MembershipReadiness::Unready(MembershipUnreadyReason::Cancelled)
+        );
+        assert_eq!(runtime.snapshot().generation, 0);
+
+        // No later pass starts either.
+        let (reply, mut answer) = oneshot::channel();
+        owner.on_command(Command::Reconcile { reply });
+        assert!(owner.pass.is_none());
+        assert!(matches!(
+            answer.try_recv(),
+            Ok(Err(MembershipRuntimeError::Cancelled))
+        ));
+
+        // Control: the same conclusion without a cancel installs Ready.
+        let control_runtime = dispatcher_test_runtime();
+        let mut control = MembershipOwner::new(&control_runtime.shared);
+        control.conclude_pass(ready_conclusion(&control));
+        assert_eq!(latched(&control_runtime), MembershipReadiness::Ready);
+    }
+
+    /// A fence restored while a pass is in flight is applied after the pass
+    /// installs its verifier, so the published fence never goes down.
+    #[tokio::test]
+    async fn a_fence_restored_during_a_pass_survives_the_pass() {
+        let runtime = dispatcher_test_runtime();
+        let mut owner = MembershipOwner::new(&runtime.shared);
+        let (reply, _answer) = oneshot::channel();
+        owner.pass = Some(InFlightPass {
+            stage: PassStage::Fetching(Box::pin(std::future::pending())),
+            reply,
+        });
+        // The pass verifies against the verifier as it is before the restore.
+        let conclusion = ready_conclusion(&owner);
+
+        let mut fences = runtime.version_state();
+        fences.checkpoint_version = Some(9);
+        let (reply, mut restored) = oneshot::channel();
+        owner.on_command(Command::RestoreVersionState {
+            version_state: fences,
+            reply,
+        });
+        assert!(
+            restored.try_recv().is_err(),
+            "the restore was answered while a pass could still overwrite it"
+        );
+
+        owner.conclude_pass(conclusion);
+        assert!(matches!(restored.try_recv(), Ok(Ok(()))));
+        assert_eq!(latched(&runtime), MembershipReadiness::Ready);
+        assert_eq!(
+            runtime.version_state().checkpoint_version,
+            Some(9),
+            "the pass installed its verifier over the restored fence"
+        );
+    }
+
     #[test]
     fn admission_cancellation_keeps_first_invalidation_reason() {
         let token = CancellationToken::new();
-        let reason = Arc::new(AtomicU8::new(0));
+        let edge = AdmissionEdge::live(token.clone());
         let cancellation = PeerAdmissionCancellation {
-            token: token.clone(),
-            reason: reason.clone(),
+            edge: edge.clone(),
             expires_at: None,
         };
-        assert!(
-            reason
-                .compare_exchange(
-                    0,
-                    PeerInvalidationReason::TrustExpired.code(),
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                )
-                .is_ok()
-        );
-        assert!(
-            reason
-                .compare_exchange(
-                    0,
-                    PeerInvalidationReason::MembershipChanged.code(),
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                )
-                .is_err()
-        );
+        assert!(edge.latch(PeerInvalidationReason::TrustExpired));
+        assert!(!edge.latch(PeerInvalidationReason::MembershipChanged));
         token.cancel();
         assert_eq!(
             cancellation.reason(),
             Some(PeerInvalidationReason::TrustExpired)
         );
+    }
+
+    #[test]
+    fn verified_evidence_transition_table() {
+        let at =
+            |seconds: i64| DateTime::from_timestamp(1_800_000_000 + seconds, 0).expect("instant");
+        let checkpoint = |version| VerifiedCheckpoint {
+            version,
+            expires_at: at(60),
+            verified_at: at(0),
+        };
+        let trust = |seconds| TrustWindow {
+            expires_at: at(seconds),
+            deadline: Instant::now() + Duration::from_secs(60),
+        };
+        let first = trust(30);
+        let unverified = VerifiedEvidence::Unverified;
+        assert_eq!((unverified.checkpoint(), unverified.trust()), (None, None));
+
+        // An unready pass records its checkpoint and no trust window.
+        let checkpointed = unverified.checkpoint_verified(checkpoint(1));
+        assert_eq!(checkpointed, VerifiedEvidence::Checkpoint(checkpoint(1)));
+        assert_eq!(
+            checkpointed.checkpoint_verified(checkpoint(2)),
+            VerifiedEvidence::Checkpoint(checkpoint(2))
+        );
+        assert_eq!(checkpointed.trust(), None);
+
+        // A ready pass records both, from every state.
+        let trusted = VerifiedEvidence::Trusted {
+            checkpoint: checkpoint(3),
+            trust: first,
+        };
+        assert_eq!(unverified.ready(checkpoint(3), first), trusted);
+        assert_eq!(checkpointed.ready(checkpoint(3), first), trusted);
+        let second = trust(45);
+        assert_eq!(
+            trusted.ready(checkpoint(4), second),
+            VerifiedEvidence::Trusted {
+                checkpoint: checkpoint(4),
+                trust: second,
+            }
+        );
+
+        // A later unready pass replaces the checkpoint and keeps the window;
+        // nothing returns to a state without one.
+        let stale = trusted.checkpoint_verified(checkpoint(5));
+        assert_eq!(
+            stale,
+            VerifiedEvidence::Trusted {
+                checkpoint: checkpoint(5),
+                trust: first,
+            }
+        );
+        assert_eq!(stale.checkpoint(), Some(checkpoint(5)));
+        assert_eq!(stale.trust(), Some(first));
+    }
+
+    #[test]
+    fn admission_edge_transition_table() {
+        use AdmissionEdgeState::{Cancelled, Invalidating, Live};
+        use PeerInvalidationReason::{MembershipChanged, TrustExpired};
+        // The reason conversion is one-to-one, and unclassified is its own
+        // code.
+        assert_eq!(PeerInvalidationReason::decode(UNCLASSIFIED_REASON), None);
+        assert_eq!(PeerInvalidationReason::encode(None), UNCLASSIFIED_REASON);
+        assert_eq!(PeerInvalidationReason::decode(u8::MAX), None);
+        for reason in PeerInvalidationReason::ALL {
+            let code = PeerInvalidationReason::encode(Some(reason));
+            assert_ne!(code, UNCLASSIFIED_REASON);
+            assert_eq!(PeerInvalidationReason::decode(code), Some(reason));
+        }
+
+        // Live -> Cancelled(reason), through Invalidating.
+        let edge = AdmissionEdge::live(CancellationToken::new());
+        assert_eq!(edge.state(), Live);
+        assert!(edge.latch(TrustExpired));
+        assert_eq!(edge.state(), Invalidating(TrustExpired));
+        assert_eq!(edge.invalidate(TrustExpired), Cancelled(Some(TrustExpired)));
+        // Cancelled is terminal: no later reason or close changes it.
+        assert_eq!(
+            edge.invalidate(MembershipChanged),
+            Cancelled(Some(TrustExpired))
+        );
+        assert_eq!(edge.close(), Cancelled(Some(TrustExpired)));
+
+        // Invalidating keeps its first reason when a second dispatch wins
+        // the cancel.
+        let edge = AdmissionEdge::live(CancellationToken::new());
+        assert!(edge.latch(TrustExpired));
+        assert!(!edge.latch(MembershipChanged));
+        assert_eq!(
+            edge.invalidate(MembershipChanged),
+            Cancelled(Some(TrustExpired))
+        );
+
+        // Live -> Cancelled(None) by close or by the bare token; a reason
+        // dispatched afterwards is latched but the edge stays cancelled.
+        let edge = AdmissionEdge::live(CancellationToken::new());
+        assert_eq!(edge.close(), Cancelled(None));
+        let token = CancellationToken::new();
+        let edge = AdmissionEdge::live(token.clone());
+        token.cancel();
+        assert_eq!(edge.state(), Cancelled(None));
+        assert_eq!(
+            edge.invalidate(MembershipChanged),
+            Cancelled(Some(MembershipChanged))
+        );
+
+        // Clones share one edge.
+        let edge = AdmissionEdge::live(CancellationToken::new());
+        let cancellation = PeerAdmissionCancellation {
+            edge: edge.clone(),
+            expires_at: None,
+        };
+        edge.invalidate(MembershipChanged);
+        assert_eq!(cancellation.state(), Cancelled(Some(MembershipChanged)));
     }
 
     #[test]
@@ -3617,22 +4948,14 @@ mod tests {
         // The dispatcher's typed trust-expiry reason counts without a
         // deadline, while a different explicit reason is never reinterpreted
         // as expiry even after the deadline has passed.
-        let typed = PeerAdmissionCancellation {
-            token: CancellationToken::new(),
-            reason: Arc::new(AtomicU8::new(PeerInvalidationReason::TrustExpired.code())),
-            expires_at: None,
-        };
+        let typed = PeerAdmissionCancellation::from_token(CancellationToken::new())
+            .with_reason_for_test(PeerInvalidationReason::TrustExpired);
         assert!(typed.trust_expired());
-        let revoked_after_deadline = PeerAdmissionCancellation {
-            token: CancellationToken::new(),
-            reason: Arc::new(AtomicU8::new(
-                PeerInvalidationReason::MembershipRevoked.code(),
-            )),
-            expires_at: Some(SharedAdmissionExpiry::new(
-                Instant::now() - Duration::from_millis(1),
-                None,
-            )),
-        };
+        let revoked_after_deadline = PeerAdmissionCancellation::from_token_with_deadline(
+            CancellationToken::new(),
+            Instant::now() - Duration::from_millis(1),
+        )
+        .with_reason_for_test(PeerInvalidationReason::MembershipRevoked);
         revoked_after_deadline.token().cancel();
         assert!(!revoked_after_deadline.trust_expired());
     }

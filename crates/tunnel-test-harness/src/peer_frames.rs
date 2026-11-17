@@ -35,6 +35,7 @@ use http::{Request, StatusCode};
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use serde::Serialize;
 use tokio::{
+    sync::watch,
     task::JoinHandle,
     time::{Instant, timeout, timeout_at},
 };
@@ -353,9 +354,13 @@ impl PeerFrameEvidence {
 /// Wrap the production ingress so a bounded, payload-free copy of the last
 /// handler error is available to the fixture's own failure messages.  The
 /// wrapper only observes; it never changes the handler's result.
+///
+/// The ingress wrapper is the slot's one publisher: each failed request
+/// replaces the whole value, nothing reads it back to decide what to write,
+/// and the fixture samples whichever error was published last.
 struct RecordingIngress<H> {
     inner: H,
-    last_error: Arc<std::sync::Mutex<Option<String>>>,
+    last_error: watch::Sender<Option<String>>,
 }
 
 impl<H> tunnel_relay::peer_runtime::PeerIngressHandler for RecordingIngress<H>
@@ -367,13 +372,11 @@ where
         request: tunnel_relay::peer_runtime::InboundPeerRequest,
     ) -> tunnel_relay::peer_runtime::PeerIngressHandlerFuture {
         let inner = self.inner.handle(request);
-        let last_error = Arc::clone(&self.last_error);
+        let last_error = self.last_error.clone();
         Box::pin(async move {
             let result = inner.await;
-            if let Err(error) = &result
-                && let Ok(mut slot) = last_error.lock()
-            {
-                *slot = Some(error.to_string());
+            if let Err(error) = &result {
+                last_error.send_replace(Some(error.to_string()));
             }
             result
         })
@@ -434,8 +437,11 @@ pub(crate) struct RunningFixture {
     /// from a client-side refusal.
     pub(crate) server_diagnostics: Arc<tunnel_transport::PeerServerDiagnostics>,
     runtime: Arc<PeerRuntime>,
-    owner_token: std::sync::Mutex<OwnerToken>,
-    last_ingress_error: Arc<std::sync::Mutex<Option<String>>>,
+    /// The owner fence every later envelope must carry. The scenario that
+    /// drives this fixture is its only writer and registers one control
+    /// stream at a time, so it publishes the current token and samples it.
+    owner_token: watch::Sender<OwnerToken>,
+    last_ingress_error: watch::Receiver<Option<String>>,
     source_boot_id: String,
     pub(crate) consumer_token: String,
     cancel: CancellationToken,
@@ -516,21 +522,17 @@ impl RunningFixture {
     }
 
     pub(crate) fn owner_token(&self) -> OwnerToken {
-        self.owner_token
-            .lock()
-            .expect("ec044 owner token lock")
-            .clone()
+        self.owner_token.borrow().clone()
     }
 
     fn set_owner_token(&self, token: OwnerToken) {
-        *self.owner_token.lock().expect("ec044 owner token lock") = token;
+        self.owner_token.send_replace(token);
     }
 
     fn ingress_error_suffix(&self) -> String {
         self.last_ingress_error
-            .lock()
-            .ok()
-            .and_then(|slot| slot.clone())
+            .borrow()
+            .clone()
             .map_or_else(String::new, |error| format!(" (owner ingress: {error})"))
     }
 }
@@ -1655,10 +1657,10 @@ async fn start_fixture(
         owner.node_id.clone(),
         owner.boot_id.clone(),
     );
-    let last_ingress_error = Arc::new(std::sync::Mutex::new(None));
+    let (record_ingress_error, last_ingress_error) = watch::channel(None);
     let (policy, server_handler) = runtime.server_components(RecordingIngress {
         inner: ingress,
-        last_error: Arc::clone(&last_ingress_error),
+        last_error: record_ingress_error,
     });
     let server = PeerServer::new_with_pin_provider(
         server_endpoint,
@@ -1708,7 +1710,7 @@ async fn start_fixture(
         destination,
         server_diagnostics,
         runtime,
-        owner_token: std::sync::Mutex::new(bootstrap.token),
+        owner_token: watch::Sender::new(bootstrap.token),
         last_ingress_error,
         source_boot_id: source.boot_id.clone(),
         consumer_token,

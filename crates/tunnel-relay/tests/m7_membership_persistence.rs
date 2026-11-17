@@ -18,7 +18,7 @@ use std::{
 };
 
 use chrono::{Duration as ChronoDuration, Utc};
-use tokio::sync::RwLock;
+use tokio::sync::watch;
 use tunnel_catalog::SignedMembershipRecord as CatalogMembershipRecord;
 use tunnel_cluster::membership::{
     MEMBERSHIP_SCHEMA_VERSION, MembershipCheckpoint, MembershipError, MembershipIssuer,
@@ -84,7 +84,8 @@ impl Drop for TestDirectory {
 struct TestCheckpointAuthority {
     issuer: Arc<MembershipIssuer>,
     next_checkpoint_version: AtomicU64,
-    checkpoint_lifetime: Arc<RwLock<ChronoDuration>>,
+    /// The lifetime the next checkpoint is issued with, set by the test.
+    checkpoint_lifetime: Arc<watch::Sender<ChronoDuration>>,
 }
 
 impl TestCheckpointAuthority {
@@ -92,12 +93,12 @@ impl TestCheckpointAuthority {
         Self {
             issuer,
             next_checkpoint_version: AtomicU64::new(1),
-            checkpoint_lifetime: Arc::new(RwLock::new(ChronoDuration::seconds(30))),
+            checkpoint_lifetime: Arc::new(watch::Sender::new(ChronoDuration::seconds(30))),
         }
     }
 
     async fn set_checkpoint_lifetime(&self, lifetime: ChronoDuration) {
-        *self.checkpoint_lifetime.write().await = lifetime;
+        self.checkpoint_lifetime.send_replace(lifetime);
     }
 }
 
@@ -108,7 +109,7 @@ impl CheckpointAuthority for TestCheckpointAuthority {
     ) -> MembershipFuture<'a, Result<CheckpointResponse, CheckpointAuthorityError>> {
         Box::pin(async move {
             let now = Utc::now();
-            let checkpoint_lifetime = *self.checkpoint_lifetime.read().await;
+            let checkpoint_lifetime = *self.checkpoint_lifetime.borrow();
             let checkpoint = MembershipCheckpoint {
                 schema_version: MEMBERSHIP_SCHEMA_VERSION,
                 deployment_id: request.deployment_id,
@@ -131,7 +132,9 @@ impl CheckpointAuthority for TestCheckpointAuthority {
 
 #[derive(Clone)]
 struct TestMembershipSource {
-    records: Arc<RwLock<Vec<CatalogMembershipRecord>>>,
+    /// The catalog's current records: the test replaces the whole list and
+    /// every read samples the latest one.
+    records: Arc<watch::Sender<Vec<CatalogMembershipRecord>>>,
     make_state_insecure_on_read: Arc<AtomicBool>,
     // Read only by the Unix-only permission fault below.
     #[cfg_attr(not(unix), allow(dead_code))]
@@ -141,14 +144,14 @@ struct TestMembershipSource {
 impl TestMembershipSource {
     fn new(state_path: PathBuf) -> Self {
         Self {
-            records: Arc::new(RwLock::new(Vec::new())),
+            records: Arc::new(watch::Sender::new(Vec::new())),
             make_state_insecure_on_read: Arc::new(AtomicBool::new(false)),
             state_path,
         }
     }
 
     async fn replace(&self, records: Vec<CatalogMembershipRecord>) {
-        *self.records.write().await = records;
+        self.records.send_replace(records);
     }
 
     #[cfg_attr(not(unix), allow(dead_code))]
@@ -163,7 +166,7 @@ impl MembershipRecordSource for TestMembershipSource {
         &'a self,
     ) -> MembershipFuture<'a, Result<Vec<CatalogMembershipRecord>, MembershipSourceError>> {
         Box::pin(async move {
-            let records = self.records.read().await.clone();
+            let records = self.records.borrow().clone();
             if self
                 .make_state_insecure_on_read
                 .swap(false, Ordering::AcqRel)
@@ -287,6 +290,7 @@ async fn durable_refresh_preserves_existing_peer_admission() {
     runtime.bootstrap().await.expect("initial bootstrap");
     let admission = runtime
         .admit_peer(MembershipPeerIdentity::new(NODE_ID, BOOT_ID, SPKI_SHA256))
+        .await
         .expect("ready runtime admits peer");
 
     // The signed record is unchanged. Only the nonce-bound checkpoint
@@ -321,10 +325,12 @@ async fn pooled_admissions_reuse_deadline_and_reject_real_checkpoint_shrink() {
     let identity = MembershipPeerIdentity::new(NODE_ID, BOOT_ID, SPKI_SHA256);
     let first_stream = runtime
         .admit_peer(identity.clone())
+        .await
         .expect("first pooled stream admission");
     let first_deadline = first_stream.deadline();
     let second_stream = runtime
         .admit_peer(identity.clone())
+        .await
         .expect("second pooled stream admission");
     let second_deadline = second_stream.deadline();
 
@@ -392,6 +398,7 @@ async fn failed_candidate_persistence_keeps_runtime_unready_and_withdraws_peer()
     runtime.bootstrap().await.expect("initial bootstrap");
     let admission = runtime
         .admit_peer(MembershipPeerIdentity::new(NODE_ID, BOOT_ID, SPKI_SHA256))
+        .await
         .expect("ready runtime admits peer");
 
     // Advance the signed record so the final candidate has a new node fence.

@@ -224,14 +224,92 @@ impl StreamSender {
     }
 }
 
+/// Where a streaming response body is in its life.
+///
+/// `sent` exists only while the body is streaming: once it failed or ended
+/// there is no cumulative count left to compare against a limit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BodyPhase {
+    /// Frames are still being forwarded; `sent` data bytes have been.
+    Streaming { sent: u64 },
+    /// One error frame was yielded.  Every later poll is end of stream.
+    Failed,
+    /// The source ended cleanly.
+    Done,
+}
+
+/// What the body's source produced.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BodyEvent {
+    /// A data frame of this many bytes.
+    Data(u64),
+    /// A frame that is not data (trailers), which the bridge judges.
+    Other,
+    /// The source failed.
+    Failure(StreamFailure),
+    /// The source ended.
+    End,
+}
+
+/// What the body does with the frame that caused a transition.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BodyEffect {
+    /// Yield the frame.
+    Forward,
+    /// Yield this failure instead of the frame.
+    Fail(StreamFailure),
+    /// Yield end of stream.
+    Finish,
+}
+
+/// An event offered to a body that is no longer streaming.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct BodyOver;
+
+impl BodyPhase {
+    pub(crate) const START: Self = Self::Streaming { sent: 0 };
+
+    /// The only place a body's phase changes.  `limit` is the cumulative
+    /// data-byte bound: a data frame that would pass it fails the body
+    /// instead of being forwarded.
+    ///
+    /// # Errors
+    /// [`BodyOver`] for any event once the body failed or ended.
+    pub(crate) fn on_event(
+        self,
+        event: BodyEvent,
+        limit: u64,
+    ) -> Result<(Self, BodyEffect), BodyOver> {
+        let Self::Streaming { sent } = self else {
+            return Err(BodyOver);
+        };
+        Ok(match event {
+            BodyEvent::Data(len) => {
+                let total = sent.saturating_add(len);
+                if total > limit {
+                    (Self::Failed, BodyEffect::Fail(StreamFailure::Limit))
+                } else {
+                    (Self::Streaming { sent: total }, BodyEffect::Forward)
+                }
+            }
+            BodyEvent::Other => (self, BodyEffect::Forward),
+            BodyEvent::Failure(failure) => (Self::Failed, BodyEffect::Fail(failure)),
+            BodyEvent::End => (Self::Done, BodyEffect::Finish),
+        })
+    }
+
+    pub(crate) const fn is_streaming(self) -> bool {
+        matches!(self, Self::Streaming { .. })
+    }
+}
+
 /// A response body fed by a bounded queue, failing once its cumulative
 /// limit is exceeded.
 #[derive(Debug)]
 pub struct ChannelResponseBody {
     rx: mpsc::Receiver<Result<Bytes, StreamFailure>>,
     limit: u64,
-    sent: u64,
-    failed: bool,
+    phase: BodyPhase,
     bytes: Arc<AtomicU64>,
 }
 
@@ -245,11 +323,21 @@ impl ChannelResponseBody {
             Self {
                 rx,
                 limit,
-                sent: 0,
-                failed: false,
+                phase: BodyPhase::START,
                 bytes,
             },
         )
+    }
+
+    /// Apply one event and report what to yield for it.
+    fn advance(&mut self, event: BodyEvent) -> BodyEffect {
+        match self.phase.on_event(event, self.limit) {
+            Ok((next, effect)) => {
+                self.phase = next;
+                effect
+            }
+            Err(BodyOver) => BodyEffect::Finish,
+        }
     }
 }
 
@@ -261,27 +349,29 @@ impl Body for ChannelResponseBody {
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Bytes>, BoxError>>> {
-        if self.failed {
+        if !self.phase.is_streaming() {
             return Poll::Ready(None);
         }
-        match self.rx.poll_recv(cx) {
-            Poll::Pending => Poll::Pending,
-            Poll::Ready(None) => Poll::Ready(None),
-            Poll::Ready(Some(Err(failure))) => {
-                self.failed = true;
-                Poll::Ready(Some(Err(Box::new(failure))))
-            }
-            Poll::Ready(Some(Ok(bytes))) => {
-                let sent = self.sent.saturating_add(bytes.len() as u64);
-                if sent > self.limit {
-                    self.failed = true;
-                    self.rx.close();
-                    return Poll::Ready(Some(Err(Box::new(StreamFailure::Limit))));
-                }
-                self.sent = sent;
+        let (event, bytes) = match self.rx.poll_recv(cx) {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(None) => (BodyEvent::End, None),
+            Poll::Ready(Some(Err(failure))) => (BodyEvent::Failure(failure), None),
+            Poll::Ready(Some(Ok(bytes))) => (BodyEvent::Data(bytes.len() as u64), Some(bytes)),
+        };
+        match (self.advance(event), bytes) {
+            (BodyEffect::Forward, Some(bytes)) => {
                 self.bytes.fetch_add(bytes.len() as u64, Ordering::Relaxed);
                 Poll::Ready(Some(Ok(Frame::data(bytes))))
             }
+            (BodyEffect::Fail(failure), bytes) => {
+                if bytes.is_some() {
+                    // The limit refused a frame the queue delivered: nothing
+                    // further is read from it.
+                    self.rx.close();
+                }
+                Poll::Ready(Some(Err(Box::new(failure))))
+            }
+            (BodyEffect::Finish | BodyEffect::Forward, _) => Poll::Ready(None),
         }
     }
 
@@ -328,5 +418,57 @@ mod tests {
     #[test]
     fn sse_events_are_single_data_lines() {
         assert_eq!(sse_event(br#"{"a":1}"#), &b"data: {\"a\":1}\n\n"[..]);
+    }
+
+    #[test]
+    fn a_streaming_body_counts_data_and_stays_streaming() {
+        let phase = BodyPhase::START;
+        let (phase, effect) = phase.on_event(BodyEvent::Data(6), 10).unwrap();
+        assert_eq!(phase, BodyPhase::Streaming { sent: 6 });
+        assert_eq!(effect, BodyEffect::Forward);
+        // Exactly the limit is accepted.
+        let (phase, effect) = phase.on_event(BodyEvent::Data(4), 10).unwrap();
+        assert_eq!(phase, BodyPhase::Streaming { sent: 10 });
+        assert_eq!(effect, BodyEffect::Forward);
+        // A frame that is not data is forwarded and not counted.
+        assert_eq!(
+            phase.on_event(BodyEvent::Other, 10),
+            Ok((BodyPhase::Streaming { sent: 10 }, BodyEffect::Forward))
+        );
+    }
+
+    #[test]
+    fn a_streaming_body_fails_on_the_limit_or_a_failure_and_ends_on_end() {
+        let streaming = BodyPhase::Streaming { sent: 10 };
+        assert_eq!(
+            streaming.on_event(BodyEvent::Data(1), 10),
+            Ok((BodyPhase::Failed, BodyEffect::Fail(StreamFailure::Limit)))
+        );
+        assert_eq!(
+            streaming.on_event(BodyEvent::Failure(StreamFailure::Interrupted), 10),
+            Ok((
+                BodyPhase::Failed,
+                BodyEffect::Fail(StreamFailure::Interrupted)
+            ))
+        );
+        assert_eq!(
+            streaming.on_event(BodyEvent::End, 10),
+            Ok((BodyPhase::Done, BodyEffect::Finish))
+        );
+    }
+
+    #[test]
+    fn a_body_that_failed_or_ended_refuses_every_event() {
+        for over in [BodyPhase::Failed, BodyPhase::Done] {
+            assert!(!over.is_streaming());
+            for event in [
+                BodyEvent::Data(1),
+                BodyEvent::Other,
+                BodyEvent::Failure(StreamFailure::Interrupted),
+                BodyEvent::End,
+            ] {
+                assert_eq!(over.on_event(event, u64::MAX), Err(BodyOver));
+            }
+        }
     }
 }

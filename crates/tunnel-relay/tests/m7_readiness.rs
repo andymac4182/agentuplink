@@ -15,7 +15,7 @@ use std::{
 };
 
 use chrono::{DateTime, Utc};
-use tokio::sync::RwLock;
+use tokio::sync::watch;
 use tunnel_catalog::SignedMembershipRecord as CatalogMembershipRecord;
 use tunnel_cluster::membership::{
     MEMBERSHIP_SCHEMA_VERSION, MembershipCheckpoint, MembershipError, MembershipIssuer,
@@ -145,7 +145,9 @@ impl CheckpointAuthority for TestCheckpointAuthority {
 
 #[derive(Clone)]
 struct TestMembershipSource {
-    records: Arc<RwLock<Vec<CatalogMembershipRecord>>>,
+    /// The catalog's current records: the test replaces the whole list and
+    /// every read samples the latest one.
+    records: Arc<watch::Sender<Vec<CatalogMembershipRecord>>>,
     fail_reads: Arc<AtomicBool>,
     read_count: Arc<AtomicUsize>,
 }
@@ -153,14 +155,14 @@ struct TestMembershipSource {
 impl TestMembershipSource {
     fn new(records: Vec<CatalogMembershipRecord>) -> Self {
         Self {
-            records: Arc::new(RwLock::new(records)),
+            records: Arc::new(watch::Sender::new(records)),
             fail_reads: Arc::new(AtomicBool::new(false)),
             read_count: Arc::new(AtomicUsize::new(0)),
         }
     }
 
     async fn replace(&self, records: Vec<CatalogMembershipRecord>) {
-        *self.records.write().await = records;
+        self.records.send_replace(records);
     }
 
     fn set_fail_reads(&self, fail: bool) {
@@ -181,7 +183,7 @@ impl MembershipRecordSource for TestMembershipSource {
             if self.fail_reads.load(Ordering::Acquire) {
                 return Err(MembershipSourceError::Catalog);
             }
-            Ok(self.records.read().await.clone())
+            Ok(self.records.borrow().clone())
         })
     }
 }
@@ -476,6 +478,7 @@ async fn ec011_failed_catalog_refresh_blocks_new_admission() {
     let admission = fixture
         .runtime
         .admit_peer(RuntimeFixture::peer_identity())
+        .await
         .expect("ready runtime should admit the signed peer");
 
     fixture.source.set_fail_reads(true);
@@ -494,7 +497,10 @@ async fn ec011_failed_catalog_refresh_blocks_new_admission() {
     );
     assert!(!admission.is_invalidated());
     assert!(matches!(
-        fixture.runtime.admit_peer(RuntimeFixture::peer_identity()),
+        fixture
+            .runtime
+            .admit_peer(RuntimeFixture::peer_identity())
+            .await,
         Err(MembershipRuntimeError::NotReady)
     ));
 }
@@ -511,6 +517,7 @@ async fn ec011_expired_membership_refresh_withdraws_admitted_peer() {
     let admission = fixture
         .runtime
         .admit_peer(RuntimeFixture::peer_identity())
+        .await
         .expect("ready runtime should admit the signed peer");
 
     fixture
@@ -550,6 +557,7 @@ async fn ec010_staged_key_overlap_accepts_old_and_new_peer_pins() {
     let old_admission = fixture
         .runtime
         .admit_peer(RuntimeFixture::peer_identity_with("boot-old", SPKI_SHA256))
+        .await
         .expect("the old pin remains valid during overlap");
     let new_admission = fixture
         .runtime
@@ -557,6 +565,7 @@ async fn ec010_staged_key_overlap_accepts_old_and_new_peer_pins() {
             "boot-new",
             NEXT_SPKI_SHA256,
         ))
+        .await
         .expect("the staged pin is valid during overlap");
     assert_eq!(old_admission.binding().key_id(), RELAY_KEY_ID);
     assert_eq!(new_admission.binding().key_id(), NEXT_RELAY_KEY_ID);
@@ -581,6 +590,7 @@ async fn ec010_local_pin_survives_overlap_then_expires_independently() {
     let old_admission = fixture
         .runtime
         .admit_peer(RuntimeFixture::peer_identity())
+        .await
         .expect("the configured old pin should remain admissible during overlap");
     assert_eq!(old_admission.binding().key_id(), RELAY_KEY_ID);
 
@@ -617,6 +627,7 @@ async fn ec010_key_removal_withdraws_old_peer_and_rejects_old_pin() {
     let old_admission = fixture
         .runtime
         .admit_peer(old_identity.clone())
+        .await
         .expect("the old pin should be admitted before retirement");
 
     fixture
@@ -631,7 +642,7 @@ async fn ec010_key_removal_withdraws_old_peer_and_rejects_old_pin() {
 
     assert!(old_admission.is_invalidated());
     assert!(matches!(
-        fixture.runtime.admit_peer(old_identity),
+        fixture.runtime.admit_peer(old_identity).await,
         Err(MembershipRuntimeError::PeerRejected)
     ));
     let new_admission = fixture
@@ -640,6 +651,7 @@ async fn ec010_key_removal_withdraws_old_peer_and_rejects_old_pin() {
             "boot-new",
             NEXT_SPKI_SHA256,
         ))
+        .await
         .expect("the replacement pin should remain admitted");
     assert_eq!(new_admission.binding().key_id(), NEXT_RELAY_KEY_ID);
 }
@@ -660,6 +672,7 @@ async fn ec010_expired_old_key_withdraws_old_peer_and_rejects_old_pin() {
     let old_admission = fixture
         .runtime
         .admit_peer(old_identity.clone())
+        .await
         .expect("the old pin should be admitted before expiry");
 
     fixture
@@ -674,7 +687,7 @@ async fn ec010_expired_old_key_withdraws_old_peer_and_rejects_old_pin() {
 
     assert!(old_admission.is_invalidated());
     assert!(matches!(
-        fixture.runtime.admit_peer(old_identity),
+        fixture.runtime.admit_peer(old_identity).await,
         Err(MembershipRuntimeError::PeerRejected)
     ));
     let new_admission = fixture
@@ -683,6 +696,7 @@ async fn ec010_expired_old_key_withdraws_old_peer_and_rejects_old_pin() {
             "boot-new",
             NEXT_SPKI_SHA256,
         ))
+        .await
         .expect("the replacement pin should remain admitted");
     assert_eq!(new_admission.binding().key_id(), NEXT_RELAY_KEY_ID);
 }
@@ -703,6 +717,7 @@ async fn ec011_periodic_reconcile_applies_rotation_without_refresh_hint() {
     let old_admission = fixture
         .runtime
         .admit_peer(old_identity.clone())
+        .await
         .expect("the old pin should be admitted before polling");
     let reads_before_rotation = fixture.source.read_count();
 
@@ -722,7 +737,7 @@ async fn ec011_periodic_reconcile_applies_rotation_without_refresh_hint() {
     assert_eq!(snapshot.generation, 2);
     assert!(old_admission.is_invalidated());
     assert!(matches!(
-        fixture.runtime.admit_peer(old_identity),
+        fixture.runtime.admit_peer(old_identity).await,
         Err(MembershipRuntimeError::PeerRejected)
     ));
     assert!(
@@ -732,6 +747,7 @@ async fn ec011_periodic_reconcile_applies_rotation_without_refresh_hint() {
                 "boot-new",
                 NEXT_SPKI_SHA256
             ))
+            .await
             .is_ok()
     );
 }
@@ -758,16 +774,17 @@ async fn m8c45_switching_the_served_key_keeps_the_relay_ready_when_the_old_key_i
             .is_approved()
     );
 
-    let mut installed = false;
+    let installed = Arc::new(AtomicBool::new(false));
+    let install = Arc::clone(&installed);
     fixture
         .runtime
-        .switch_local_serving_spki(NEXT_SPKI_SHA256, || {
-            installed = true;
+        .switch_local_serving_spki(NEXT_SPKI_SHA256, move || {
+            install.store(true, Ordering::Release);
             Ok::<(), ()>(())
         })
         .await
         .expect("an approved successor may be served");
-    assert!(installed);
+    assert!(installed.load(Ordering::Acquire));
     assert_eq!(
         fixture.runtime.local_serving_spki().as_deref(),
         Some(NEXT_SPKI_SHA256)
@@ -836,11 +853,12 @@ async fn m8c45_a_switch_to_an_unapproved_key_is_refused_before_anything_is_insta
         fixture.runtime.local_key_approval(NEXT_SPKI_SHA256),
         LocalKeyApproval::Absent
     );
-    let mut installed = false;
+    let installed = Arc::new(AtomicBool::new(false));
+    let install = Arc::clone(&installed);
     let refused = fixture
         .runtime
-        .switch_local_serving_spki(NEXT_SPKI_SHA256, || {
-            installed = true;
+        .switch_local_serving_spki(NEXT_SPKI_SHA256, move || {
+            install.store(true, Ordering::Release);
             Ok::<(), ()>(())
         })
         .await;
@@ -850,7 +868,10 @@ async fn m8c45_a_switch_to_an_unapproved_key_is_refused_before_anything_is_insta
             LocalKeyApproval::Absent
         ))
     ));
-    assert!(!installed, "nothing may be installed for an unapproved key");
+    assert!(
+        !installed.load(Ordering::Acquire),
+        "nothing may be installed for an unapproved key"
+    );
     assert_eq!(
         fixture.runtime.local_serving_spki().as_deref(),
         Some(SPKI_SHA256)
@@ -1013,6 +1034,7 @@ mod rekey {
 
         let staged = rekey
             .stage_pem(next.chain.as_bytes(), next.key.as_bytes())
+            .await
             .expect("staged");
         assert_eq!(staged, next.spki);
         // Not approved: staged, never served.
@@ -1105,6 +1127,7 @@ mod rekey {
         let rekey = machine(&fixture, &pki, &current);
         rekey
             .stage_pem(next.chain.as_bytes(), next.key.as_bytes())
+            .await
             .expect("staged");
         assert_eq!(rekey.tick().await.phase, PeerRekeyPhase::Staged);
         tokio::time::sleep(HOLD * 3 / 4).await;
@@ -1150,6 +1173,7 @@ mod rekey {
         let rekey = machine(&fixture, &pki, &current);
         rekey
             .stage_pem(next.chain.as_bytes(), next.key.as_bytes())
+            .await
             .expect("staged");
         tokio::time::sleep(HOLD * 2).await;
         let snapshot = rekey.tick().await;
@@ -1174,22 +1198,31 @@ mod rekey {
         fixture.runtime.bootstrap().await.expect("ready");
         let rekey = machine(&fixture, &pki, &current);
         assert!(matches!(
-            rekey.stage_pem(current.chain.as_bytes(), current.key.as_bytes()),
+            rekey
+                .stage_pem(current.chain.as_bytes(), current.key.as_bytes())
+                .await,
             Err(PeerRekeyError::SameKey)
         ));
         assert!(matches!(
-            rekey.stage_pem(foreign.chain.as_bytes(), foreign.key.as_bytes()),
+            rekey
+                .stage_pem(foreign.chain.as_bytes(), foreign.key.as_bytes())
+                .await,
             Err(PeerRekeyError::Identity(PeerIdentityError::DifferentNode))
         ));
         assert!(matches!(
-            rekey.stage_pem(next.chain.as_bytes(), another.key.as_bytes()),
+            rekey
+                .stage_pem(next.chain.as_bytes(), another.key.as_bytes())
+                .await,
             Err(PeerRekeyError::Identity(PeerIdentityError::KeyMismatch))
         ));
         rekey
             .stage_pem(next.chain.as_bytes(), next.key.as_bytes())
+            .await
             .expect("staged");
         assert!(matches!(
-            rekey.stage_pem(another.chain.as_bytes(), another.key.as_bytes()),
+            rekey
+                .stage_pem(another.chain.as_bytes(), another.key.as_bytes())
+                .await,
             Err(PeerRekeyError::InProgress("staged"))
         ));
         // A validated candidate that is not staged changes nothing either.
@@ -1220,6 +1253,7 @@ mod rekey {
         let rekey = machine(fixture, pki, current);
         rekey
             .stage_pem(next.chain.as_bytes(), next.key.as_bytes())
+            .await
             .expect("staged");
         assert_eq!(rekey.tick().await.phase, PeerRekeyPhase::Staged);
         tokio::time::sleep(HOLD * 2).await;
@@ -1258,7 +1292,9 @@ mod rekey {
             );
             tokio::task::yield_now().await;
         }
-        let refused = rekey.stage_pem(late.chain.as_bytes(), late.key.as_bytes());
+        let refused = rekey
+            .stage_pem(late.chain.as_bytes(), late.key.as_bytes())
+            .await;
         assert!(
             matches!(refused, Err(PeerRekeyError::InProgress("switching"))),
             "a trigger during a switch must be refused, got {refused:?}"
@@ -1294,13 +1330,15 @@ mod rekey {
         // connections (up to the drain budget in production), and try to
         // restage the retiring key inside that window.
         let hold = Arc::new(tunnel_relay::peer_rekey::RetireHold::default());
-        rekey.hold_next_retirement(Arc::clone(&hold));
+        rekey.hold_next_retirement(Arc::clone(&hold)).await;
         let retiring = {
             let rekey = Arc::clone(&rekey);
             tokio::spawn(async move { rekey.tick().await })
         };
         hold.entered.notified().await;
-        let mid_retirement = rekey.stage_pem(current.chain.as_bytes(), current.key.as_bytes());
+        let mid_retirement = rekey
+            .stage_pem(current.chain.as_bytes(), current.key.as_bytes())
+            .await;
         assert!(
             mid_retirement.is_err(),
             "the retiring key was restaged while its retirement was still closing connections"
@@ -1311,7 +1349,9 @@ mod rekey {
             PeerRekeyPhase::Stable
         );
         // Rolling back to the key this process just retired is refused.
-        let rollback = rekey.stage_pem(current.chain.as_bytes(), current.key.as_bytes());
+        let rollback = rekey
+            .stage_pem(current.chain.as_bytes(), current.key.as_bytes())
+            .await;
         assert!(
             matches!(rollback, Err(PeerRekeyError::Retired)),
             "{rollback:?}"
@@ -1321,6 +1361,7 @@ mod rekey {
         let fresh = pki.peer(NODE_ID);
         rekey
             .stage_pem(fresh.chain.as_bytes(), fresh.key.as_bytes())
+            .await
             .expect("a fresh key stages");
     }
 
@@ -1346,6 +1387,7 @@ mod rekey {
         let rekey = machine(&fixture, &pki, &current);
         rekey
             .stage_pem(next.chain.as_bytes(), next.key.as_bytes())
+            .await
             .expect("staged");
         fixture
             .source

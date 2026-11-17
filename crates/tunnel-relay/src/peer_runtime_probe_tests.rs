@@ -295,16 +295,17 @@ struct H3Fixture {
 }
 
 impl H3Fixture {
-    fn new(mode: ProbeMode, max_streams_per_connection: usize) -> Self {
+    async fn new(mode: ProbeMode, max_streams_per_connection: usize) -> Self {
         Self::new_with_limits(
             mode,
             max_streams_per_connection,
             Duration::from_millis(100),
             Duration::from_millis(200),
         )
+        .await
     }
 
-    fn new_with_limits(
+    async fn new_with_limits(
         mode: ProbeMode,
         max_streams_per_connection: usize,
         stream_timeout: Duration,
@@ -317,9 +318,10 @@ impl H3Fixture {
             idle_timeout,
             None,
         )
+        .await
     }
 
-    fn new_with_handler(handler: Arc<dyn PeerRequestHandler>) -> Self {
+    async fn new_with_handler(handler: Arc<dyn PeerRequestHandler>) -> Self {
         Self::new_with_optional_handler(
             ProbeMode::Runtime,
             4,
@@ -327,9 +329,10 @@ impl H3Fixture {
             Duration::from_secs(2),
             Some(handler),
         )
+        .await
     }
 
-    fn new_with_optional_handler(
+    async fn new_with_optional_handler(
         mode: ProbeMode,
         max_streams_per_connection: usize,
         stream_timeout: Duration,
@@ -394,14 +397,15 @@ impl H3Fixture {
             destination_address.to_string(),
             "localhost",
             vec![destination_pin.clone()],
-        ));
+        ))
+        .await;
         let server_route = PeerRouteTarget::for_test(
             SOURCE_NODE,
             source_address.to_string(),
             "localhost",
             vec![source_pin.clone()],
         );
-        let server_readiness = readiness(server_route.clone());
+        let server_readiness = readiness(server_route.clone()).await;
         let client_provider = ReadyProvider::default();
         let server_provider = ReadyProvider::default();
         let client_bindings: Arc<dyn PeerBindingProvider> = Arc::new(client_provider);
@@ -507,9 +511,9 @@ impl H3Fixture {
     /// readiness is not `Ready`: membership readiness goes false and the
     /// product's [`PeerRuntime::withdraw_peer_readiness`] withdraws its peer
     /// readiness evidence.
-    fn withdraw_server_cluster_readiness(&self) {
+    async fn withdraw_server_cluster_readiness(&self) {
         self.server_provider.set_ready(false);
-        self.server_runtime.withdraw_peer_readiness();
+        self.server_runtime.withdraw_peer_readiness().await;
         assert!(
             !self.server_runtime.is_ready(),
             "destination relay stayed ready after a membership withdrawal"
@@ -518,21 +522,23 @@ impl H3Fixture {
 
     /// Restore the destination relay the way the refresh loop does once its
     /// membership readiness returns.
-    fn restore_server_cluster_readiness(&self) {
+    async fn restore_server_cluster_readiness(&self) {
         self.server_provider.set_ready(true);
-        self.server_runtime.set_peer_capacity(1);
+        self.server_runtime.set_peer_capacity(1).await;
         self.server_readiness
             .replace_required_routes([self.server_route.clone()])
+            .await
             .expect("destination route reinstall");
         self.server_readiness
             .record_probe(&self.server_route, PeerProbeState::Reachable)
+            .await
             .expect("destination route probe");
     }
 
     /// Install a route set on the destination which does not approve the
     /// source's authenticated certificate.  Used to show that withdrawing
     /// readiness did not loosen probe admission.
-    fn install_unapproved_server_route(&self) {
+    async fn install_unapproved_server_route(&self) {
         self.server_readiness
             .replace_required_routes([PeerRouteTarget::for_test(
                 SOURCE_NODE,
@@ -540,6 +546,7 @@ impl H3Fixture {
                 self.server_route.server_name(),
                 vec!["00".repeat(32)],
             )])
+            .await
             .expect("unapproved destination route");
     }
 
@@ -604,19 +611,20 @@ fn owner_router(node_id: &str, boot_id: &str) -> Arc<OwnerRouter<dyn Catalog>> {
     Arc::new(OwnerRouter::new(catalog, identity).expect("owner router"))
 }
 
-fn readiness(target: PeerRouteTarget) -> Arc<PeerReadiness> {
+async fn readiness(target: PeerRouteTarget) -> Arc<PeerReadiness> {
     let readiness = Arc::new(PeerReadiness::new(1).expect("readiness"));
     readiness.set_listener_state(PeerListenerState::Bound);
-    readiness.set_available_capacity(1);
+    readiness.set_available_capacity(1).await;
     readiness
         .replace_required_routes([target])
+        .await
         .expect("readiness route");
     readiness
 }
 
 #[tokio::test]
 async fn real_h3_probe_accepts_authenticated_empty_eof() {
-    let fixture = H3Fixture::new(ProbeMode::Runtime, 2);
+    let fixture = H3Fixture::new(ProbeMode::Runtime, 2).await;
     let result = fixture
         .client_runtime
         .refresh_required_routes(vec![fixture.target.clone()])
@@ -631,7 +639,7 @@ async fn real_h3_probe_accepts_authenticated_empty_eof() {
 
 #[tokio::test]
 async fn real_h3_probe_rejects_nonempty_response_body() {
-    let fixture = H3Fixture::new(ProbeMode::Body, 2);
+    let fixture = H3Fixture::new(ProbeMode::Body, 2).await;
     let result = fixture
         .client_runtime
         .refresh_required_routes(vec![fixture.target.clone()])
@@ -646,7 +654,7 @@ async fn real_h3_probe_rejects_nonempty_response_body() {
 
 #[tokio::test]
 async fn real_h3_probe_has_one_deadline_after_cached_connection_blackhole() {
-    let fixture = H3Fixture::new(ProbeMode::Runtime, 2);
+    let fixture = H3Fixture::new(ProbeMode::Runtime, 2).await;
     fixture
         .client_runtime
         .refresh_required_routes(vec![fixture.target.clone()])
@@ -677,7 +685,7 @@ async fn real_h3_probe_has_one_deadline_after_cached_connection_blackhole() {
 
 #[tokio::test]
 async fn real_h3_stream_capacity_failure_withdraws_and_recovers_readiness() {
-    let fixture = H3Fixture::new(ProbeMode::Runtime, 1);
+    let fixture = H3Fixture::new(ProbeMode::Runtime, 1).await;
     let connection = fixture
         .client_runtime
         .client
@@ -755,7 +763,7 @@ async fn real_h3_stream_capacity_failure_withdraws_and_recovers_readiness() {
 #[tokio::test]
 async fn real_h3_full_stream_checkout_is_typed_capacity() {
     const STREAM_LIMIT: usize = 128;
-    let fixture = H3Fixture::new(ProbeMode::Runtime, STREAM_LIMIT);
+    let fixture = H3Fixture::new(ProbeMode::Runtime, STREAM_LIMIT).await;
     fixture
         .client_runtime
         .refresh_required_routes(vec![fixture.target.clone()])
@@ -830,7 +838,7 @@ async fn real_h3_full_stream_checkout_is_typed_capacity() {
 /// classification must not relabel a cached-connection blackhole.
 #[tokio::test]
 async fn real_h3_response_timeout_remains_timeout() {
-    let fixture = H3Fixture::new(ProbeMode::Runtime, 2);
+    let fixture = H3Fixture::new(ProbeMode::Runtime, 2).await;
     fixture
         .client_runtime
         .refresh_required_routes(vec![fixture.target.clone()])
@@ -853,7 +861,7 @@ async fn real_h3_response_timeout_remains_timeout() {
 
 #[tokio::test]
 async fn real_h3_probe_failure_does_not_close_active_customer_stream() {
-    let fixture = H3Fixture::new(ProbeMode::Body, 2);
+    let fixture = H3Fixture::new(ProbeMode::Body, 2).await;
     let connection = fixture
         .client_runtime
         .client
@@ -924,7 +932,7 @@ async fn real_h3_probe_failure_does_not_close_active_customer_stream() {
 
 #[tokio::test]
 async fn real_h3_revision_fences_old_success_after_current_route_loss() {
-    let fixture = H3Fixture::new(ProbeMode::Delayed, 2);
+    let fixture = H3Fixture::new(ProbeMode::Delayed, 2).await;
     let started = fixture.probe_started.notified();
     let runtime = Arc::clone(&fixture.client_runtime);
     let target = fixture.target.clone();
@@ -935,6 +943,7 @@ async fn real_h3_revision_fences_old_success_after_current_route_loss() {
     let second_revision = fixture
         .client_readiness
         .replace_required_routes_with_revision([fixture.target.clone()])
+        .await
         .expect("new refresh revision");
     fixture
         .client_readiness
@@ -943,6 +952,7 @@ async fn real_h3_revision_fences_old_success_after_current_route_loss() {
             &fixture.target,
             PeerProbeState::Unreachable,
         )
+        .await
         .expect("current route loss");
     fixture.release_probe.notify_one();
     let refresh_result = refresh.await.expect("refresh task join");
@@ -965,7 +975,7 @@ async fn real_h3_revision_fences_old_success_after_current_route_loss() {
 
 #[tokio::test]
 async fn real_h3_stale_capacity_error_is_returned_without_overwriting_current_healthy_revision() {
-    let fixture = H3Fixture::new(ProbeMode::Runtime, 1);
+    let fixture = H3Fixture::new(ProbeMode::Runtime, 1).await;
     fixture
         .client_runtime
         .refresh_required_routes(vec![fixture.target.clone()])
@@ -1013,10 +1023,12 @@ async fn real_h3_stale_capacity_error_is_returned_without_overwriting_current_he
     let current_revision = fixture
         .client_readiness
         .replace_required_routes_with_revision([fixture.target.clone()])
+        .await
         .expect("current healthy revision");
     fixture
         .client_readiness
         .record_probe_at(current_revision, &fixture.target, PeerProbeState::Reachable)
+        .await
         .expect("publish current healthy probe");
     assert!(fixture.client_readiness.is_ready());
 
@@ -1049,7 +1061,7 @@ async fn real_h3_stale_capacity_error_is_returned_without_overwriting_current_he
 
 #[tokio::test]
 async fn real_h3_health_request_body_is_rejected_before_response() {
-    let fixture = H3Fixture::new(ProbeMode::Runtime, 2);
+    let fixture = H3Fixture::new(ProbeMode::Runtime, 2).await;
     let connection = fixture
         .client_runtime
         .client
@@ -1083,7 +1095,8 @@ async fn real_h3_dropped_admission_stream_cancels_without_poisoning_connection()
         2,
         Duration::from_secs(1),
         Duration::from_secs(2),
-    );
+    )
+    .await;
     let connection = fixture
         .client_runtime
         .client
@@ -1168,7 +1181,7 @@ async fn real_h3_dropped_admission_stream_cancels_without_poisoning_connection()
 /// that no observation ever sees one without the other.
 #[tokio::test]
 async fn peer_readiness_and_admission_never_disagree() {
-    let fixture = H3Fixture::new(ProbeMode::Runtime, 2);
+    let fixture = H3Fixture::new(ProbeMode::Runtime, 2).await;
     fixture
         .client_runtime
         .refresh_required_routes(vec![fixture.target.clone()])
@@ -1199,7 +1212,7 @@ async fn peer_readiness_and_admission_never_disagree() {
 
     for pass in 0..8 {
         // Withdrawal: admission must be fenced no later than readiness.
-        fixture.client_runtime.withdraw_peer_readiness();
+        fixture.client_runtime.withdraw_peer_readiness().await;
         assert!(
             !crate::http::peer_admits_public_work(Some(&runtime)),
             "pass {pass}: admission survived a readiness withdrawal"
@@ -1211,7 +1224,7 @@ async fn peer_readiness_and_admission_never_disagree() {
         );
 
         // Recovery: readiness must not be reported before admission accepts.
-        fixture.client_runtime.set_peer_capacity(1);
+        fixture.client_runtime.set_peer_capacity(1).await;
         fixture
             .client_runtime
             .refresh_required_routes(vec![fixture.target.clone()])
@@ -1245,8 +1258,8 @@ async fn peer_readiness_and_admission_never_disagree() {
 /// distinguish a peer which is starting from one which is unreachable.
 #[tokio::test]
 async fn real_h3_probe_converges_while_peer_cluster_readiness_is_withdrawn() {
-    let fixture = H3Fixture::new(ProbeMode::Runtime, 2);
-    fixture.withdraw_server_cluster_readiness();
+    let fixture = H3Fixture::new(ProbeMode::Runtime, 2).await;
+    fixture.withdraw_server_cluster_readiness().await;
 
     let result = fixture
         .client_runtime
@@ -1279,12 +1292,12 @@ async fn real_h3_probe_converges_while_peer_cluster_readiness_is_withdrawn() {
 /// readiness must converge on each pass rather than starve.
 #[tokio::test]
 async fn real_h3_probe_converges_across_a_peer_readiness_flap() {
-    let fixture = H3Fixture::new(ProbeMode::Runtime, 2);
+    let fixture = H3Fixture::new(ProbeMode::Runtime, 2).await;
     for pass in 0..4 {
         if pass % 2 == 0 {
-            fixture.withdraw_server_cluster_readiness();
+            fixture.withdraw_server_cluster_readiness().await;
         } else {
-            fixture.restore_server_cluster_readiness();
+            fixture.restore_server_cluster_readiness().await;
         }
         let result = fixture
             .client_runtime
@@ -1308,12 +1321,12 @@ async fn real_h3_probe_converges_across_a_peer_readiness_flap() {
 /// explicit route failure rather than silently accepted.
 #[tokio::test]
 async fn real_h3_probe_still_refuses_an_unapproved_peer_while_withdrawn() {
-    let fixture = H3Fixture::new(ProbeMode::Runtime, 2);
+    let fixture = H3Fixture::new(ProbeMode::Runtime, 2).await;
     for withdrawn in [false, true] {
         if withdrawn {
-            fixture.withdraw_server_cluster_readiness();
+            fixture.withdraw_server_cluster_readiness().await;
         }
-        fixture.install_unapproved_server_route();
+        fixture.install_unapproved_server_route().await;
         let result = fixture
             .client_runtime
             .refresh_required_routes(vec![fixture.target.clone()])
@@ -1342,11 +1355,12 @@ async fn real_h3_probe_still_refuses_an_unapproved_peer_while_withdrawn() {
 /// boundary the withdrawal path must not cross.
 #[tokio::test]
 async fn real_h3_probe_is_refused_without_a_known_route_set() {
-    let fixture = H3Fixture::new(ProbeMode::Runtime, 2);
-    fixture.withdraw_server_cluster_readiness();
+    let fixture = H3Fixture::new(ProbeMode::Runtime, 2).await;
+    fixture.withdraw_server_cluster_readiness().await;
     fixture
         .server_readiness
         .replace_required_routes(std::iter::empty::<PeerRouteTarget>())
+        .await
         .expect("empty destination route set");
 
     let result = fixture
@@ -1367,10 +1381,11 @@ async fn real_h3_probe_is_refused_without_a_known_route_set() {
 /// its membership authority was lost.
 #[tokio::test]
 async fn peer_readiness_withdrawal_drops_stale_probe_evidence() {
-    let fixture = H3Fixture::new(ProbeMode::Runtime, 2);
+    let fixture = H3Fixture::new(ProbeMode::Runtime, 2).await;
     fixture
         .server_readiness
         .record_probe(&fixture.server_route, PeerProbeState::Reachable)
+        .await
         .expect("seed reachable route");
     assert_eq!(
         fixture
@@ -1381,7 +1396,7 @@ async fn peer_readiness_withdrawal_drops_stale_probe_evidence() {
     );
     let before = fixture.server_readiness.current_revision();
 
-    fixture.withdraw_server_cluster_readiness();
+    fixture.withdraw_server_cluster_readiness().await;
 
     assert!(!fixture.server_readiness.is_ready());
     assert_eq!(

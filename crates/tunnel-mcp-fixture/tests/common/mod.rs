@@ -7,7 +7,7 @@
 
 use std::convert::Infallible;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -159,10 +159,27 @@ pub fn gateway(export: McpExport, dir: &Path) -> Gateway {
 }
 
 /// An rmcp client that records progress notifications.
+///
+/// Each notification is sent to the test's [`ProgressLog`], if the test kept
+/// one; a client nobody is reading discards them.
 #[derive(Clone, Debug, Default)]
 pub struct RecordingClient {
-    pub progress: Arc<Mutex<Vec<f64>>>,
+    pub progress: Option<tokio::sync::mpsc::UnboundedSender<f64>>,
     pub protocol: Option<ProtocolVersion>,
+}
+
+/// The progress values a [`RecordingClient`] saw, in the order it saw them.
+#[derive(Debug)]
+pub struct ProgressLog {
+    seen: tokio::sync::mpsc::UnboundedReceiver<f64>,
+}
+
+impl ProgressLog {
+    /// Every value recorded since the last call, in order.
+    #[allow(dead_code)]
+    pub fn drain(&mut self) -> Vec<f64> {
+        core::iter::from_fn(|| self.seen.try_recv().ok()).collect()
+    }
 }
 
 impl ClientHandler for RecordingClient {
@@ -179,42 +196,45 @@ impl ClientHandler for RecordingClient {
         params: ProgressNotificationParam,
         _context: NotificationContext<RoleClient>,
     ) {
-        self.progress
-            .lock()
-            .expect("progress lock")
-            .push(params.progress);
+        if let Some(progress) = &self.progress {
+            let _ = progress.send(params.progress);
+        }
     }
 }
 
 pub async fn connect(
     gateway: &Gateway,
     legacy: bool,
-) -> (RunningService<RoleClient, RecordingClient>, RecordingClient) {
+) -> (RunningService<RoleClient, RecordingClient>, ProgressLog) {
     let http = UnixSocketHttpClient::new(gateway.socket.to_str().expect("utf-8 path"), URI);
     let transport = StreamableHttpClientTransport::with_client(
         http,
         StreamableHttpClientTransportConfig::with_uri(URI),
     );
+    let (progress, seen) = tokio::sync::mpsc::unbounded_channel();
     let (handler, lifecycle) = if legacy {
         (
             RecordingClient {
+                progress: Some(progress),
                 protocol: Some(ProtocolVersion::V_2025_11_25),
-                ..RecordingClient::default()
             },
             ClientLifecycleMode::Initialize,
         )
     } else {
         (
-            RecordingClient::default(),
+            RecordingClient {
+                progress: Some(progress),
+                protocol: None,
+            },
             ClientLifecycleMode::Discover {
                 preferred_versions: vec![ProtocolVersion::V_2026_07_28],
             },
         )
     };
-    let running = within(handler.clone().serve_with_lifecycle(transport, lifecycle))
+    let running = within(handler.serve_with_lifecycle(transport, lifecycle))
         .await
         .expect("client lifecycle");
-    (running, handler)
+    (running, ProgressLog { seen })
 }
 
 /// Run the `initialize` lifecycle with a client pinned to `protocol`, and

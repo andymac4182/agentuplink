@@ -3,8 +3,11 @@
 //! not membership admission or the peer's reason for finishing its stream.
 
 use super::*;
-use std::{collections::BTreeMap, sync::Mutex as StdMutex};
-use tokio::sync::mpsc;
+use std::{
+    collections::BTreeMap,
+    sync::atomic::{AtomicU64, Ordering as AtomicOrdering},
+};
+use tokio::sync::{mpsc, watch};
 use tunnel_cluster::{
     envelope::{HealthRequest, InternalRequest},
     membership::{
@@ -167,7 +170,12 @@ async fn observe(mut recv: Receiver, case: Case) -> Observation {
 
 struct EofHandler {
     direction: Direction,
-    next_case: Arc<StdMutex<Option<Case>>>,
+    /// The numbered case the test published for its next stream.  The test
+    /// is the only writer.
+    next_case: watch::Receiver<Option<(u64, Case)>>,
+    /// The number of the last case a stream took; each case serves one
+    /// stream.
+    taken: AtomicU64,
     observations: mpsc::Sender<Observation>,
 }
 
@@ -178,12 +186,11 @@ impl PeerRequestHandler for EofHandler {
         request: Request<()>,
         stream: PeerServerStream,
     ) -> PeerHandlerFuture {
-        let case = self
-            .next_case
-            .lock()
-            .expect("case lock")
-            .take()
-            .expect("case");
+        let (number, case) = (*self.next_case.borrow()).expect("case");
+        assert!(
+            self.taken.swap(number, AtomicOrdering::AcqRel) < number,
+            "one case served two streams"
+        );
         let direction = self.direction;
         let observations = self.observations.clone();
         Box::pin(async move {
@@ -219,13 +226,16 @@ async fn run_cases(
     admissions: &[Admission],
     wires: &[Wire],
 ) -> Vec<(Case, Observation)> {
-    let next_case = Arc::new(StdMutex::new(None));
+    let (next_case, published_case) = watch::channel(None);
+    let mut case_number = 0_u64;
     let (observations, mut results) = mpsc::channel(1);
     let fixture = H3Fixture::new_with_handler(Arc::new(EofHandler {
         direction,
-        next_case: Arc::clone(&next_case),
+        next_case: published_case,
+        taken: AtomicU64::new(0),
         observations,
-    }));
+    }))
+    .await;
     let connection = fixture
         .client_runtime
         .client
@@ -241,7 +251,8 @@ async fn run_cases(
                     wire,
                     absolute_deadline,
                 };
-                *next_case.lock().expect("case lock") = Some(case);
+                case_number += 1;
+                next_case.send_replace(Some((case_number, case)));
                 let mut stream = connection
                     .open(H3Fixture::health_request())
                     .await
@@ -265,7 +276,7 @@ async fn run_cases(
                             recv,
                             decoder: PeerRecordDecoder::new(budget.clone()),
                             pending: VecDeque::new(),
-                            response_seen: true,
+                            response: ResponsePhase::Body,
                             budget,
                             admission_cancellation: context
                                 .as_ref()

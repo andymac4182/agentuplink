@@ -181,7 +181,7 @@ mod gateway_support {
     use std::convert::Infallible;
     use std::net::SocketAddr;
     use std::pin::Pin;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
     use std::task::{Context, Poll};
 
     use bytes::Bytes;
@@ -191,17 +191,20 @@ mod gateway_support {
     use hyper::service::service_fn;
     use hyper_util::rt::{TokioExecutor, TokioIo};
     use tokio::net::TcpListener;
+    use tokio::sync::{mpsc, watch};
     use tokio_util::sync::CancellationToken;
     use tunnel_acp_export::AcpExport;
 
     /// A body that records every byte it yields, in the order it yields them.
+    ///
+    /// The tap is the only writer of its log; it publishes the bytes so far.
     pub struct Tap<B> {
         inner: B,
-        log: Arc<Mutex<Vec<u8>>>,
+        log: watch::Sender<Vec<u8>>,
     }
 
     impl<B> Tap<B> {
-        pub fn new(inner: B, log: Arc<Mutex<Vec<u8>>>) -> Self {
+        pub fn new(inner: B, log: watch::Sender<Vec<u8>>) -> Self {
             Self { inner, log }
         }
     }
@@ -221,10 +224,7 @@ mod gateway_support {
             if let Poll::Ready(Some(Ok(frame))) = &polled
                 && let Some(data) = frame.data_ref()
             {
-                self.log
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .extend_from_slice(data);
+                self.log.send_modify(|bytes| bytes.extend_from_slice(data));
             }
             polled
         }
@@ -234,47 +234,68 @@ mod gateway_support {
         }
     }
 
-    /// One recorded exchange: the label it was opened under and its bytes.
-    type RecordedStream = (String, Arc<Mutex<Vec<u8>>>);
+    /// One recorded exchange: the label it was opened under and the bytes its
+    /// tap has published so far.
+    type RecordedStream = (String, watch::Receiver<Vec<u8>>);
+
+    /// The gateway's side of the wire log: every exchange announces itself
+    /// here as it is opened.
+    #[derive(Clone, Debug)]
+    struct WireRecorder {
+        opened: mpsc::UnboundedSender<RecordedStream>,
+    }
+
+    impl WireRecorder {
+        fn open(&self, label: String) -> watch::Sender<Vec<u8>> {
+            let (log, published) = watch::channel(Vec::new());
+            // The test may have dropped its `Gateway`; nothing reads then.
+            let _ = self.opened.send((label, published));
+            log
+        }
+    }
 
     /// What the gateway recorded at the transport, keyed by the exchange it
-    /// belonged to.
-    #[derive(Clone, Debug, Default)]
+    /// belonged to. Owned by the test, which drains the announcements when it
+    /// reads.
+    #[derive(Debug)]
     pub struct WireLog {
-        streams: Arc<Mutex<Vec<RecordedStream>>>,
+        opened: mpsc::UnboundedReceiver<RecordedStream>,
+        streams: Vec<RecordedStream>,
     }
 
     impl WireLog {
-        fn open(&self, label: String) -> Arc<Mutex<Vec<u8>>> {
-            let log = Arc::new(Mutex::new(Vec::new()));
-            self.streams
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push((label, Arc::clone(&log)));
-            log
+        fn new() -> (WireRecorder, Self) {
+            let (sender, opened) = mpsc::unbounded_channel();
+            (
+                WireRecorder { opened: sender },
+                Self {
+                    opened,
+                    streams: Vec::new(),
+                },
+            )
+        }
+
+        /// Every exchange opened so far, in the order it was opened.
+        fn streams(&mut self) -> &[RecordedStream] {
+            while let Ok(stream) = self.opened.try_recv() {
+                self.streams.push(stream);
+            }
+            &self.streams
         }
 
         /// The recorded bytes of every exchange whose label contains `needle`.
         #[must_use]
-        pub fn bytes(&self, needle: &str) -> Vec<Vec<u8>> {
-            self.streams
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        pub fn bytes(&mut self, needle: &str) -> Vec<Vec<u8>> {
+            self.streams()
                 .iter()
                 .filter(|(label, _)| label.contains(needle))
-                .map(|(_, log)| {
-                    log.lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .clone()
-                })
+                .map(|(_, log)| log.borrow().clone())
                 .collect()
         }
 
         #[must_use]
-        pub fn labels(&self) -> Vec<String> {
-            self.streams
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        pub fn labels(&mut self) -> Vec<String> {
+            self.streams()
                 .iter()
                 .map(|(label, _)| label.clone())
                 .collect()
@@ -312,8 +333,7 @@ mod gateway_support {
         let listener = TcpListener::from_std(listener).expect("tokio listener");
         let shutdown = CancellationToken::new();
         let stop = shutdown.clone();
-        let wire = WireLog::default();
-        let recorder = wire.clone();
+        let (recorder, wire) = WireLog::new();
         let profile = Arc::new(export.profile_policies().expect("profile"));
         tokio::spawn(async move {
             loop {

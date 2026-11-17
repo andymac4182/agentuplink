@@ -81,9 +81,9 @@
 //! on lengths: `AGENTS.md` keeps keystrokes out of diagnostics, and an
 //! in-memory ledger a panic message prints is a diagnostic.
 
-use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -91,6 +91,7 @@ use tokio::net::{TcpListener, TcpStream};
 
 pub mod client;
 pub mod process;
+mod registries;
 
 /// The backend's `/cmd` path, as the pin records it.
 pub const CMD_PATH: &str = "/cmd";
@@ -201,10 +202,50 @@ pub fn pointer_clicks_for(command: &str) -> u32 {
 /// It stores a **count** of typed characters and never the text, like the
 /// in-memory entry, because a file on disk is at least as much of a
 /// diagnostic as a panic message.
-#[derive(Clone, Debug, Default)]
+///
+/// # How the in-memory record is shared
+///
+/// Every connection task appends and any test thread reads, with no async
+/// context on the reading side. The record is **append-only**, so it is a
+/// chain of set-once slots: an entry is recorded by filling the first empty
+/// slot, and a slot that has been filled is never changed again. The order of
+/// the chain is the order in which the slots were filled, which is the order
+/// entries were accepted. A reader walks the chain and sees a prefix of it.
+#[derive(Clone, Default)]
 pub struct Ledger {
-    entries: Arc<Mutex<Vec<LedgerEntry>>>,
+    head: Arc<OnceLock<Arc<LedgerNode>>>,
     journal: Option<Arc<std::path::PathBuf>>,
+}
+
+/// One recorded entry and the set-once slot for the entry after it.
+struct LedgerNode {
+    entry: LedgerEntry,
+    next: OnceLock<Arc<Self>>,
+}
+
+impl Drop for LedgerNode {
+    /// Unlink the tail iteratively, so dropping a long ledger does not recurse
+    /// once per entry.
+    fn drop(&mut self) {
+        let mut next = self.next.take();
+        while let Some(node) = next {
+            match Arc::try_unwrap(node) {
+                Ok(mut node) => next = node.next.take(),
+                // Somebody else still holds the rest of the chain.
+                Err(_) => break,
+            }
+        }
+    }
+}
+
+impl core::fmt::Debug for Ledger {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("Ledger")
+            .field("entries", &self.entries())
+            .field("journal", &self.journal)
+            .finish()
+    }
 }
 
 impl Ledger {
@@ -217,7 +258,7 @@ impl Ledger {
     #[must_use]
     pub fn with_journal(journal: std::path::PathBuf) -> Self {
         Self {
-            entries: Arc::default(),
+            head: Arc::default(),
             journal: Some(Arc::new(journal)),
         }
     }
@@ -228,10 +269,23 @@ impl Ledger {
         // and over-reporting is the safe direction for a count whose job is to
         // catch a duplicated effect.
         self.append(&entry);
-        self.entries
-            .lock()
-            .expect("the ledger mutex is never poisoned by fixture code")
-            .push(entry);
+        let mut node = Arc::new(LedgerNode {
+            entry,
+            next: OnceLock::new(),
+        });
+        let mut slot: &OnceLock<Arc<LedgerNode>> = &self.head;
+        loop {
+            // Walk to the first empty slot, then try to fill it. Losing the
+            // race to another connection means that slot now holds an earlier
+            // entry, so keep walking from it.
+            while let Some(filled) = slot.get() {
+                slot = &filled.next;
+            }
+            match slot.set(node) {
+                Ok(()) => return,
+                Err(returned) => node = returned,
+            }
+        }
     }
 
     fn append(&self, entry: &LedgerEntry) {
@@ -306,10 +360,13 @@ impl Ledger {
     /// Every entry, in order.
     #[must_use]
     pub fn entries(&self) -> Vec<LedgerEntry> {
-        self.entries
-            .lock()
-            .expect("the ledger mutex is never poisoned by fixture code")
-            .clone()
+        let mut entries = Vec::new();
+        let mut slot: &OnceLock<Arc<LedgerNode>> = &self.head;
+        while let Some(filled) = slot.get() {
+            entries.push(filled.entry.clone());
+            slot = &filled.next;
+        }
+        entries
     }
 
     /// How many times `command` was accepted.
@@ -427,10 +484,50 @@ pub enum Fault {
     ResultOverridesEnvelope,
 }
 
+impl Fault {
+    /// One word per fault: the variant in the low byte, and the status of a
+    /// [`Fault::PreDispatchRejection`] above it. Zero is [`Fault::None`], so a
+    /// freshly zeroed table behaves correctly.
+    fn encode(self) -> u32 {
+        match self {
+            Self::None => 0,
+            Self::SuccessFalse => 1,
+            Self::TruncateAfterLedger => 2,
+            Self::DropAfterLedger => 3,
+            Self::PreDispatchRejection { status } => 4 | (u32::from(status) << 8),
+            Self::Unavailable => 5,
+            Self::SuccessAbsent => 6,
+            Self::HangAfterLedger => 7,
+            Self::ResultOverridesEnvelope => 8,
+        }
+    }
+
+    fn decode(word: u32) -> Self {
+        match word & 0xFF {
+            1 => Self::SuccessFalse,
+            2 => Self::TruncateAfterLedger,
+            3 => Self::DropAfterLedger,
+            4 => Self::PreDispatchRejection {
+                status: u16::try_from(word >> 8).unwrap_or(u16::MAX),
+            },
+            5 => Self::Unavailable,
+            6 => Self::SuccessAbsent,
+            7 => Self::HangAfterLedger,
+            8 => Self::ResultOverridesEnvelope,
+            _ => Self::None,
+        }
+    }
+}
+
 /// What the fixture answers, per command name.
+///
+/// One independent word per entry of [`REGISTERED_COMMANDS`], in that order.
+/// A fault is only ever consulted for a registered command -- an unregistered
+/// one is refused before the fault table is read -- so there is nothing to
+/// store for any other name.
 #[derive(Clone, Debug, Default)]
 pub struct Faults {
-    by_command: Arc<Mutex<HashMap<String, Fault>>>,
+    by_command: Arc<[AtomicU32; REGISTERED_COMMANDS.len()]>,
 }
 
 impl Faults {
@@ -442,19 +539,22 @@ impl Faults {
     /// Make `command` behave pathologically. Applies to every later request
     /// for that command until changed.
     pub fn set(&self, command: &str, fault: Fault) {
-        self.by_command
-            .lock()
-            .expect("the fault mutex is never poisoned by fixture code")
-            .insert(command.to_owned(), fault);
+        if let Some(slot) = self.slot(command) {
+            slot.store(fault.encode(), Ordering::SeqCst);
+        }
     }
 
     fn get(&self, command: &str) -> Fault {
-        self.by_command
-            .lock()
-            .expect("the fault mutex is never poisoned by fixture code")
-            .get(command)
-            .copied()
-            .unwrap_or(Fault::None)
+        self.slot(command).map_or(Fault::None, |slot| {
+            Fault::decode(slot.load(Ordering::SeqCst))
+        })
+    }
+
+    fn slot(&self, command: &str) -> Option<&AtomicU32> {
+        let index = REGISTERED_COMMANDS
+            .iter()
+            .position(|registered| *registered == command)?;
+        self.by_command.get(index)
     }
 }
 
@@ -495,24 +595,33 @@ pub const REGISTERED_COMMANDS: &[&str] = &[
 /// that arm as **modelled, not measured**.
 #[derive(Clone, Debug, Default)]
 pub struct CaptureAuthorityKnob {
-    value: Arc<Mutex<Option<bool>>>,
+    /// [`Self::OMITTED`], [`Self::DENIED`] or [`Self::AUTHORIZED`].
+    value: Arc<AtomicU8>,
 }
 
 impl CaptureAuthorityKnob {
+    /// Zero, so the default knob omits the key.
+    const OMITTED: u8 = 0;
+    const DENIED: u8 = 1;
+    const AUTHORIZED: u8 = 2;
+
     /// Emit `desktop_capture_authorized` with this value, or omit the key
     /// entirely for `None`.
     pub fn set(&self, value: Option<bool>) {
-        *self
-            .value
-            .lock()
-            .expect("the knob mutex is never poisoned by fixture code") = value;
+        let encoded = match value {
+            None => Self::OMITTED,
+            Some(false) => Self::DENIED,
+            Some(true) => Self::AUTHORIZED,
+        };
+        self.value.store(encoded, Ordering::SeqCst);
     }
 
     fn get(&self) -> Option<bool> {
-        *self
-            .value
-            .lock()
-            .expect("the knob mutex is never poisoned by fixture code")
+        match self.value.load(Ordering::SeqCst) {
+            Self::DENIED => Some(false),
+            Self::AUTHORIZED => Some(true),
+            _ => None,
+        }
     }
 }
 
@@ -538,15 +647,15 @@ impl CaptureAuthorityKnob {
 /// the proof-4 control uses since M5-C12 made a second display unreachable.
 #[derive(Clone, Debug)]
 pub struct CaptureScaleKnob {
-    percent: Arc<Mutex<u32>>,
-    content: Arc<Mutex<u32>>,
+    percent: Arc<AtomicU32>,
+    content: Arc<AtomicU32>,
 }
 
 impl Default for CaptureScaleKnob {
     fn default() -> Self {
         Self {
-            percent: Arc::new(Mutex::new(tunnel_cua::capture::IDENTITY_SCALE_PERCENT)),
-            content: Arc::new(Mutex::new(0)),
+            percent: Arc::new(AtomicU32::new(tunnel_cua::capture::IDENTITY_SCALE_PERCENT)),
+            content: Arc::new(AtomicU32::new(0)),
         }
     }
 }
@@ -554,34 +663,22 @@ impl Default for CaptureScaleKnob {
 impl CaptureScaleKnob {
     /// Serve captures at this scale, as a percentage. 100 is 1x.
     pub fn set(&self, percent: u32) {
-        *self
-            .percent
-            .lock()
-            .expect("the knob mutex is never poisoned by fixture code") = percent;
+        self.percent.store(percent, Ordering::SeqCst);
     }
 
     /// Change what is on the synthetic screen: later captures are seeded with
     /// `IMAGE_SEED + display + offset`. Geometry is unchanged, so two captures
     /// either side of a change have identical length and different markers.
     pub fn set_content(&self, offset: u32) {
-        *self
-            .content
-            .lock()
-            .expect("the knob mutex is never poisoned by fixture code") = offset;
+        self.content.store(offset, Ordering::SeqCst);
     }
 
     fn get(&self) -> u32 {
-        *self
-            .percent
-            .lock()
-            .expect("the knob mutex is never poisoned by fixture code")
+        self.percent.load(Ordering::SeqCst)
     }
 
     fn content(&self) -> u32 {
-        *self
-            .content
-            .lock()
-            .expect("the knob mutex is never poisoned by fixture code")
+        self.content.load(Ordering::SeqCst)
     }
 }
 
@@ -1166,4 +1263,92 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack
         .windows(needle.len())
         .position(|window| window == needle)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Fault, Faults, Ledger, LedgerEntry, REGISTERED_COMMANDS};
+
+    /// Entries recorded from many threads at once are all kept, each exactly
+    /// once, and every thread's own entries stay in the order it recorded
+    /// them.
+    #[test]
+    fn concurrent_records_are_all_kept_in_per_writer_order() {
+        const WRITERS: u32 = 8;
+        const PER_WRITER: u32 = 200;
+        let ledger = Ledger::new();
+        std::thread::scope(|scope| {
+            for writer in 0..WRITERS {
+                let ledger = ledger.clone();
+                scope.spawn(move || {
+                    for sequence in 0..PER_WRITER {
+                        ledger.record(
+                            LedgerEntry::new("left_click", Some(writer))
+                                .with_point(Some((sequence, 0))),
+                        );
+                    }
+                });
+            }
+        });
+        let entries = ledger.entries();
+        assert_eq!(entries.len(), (WRITERS * PER_WRITER) as usize);
+        assert_eq!(ledger.pointer_clicks(), WRITERS * PER_WRITER);
+        for writer in 0..WRITERS {
+            let sequences: Vec<u32> = entries
+                .iter()
+                .filter(|entry| entry.display == Some(writer))
+                .filter_map(|entry| entry.point.map(|(sequence, _)| sequence))
+                .collect();
+            assert_eq!(sequences, (0..PER_WRITER).collect::<Vec<_>>());
+        }
+    }
+
+    /// A reader holding an earlier snapshot is unaffected by later records,
+    /// and a later read is an extension of the earlier one.
+    #[test]
+    fn a_later_read_extends_an_earlier_one() {
+        let ledger = Ledger::new();
+        assert!(ledger.is_empty());
+        ledger.record(LedgerEntry::new("double_click", None));
+        let first = ledger.entries();
+        ledger.record(LedgerEntry::new("type_text", None).with_typed_characters(3));
+        let second = ledger.entries();
+        assert_eq!(first.len(), 1);
+        assert_eq!(second[..1], first[..]);
+        assert_eq!(second[1].command, "type_text");
+        assert_eq!(ledger.count("double_click"), 1);
+        assert_eq!(ledger.typed_characters(), 3);
+    }
+
+    /// Every fault survives the table, including the rejection's status, and
+    /// a command nobody set is `None`.
+    #[test]
+    fn every_fault_round_trips_through_the_table() {
+        let all = [
+            Fault::None,
+            Fault::SuccessFalse,
+            Fault::TruncateAfterLedger,
+            Fault::DropAfterLedger,
+            Fault::PreDispatchRejection { status: 400 },
+            Fault::PreDispatchRejection { status: 401 },
+            Fault::PreDispatchRejection { status: u16::MAX },
+            Fault::Unavailable,
+            Fault::SuccessAbsent,
+            Fault::HangAfterLedger,
+            Fault::ResultOverridesEnvelope,
+        ];
+        let faults = Faults::new();
+        for command in REGISTERED_COMMANDS {
+            assert_eq!(faults.get(command), Fault::None);
+        }
+        for fault in all {
+            faults.set("left_click", fault);
+            assert_eq!(faults.get("left_click"), fault);
+            assert_eq!(faults.get("right_click"), Fault::None);
+        }
+        // A clone shares the table, as the serving task's clone must.
+        let clone = faults.clone();
+        clone.set("screenshot", Fault::Unavailable);
+        assert_eq!(faults.get("screenshot"), Fault::Unavailable);
+    }
 }

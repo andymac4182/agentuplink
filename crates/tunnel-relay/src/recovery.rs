@@ -22,7 +22,7 @@ use std::{
     fs::{self, File, Metadata, OpenOptions, TryLockError},
     io::{self, Read, Write},
     path::{Component, Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{Arc, mpsc},
     time::Duration,
 };
 
@@ -190,14 +190,60 @@ impl Error for RecoveryFenceStoreError {}
 ///
 /// `open` is the serving/recovery path and requires an existing valid file.
 /// `bootstrap` is the only creation path.  Clones share both the process-local
-/// writer mutex and the stable sidecar lock held for this instance's lifetime;
-/// a second process opening the same fence receives [`Busy`].
+/// writer thread, which owns every read and advance of the fence and applies
+/// them one at a time in arrival order, and the stable sidecar lock held for
+/// this instance's lifetime; a second process opening the same fence receives
+/// [`Busy`].
 #[derive(Clone, Debug)]
 pub struct RecoveryApprovalVersionStore {
+    file: RecoveryFenceFile,
+    _lock: Arc<File>,
+    writer: mpsc::SyncSender<FenceRequest>,
+}
+
+/// Requests queued for the writer thread.  The queue is bounded: a caller
+/// whose request does not fit blocks until it does, as it blocks for the
+/// outcome.
+const FENCE_WRITER_QUEUE: usize = 16;
+
+/// One read or advance of the fence and where its outcome goes.
+enum FenceRequest {
+    Load {
+        outcome: mpsc::SyncSender<Result<RecoveryFenceState, RecoveryFenceStoreError>>,
+    },
+    Record {
+        approval_version: u64,
+        outcome: mpsc::SyncSender<Result<(), RecoveryFenceStoreError>>,
+    },
+}
+
+/// The fence file itself: its path and the identity it is bound to.
+#[derive(Clone, Debug)]
+struct RecoveryFenceFile {
     path: PathBuf,
     identity: RecoveryFenceIdentity,
-    _lock: Arc<File>,
-    writer: Arc<Mutex<()>>,
+}
+
+/// The writer thread: it alone reads and advances the fence, one request at
+/// a time, so a read never observes a replacement in progress and two
+/// advances never interleave.  It reports an advance only after the
+/// replacement is durable (or refused), and ends when the last store clone
+/// is dropped.
+fn run_fence_writer(file: RecoveryFenceFile, requests: mpsc::Receiver<FenceRequest>) {
+    for request in requests {
+        // A caller that stopped waiting still has its request applied whole.
+        match request {
+            FenceRequest::Load { outcome } => {
+                let _ = outcome.send(file.load());
+            }
+            FenceRequest::Record {
+                approval_version,
+                outcome,
+            } => {
+                let _ = outcome.send(file.record(approval_version));
+            }
+        }
+    }
 }
 
 impl RecoveryApprovalVersionStore {
@@ -221,24 +267,23 @@ impl RecoveryApprovalVersionStore {
         identity: RecoveryFenceIdentity,
     ) -> Result<Self, RecoveryFenceStoreError> {
         let store = Self::new(path, identity)?;
-        let bytes = encode_envelope(&PersistedRecoveryFence::empty(&store.identity))?;
-        store.create_initial(&bytes)?;
+        let bytes = encode_envelope(&PersistedRecoveryFence::empty(&store.file.identity))?;
+        store.file.create_initial(&bytes)?;
         Ok(store)
     }
 
     /// Return the configured fence path for operator diagnostics.
     #[must_use]
     pub fn path(&self) -> &Path {
-        &self.path
+        &self.file.path
     }
 
     /// Load and validate the current high-water state.
+    ///
+    /// Like [`Self::record`], this blocks the calling thread until the
+    /// writer thread answers; call it from a blocking context.
     pub fn load(&self) -> Result<RecoveryFenceState, RecoveryFenceStoreError> {
-        let _writer = self
-            .writer
-            .lock()
-            .map_err(|_| RecoveryFenceStoreError::Io)?;
-        self.load_unlocked()
+        self.request(|outcome| FenceRequest::Load { outcome })
     }
 
     /// Durably advance the fence before a catalog activation.
@@ -247,15 +292,61 @@ impl RecoveryApprovalVersionStore {
     /// exclusively with mode `0600`, synced, renamed atomically, and followed
     /// by a parent-directory sync.  A failure leaves activation to the caller
     /// (which must remain unavailable) and never silently accepts the record.
+    ///
+    /// The advance is handed to the store's writer thread and this call
+    /// blocks the calling thread until that thread reports the durable
+    /// outcome.  It performs file I/O either way, so call it from a blocking
+    /// context (`spawn_blocking` or a synchronous command), never from an
+    /// asynchronous task's worker thread.
     pub fn record(&self, approval_version: u64) -> Result<(), RecoveryFenceStoreError> {
         if approval_version == 0 {
             return Err(RecoveryFenceStoreError::InvalidState);
         }
-        let _writer = self
-            .writer
-            .lock()
+        self.request(|outcome| FenceRequest::Record {
+            approval_version,
+            outcome,
+        })
+    }
+
+    /// Queue one request for the writer thread and block for its outcome.
+    fn request<T>(
+        &self,
+        request: impl FnOnce(mpsc::SyncSender<Result<T, RecoveryFenceStoreError>>) -> FenceRequest,
+    ) -> Result<T, RecoveryFenceStoreError> {
+        let (outcome, answer) = mpsc::sync_channel(1);
+        self.writer
+            .send(request(outcome))
             .map_err(|_| RecoveryFenceStoreError::Io)?;
-        let current = self.load_unlocked()?;
+        answer.recv().map_err(|_| RecoveryFenceStoreError::Io)?
+    }
+
+    fn new(
+        path: impl Into<PathBuf>,
+        identity: RecoveryFenceIdentity,
+    ) -> Result<Self, RecoveryFenceStoreError> {
+        let path = path.into();
+        validate_path(&path)?;
+        let lock = Arc::new(open_lock_file(&lock_path(&path)?)?);
+        let file = RecoveryFenceFile { path, identity };
+        let (writer, requests) = mpsc::sync_channel(FENCE_WRITER_QUEUE);
+        let writer_file = file.clone();
+        std::thread::Builder::new()
+            .name("recovery-fence-writer".to_owned())
+            .spawn(move || run_fence_writer(writer_file, requests))
+            .map_err(|_| RecoveryFenceStoreError::Io)?;
+        Ok(Self {
+            file,
+            _lock: lock,
+            writer,
+        })
+    }
+}
+
+impl RecoveryFenceFile {
+    /// The whole advance: compare against the durable fence, then replace.
+    /// Only the writer thread runs it.
+    fn record(&self, approval_version: u64) -> Result<(), RecoveryFenceStoreError> {
+        let current = self.load()?;
         if let Some(highest) = current.highest_approval_version {
             if approval_version < highest {
                 return Err(RecoveryFenceStoreError::VersionRollback {
@@ -279,22 +370,8 @@ impl RecoveryApprovalVersionStore {
         self.replace_atomically(&bytes)
     }
 
-    fn new(
-        path: impl Into<PathBuf>,
-        identity: RecoveryFenceIdentity,
-    ) -> Result<Self, RecoveryFenceStoreError> {
-        let path = path.into();
-        validate_path(&path)?;
-        let lock = Arc::new(open_lock_file(&lock_path(&path)?)?);
-        Ok(Self {
-            path,
-            identity,
-            _lock: lock,
-            writer: Arc::new(Mutex::new(())),
-        })
-    }
-
-    fn load_unlocked(&self) -> Result<RecoveryFenceState, RecoveryFenceStoreError> {
+    /// Read and validate the fence.  Only the writer thread runs it.
+    fn load(&self) -> Result<RecoveryFenceState, RecoveryFenceStoreError> {
         let bytes = read_bounded_control_file(&self.path, MAX_RECOVERY_FENCE_BYTES)
             .map_err(map_control_file_error)?;
         let envelope = decode_envelope(&bytes)?;

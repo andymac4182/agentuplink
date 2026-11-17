@@ -74,7 +74,10 @@ use std::{
     net::{SocketAddr, TcpListener},
     path::{Path, PathBuf},
     process::{Child, Command, Output, Stdio},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -662,13 +665,18 @@ impl Deployment {
 
     /// [`Deployment::serve`] at the relay's default `info` level, keeping
     /// every stderr line after `listening` for the caller (M6-C52).
-    fn serve_logged(&self, name: &str) -> (Running, Arc<Mutex<Vec<String>>>) {
-        let lines = Arc::new(Mutex::new(Vec::new()));
-        let relay = self.serve_at(name, "info", Some(Arc::clone(&lines)));
+    fn serve_logged(&self, name: &str) -> (Running, Collected<String>) {
+        let (keep, lines) = Collected::channel();
+        let relay = self.serve_at(name, "info", Some(keep));
         (relay, lines)
     }
 
-    fn serve_at(&self, name: &str, level: &str, keep: Option<Arc<Mutex<Vec<String>>>>) -> Running {
+    fn serve_at(
+        &self,
+        name: &str,
+        level: &str,
+        keep: Option<std::sync::mpsc::Sender<String>>,
+    ) -> Running {
         let mut relay = Running(
             Command::new(&self.relay_bin)
                 .args(["serve", "--config"])
@@ -706,7 +714,7 @@ impl Deployment {
         std::thread::spawn(move || {
             while let Ok(line) = rx.recv() {
                 if let Some(keep) = &keep {
-                    keep.lock().expect("relay log").push(line);
+                    let _ = keep.send(line);
                 }
             }
         });
@@ -715,7 +723,7 @@ impl Deployment {
 
     /// One echo through the relay to the device, retried until the step
     /// deadline; returns only on the device's canary followed by the bytes.
-    async fn echo(&self, step_name: &str, client: &Client) {
+    async fn echo(&self, step_name: &str, client: &mut Client) {
         let token = access_token(&self.issuer_key, &self.subject);
         let payload = format!("m6c23-{step_name}-{}", self.nonce);
         let deadline = Instant::now() + STEP_DEADLINE;
@@ -760,18 +768,15 @@ impl Deployment {
             .stderr(Stdio::null())
             .spawn()
             .expect("spawn connect");
-        let events = Arc::new(Mutex::new(Vec::new()));
+        let (collect, events) = Collected::channel();
         let stdout = child.stdout.take().expect("connect stdout");
-        {
-            let events = Arc::clone(&events);
-            std::thread::spawn(move || {
-                for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-                    let value = serde_json::from_str(&line)
-                        .unwrap_or_else(|_| Value::String(format!("non-JSON stdout: {line}")));
-                    events.lock().expect("events").push((Instant::now(), value));
-                }
-            });
-        }
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                let value = serde_json::from_str(&line)
+                    .unwrap_or_else(|_| Value::String(format!("non-JSON stdout: {line}")));
+                let _ = collect.send((Instant::now(), value));
+            }
+        });
         Client {
             process: Running(child),
             events,
@@ -825,18 +830,46 @@ fn unix_now() -> i64 {
     chrono::Utc::now().timestamp()
 }
 
+/// What a reader thread has collected so far, in arrival order.
+///
+/// The thread sends each item as it reads it; the one test that owns this
+/// value moves whatever has arrived into `seen` whenever it looks.
+struct Collected<T> {
+    incoming: std::sync::mpsc::Receiver<T>,
+    seen: Vec<T>,
+}
+
+impl<T> Collected<T> {
+    fn channel() -> (std::sync::mpsc::Sender<T>, Self) {
+        let (collect, incoming) = std::sync::mpsc::channel();
+        (
+            collect,
+            Self {
+                incoming,
+                seen: Vec::new(),
+            },
+        )
+    }
+
+    /// Everything collected up to now.
+    fn all(&mut self) -> &[T] {
+        self.seen.extend(self.incoming.try_iter());
+        &self.seen
+    }
+}
+
 /// A running `tunnel-client connect --json` and its timestamped events.
 struct Client {
     process: Running,
-    events: Arc<Mutex<Vec<(Instant, Value)>>>,
+    events: Collected<(Instant, Value)>,
 }
 
 impl Client {
-    fn events(&self) -> Vec<(Instant, Value)> {
-        self.events.lock().expect("events").clone()
+    fn events(&mut self) -> Vec<(Instant, Value)> {
+        self.events.all().to_vec()
     }
 
-    fn states(&self, state: &str) -> Vec<(Instant, Value)> {
+    fn states(&mut self, state: &str) -> Vec<(Instant, Value)> {
         self.events()
             .into_iter()
             .filter(|(_, event)| {
@@ -852,7 +885,7 @@ impl Client {
             .collect()
     }
 
-    fn context(&self) -> String {
+    fn context(&mut self) -> String {
         let events: Vec<Value> = self.events().into_iter().map(|(_, event)| event).collect();
         format!("{events:?}")
     }
@@ -1006,7 +1039,7 @@ async fn m6c23_connect_reconnects_after_the_relay_is_killed_and_after_it_is_stop
     let relay = deployment.serve("serve 1");
     let mut client = deployment.connect();
     let first = session_id(&client.wait_for("session 1", "ready", 1)[0].1);
-    deployment.echo("echo 1", &client).await;
+    deployment.echo("echo 1", &mut client).await;
 
     // 1. The relay dies without a word.
     drop(relay);
@@ -1029,7 +1062,7 @@ async fn m6c23_connect_reconnects_after_the_relay_is_killed_and_after_it_is_stop
     assert_ne!(second, first, "a new session, not the old one");
     assert_eq!(session_id(&reconnected[0].1), second);
     let kill_reconnect = reconnected[0].0.duration_since(restarted);
-    deployment.echo("echo 2", &client).await;
+    deployment.echo("echo 2", &mut client).await;
 
     // 2. The relay is stopped in order, as a service manager would.
     stop_relay(relay);
@@ -1046,7 +1079,7 @@ async fn m6c23_connect_reconnects_after_the_relay_is_killed_and_after_it_is_stop
     let third = session_id(&readies[2].1);
     assert!(third != first && third != second);
     let stop_reconnect = reconnected[1].0.duration_since(restarted);
-    deployment.echo("echo 3", &client).await;
+    deployment.echo("echo 3", &mut client).await;
 
     let causes: Vec<String> = client
         .states("disconnected")
@@ -1086,7 +1119,7 @@ async fn m6c23_connect_started_before_its_relay_backs_off_until_the_relay_appear
     assert_eq!(session_id(&reconnected[0].1), session_id(&ready[0].1));
     let attempts = reconnected[0].1["result"]["attempt"].as_u64().unwrap_or(0);
     let waited = reconnected[0].0.duration_since(appeared);
-    deployment.echo("echo", &client).await;
+    deployment.echo("echo", &mut client).await;
     client.stop();
     drop(relay);
     println!(
@@ -1128,7 +1161,7 @@ async fn m6c23_a_device_certificate_not_yet_valid_is_retried_until_it_is() {
         client.context()
     );
     let backoffs = client.states("backoff").len();
-    deployment.echo("echo", &client).await;
+    deployment.echo("echo", &mut client).await;
     client.stop();
     drop(relay);
     println!(
@@ -1149,7 +1182,7 @@ async fn m6c23_an_expired_device_certificate_exits_three_without_retrying() {
     let deployment = Deployment::provision("expired").await;
     let now = unix_now();
     deployment.reissue_device_certificate(now - 172_800, now - 3_600);
-    let (relay, relay_log) = deployment.serve_logged("serve");
+    let (relay, mut relay_log) = deployment.serve_logged("serve");
     let mut client = deployment.connect();
     let exit = client.wait_exit("expired certificate");
     let events: Vec<Value> = client
@@ -1167,7 +1200,7 @@ async fn m6c23_an_expired_device_certificate_exits_three_without_retrying() {
     );
     assert!(client.states("backoff").is_empty(), "{events:?}");
     // M6-C52: the relay's side of the same refusal, at its default level.
-    let refusal = wait_for_log_line(&relay_log, "TLS handshake refused");
+    let refusal = wait_for_log_line(&mut relay_log, "TLS handshake refused");
     assert!(
         refusal.contains("\"refusal\":\"client_certificate_expired\""),
         "{refusal}"
@@ -1200,7 +1233,7 @@ async fn m6c23_an_identity_mismatch_exits_three_without_retrying() {
         ),
     )
     .expect("mismatched profile");
-    let (relay, relay_log) = deployment.serve_logged("serve");
+    let (relay, mut relay_log) = deployment.serve_logged("serve");
     let mut client = deployment.connect_with(&mismatched);
     let exit = client.wait_exit("identity mismatch");
     let events: Vec<Value> = client
@@ -1223,7 +1256,7 @@ async fn m6c23_an_identity_mismatch_exits_three_without_retrying() {
     assert!(client.states("disconnected").is_empty(), "{events:?}");
     // M6-C52: the relay says why, in one bounded line naming the stage and
     // the certificate's device, and nothing the device sent.
-    let refusal = wait_for_log_line(&relay_log, "device session refused");
+    let refusal = wait_for_log_line(&mut relay_log, "device session refused");
     assert!(refusal.contains("\"stage\":\"control_hello\""), "{refusal}");
     assert!(refusal.contains("identity_rejected"), "{refusal}");
     let mismatched_id = fs::read_to_string(&mismatched)
@@ -1245,21 +1278,16 @@ async fn m6c23_an_identity_mismatch_exits_three_without_retrying() {
 }
 
 /// Wait up to the step deadline for a relay log line containing `needle`.
-fn wait_for_log_line(lines: &Arc<Mutex<Vec<String>>>, needle: &str) -> String {
+fn wait_for_log_line(lines: &mut Collected<String>, needle: &str) -> String {
     let deadline = Instant::now() + STEP_DEADLINE;
     loop {
-        if let Some(line) = lines
-            .lock()
-            .expect("relay log")
-            .iter()
-            .find(|line| line.contains(needle))
-        {
+        if let Some(line) = lines.all().iter().find(|line| line.contains(needle)) {
             return line.clone();
         }
         assert!(
             Instant::now() < deadline,
             "no relay log line containing {needle:?} within {STEP_DEADLINE:?}: {:?}",
-            lines.lock().expect("relay log")
+            lines.all()
         );
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -1281,7 +1309,7 @@ async fn m6c38_a_hello_on_another_protocol_major_is_closed_typed() {
     };
 
     let deployment = Deployment::provision("protocol-major").await;
-    let (relay, relay_log) = deployment.serve_logged("serve");
+    let (relay, mut relay_log) = deployment.serve_logged("serve");
     let credentials = deployment
         .client_config
         .parent()
@@ -1346,7 +1374,7 @@ async fn m6c38_a_hello_on_another_protocol_major_is_closed_typed() {
         frame.reason.as_str(),
         tunnel_protocol::CONTROL_PROTOCOL_UNSUPPORTED_CLOSE_REASON
     );
-    let refusal = wait_for_log_line(&relay_log, "device session refused");
+    let refusal = wait_for_log_line(&mut relay_log, "device session refused");
     assert!(refusal.contains("protocol_major_unsupported"), "{refusal}");
     assert!(refusal.contains("\"stage\":\"control_hello\""), "{refusal}");
     drop(relay);
@@ -1494,8 +1522,10 @@ struct CutPathProxy {
     address: SocketAddr,
     generation: tokio::sync::watch::Sender<u64>,
     /// The relay-side halves of cut connections, never read or written again
-    /// until the test ends.
-    held: Arc<Mutex<Vec<TcpStream>>>,
+    /// until the test ends: the cut connections park them here, and nothing
+    /// takes them out, so they stay open for as long as the proxy does.
+    _held: tokio::sync::mpsc::UnboundedReceiver<TcpStream>,
+    held_count: Arc<AtomicUsize>,
 }
 
 impl CutPathProxy {
@@ -1505,9 +1535,10 @@ impl CutPathProxy {
             .expect("bind cut-path proxy");
         let address = listener.local_addr().expect("proxy address");
         let (generation, _) = tokio::sync::watch::channel(0_u64);
-        let held = Arc::new(Mutex::new(Vec::new()));
+        let (hold, held) = tokio::sync::mpsc::unbounded_channel();
+        let held_count = Arc::new(AtomicUsize::new(0));
         let accept_generation = generation.clone();
-        let accept_held = Arc::clone(&held);
+        let accept_held = (hold, Arc::clone(&held_count));
         tokio::spawn(async move {
             loop {
                 let Ok((mut device, _)) = listener.accept().await else {
@@ -1515,7 +1546,7 @@ impl CutPathProxy {
                 };
                 let mut cut = accept_generation.subscribe();
                 let born = *cut.borrow_and_update();
-                let held = Arc::clone(&accept_held);
+                let (hold, held_count) = accept_held.clone();
                 tokio::spawn(async move {
                     let Ok(mut relay) = TcpStream::connect(upstream).await else {
                         return;
@@ -1526,7 +1557,9 @@ impl CutPathProxy {
                     };
                     if was_cut {
                         drop(device);
-                        held.lock().expect("held").push(relay);
+                        if hold.send(relay).is_ok() {
+                            held_count.fetch_add(1, Ordering::SeqCst);
+                        }
                     }
                 });
             }
@@ -1534,7 +1567,8 @@ impl CutPathProxy {
         Self {
             address,
             generation,
-            held,
+            _held: held,
+            held_count,
         }
     }
 
@@ -1543,7 +1577,7 @@ impl CutPathProxy {
     async fn cut(&self) -> usize {
         self.generation.send_modify(|now| *now += 1);
         tokio::time::sleep(Duration::from_millis(200)).await;
-        self.held.lock().expect("held").len()
+        self.held_count.load(Ordering::SeqCst)
     }
 }
 
@@ -1582,7 +1616,7 @@ async fn m6c68_a_relay_evicts_a_device_whose_path_vanished_and_admits_its_reconn
     let relay = deployment.serve("serve");
     let mut client = deployment.connect();
     let first = session_id(&client.wait_for("session 1", "ready", 1)[0].1);
-    deployment.echo("echo 1", &client).await;
+    deployment.echo("echo 1", &mut client).await;
 
     // 1. A healthy device that sends nothing for longer than the idle
     //    timeout is not evicted: the relay's Pings draw Pongs, and a Pong is
@@ -1596,7 +1630,7 @@ async fn m6c68_a_relay_evicts_a_device_whose_path_vanished_and_admits_its_reconn
         "a healthy idle session must survive {quiet:?}: {}",
         client.context()
     );
-    deployment.echo("echo after idle", &client).await;
+    deployment.echo("echo after idle", &mut client).await;
 
     // 2. The device's path vanishes; the relay's half stays open and silent.
     let held = proxy.cut().await;
@@ -1628,7 +1662,7 @@ async fn m6c68_a_relay_evicts_a_device_whose_path_vanished_and_admits_its_reconn
         "the relay must have refused OWNER_BUSY while it still held the dead session: {}",
         client.context()
     );
-    deployment.echo("echo after reconnect", &client).await;
+    deployment.echo("echo after reconnect", &mut client).await;
     client.stop();
     drop(relay);
     println!(
@@ -1868,7 +1902,7 @@ async fn m6c105_a_forget_proof_starved_of_its_ack_reconnects_instead_of_exiting(
         "{body}"
     );
 
-    deployment.echo("echo after reconnect", &client).await;
+    deployment.echo("echo after reconnect", &mut client).await;
     let held_bytes = proxy.held_bytes();
     assert!(
         held_bytes > 0,

@@ -73,7 +73,9 @@ if [ "${PROOF_SKIP_BUILD:-0}" != 1 ]; then
   docker build -q -f "$repo/deploy/fly/relay/Dockerfile" -t "$relay_image" "$repo" >/dev/null
   docker build -q -t "$redis_image" "$repo/deploy/fly/redis" >/dev/null
 fi
-docker image inspect "$relay_image" "$redis_image" --format '{{.RepoTags}} {{.Id}} {{.Architecture}} user={{.Config.User}}'
+# An image with no USER has no `User` key at all on newer Docker engines, and
+# naming a missing key is a template error there; `index` reads it as empty.
+docker image inspect "$relay_image" "$redis_image" --format '{{.RepoTags}} {{.Id}} {{.Architecture}} user={{index .Config "User"}}'
 
 echo "== keys (generated now, in $work)"
 pki=$work/pki

@@ -1173,7 +1173,9 @@ async fn start_cluster(
         let _ = membership_handle.shutdown().await;
         return Err("cluster membership contains no approved peer keys".into());
     }
-    peer_readiness.replace_required_routes(required_peer_routes(&membership, &config.node_id))?;
+    peer_readiness
+        .replace_required_routes(required_peer_routes(&membership, &config.node_id))
+        .await?;
 
     // Membership changes revoke the dynamic SPKI snapshot immediately.  The
     // transport's pin watcher closes connections whose certificate is no
@@ -1183,12 +1185,14 @@ async fn start_cluster(
     // usable and every new request still performs its exact binding check.
     let pin_membership = Arc::clone(&membership);
     let pin_updates = pins.clone();
-    membership.set_invalidation_callback(Some(Arc::new(move |_identity, _reason| {
-        if let Err(error) = publish_membership_pins(&pin_membership, &pin_updates) {
-            tracing::warn!(?error, "membership pin publication failed closed");
-            let _ = pin_updates.replace(std::iter::empty::<SpkiSha256>());
-        }
-    })));
+    membership
+        .set_invalidation_callback(Some(Arc::new(move |_identity, _reason| {
+            if let Err(error) = publish_membership_pins(&pin_membership, &pin_updates) {
+                tracing::warn!(?error, "membership pin publication failed closed");
+                let _ = pin_updates.replace(std::iter::empty::<SpkiSha256>());
+            }
+        })))
+        .await;
     let running = match config
         .start_with_peer(
             options,
@@ -1301,7 +1305,7 @@ impl RekeyTrigger {
 
     /// Read, validate and stage the configured successor identity.  Prints
     /// only public facts: the phase and SPKI digests.
-    fn stage(&self) {
+    async fn stage(&self) {
         let Some((chain_path, key_path)) = &self.next else {
             eprintln!(
                 "tunnel-relay: SIGHUP received; no cluster.peer_tls_next_* identity is configured, nothing staged"
@@ -1328,7 +1332,7 @@ impl RekeyTrigger {
                 return;
             }
         };
-        let result = self.rekey.stage_pem(&chain, &key);
+        let result = self.rekey.stage_pem(&chain, &key).await;
         key.fill(0);
         match result {
             Ok(spki) => eprintln!(
@@ -1370,7 +1374,7 @@ impl ClusterServing {
             tokio::select! {
                 requested = stop.recv() => break Some(requested),
                 () = shutdown.cancelled() => break None,
-                () = rekey_trigger.recv() => rekey_trigger.stage(),
+                () = rekey_trigger.recv() => rekey_trigger.stage().await,
             }
         };
         let first = match &requested {
@@ -1540,7 +1544,7 @@ async fn peer_refresh_loop(
                 if pins.snapshot().is_empty() {
                     // No current signed peer key material could be published,
                     // so there is no trust evidence for any peer at all.
-                    peer.withdraw_peer_trust();
+                    peer.withdraw_peer_trust().await;
                     continue;
                 }
                 if !matches!(membership.readiness(), MembershipReadiness::Ready) {
@@ -1549,13 +1553,13 @@ async fn peer_refresh_loop(
                     // and pin set stays installed so an authenticated peer's
                     // bounded reachability probe is still answered; otherwise
                     // two relays wait on each other and neither converges.
-                    peer.withdraw_peer_readiness();
+                    peer.withdraw_peer_readiness().await;
                     continue;
                 }
                 // The configured ceiling supplies the global capacity floor;
                 // every successful route probe separately proves an actual
                 // HTTP/3 request slot and response path for that destination.
-                peer.set_peer_capacity(configured_capacity);
+                peer.set_peer_capacity(configured_capacity).await;
                 let targets = required_peer_routes(&membership, &local_node_id);
                 tokio::select! {
                     _ = shutdown.cancelled() => break,

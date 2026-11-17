@@ -22,7 +22,6 @@ use redis::IntoConnectionInfo;
 use tokio::{
     io::AsyncWriteExt,
     net::{TcpListener, TcpStream},
-    sync::Mutex,
 };
 use tunnel_catalog::{
     CatalogConnectionFailure, CatalogConnectionLane, CatalogConnectionStage, RedisCatalog,
@@ -136,15 +135,16 @@ async fn forwarder(upstream: SocketAddr, silent: usize) -> (SocketAddr, Arc<Atom
     let address = listener.local_addr().expect("forwarder address");
     let accepted = Arc::new(AtomicUsize::new(0));
     let counter = Arc::clone(&accepted);
-    let held: Arc<Mutex<Vec<TcpStream>>> = Arc::default();
     tokio::spawn(async move {
+        // The silent connection stays open for as long as this task runs.
+        let mut held: Vec<TcpStream> = Vec::new();
         loop {
             let Ok((mut socket, _)) = listener.accept().await else {
                 return;
             };
             let number = counter.fetch_add(1, Ordering::SeqCst) + 1;
             if number == silent {
-                held.lock().await.push(socket);
+                held.push(socket);
                 continue;
             }
             tokio::spawn(async move {

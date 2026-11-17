@@ -787,9 +787,9 @@ async fn park_committed_claims(
         let mut guard = super::OwnerClaimCleanup::new(spare.dispatcher());
         guard.arm_token(claim.token);
         // Dropping a handoff whose guard is parked leaves the guard parked.
-        drop(handle.claim_handoffs.deposit(Some(guard)));
+        drop(handle.deposit_claim_for_test(guard).await);
     }
-    assert_eq!(handle.claim_handoffs.parked(), count);
+    assert_eq!(handle.parked_claims_for_test(), count);
     (tenant_id, device_ids, spare)
 }
 
@@ -834,7 +834,7 @@ async fn close_all_releases_more_parked_claims_than_the_cleanup_queue_holds() {
         .await
         .expect("shutdown with a full cleanup queue is bounded");
     assert!(matches!(shutdown, Ok(()) | Err(RelayError::Shutdown)));
-    assert_eq!(handle.claim_handoffs.parked(), 0, "nothing is left parked");
+    assert_eq!(handle.parked_claims_for_test(), 0, "nothing is left parked");
 
     let claimed = still_claimed(&catalog, tenant_id, &device_ids).await;
     assert_eq!(
@@ -886,7 +886,7 @@ async fn close_all_releases_the_overflow_within_one_shutdown_deadline() {
         "the overflow release took {elapsed:?}, past the {:?} shutdown deadline",
         super::CLEANUP_SHUTDOWN_TIMEOUT
     );
-    assert_eq!(handle.claim_handoffs.parked(), 0, "nothing is left parked");
+    assert_eq!(handle.parked_claims_for_test(), 0, "nothing is left parked");
     catalog.release_delay_ms.store(0, Ordering::Release);
     let released = PARKED - still_claimed(&catalog, tenant_id, &device_ids).await;
     assert!(
@@ -1081,7 +1081,7 @@ async fn expire_owner_forget_deadlines(handle: &RelayHandle) {
         .send(Command::TestMutate(Box::new(|actor| {
             let now = std::time::Instant::now();
             for session in actor.sessions.values_mut() {
-                session.owner_forget_deadline = Some(now);
+                session.owner_forget_deadline.set(Some(now));
             }
         })))
         .await
@@ -1189,8 +1189,7 @@ async fn an_owner_guard_dropped_while_owners_are_kept_does_not_cancel_the_relay(
         .tx
         .send(Command::TestMutate(Box::new(|actor| {
             let dispatcher = actor
-                .cleanup_dispatcher
-                .clone()
+                .owner_cleanup_dispatcher()
                 .expect("cleanup dispatcher present while running");
             let filler = synthetic_owner("filler");
             while dispatcher
@@ -1237,8 +1236,8 @@ async fn an_owner_cleanup_refused_at_the_backlog_cap_is_left_to_lease_expiry() {
     let (tenant_id, device_ids, registrations) = register_live_sessions(&handle, &catalog, 2).await;
 
     let kept_after = Arc::new(AtomicUsize::new(usize::MAX));
-    let refused_device = Arc::new(std::sync::Mutex::new(None));
-    let refused_count = Arc::new(std::sync::Mutex::new(None));
+    let refused_device = Arc::new(std::sync::OnceLock::new());
+    let refused_count = Arc::new(std::sync::OnceLock::new());
     {
         let kept_after = kept_after.clone();
         let refused_device = refused_device.clone();
@@ -1248,12 +1247,12 @@ async fn an_owner_cleanup_refused_at_the_backlog_cap_is_left_to_lease_expiry() {
             .send(Command::TestMutate(Box::new(move |actor| {
                 const CAP: usize = 2;
                 let dispatcher = actor
-                    .cleanup_dispatcher
-                    .clone()
+                    .owner_cleanup_dispatcher()
                     .expect("cleanup dispatcher present while running");
                 actor.owner_backlog.set_cap(CAP);
-                *refused_count.lock().expect("refused count") =
-                    Some(dispatcher.refused_count.clone());
+                refused_count
+                    .set(dispatcher.refused_count.clone())
+                    .expect("the mutation runs once");
                 let filler = synthetic_owner("filler");
                 while dispatcher
                     .enqueue_if_room(|| Some(super::OwnerCleanupItem::Token(filler.clone())))
@@ -1273,7 +1272,9 @@ async fn an_owner_cleanup_refused_at_the_backlog_cap_is_left_to_lease_expiry() {
                     .cloned()
                     .expect("a live session");
                 let session = actor.sessions.remove(&scope).expect("live session");
-                *refused_device.lock().expect("refused device") = Some(session.owner.device_id);
+                refused_device
+                    .set(session.owner.device_id)
+                    .expect("the mutation runs once");
                 let mut refused = super::OwnerClaimCleanup::new(dispatcher);
                 refused.arm_token(session.owner.clone());
                 drop(refused);
@@ -1301,10 +1302,7 @@ async fn an_owner_cleanup_refused_at_the_backlog_cap_is_left_to_lease_expiry() {
         !cancel.is_cancelled(),
         "an owner cleanup refused at the backlog cap cancelled the relay"
     );
-    let refused_device = refused_device
-        .lock()
-        .expect("refused device")
-        .expect("the mutation ran");
+    let refused_device = *refused_device.get().expect("the mutation ran");
     assert!(
         catalog
             .inner
@@ -1315,9 +1313,7 @@ async fn an_owner_cleanup_refused_at_the_backlog_cap_is_left_to_lease_expiry() {
         "the refused owner was released instead of left to lease expiry"
     );
     let refused = refused_count
-        .lock()
-        .expect("refused count")
-        .clone()
+        .get()
         .expect("the mutation ran")
         .load(Ordering::Acquire);
     assert_eq!(refused, 1, "the refusal at the backlog cap was not counted");
@@ -1337,7 +1333,7 @@ async fn kept_owner_release_counts_releases_in_flight_at_the_deadline() {
     const KEPT: usize = 960;
     let catalog = HeldCatalog::new();
     catalog.release_delay_ms.store(20, Ordering::Release);
-    let backlog = super::OwnerBacklog::new(usize::MAX);
+    let (backlog, mut drain) = super::OwnerBacklog::new(usize::MAX);
     for index in 0..KEPT {
         backlog.push(super::OwnerCleanupItem::Token(synthetic_owner(&format!(
             "in-flight-{index}"
@@ -1346,7 +1342,7 @@ async fn kept_owner_release_counts_releases_in_flight_at_the_deadline() {
     let shared: tunnel_catalog::SharedCatalog = Arc::new(catalog.clone());
     let (attempted, abandoned) = super::release_backlog_until(
         &shared,
-        &backlog,
+        &mut drain,
         tokio::time::Instant::now() + Duration::from_millis(1_010),
         false,
     )
@@ -1365,7 +1361,7 @@ async fn kept_owner_release_counts_releases_in_flight_at_the_deadline() {
 #[tokio::test(start_paused = true)]
 async fn kept_owner_release_past_its_deadline_starts_nothing() {
     let catalog = HeldCatalog::new();
-    let backlog = super::OwnerBacklog::new(usize::MAX);
+    let (backlog, mut drain) = super::OwnerBacklog::new(usize::MAX);
     for index in 0..20 {
         backlog.push(super::OwnerCleanupItem::Token(synthetic_owner(&format!(
             "late-{index}"
@@ -1374,7 +1370,7 @@ async fn kept_owner_release_past_its_deadline_starts_nothing() {
     let shared: tunnel_catalog::SharedCatalog = Arc::new(catalog.clone());
     let deadline = tokio::time::Instant::now();
     tokio::time::advance(Duration::from_millis(1)).await;
-    let result = super::release_backlog_until(&shared, &backlog, deadline, false).await;
+    let result = super::release_backlog_until(&shared, &mut drain, deadline, false).await;
     assert_eq!(result, (0, 20));
     assert!(backlog.is_empty());
     assert_eq!(
@@ -1395,7 +1391,7 @@ async fn kept_owner_release_is_concurrent_and_bounded() {
     const KEPT: usize = 960;
     let catalog = HeldCatalog::new();
     catalog.release_delay_ms.store(20, Ordering::Release);
-    let backlog = super::OwnerBacklog::new(usize::MAX);
+    let (backlog, mut drain) = super::OwnerBacklog::new(usize::MAX);
     for index in 0..KEPT {
         backlog.push(super::OwnerCleanupItem::Token(OwnerToken {
             deployment_incarnation: "c187".to_owned(),
@@ -1411,7 +1407,7 @@ async fn kept_owner_release_is_concurrent_and_bounded() {
     let started = tokio::time::Instant::now();
     let (released, abandoned) = super::release_backlog_until(
         &shared,
-        &backlog,
+        &mut drain,
         started + super::CLEANUP_SHUTDOWN_TIMEOUT,
         false,
     )
@@ -1500,8 +1496,7 @@ async fn the_worker_wakes_the_actor_to_refill_the_queue_between_ticks() {
     let fill = || {
         Command::TestMutate(Box::new(|actor| {
             let dispatcher = actor
-                .cleanup_dispatcher
-                .clone()
+                .owner_cleanup_dispatcher()
                 .expect("cleanup dispatcher present while running");
             let filler = synthetic_owner("filler");
             while dispatcher
@@ -1518,15 +1513,14 @@ async fn the_worker_wakes_the_actor_to_refill_the_queue_between_ticks() {
         .await
         .expect("actor accepts the fill");
     tokio::time::sleep(Duration::from_millis(1)).await;
-    let kept_at = Arc::new(std::sync::Mutex::new(None));
+    let kept_at = Arc::new(std::sync::OnceLock::new());
     {
         let kept_at = kept_at.clone();
         handle
             .tx
             .send(Command::TestMutate(Box::new(move |actor| {
                 let dispatcher = actor
-                    .cleanup_dispatcher
-                    .clone()
+                    .owner_cleanup_dispatcher()
                     .expect("cleanup dispatcher present while running");
                 let filler = synthetic_owner("filler");
                 while dispatcher
@@ -1534,15 +1528,16 @@ async fn the_worker_wakes_the_actor_to_refill_the_queue_between_ticks() {
                 {
                 }
                 dispatcher.enqueue(super::OwnerCleanupItem::Token(synthetic_owner("kept")));
-                *kept_at.lock().expect("kept at") =
-                    Some((tokio::time::Instant::now(), actor.owner_backlog.len()));
+                kept_at
+                    .set((tokio::time::Instant::now(), actor.owner_backlog.len()))
+                    .expect("the mutation runs once");
             })))
             .await
             .expect("actor accepts the test mutation");
     }
     let (kept_at, kept) = loop {
-        if let Some(kept) = *kept_at.lock().expect("kept at") {
-            break kept;
+        if let Some(kept) = kept_at.get() {
+            break *kept;
         }
         tokio::time::sleep(Duration::from_millis(1)).await;
     };

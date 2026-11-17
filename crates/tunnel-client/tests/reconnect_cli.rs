@@ -39,8 +39,9 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
     sync::{
-        Arc, Mutex,
+        Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
+        mpsc,
     },
     thread,
     time::{Duration, Instant},
@@ -207,13 +208,39 @@ enum Mode {
     ControlClose(Arc<rustls::ServerConfig>, u16, &'static str),
 }
 
+/// What one producer thread has reported, in order. The thread sends each
+/// item as it happens; the test that owns the log collects them when it
+/// looks.
+struct Log<T> {
+    reported: mpsc::Receiver<T>,
+    seen: Vec<T>,
+}
+
+impl<T> Log<T> {
+    fn new() -> (mpsc::Sender<T>, Self) {
+        let (sender, reported) = mpsc::channel();
+        (
+            sender,
+            Self {
+                reported,
+                seen: Vec::new(),
+            },
+        )
+    }
+
+    fn so_far(&mut self) -> &[T] {
+        self.seen.extend(self.reported.try_iter());
+        &self.seen
+    }
+}
+
 /// A local stand-in for the relay's device listener that counts the
 /// connections it accepts.
 struct FakeRelay {
     port: u16,
     stop: Arc<AtomicBool>,
     accepted: Arc<AtomicUsize>,
-    tls_errors: Arc<Mutex<Vec<String>>>,
+    tls_errors: Log<String>,
     tls_completed: Arc<AtomicUsize>,
     thread: Option<thread::JoinHandle<()>>,
 }
@@ -227,12 +254,11 @@ impl FakeRelay {
         let port = listener.local_addr().expect("fake relay address").port();
         let stop = Arc::new(AtomicBool::new(false));
         let accepted = Arc::new(AtomicUsize::new(0));
-        let tls_errors = Arc::new(Mutex::new(Vec::new()));
+        let (tls_errors, tls_error_log) = Log::new();
         let tls_completed = Arc::new(AtomicUsize::new(0));
         let thread = {
             let stop = Arc::clone(&stop);
             let accepted = Arc::clone(&accepted);
-            let tls_errors = Arc::clone(&tls_errors);
             let tls_completed = Arc::clone(&tls_completed);
             thread::spawn(move || {
                 while !stop.load(Ordering::Acquire) {
@@ -244,7 +270,7 @@ impl FakeRelay {
                                 .expect("fake relay blocking stream");
                             match serve(stream, &mode) {
                                 Some(error) => {
-                                    tls_errors.lock().expect("tls errors").push(error);
+                                    let _ = tls_errors.send(error);
                                 }
                                 None if matches!(mode, Mode::Tls(_) | Mode::ControlClose(..)) => {
                                     tls_completed.fetch_add(1, Ordering::AcqRel);
@@ -264,7 +290,7 @@ impl FakeRelay {
             port,
             stop,
             accepted,
-            tls_errors,
+            tls_errors: tls_error_log,
             tls_completed,
             thread: Some(thread),
         }
@@ -276,6 +302,11 @@ impl FakeRelay {
 
     fn accepted(&self) -> usize {
         self.accepted.load(Ordering::Acquire)
+    }
+
+    /// Every TLS error the relay thread has reported so far.
+    fn tls_errors(&mut self) -> &[String] {
+        self.tls_errors.so_far()
     }
 }
 
@@ -515,8 +546,8 @@ fn toml_string(path: &Path) -> String {
 struct Run {
     child: Child,
     started: Instant,
-    events: Arc<Mutex<Vec<Value>>>,
-    stderr: Arc<Mutex<String>>,
+    events: Log<Value>,
+    stderr: Log<String>,
 }
 
 impl Run {
@@ -532,52 +563,50 @@ impl Run {
             .stderr(Stdio::piped())
             .spawn()
             .expect("spawn tunnel-client connect");
-        let events = Arc::new(Mutex::new(Vec::new()));
+        let (events, event_log) = Log::new();
         let stdout = child.stdout.take().expect("stdout pipe");
         {
-            let events = Arc::clone(&events);
             thread::spawn(move || {
                 for line in BufReader::new(stdout).lines().map_while(Result::ok) {
                     let value = serde_json::from_str(&line)
                         .unwrap_or_else(|_| Value::String(format!("non-JSON stdout: {line}")));
-                    events.lock().expect("events").push(value);
+                    let _ = events.send(value);
                 }
             });
         }
-        let stderr = Arc::new(Mutex::new(String::new()));
+        let (stderr, stderr_log) = Log::new();
         let pipe = child.stderr.take().expect("stderr pipe");
         {
-            let stderr = Arc::clone(&stderr);
             thread::spawn(move || {
                 let mut text = String::new();
                 let _ = BufReader::new(pipe).read_to_string(&mut text);
-                stderr.lock().expect("stderr").push_str(&text);
+                let _ = stderr.send(text);
             });
         }
         Self {
             child,
             started: Instant::now(),
-            events,
-            stderr,
+            events: event_log,
+            stderr: stderr_log,
         }
     }
 
-    fn events(&self) -> Vec<Value> {
-        self.events.lock().expect("events").clone()
+    fn events(&mut self) -> Vec<Value> {
+        self.events.so_far().to_vec()
     }
 
-    fn states(&self, state: &str) -> Vec<Value> {
+    fn states(&mut self, state: &str) -> Vec<Value> {
         self.events()
             .into_iter()
             .filter(|event| event["result"]["state"] == state)
             .collect()
     }
 
-    fn context(&self) -> String {
+    fn context(&mut self) -> String {
         format!(
             "events={:?} stderr={:?}",
             self.events(),
-            self.stderr.lock().expect("stderr")
+            self.stderr.so_far().concat()
         )
     }
 
@@ -636,7 +665,7 @@ impl Run {
     }
 
     /// The final `ok:false` diagnostic.
-    fn final_error(&self) -> Value {
+    fn final_error(&mut self) -> Value {
         let events = self.events();
         let last = events
             .last()
@@ -831,7 +860,7 @@ fn handshake_loss_is_retried(mode: Mode) {
 fn an_untrusted_relay_certificate_exits_credential_error_without_retrying() {
     let relay_pki = Pki::new("relay");
     let other = Pki::new("other");
-    let relay = FakeRelay::start(Mode::Tls(server_without_client_auth(&relay_pki)));
+    let mut relay = FakeRelay::start(Mode::Tls(server_without_client_auth(&relay_pki)));
     let profile = profile(
         &relay.url(),
         &other,
@@ -845,7 +874,7 @@ fn an_untrusted_relay_certificate_exits_credential_error_without_retrying() {
     let context = format!(
         "accepted={} relay_errors={:?} elapsed={elapsed:?} {}",
         relay.accepted(),
-        relay.tls_errors.lock().expect("tls errors"),
+        relay.tls_errors(),
         run.context()
     );
     assert_eq!(status.code(), Some(3), "{context}");
@@ -871,7 +900,7 @@ fn an_untrusted_relay_certificate_exits_credential_error_without_retrying() {
 fn a_relay_refusing_the_device_certificate_exits_credential_error_without_retrying() {
     let pki = Pki::new("relay");
     let other_devices = Pki::new("other-devices");
-    let relay = FakeRelay::start(Mode::Tls(server_requiring_devices_of(&pki, &other_devices)));
+    let mut relay = FakeRelay::start(Mode::Tls(server_requiring_devices_of(&pki, &other_devices)));
     let profile = profile(
         &relay.url(),
         &pki,
@@ -884,11 +913,11 @@ fn a_relay_refusing_the_device_certificate_exits_credential_error_without_retryi
     let context = format!(
         "accepted={} relay_errors={:?} elapsed={elapsed:?} {}",
         relay.accepted(),
-        relay.tls_errors.lock().expect("tls errors"),
+        relay.tls_errors(),
         run.context()
     );
     assert!(
-        !relay.tls_errors.lock().expect("tls errors").is_empty(),
+        !relay.tls_errors().is_empty(),
         "the relay stand-in must have refused the device certificate: {context}"
     );
     assert_eq!(status.code(), Some(3), "{context}");
@@ -915,7 +944,7 @@ fn a_relay_refusing_the_device_certificate_exits_credential_error_without_retryi
 #[test]
 fn a_protocol_major_refusal_exits_protocol_error_without_retrying() {
     let pki = Pki::new("relay");
-    let relay = FakeRelay::start(Mode::ControlClose(
+    let mut relay = FakeRelay::start(Mode::ControlClose(
         server_requiring_devices_of(&pki, &pki),
         1002,
         "PROTOCOL_UNSUPPORTED",
@@ -933,7 +962,7 @@ fn a_protocol_major_refusal_exits_protocol_error_without_retrying() {
         "accepted={} completed={} relay_errors={:?} elapsed={elapsed:?} {}",
         relay.accepted(),
         relay.tls_completed.load(Ordering::Acquire),
-        relay.tls_errors.lock().expect("tls errors"),
+        relay.tls_errors(),
         run.context()
     );
     assert_eq!(
@@ -1080,7 +1109,7 @@ fn reconnect_disabled_in_the_profile_exits_on_the_first_failure() {
 fn a_device_certificate_not_yet_valid_is_retried_until_the_relay_accepts_it() {
     let now = unix_now();
     let pki = Pki::with_windows("skew", None, Some((now + 5, now + 86_400)));
-    let relay = FakeRelay::start(Mode::Tls(server_requiring_devices_of(&pki, &pki)));
+    let mut relay = FakeRelay::start(Mode::Tls(server_requiring_devices_of(&pki, &pki)));
     let profile = profile(
         &relay.url(),
         &pki,
@@ -1089,12 +1118,12 @@ fn a_device_certificate_not_yet_valid_is_retried_until_the_relay_accepts_it() {
     );
     let mut run = Run::start(&profile, &[]);
     let first = run.wait_for_state("disconnected");
-    fn context(relay: &FakeRelay, run: &Run) -> String {
+    fn context(relay: &mut FakeRelay, run: &mut Run) -> String {
         format!(
             "accepted={} tls_completed={} relay_errors={:?} {}",
             relay.accepted(),
             relay.tls_completed.load(Ordering::Acquire),
-            relay.tls_errors.lock().expect("tls errors"),
+            relay.tls_errors(),
             run.context()
         )
     }
@@ -1102,37 +1131,42 @@ fn a_device_certificate_not_yet_valid_is_retried_until_the_relay_accepts_it() {
         first["result"]["code"],
         "TRANSPORT_ERROR",
         "{}",
-        context(&relay, &run)
+        context(&mut relay, &mut run)
     );
     let message = first["result"]["message"].as_str().unwrap_or_default();
     assert!(
         message.contains("as expired or not yet valid on the relay's clock")
             && message.contains("not valid until unix time"),
         "the event must say the certificate is not yet valid, not expired: {}",
-        context(&relay, &run)
+        context(&mut relay, &mut run)
     );
     let deadline = Instant::now() + Duration::from_secs(20);
     while relay.tls_completed.load(Ordering::Acquire) == 0 {
         assert!(
             run.child.try_wait().expect("poll").is_none(),
             "the client exited instead of retrying: {}",
-            context(&relay, &run)
+            context(&mut relay, &mut run)
         );
         assert!(
             Instant::now() < deadline,
             "the relay never accepted the certificate: {}",
-            context(&relay, &run)
+            context(&mut relay, &mut run)
         );
         thread::sleep(Duration::from_millis(20));
     }
     assert!(
-        !relay.tls_errors.lock().expect("tls errors").is_empty(),
+        !relay.tls_errors().is_empty(),
         "the relay refused it first: {}",
-        context(&relay, &run)
+        context(&mut relay, &mut run)
     );
     run.signal("TERM");
     let (status, _) = run.wait_exit(Instant::now());
-    assert_eq!(status.code(), Some(130), "{}", context(&relay, &run));
+    assert_eq!(
+        status.code(),
+        Some(130),
+        "{}",
+        context(&mut relay, &mut run)
+    );
 }
 
 /// The device side, genuinely expired: past `notAfter` on this host's clock
@@ -1141,7 +1175,7 @@ fn a_device_certificate_not_yet_valid_is_retried_until_the_relay_accepts_it() {
 fn an_expired_device_certificate_exits_credential_error_without_retrying() {
     let now = unix_now();
     let pki = Pki::with_windows("expired", None, Some((now - 172_800, now - 3_600)));
-    let relay = FakeRelay::start(Mode::Tls(server_requiring_devices_of(&pki, &pki)));
+    let mut relay = FakeRelay::start(Mode::Tls(server_requiring_devices_of(&pki, &pki)));
     let profile = profile(
         &relay.url(),
         &pki,
@@ -1154,7 +1188,7 @@ fn an_expired_device_certificate_exits_credential_error_without_retrying() {
     let context = format!(
         "accepted={} relay_errors={:?} {}",
         relay.accepted(),
-        relay.tls_errors.lock().expect("tls errors"),
+        relay.tls_errors(),
         run.context()
     );
     assert_eq!(status.code(), Some(3), "{context}");

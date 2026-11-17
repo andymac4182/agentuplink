@@ -21,7 +21,7 @@ use std::{
     future::pending,
     net::SocketAddr,
     sync::{
-        Arc, Mutex,
+        Arc,
         atomic::{AtomicUsize, Ordering},
     },
     time::Duration,
@@ -91,31 +91,25 @@ const JOIN_BUDGET: Duration = Duration::from_secs(5);
 #[derive(Clone)]
 struct BlackholeProvider {
     bindings: Arc<HashMap<(String, String), VerifiedPeerBinding>>,
-    admission_lookups: Arc<Mutex<usize>>,
-    admission_contexts: Arc<Mutex<usize>>,
+    admission_lookups: Arc<AtomicUsize>,
+    admission_contexts: Arc<AtomicUsize>,
 }
 
 impl BlackholeProvider {
     fn new(bindings: HashMap<(String, String), VerifiedPeerBinding>) -> Self {
         Self {
             bindings: Arc::new(bindings),
-            admission_lookups: Arc::new(Mutex::new(0)),
-            admission_contexts: Arc::new(Mutex::new(0)),
+            admission_lookups: Arc::new(AtomicUsize::new(0)),
+            admission_contexts: Arc::new(AtomicUsize::new(0)),
         }
     }
 
     fn admission_lookups(&self) -> usize {
-        *self
-            .admission_lookups
-            .lock()
-            .expect("blackhole admission lookup mutex")
+        self.admission_lookups.load(Ordering::SeqCst)
     }
 
     fn admission_contexts(&self) -> usize {
-        *self
-            .admission_contexts
-            .lock()
-            .expect("blackhole admission context mutex")
+        self.admission_contexts.load(Ordering::SeqCst)
     }
 }
 
@@ -174,10 +168,7 @@ impl PeerBindingProvider for BlackholeProvider {
             .get(&(node_id.to_owned(), boot_id.to_owned()))
             .cloned();
         let expected_spki = spki_sha256.to_owned();
-        *self
-            .admission_lookups
-            .lock()
-            .expect("blackhole admission lookup mutex") += 1;
+        self.admission_lookups.fetch_add(1, Ordering::SeqCst);
         Box::pin(async move {
             let binding = binding.ok_or_else(|| {
                 PeerRuntimeError::Membership("missing blackhole binding".to_owned())

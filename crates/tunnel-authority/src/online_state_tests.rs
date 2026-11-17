@@ -112,6 +112,107 @@ fn checkpoint(engine: &mut Engine) -> SignedMembershipCheckpoint {
     serde_json::from_slice(&engine.checkpoint(NONCE.into()).unwrap()).unwrap()
 }
 
+fn fresh_deadline(engine: &Engine) -> Option<Instant> {
+    match &engine.publication {
+        Publication::Fresh { deadline, .. } => Some(*deadline),
+        _ => None,
+    }
+}
+
+fn confirmation(version: u64) -> Confirmation {
+    Confirmation {
+        inventory_revision: 1,
+        membership_version: version,
+        expires_at: Utc::now() + chrono::Duration::seconds(LIFETIME_SECONDS),
+    }
+}
+
+fn confirmed(version: u64) -> PublicationEvent {
+    PublicationEvent::Confirmed {
+        confirmation: confirmation(version),
+        deadline: Instant::now() + Duration::from_secs(LIFETIME_SECONDS as u64),
+    }
+}
+
+fn confirmed_version(publication: &Publication) -> Option<u64> {
+    publication
+        .confirmation()
+        .map(|confirmation| confirmation.membership_version)
+}
+
+#[test]
+fn publication_phase_allows_exactly_its_transition_table() {
+    // Unpublished -> Fresh; a restored confirmation starts stale.
+    let mut phase = Publication::restored(None);
+    assert!(matches!(phase, Publication::Unpublished));
+    assert_eq!(phase.transition(confirmed(1)), Ok(()));
+    assert!(matches!(phase, Publication::Fresh { .. }));
+    assert_eq!(confirmed_version(&phase), Some(1));
+
+    // Fresh -> Fresh only for a higher version; a refusal changes nothing.
+    for stale in [0, 1] {
+        assert_eq!(phase.transition(confirmed(stale)), Err(IllegalTransition));
+        assert!(matches!(phase, Publication::Fresh { .. }));
+        assert_eq!(confirmed_version(&phase), Some(1));
+    }
+    assert_eq!(phase.transition(confirmed(2)), Ok(()));
+    assert_eq!(confirmed_version(&phase), Some(2));
+
+    // ConfirmedButStale -> Fresh under the same version rule.
+    let mut phase = Publication::restored(Some(confirmation(4)));
+    assert!(matches!(phase, Publication::ConfirmedButStale(_)));
+    assert_eq!(phase.transition(confirmed(4)), Err(IllegalTransition));
+    assert!(matches!(phase, Publication::ConfirmedButStale(_)));
+    assert_eq!(phase.transition(confirmed(5)), Ok(()));
+    assert!(matches!(phase, Publication::Fresh { .. }));
+
+    // Every live phase -> Fatal, which carries no confirmation and is
+    // absorbing for both events.
+    let fresh = || {
+        let mut phase = Publication::Unpublished;
+        phase.transition(confirmed(1)).unwrap();
+        phase
+    };
+    for mut phase in [
+        Publication::Unpublished,
+        Publication::restored(Some(confirmation(1))),
+        fresh(),
+    ] {
+        assert_eq!(
+            phase.transition(PublicationEvent::PersistenceFailed),
+            Ok(())
+        );
+        assert!(matches!(phase, Publication::Fatal));
+        assert!(phase.confirmation().is_none());
+        assert_eq!(phase.transition(confirmed(9)), Err(IllegalTransition));
+        assert_eq!(
+            phase.transition(PublicationEvent::PersistenceFailed),
+            Err(IllegalTransition)
+        );
+        assert!(matches!(phase, Publication::Fatal));
+    }
+}
+
+#[test]
+fn a_failed_durable_write_makes_the_engine_refuse_everything() {
+    let fixture = Fixture::new();
+    let mut engine = fixture.engine();
+    confirm_next(&mut engine);
+    checkpoint(&mut engine);
+    fs::write(&fixture.config.state_path, b"external corrupt state").unwrap();
+    assert!(engine.checkpoint(NONCE.into()).is_err());
+    assert!(engine.fatal.load(Ordering::SeqCst));
+    assert!(matches!(engine.publication, Publication::Fatal));
+    assert!(!engine.ready());
+    assert!(engine.reserve_round().is_err());
+    assert!(engine.checkpoint(NONCE.into()).is_err());
+    assert_eq!(engine.state.checkpoint_high_water, 1);
+    assert_eq!(
+        fs::read(&fixture.config.state_path).unwrap(),
+        b"external corrupt state"
+    );
+}
+
 fn confirm_next(engine: &mut Engine) -> u64 {
     let round = engine.reserve_round().unwrap();
     let version = round.version;
@@ -131,7 +232,7 @@ fn restart_requires_a_new_confirmed_publication_without_resetting_allocators() {
 
     let mut restarted = fixture.engine();
     assert!(
-        restarted.state.confirmed.is_some(),
+        matches!(restarted.publication, Publication::ConfirmedButStale(_)),
         "confirmation was durable"
     );
     assert!(
@@ -193,7 +294,7 @@ fn approval_preserves_both_allocators_and_removes_old_inventory_confirmation() {
     assert_eq!(restarted.expected_run(), RUN_B);
     assert_eq!(restarted.state.membership_high_water, 2);
     assert_eq!(restarted.state.checkpoint_high_water, 2);
-    assert!(restarted.state.confirmed.is_none());
+    assert!(matches!(restarted.publication, Publication::Unpublished));
     assert!(restarted.checkpoint(NONCE.into()).is_err());
     assert!(
         !restarted
@@ -261,7 +362,7 @@ fn historical_node_slots_survive_replacements_and_incarnation_changes() {
     assert_eq!(replaced.state.membership_high_water, 2);
     assert_eq!(replaced.state.checkpoint_high_water, 2);
     assert_eq!(replaced.expected_run(), RUN_B);
-    assert!(replaced.state.confirmed.is_none());
+    assert!(matches!(replaced.publication, Publication::Unpublished));
     drop(replaced);
 
     // Current inventory still has only32 nodes, but removing one does not
@@ -294,17 +395,21 @@ fn same_inventory_abandoned_refresh_cannot_extend_confirmed_authorization() {
     let mut engine = fixture.engine();
     confirm_next(&mut engine);
     let first = checkpoint(&mut engine);
-    let original_deadline = engine.fresh_deadline;
+    let original_deadline = fresh_deadline(&engine);
+    assert!(original_deadline.is_some());
     let abandoned = engine.reserve_round().unwrap();
     assert_eq!(abandoned.version, 2);
     let second = checkpoint(&mut engine);
     assert_eq!(second.expires_at, first.expires_at);
     assert_eq!(second.minimum_versions, first.minimum_versions);
     assert_eq!(second.checkpoint_version, first.checkpoint_version + 1);
-    assert_eq!(engine.fresh_deadline, original_deadline);
+    assert_eq!(fresh_deadline(&engine), original_deadline);
     // Move only the independent monotonic clock to its refusal boundary. A
     // still-valid wall-clock expiry and a newer reservation cannot rescue it.
-    engine.fresh_deadline = Some(Instant::now() + RESPONSE_MARGIN);
+    let Publication::Fresh { deadline, .. } = &mut engine.publication else {
+        panic!("a confirmed round is fresh in its own process");
+    };
+    *deadline = Instant::now() + RESPONSE_MARGIN;
     assert!(engine.checkpoint(NONCE.into()).is_err());
     assert_eq!(
         engine.state.checkpoint_high_water,
@@ -340,7 +445,8 @@ fn expired_and_future_only_keys_refuse_the_whole_round_without_extending_trust()
     let mut engine = fixture.engine();
     confirm_next(&mut engine);
     let confirmed = checkpoint(&mut engine);
-    let deadline = engine.fresh_deadline;
+    let deadline = fresh_deadline(&engine);
+    assert!(deadline.is_some());
     let durable = engine.store.load().unwrap();
     for future_only in [false, true] {
         engine.state.inventory = fixture.inventory.clone();
@@ -355,9 +461,9 @@ fn expired_and_future_only_keys_refuse_the_whole_round_without_extending_trust()
         assert!(engine.reserve_round().is_err());
         assert_eq!(engine.state.membership_high_water, 1);
         assert_eq!(engine.store.load().unwrap(), durable);
-        assert_eq!(engine.fresh_deadline, deadline);
+        assert_eq!(fresh_deadline(&engine), deadline);
         assert_eq!(
-            engine.state.confirmed.as_ref().unwrap().expires_at,
+            engine.publication.confirmation().unwrap().expires_at,
             confirmed.expires_at
         );
         assert!(!engine.fatal.load(Ordering::SeqCst));
@@ -392,11 +498,8 @@ async fn a_fatal_latch_suppresses_even_a_successfully_persisted_checkpoint() {
     );
     assert_eq!(
         coordinator
-            .engine
-            .lock()
-            .unwrap()
-            .state
-            .checkpoint_high_water,
+            .inspect(|engine| engine.state.checkpoint_high_water)
+            .await,
         1,
         "undelivered checkpoint allocation stays spent"
     );
@@ -493,6 +596,8 @@ async fn eventually(mut condition: impl FnMut() -> bool) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancelled_slow_caller_keeps_its_watchdog_and_real_serializer_permit() {
+    // The serializer is the engine's single owner: while the slow operation
+    // runs it holds the engine, so nothing else can.
     let fixture = Fixture::new();
     let coordinator = fixture.coordinator();
     let (entered, started) = tokio::sync::oneshot::channel();
@@ -517,10 +622,9 @@ async fn cancelled_slow_caller_keeps_its_watchdog_and_real_serializer_permit() {
     caller.abort();
     assert!(caller.await.unwrap_err().is_cancelled());
     eventually(|| coordinator.fatal.load(Ordering::SeqCst)).await;
-    assert_eq!(
-        coordinator.permit.available_permits(),
-        0,
-        "timeout must not release the actual task's serializer"
+    assert!(
+        coordinator.operating(),
+        "timeout must not release the engine the actual task still holds"
     );
     assert!(
         coordinator
@@ -531,7 +635,7 @@ async fn cancelled_slow_caller_keeps_its_watchdog_and_real_serializer_permit() {
             .is_err()
     );
     release.release();
-    eventually(|| coordinator.permit.available_permits() == 1).await;
+    eventually(|| !coordinator.operating()).await;
     assert!(coordinator.fatal.load(Ordering::SeqCst));
 }
 
@@ -561,7 +665,7 @@ async fn request_cancellation_alone_does_not_latch_global_failure() {
     caller.abort();
     assert!(caller.await.unwrap_err().is_cancelled());
     release.release();
-    eventually(|| coordinator.permit.available_permits() == 1).await;
+    eventually(|| !coordinator.operating()).await;
     let next = coordinator
         .call(true, |engine| {
             engine.reserve_round().map(|round| round.version)
@@ -698,7 +802,7 @@ async fn publisher_survives_three_admitted_durable_checkpoint_operations() {
     let active = Arc::new(AtomicUsize::new(0));
     let completed = Arc::new(AtomicUsize::new(0));
     let overlap = Arc::new(AtomicBool::new(false));
-    let queue_residence = Arc::new(Mutex::new(Vec::new()));
+    let (queue_residence, mut observed_queue_residence) = tokio::sync::mpsc::unbounded_channel();
     let mut releases = std::collections::VecDeque::new();
     let mut checkpointed = std::collections::VecDeque::new();
     let mut http_tasks = Vec::new();
@@ -717,7 +821,7 @@ async fn publisher_survives_three_admitted_durable_checkpoint_operations() {
             let queued_at = tokio::time::Instant::now();
             caller
                 .call(false, move |engine| {
-                    residence.lock().unwrap().push((index, queued_at.elapsed()));
+                    let _ = residence.send((index, queued_at.elapsed()));
                     if active.fetch_add(1, Ordering::SeqCst) != 0 {
                         overlap.store(true, Ordering::SeqCst);
                     }
@@ -737,8 +841,8 @@ async fn publisher_survives_three_admitted_durable_checkpoint_operations() {
                 .await
         })));
         // On this single async thread, observing the consumed HTTP slot means
-        // the call has suspended on the occupied fair serializer (or, for the
-        // first call, spawned the actual blocking operation).
+        // the call has queued behind the occupied engine (or, for the first
+        // call, been handed to the actor that runs the blocking operation).
         real_wait(
             async {
                 while coordinator.admission.available_permits() != 31 - index {
@@ -761,11 +865,10 @@ async fn publisher_survives_three_admitted_durable_checkpoint_operations() {
     let publisher_active = active.clone();
     let publisher_completed = completed.clone();
     let publisher_overlap = overlap.clone();
-    let publisher_residence = Arc::new(Mutex::new(None));
-    let observed_residence = publisher_residence.clone();
+    let (observed_residence, mut publisher_residence) = tokio::sync::mpsc::unbounded_channel();
     let publisher_queued_at = tokio::time::Instant::now();
     let mut publisher = Box::pin(publisher_coordinator.call(true, move |engine| {
-        *observed_residence.lock().unwrap() = Some(publisher_queued_at.elapsed());
+        let _ = observed_residence.send(publisher_queued_at.elapsed());
         if publisher_active.fetch_add(1, Ordering::SeqCst) != 0 {
             publisher_overlap.store(true, Ordering::SeqCst);
         }
@@ -779,7 +882,7 @@ async fn publisher_survives_three_admitted_durable_checkpoint_operations() {
     // behind all three HTTP calls rather than inferring it from task startup.
     assert!(poll_once(publisher.as_mut()).await.is_none());
     assert_eq!(coordinator.admission.available_permits(), 29);
-    assert_eq!(coordinator.permit.available_permits(), 0);
+    assert!(coordinator.operating());
 
     let mut real_io_times = vec![first_io];
     let mut responses = Vec::new();
@@ -792,15 +895,15 @@ async fn publisher_survives_three_admitted_durable_checkpoint_operations() {
                     .unwrap(),
             );
         }
-        // Completed signing/fsync and the held permit are established before
+        // Completed signing/fsync and the held engine are established before
         // moving the timer clock; host scheduling/disk delay cannot consume
         // another HTTP call's intentional queue-wait margin.
         tokio::time::advance(Duration::from_millis(400)).await;
         if index == 2 {
-            assert_eq!(coordinator.permit.available_permits(), 0);
-            // Poll while the final operation still holds the permit. An old
+            assert!(coordinator.operating());
+            // Poll while the final operation still holds the engine. An old
             // one-second publisher budget must expire here, never win a race
-            // with the subsequent permit release despite being overdue.
+            // with the subsequent engine return despite being overdue.
             publisher_result = poll_once(publisher.as_mut()).await;
         }
         releases.pop_front().unwrap().release();
@@ -821,8 +924,12 @@ async fn publisher_survives_three_admitted_durable_checkpoint_operations() {
         })
         .collect();
     assert_eq!(versions, [1, 2, 3]);
+    let mut residences = Vec::new();
+    while let Ok(residence) = observed_queue_residence.try_recv() {
+        residences.push(residence);
+    }
     assert_eq!(
-        *queue_residence.lock().unwrap(),
+        residences,
         [
             (0, Duration::ZERO),
             (1, Duration::from_millis(400)),
@@ -834,7 +941,7 @@ async fn publisher_survives_three_admitted_durable_checkpoint_operations() {
     assert!(!overlap.load(Ordering::SeqCst));
     assert!(!coordinator.fatal.load(Ordering::SeqCst));
     assert_eq!(coordinator.admission.available_permits(), 32);
-    assert_eq!(coordinator.permit.available_permits(), 1);
+    assert!(!coordinator.operating());
     assert_eq!(
         State::decode(&fs::read(&fixture.config.state_path).unwrap())
             .unwrap()
@@ -847,7 +954,13 @@ async fn publisher_survives_three_admitted_durable_checkpoint_operations() {
         ),
         2
     );
-    let publisher_wait = publisher_residence.lock().unwrap().unwrap();
+    let publisher_wait = publisher_residence
+        .try_recv()
+        .expect("the publisher operation ran");
+    assert!(
+        publisher_residence.try_recv().is_err(),
+        "the publisher operation ran once"
+    );
     assert_eq!(publisher_wait, Duration::from_millis(1200));
     assert!(publisher_wait > STATE_IO_BUDGET);
     assert!(publisher_wait < PUBLISHER_QUEUE_BUDGET);

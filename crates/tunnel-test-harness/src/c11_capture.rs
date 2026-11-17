@@ -13,8 +13,9 @@ use std::{
     io::Write,
     net::{SocketAddr, TcpListener},
     path::{Path, PathBuf},
+    sync::OnceLock,
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
-    sync::{Mutex, OnceLock},
+    sync::mpsc::{SyncSender, sync_channel},
 };
 
 #[cfg(unix)]
@@ -29,14 +30,50 @@ const MAX_MANIFEST_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_RECORD_BYTES: usize = 256 * 1024;
 const MAX_SNAPSHOT_BYTES: usize = 1024 * 1024;
 
-static CAPTURE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static STREAM_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 type RecordedSentinel = (PathBuf, u8, Vec<u8>);
-static RECORDED_SENTINELS: OnceLock<Mutex<BTreeSet<RecordedSentinel>>> = OnceLock::new();
 /// Upper bound on UDP private endpoints one C11 child may hold a TCP twin for.
 const MAX_UDP_ENDPOINT_TWINS: usize = 256;
-type TcpTwins = Mutex<BTreeMap<SocketAddr, TcpListener>>;
-static UDP_ENDPOINT_TWINS: OnceLock<TcpTwins> = OnceLock::new();
+type TcpTwins = BTreeMap<SocketAddr, TcpListener>;
+
+/// Everything a C11 child's capture mutates: the sentinels already written to
+/// the manifest, the held TCP twins, and (implicitly) the capture files.
+#[derive(Default)]
+struct CaptureState {
+    recorded: BTreeSet<RecordedSentinel>,
+    twins: TcpTwins,
+}
+
+type CaptureJob = Box<dyn FnOnce(&mut CaptureState) + Send>;
+
+/// Jobs queued behind the capture owner. A full queue makes the recording
+/// caller wait its turn; a capture record is never dropped or reordered.
+const CAPTURE_QUEUE: usize = 64;
+
+/// The one thread that owns [`CaptureState`] and performs every capture write
+/// in arrival order. It exists only in a C11 child: every entry point returns
+/// before reaching it when `C11_INNER_CAPTURE_DIR` is unset. The hooks are
+/// called from synchronous code, so the owner is an operating-system thread
+/// and a caller waits for its own job's result, exactly as long as the file
+/// write it asked for takes.
+static CAPTURE_OWNER: OnceLock<SyncSender<CaptureJob>> = OnceLock::new();
+
+fn capture_owner() -> &'static SyncSender<CaptureJob> {
+    CAPTURE_OWNER.get_or_init(|| {
+        let (jobs, inbox) = sync_channel::<CaptureJob>(CAPTURE_QUEUE);
+        // If the thread cannot start, `inbox` is dropped with the closure and
+        // every later job reports that the owner stopped.
+        let _ = std::thread::Builder::new()
+            .name("c11-capture".into())
+            .spawn(move || {
+                let mut state = CaptureState::default();
+                for job in inbox {
+                    job(&mut state);
+                }
+            });
+        jobs
+    })
+}
 
 /// Return the opt-in capture directory, if the current process is a C11
 /// child. Ordinary acceptance runs do not pay any I/O cost at all.
@@ -155,22 +192,18 @@ const WIRE_SENTINEL_SLICE: usize = 256;
 /// caller can allocate a different UDP port.  Outside a C11 child this does
 /// nothing and returns `Ok(true)`.
 pub(crate) fn hold_udp_endpoint_tcp_twin(address: SocketAddr) -> Result<bool> {
-    match twin_registry() {
-        Some(twins) => hold_tcp_twin_in(twins, address),
-        None => Ok(true),
+    if capture_dir().is_none() {
+        return Ok(true);
     }
+    hold_twin_with_owner(address)
 }
 
-/// The process-wide twin registry, only in a C11 child.
-fn twin_registry() -> Option<&'static TcpTwins> {
-    capture_dir()?;
-    Some(UDP_ENDPOINT_TWINS.get_or_init(|| Mutex::new(BTreeMap::new())))
+/// Hold `address` in the process-wide twin set; only reached in a C11 child.
+fn hold_twin_with_owner(address: SocketAddr) -> Result<bool> {
+    with_capture_owner(move |state| hold_tcp_twin_in(&mut state.twins, address))
 }
 
-fn hold_tcp_twin_in(twins: &TcpTwins, address: SocketAddr) -> Result<bool> {
-    let mut twins = twins
-        .lock()
-        .map_err(|_| HarnessError::Process("C11 UDP endpoint twin set was poisoned".into()))?;
+fn hold_tcp_twin_in(twins: &mut TcpTwins, address: SocketAddr) -> Result<bool> {
     if twins.contains_key(&address) {
         return Ok(true);
     }
@@ -216,17 +249,23 @@ pub(crate) fn record_udp_endpoint_sentinel(address: SocketAddr) -> Result<()> {
 /// port whose twin is taken is released and another is drawn, within a fixed
 /// bound.
 pub(crate) fn bind_twinned_loopback_udp() -> Result<std::net::UdpSocket> {
-    bind_twinned_loopback_udp_in(twin_registry())
+    if capture_dir().is_none() {
+        return bind_twinned_loopback_udp_in(None);
+    }
+    bind_twinned_loopback_udp_in(Some(&mut hold_twin_with_owner))
 }
 
-fn bind_twinned_loopback_udp_in(twins: Option<&TcpTwins>) -> Result<std::net::UdpSocket> {
+/// `hold` takes the TCP twin of one drawn port; `None` twins nothing.
+fn bind_twinned_loopback_udp_in(
+    mut hold: Option<&mut dyn FnMut(SocketAddr) -> Result<bool>>,
+) -> Result<std::net::UdpSocket> {
     const MAX_ATTEMPTS: usize = 64;
     for _ in 0..MAX_ATTEMPTS {
         let socket = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0))?;
-        let Some(twins) = twins else {
+        let Some(hold) = hold.as_mut() else {
             return Ok(socket);
         };
-        if hold_tcp_twin_in(twins, socket.local_addr()?)? {
+        if hold(socket.local_addr()?)? {
             return Ok(socket);
         }
     }
@@ -255,20 +294,17 @@ fn record_manifest_entry(kind: &'static str, value: &[u8], retired: bool) -> Res
             "C11 sentinel value exceeded its bounded capture limit".into(),
         ));
     }
-    with_capture_lock(|| {
-        let recorded = RECORDED_SENTINELS.get_or_init(|| Mutex::new(BTreeSet::new()));
-        let mut recorded = recorded
-            .lock()
-            .map_err(|_| HarnessError::Process("C11 sentinel set was poisoned".into()))?;
-        let kind_code = if retired {
-            kind_code | RETIRED_SENTINEL_FLAG
-        } else {
-            kind_code
-        };
-        let key = (directory.clone(), kind_code, value.to_vec());
-        if recorded.contains(&key) {
-            return Ok(());
+    let kind_code = if retired {
+        kind_code | RETIRED_SENTINEL_FLAG
+    } else {
+        kind_code
+    };
+    let key = (directory.clone(), kind_code, value.to_vec());
+    let newly_recorded = with_capture_owner(move |state| {
+        if state.recorded.contains(&key) {
+            return Ok(false);
         }
+        let value = &key.2;
         let path = directory.join(MANIFEST_FILE);
         let existing = existing_regular_file_len(&path, "C11 sentinel manifest")?;
         let record_bytes = 1_u64
@@ -287,12 +323,15 @@ fn record_manifest_entry(kind: &'static str, value: &[u8], retired: bool) -> Res
             .and_then(|_| file.write_all(&length.to_le_bytes()))
             .and_then(|_| file.write_all(value))
             .map_err(|_| HarnessError::Process("C11 sentinel manifest write failed".into()))?;
-        recorded.insert(key);
-        if !retired {
-            plant_witness_leak(kind, value);
-        }
-        Ok(())
-    })
+        state.recorded.insert(key);
+        Ok(true)
+    })?;
+    // Emitted on the recording caller's thread, after the manifest holds the
+    // value, so the event reaches whichever subscriber that caller runs under.
+    if newly_recorded && !retired {
+        plant_witness_leak(kind, value);
+    }
+    Ok(())
 }
 
 /// Names the one sentinel kind the M0-08 witness control plants.
@@ -366,9 +405,10 @@ pub(crate) fn record_process_streams(
     let safe_name = safe_component(name);
     let sequence = STREAM_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let prefix = format!("managed-{}-{sequence}-{safe_name}", pid.unwrap_or(0));
-    with_capture_lock(|| {
-        write_new(&directory.join(format!("{prefix}.stdout")), stdout)?;
-        write_new(&directory.join(format!("{prefix}.stderr")), stderr)
+    let (stdout, stderr) = (stdout.to_vec(), stderr.to_vec());
+    with_capture_owner(move |_| {
+        write_new(&directory.join(format!("{prefix}.stdout")), &stdout)?;
+        write_new(&directory.join(format!("{prefix}.stderr")), &stderr)
     })
 }
 
@@ -386,7 +426,8 @@ pub(crate) fn record_snapshot(role: &str, bytes: &[u8]) -> Result<()> {
         ));
     }
     let path = directory.join(format!("snapshot-{}.bin", safe_component(role)));
-    with_capture_lock(|| {
+    let bytes = bytes.to_vec();
+    with_capture_owner(move |_| {
         let existing = existing_regular_file_len(&path, "C11 snapshot")?;
         let length = u32::try_from(bytes.len()).map_err(|_| {
             HarnessError::Process("C11 snapshot length exceeded its bounded limit".into())
@@ -399,17 +440,26 @@ pub(crate) fn record_snapshot(role: &str, bytes: &[u8]) -> Result<()> {
         }
         let mut file = open_private_append(&path, "C11 snapshot")?;
         file.write_all(&length.to_le_bytes())
-            .and_then(|_| file.write_all(bytes))
+            .and_then(|_| file.write_all(&bytes))
             .map_err(|_| HarnessError::Process("C11 snapshot write failed".into()))
     })
 }
 
-fn with_capture_lock<T>(operation: impl FnOnce() -> Result<T>) -> Result<T> {
-    let lock = CAPTURE_LOCK.get_or_init(|| Mutex::new(()));
-    let _guard = lock
-        .lock()
-        .map_err(|_| HarnessError::Process("C11 capture lock was poisoned".into()))?;
-    operation()
+/// Run `operation` on the capture owner and wait for its result.
+fn with_capture_owner<T: Send + 'static>(
+    operation: impl FnOnce(&mut CaptureState) -> Result<T> + Send + 'static,
+) -> Result<T> {
+    let (reply, outcome) = sync_channel(1);
+    capture_owner()
+        .send(Box::new(move |state| {
+            let _ = reply.send(operation(state));
+        }))
+        .map_err(|_| capture_owner_stopped())?;
+    outcome.recv().map_err(|_| capture_owner_stopped())?
+}
+
+fn capture_owner_stopped() -> HarnessError {
+    HarnessError::Process("C11 capture owner stopped".into())
 }
 
 fn write_new(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -520,17 +570,13 @@ pub(crate) fn harden_capture_directory(_path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        TcpTwins, UDP_ENDPOINT_TWINS, bind_twinned_loopback_udp, bind_twinned_loopback_udp_in,
+        CAPTURE_OWNER, TcpTwins, bind_twinned_loopback_udp, bind_twinned_loopback_udp_in,
         capture_dir, hold_tcp_twin_in,
     };
-    use std::{
-        collections::BTreeMap,
-        net::{Ipv4Addr, SocketAddr, TcpListener, UdpSocket},
-        sync::Mutex,
-    };
+    use std::net::{Ipv4Addr, SocketAddr, TcpListener, UdpSocket};
 
     fn registry() -> TcpTwins {
-        Mutex::new(BTreeMap::new())
+        TcpTwins::new()
     }
 
     /// Fresh UDP ports tried before a TCP bind on the same number must succeed.
@@ -576,21 +622,24 @@ mod tests {
 
     #[test]
     fn a_held_twin_takes_the_udp_port_number_out_of_the_tcp_pool() {
-        let twins = registry();
-        let udp = bind_twinned_loopback_udp_in(Some(&twins)).expect("twinned UDP bind");
+        let mut twins = registry();
+        let udp = bind_twinned_loopback_udp_in(Some(&mut |address| {
+            hold_tcp_twin_in(&mut twins, address)
+        }))
+        .expect("twinned UDP bind");
         let address = udp.local_addr().expect("UDP address");
         let error = TcpListener::bind(address)
             .expect_err("a held twin must leave no TCP socket able to take this port");
         assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse);
-        assert!(twins.lock().expect("twins").contains_key(&address));
+        assert!(twins.contains_key(&address));
         // Holding the same endpoint again is idempotent.
-        assert!(hold_tcp_twin_in(&twins, address).expect("hold again"));
-        assert_eq!(twins.lock().expect("twins").len(), 1);
+        assert!(hold_tcp_twin_in(&mut twins, address).expect("hold again"));
+        assert_eq!(twins.len(), 1);
     }
 
     #[test]
     fn a_port_number_a_tcp_socket_already_holds_is_refused_for_a_redraw() {
-        let twins = registry();
+        let mut twins = registry();
         // Find a TCP port whose UDP number is also free, then hold it on TCP.
         let (tcp, udp) = (0..64)
             .find_map(|_| {
@@ -601,10 +650,10 @@ mod tests {
             .expect("a port free on both TCP and UDP");
         let address: SocketAddr = udp.local_addr().expect("UDP address");
         assert!(
-            !hold_tcp_twin_in(&twins, address).expect("hold attempt"),
+            !hold_tcp_twin_in(&mut twins, address).expect("hold attempt"),
             "a port a TCP socket already holds cannot be twinned"
         );
-        assert!(twins.lock().expect("twins").is_empty());
+        assert!(twins.is_empty());
         drop(tcp);
     }
 
@@ -630,8 +679,8 @@ mod tests {
     /// M7-C166: the real gate that decides whether a process is a C11 child.
     ///
     /// `bind_twinned_loopback_udp()` chooses its registry through
-    /// `twin_registry()`, which reads `C11_INNER_CAPTURE_DIR` and creates a
-    /// process-wide registry once.  So the probe runs in a fresh copy of this
+    /// `capture_dir()`, which reads `C11_INNER_CAPTURE_DIR`, and a C11 child
+    /// creates the process-wide registry's owner once.  So the probe runs in a fresh copy of this
     /// test binary with that variable removed: no other test can have created
     /// the registry there, and the parent's environment cannot leak in.
     ///
@@ -680,8 +729,8 @@ mod tests {
             udp.local_addr().expect("UDP address")
         );
         assert!(
-            UDP_ENDPOINT_TWINS.get().is_none(),
-            "outside a C11 child the twin registry must never be created"
+            CAPTURE_OWNER.get().is_none(),
+            "outside a C11 child the twin registry's owner must never be created"
         );
         println!("{TWIN_GATE_WITNESS}");
     }

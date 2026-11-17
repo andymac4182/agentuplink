@@ -50,10 +50,9 @@
 //! or payload is retained.
 
 use std::{
-    collections::BTreeMap,
     sync::{
-        Arc, LazyLock, Mutex, PoisonError,
-        atomic::{AtomicU64, Ordering},
+        Arc, LazyLock,
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -166,16 +165,13 @@ struct NamedCounters {
 
 static PROCESS_EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
 
-static NAMED: LazyLock<Mutex<BTreeMap<&'static str, Arc<NamedCounters>>>> =
-    LazyLock::new(|| Mutex::new(BTreeMap::new()));
+/// One entry per listener name, created on first use and never removed.  The
+/// registry is append-only, so reading it never waits for a registration.
+static NAMED: crate::log_limit::StaticKeyRegistry<Arc<NamedCounters>> =
+    crate::log_limit::StaticKeyRegistry::new();
 
 fn named(listener: &'static str) -> Arc<NamedCounters> {
-    NAMED
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .entry(listener)
-        .or_default()
-        .clone()
+    NAMED.get_or_insert_with(listener, Arc::default).clone()
 }
 
 /// Milliseconds since the process epoch, plus one, so zero can mean "never".
@@ -193,9 +189,7 @@ fn window_ms() -> u64 {
 /// name order.
 pub fn listener_fairness() -> Vec<ListenerFairnessSnapshot> {
     let now = now_mark();
-    NAMED
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
+    let mut snapshots: Vec<ListenerFairnessSnapshot> = NAMED
         .iter()
         .map(|(listener, counters)| {
             let last = counters.last_full_ms.load(Ordering::Acquire);
@@ -208,7 +202,9 @@ pub fn listener_fairness() -> Vec<ListenerFairnessSnapshot> {
                 recycled: counters.recycled.load(Ordering::Acquire),
             }
         })
-        .collect()
+        .collect();
+    snapshots.sort_unstable_by_key(|snapshot| snapshot.listener);
+    snapshots
 }
 
 /// One listener instance's pressure state.  Only the accept loop writes it.
@@ -301,12 +297,18 @@ fn random_u64() -> u64 {
     hasher.finish()
 }
 
-#[derive(Debug, Default)]
-struct TurnoverCounts {
-    requests: u64,
-    episode: u64,
-    requests_before_episode: u64,
-    recycled: bool,
+/// Bits of the packed episode mark that hold the request baseline.
+const BASELINE_BITS: u32 = 36;
+const BASELINE_MASK: u64 = (1 << BASELINE_BITS) - 1;
+
+/// Pack the episode this connection last answered in with the number of
+/// requests it had dispatched before that episode's first response.  The two
+/// must be read and replaced together, so they share one atomic word: the
+/// episode keeps its low 28 bits (it is only ever compared for equality, and
+/// episodes start at least [`PRESSURE_WINDOW`] apart) and the baseline
+/// saturates at 2^36 - 1 requests.
+fn pack_episode_mark(episode: u64, requests_before_episode: u64) -> u64 {
+    (episode << BASELINE_BITS) | requests_before_episode.min(BASELINE_MASK)
 }
 
 /// One served connection's turnover state.
@@ -317,7 +319,12 @@ pub(crate) struct ConnectionTurnover {
     age_budget: Duration,
     pressure: Arc<ListenerPressure>,
     started_ms: u64,
-    counts: Mutex<TurnoverCounts>,
+    /// Requests dispatched on this connection.
+    requests: AtomicU64,
+    /// `(episode, requests_before_episode)`; see [`pack_episode_mark`].
+    episode_mark: AtomicU64,
+    /// Set by the one response that recycles this connection.
+    recycled: AtomicBool,
     /// Cancelled once an HTTP/2 connection is to send GOAWAY.
     pub(crate) goaway: CancellationToken,
 }
@@ -329,15 +336,16 @@ impl ConnectionTurnover {
             age_budget: jittered_age(policy.max_age, random_u64()),
             pressure,
             started_ms: now_mark(),
-            counts: Mutex::new(TurnoverCounts::default()),
+            requests: AtomicU64::new(0),
+            episode_mark: AtomicU64::new(pack_episode_mark(0, 0)),
+            recycled: AtomicBool::new(false),
             goaway: CancellationToken::new(),
         })
     }
 
     /// Count one dispatched request.
     pub(crate) fn on_request(&self) {
-        let mut counts = self.counts.lock().unwrap_or_else(PoisonError::into_inner);
-        counts.requests = counts.requests.saturating_add(1);
+        self.requests.fetch_add(1, Ordering::AcqRel);
     }
 
     /// Whether this connection is to close after the response now being
@@ -347,26 +355,40 @@ impl ConnectionTurnover {
         let Some((episode, episode_start)) = self.pressure.current(now) else {
             return false;
         };
-        let mut counts = self.counts.lock().unwrap_or_else(PoisonError::into_inner);
-        if counts.recycled {
+        if self.recycled.load(Ordering::Acquire) {
             return false;
         }
-        if counts.episode != episode {
-            // First response this connection returns in this episode: the
-            // request being answered is the first counted in it.
-            counts.episode = episode;
-            counts.requests_before_episode = counts.requests.saturating_sub(1);
+        let episode = episode & (u64::MAX >> BASELINE_BITS);
+        // The first response this connection returns in this episode fixes
+        // the baseline: the request being answered is the first counted in
+        // it.  Concurrent responses race for that with a compare-and-swap, so
+        // exactly one baseline is recorded per episode.
+        let mut mark = self.episode_mark.load(Ordering::Acquire);
+        while mark >> BASELINE_BITS != episode {
+            let baseline = self.requests.load(Ordering::Acquire).saturating_sub(1);
+            let entered = pack_episode_mark(episode, baseline);
+            match self.episode_mark.compare_exchange(
+                mark,
+                entered,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => mark = entered,
+                Err(current) => mark = current,
+            }
         }
         let from = self.started_ms.max(episode_start);
         let age = Duration::from_millis(now.saturating_sub(from));
-        let served = counts
+        let served = self
             .requests
-            .saturating_sub(counts.requests_before_episode);
+            .load(Ordering::Acquire)
+            .saturating_sub(mark & BASELINE_MASK);
         if age < self.age_budget && served < self.policy.max_requests {
             return false;
         }
-        counts.recycled = true;
-        drop(counts);
+        if self.recycled.swap(true, Ordering::AcqRel) {
+            return false;
+        }
         self.pressure.record_recycle();
         true
     }

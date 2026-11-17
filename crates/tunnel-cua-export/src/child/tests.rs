@@ -109,12 +109,15 @@ async fn dropping_the_handle_ends_the_backend() {
     let counters = Arc::new(ChildCounters::default());
     let (pid, mut finished) = {
         let child = spawn(&sleeper(workspace.path()), &counters).expect("started");
-        (child.pid(), child.exited.clone())
+        (child.pid(), child.phase.subscribe())
     };
-    tokio::time::timeout(Duration::from_secs(10), finished.wait_for(|done| *done))
-        .await
-        .expect("the supervisor finished within the bound after the drop")
-        .expect("the supervisor reported its end rather than vanishing");
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        finished.wait_for(|phase| *phase == ChildPhase::Exited),
+    )
+    .await
+    .expect("the supervisor finished within the bound after the drop")
+    .expect("the supervisor reported its end rather than vanishing");
     assert!(!is_live(wait_not_alive(pid).await.as_ref()));
     assert_eq!(
         counters.killed.load(Ordering::Relaxed),
@@ -224,4 +227,85 @@ async fn the_backends_environment_is_cleared_before_anything_is_set() {
         !names.contains(&"PATH"),
         "the environment was cleared, so an inherited PATH is absent: {names:?}"
     );
+}
+
+#[test]
+fn every_legal_phase_transition_reaches_the_phase_it_names() {
+    use ChildTransition::{KillRequested, Reaped};
+    assert_eq!(
+        ChildPhase::Running.on_event(KillRequested),
+        Ok(ChildPhase::KillRequested)
+    );
+    assert_eq!(ChildPhase::Running.on_event(Reaped), Ok(ChildPhase::Exited));
+    assert_eq!(
+        ChildPhase::KillRequested.on_event(Reaped),
+        Ok(ChildPhase::Exited)
+    );
+}
+
+#[test]
+fn a_repeated_request_a_late_request_and_a_second_reap_are_refused() {
+    use ChildTransition::{KillRequested, Reaped};
+    assert_eq!(
+        ChildPhase::KillRequested.on_event(KillRequested),
+        Err(IllegalChildTransition)
+    );
+    assert_eq!(
+        ChildPhase::Exited.on_event(KillRequested),
+        Err(IllegalChildTransition)
+    );
+    assert_eq!(
+        ChildPhase::Exited.on_event(Reaped),
+        Err(IllegalChildTransition)
+    );
+}
+
+#[test]
+fn the_published_phase_changes_only_on_a_legal_step() {
+    let phase = watch::Sender::new(ChildPhase::Running);
+    assert!(apply(&phase, ChildTransition::KillRequested));
+    assert!(!apply(&phase, ChildTransition::KillRequested));
+    assert_eq!(*phase.borrow(), ChildPhase::KillRequested);
+    assert!(apply(&phase, ChildTransition::Reaped));
+    assert!(!apply(&phase, ChildTransition::KillRequested));
+    assert_eq!(*phase.borrow(), ChildPhase::Exited);
+}
+
+/// The owner's handle and the supervising task both hold the phase channel
+/// open, so a supervising task that is dropped rather than run to its end --
+/// here, by tearing its runtime down -- must still publish the terminal
+/// phase, or `wait_exited` never resolves. One backend's supervisor has been
+/// polled and is parked in its `select!`; the other's was never polled. Both
+/// groups are signalled on the way out, because nothing else would.
+#[test]
+fn waiters_resolve_when_the_supervising_task_is_dropped() {
+    fn runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime")
+    }
+    let workspace = tempfile::tempdir().expect("workspace");
+    let counters = Arc::new(ChildCounters::default());
+    let first = runtime();
+    let (polled, unpolled) = first.block_on(async {
+        let polled = spawn(&sleeper(workspace.path()), &counters).expect("started");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let unpolled = spawn(&sleeper(workspace.path()), &counters).expect("started");
+        (polled, unpolled)
+    });
+    assert!(!polled.has_exited());
+    assert!(!unpolled.has_exited());
+    drop(first);
+
+    runtime().block_on(async {
+        for child in [&polled, &unpolled] {
+            tokio::time::timeout(Duration::from_secs(10), child.wait_exited())
+                .await
+                .expect("a dropped supervisor still publishes the terminal phase");
+            assert_eq!(child.phase(), ChildPhase::Exited);
+            let row = wait_not_alive(child.pid()).await;
+            assert!(!is_live(row.as_ref()), "the backend is gone: {row:?}");
+        }
+    });
 }

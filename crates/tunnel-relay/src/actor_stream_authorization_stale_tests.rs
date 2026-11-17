@@ -75,7 +75,6 @@ async fn check(case: Case, expected_reason: Option<u16>, expected_close: Option<
     let (data_tx, _data_rx) = mpsc::channel(actor.options.limits.max_queue_messages);
     let session = actor.sessions.get_mut(&key.scope()).expect("session");
     session.profile = RuntimeProfile::M2;
-    session.data_tx = Some(data_tx.clone());
     session.active_carrier = Some(DataCarrier {
         context: CarrierContext::new(key.session_id.clone(), key.epoch, 1, "m4c70-data"),
         tx: data_tx,
@@ -108,7 +107,9 @@ async fn check(case: Case, expected_reason: Option<u16>, expected_close: Option<
             .streams
             .get_mut(&stream_id)
             .expect("stream");
-        stream.open_pending = false;
+        stream
+            .admission
+            .apply(crate::actor::AdmissionEvent::Admitted);
         stream.authorization_in_flight = true;
         stream.challenge_id = Some(challenge_id.into());
         if matches!(

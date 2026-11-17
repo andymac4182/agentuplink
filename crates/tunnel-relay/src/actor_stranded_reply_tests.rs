@@ -10,10 +10,7 @@
 //! does after `run()` returns or panics.
 
 use std::{
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::{Arc, atomic::AtomicBool},
     time::Duration,
 };
 
@@ -55,8 +52,8 @@ async fn stranded_handle() -> (RelayHandle, JoinHandle<mpsc::Receiver<Command>>)
     handle.maintenance_completion = ActorCompletion::default();
     handle.maintenance_completion.mark_done(false);
     handle.background_failure = Arc::new(AtomicBool::new(false));
-    handle.actor_task = Arc::new(Mutex::new(None));
-    handle.maintenance_task = Arc::new(Mutex::new(None));
+    handle.actor_task = None;
+    handle.maintenance_task = None;
     let completion = handle.actor_completion.clone();
     let owner = tokio::spawn(async move {
         // Wait until the caller's send has stored its command, then end
@@ -311,29 +308,19 @@ async fn a_reply_sent_before_the_actor_ended_is_still_returned() {
 #[tokio::test]
 async fn aborting_the_actor_and_maintenance_tasks_records_their_completion() {
     let handle = spawned_handle();
-    let actor = handle
-        .actor_task
-        .lock()
-        .expect("actor slot")
-        .take()
-        .expect("actor task");
-    let maintenance = handle
-        .maintenance_task
-        .lock()
-        .expect("maintenance slot")
-        .take()
-        .expect("maintenance task");
-    actor.abort();
-    maintenance.abort();
-    let _ = actor.await;
-    let _ = maintenance.await;
+    let actor = handle.actor_task.clone().expect("actor task");
+    let maintenance = handle.maintenance_task.clone().expect("maintenance task");
+    actor.abort.abort();
+    maintenance.abort.abort();
+    actor.exited.cancelled().await;
+    maintenance.exited.cancelled().await;
     assert!(
-        handle.actor_completion.done.load(Ordering::Acquire),
+        handle.actor_completion.is_done(),
         "an aborted actor task left its completion unset"
     );
     assert!(handle.actor_completion.failed());
     assert!(
-        handle.maintenance_completion.done.load(Ordering::Acquire),
+        handle.maintenance_completion.is_done(),
         "an aborted maintenance task left its completion unset"
     );
     let outcome = timeout(BOUND, handle.snapshot())
@@ -349,16 +336,11 @@ async fn aborting_the_actor_and_maintenance_tasks_records_their_completion() {
 #[tokio::test]
 async fn an_aborted_maintenance_task_is_done_without_ever_failing() {
     let handle = spawned_handle();
-    let maintenance = handle
-        .maintenance_task
-        .lock()
-        .expect("maintenance slot")
-        .take()
-        .expect("maintenance task");
-    maintenance.abort();
-    let _ = maintenance.await;
+    let maintenance = handle.maintenance_task.clone().expect("maintenance task");
+    maintenance.abort.abort();
+    maintenance.exited.cancelled().await;
     assert!(
-        handle.maintenance_completion.done.load(Ordering::Acquire),
+        handle.maintenance_completion.is_done(),
         "an aborted maintenance task left its completion unset"
     );
     assert!(
@@ -375,7 +357,7 @@ async fn an_aborted_maintenance_task_is_done_without_ever_failing() {
 
     let handle = spawned_handle();
     handle.abort_maintenance_task().await;
-    assert!(handle.maintenance_completion.done.load(Ordering::Acquire));
+    assert!(handle.maintenance_completion.is_done());
     assert!(
         !handle.maintenance_completion.failed(),
         "abort_maintenance_task recorded the abort as a failure"
@@ -501,7 +483,7 @@ async fn a_shutdown_stranded_after_its_completion_check_returns_shutdown() {
     let (handle, owner) = stranded_handle().await;
     // The owner is still running when shutdown() checks completion, so the
     // Shutdown command is sent and then stranded.
-    assert!(!handle.actor_completion.done.load(Ordering::Acquire));
+    assert!(!handle.actor_completion.is_done());
     let outcome = timeout(BOUND, handle.shutdown())
         .await
         .expect("a shutdown stranded behind an ended actor waited for a reply it could never get");

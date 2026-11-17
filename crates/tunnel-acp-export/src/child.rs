@@ -47,8 +47,9 @@
 //!   ships a fixture that demonstrates the escape rather than a claim that it
 //!   does not exist. Group signalling is Unix-only; macOS is the only host this
 //!   has run on.
-//! * No lock is held across child I/O: a writer task owns stdin, a reader task
-//!   owns stdout and a supervisor task owns the process.
+//! * Nothing is shared across child I/O but the child's published phase: a
+//!   writer task owns stdin, a reader task owns stdout and a supervisor task
+//!   owns the process.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -59,7 +60,6 @@ use bytes::Bytes;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::{mpsc, watch};
-use tokio_util::sync::CancellationToken;
 use tunnel_acp::is_accepted_method;
 use tunnel_acp::message::{AcpMessage, AcpRule, parse_message};
 
@@ -172,12 +172,142 @@ impl core::fmt::Display for SpawnError {
 
 impl std::error::Error for SpawnError {}
 
+/// Where one child process is in its life.
+///
+/// A kill can be asked for before the reap or after it, and the I/O tasks
+/// stop on the request either way -- after a natural exit that is what ends a
+/// reader whose pipe a descendant outside the group still holds open.  So
+/// "reaped" remembers whether a stop was ever requested.  Whether stdin is
+/// still open is orthogonal and is the stdin queue's own state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ChildPhase {
+    /// Spawned; nobody has asked for it to end and it has not been reaped.
+    Running,
+    /// A kill was asked for and the reap has not happened yet.
+    KillRequested,
+    /// Reaped, its group signalled and its sentinel resolved.
+    Exited {
+        /// Whether a kill was asked for, before the reap or after it.
+        stop_requested: bool,
+    },
+}
+
+/// What can happen to a child's phase.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ChildTransition {
+    /// The owner, the reader or a dropped handle asked for the child to end.
+    KillRequested,
+    /// The supervising task reaped the process.
+    Reaped,
+}
+
+/// A transition the phase refuses: a repeated kill request, or a second reap.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IllegalChildTransition;
+
+impl ChildPhase {
+    /// The only place a child's phase changes.
+    ///
+    /// # Errors
+    /// [`IllegalChildTransition`] when the event changes nothing: a kill
+    /// already requested, or a process already reaped.
+    pub const fn on_event(self, event: ChildTransition) -> Result<Self, IllegalChildTransition> {
+        match (self, event) {
+            (Self::Running, ChildTransition::KillRequested) => Ok(Self::KillRequested),
+            (Self::Running, ChildTransition::Reaped) => Ok(Self::Exited {
+                stop_requested: false,
+            }),
+            (Self::KillRequested, ChildTransition::Reaped)
+            | (
+                Self::Exited {
+                    stop_requested: false,
+                },
+                ChildTransition::KillRequested,
+            ) => Ok(Self::Exited {
+                stop_requested: true,
+            }),
+            (Self::KillRequested, ChildTransition::KillRequested)
+            | (
+                Self::Exited {
+                    stop_requested: true,
+                },
+                ChildTransition::KillRequested,
+            )
+            | (Self::Exited { .. }, ChildTransition::Reaped) => Err(IllegalChildTransition),
+        }
+    }
+
+    /// Whether anything has asked for the child to end.
+    #[must_use]
+    pub const fn stop_requested(self) -> bool {
+        matches!(
+            self,
+            Self::KillRequested
+                | Self::Exited {
+                    stop_requested: true
+                }
+        )
+    }
+
+    /// Whether the process has been reaped.
+    #[must_use]
+    pub const fn is_exited(self) -> bool {
+        matches!(self, Self::Exited { .. })
+    }
+}
+
+/// The one published phase of a child, and the only way to change it.
+///
+/// Every holder shares one `watch` value.  Each writer applies exactly one
+/// [`ChildPhase::on_event`] step to it; nothing else is ever done under the
+/// channel, so readers sample a phase and never a half-applied one.
+#[derive(Clone, Debug)]
+pub(crate) struct PhaseCell(watch::Sender<ChildPhase>);
+
+impl PhaseCell {
+    fn new() -> Self {
+        Self(watch::Sender::new(ChildPhase::Running))
+    }
+
+    /// Apply one transition.  Returns whether the phase changed.
+    fn apply(&self, event: ChildTransition) -> bool {
+        self.0
+            .send_if_modified(|phase| match phase.on_event(event) {
+                Ok(next) => {
+                    *phase = next;
+                    true
+                }
+                Err(IllegalChildTransition) => false,
+            })
+    }
+
+    /// Ask for the child to end.  Idempotent.
+    pub(crate) fn request_kill(&self) {
+        let _ = self.apply(ChildTransition::KillRequested);
+    }
+
+    fn get(&self) -> ChildPhase {
+        *self.0.borrow()
+    }
+
+    /// Resolves once a stop has been requested, whenever that was.
+    pub(crate) async fn stop_requested(&self) {
+        let mut phase = self.0.subscribe();
+        let _ = phase.wait_for(|phase| phase.stop_requested()).await;
+    }
+
+    /// Resolves once the process has been reaped.
+    async fn exited(&self) {
+        let mut phase = self.0.subscribe();
+        let _ = phase.wait_for(|phase| phase.is_exited()).await;
+    }
+}
+
 /// The owner's handle. Dropping it kills the child's process group.
 #[derive(Debug)]
 pub struct ChildHandle {
     stdin: mpsc::Sender<Bytes>,
-    kill: CancellationToken,
-    exited: watch::Receiver<bool>,
+    phase: PhaseCell,
     pid: Option<u32>,
 }
 
@@ -205,18 +335,18 @@ impl ChildHandle {
 
     /// Kill the child now.
     pub fn kill(&self) {
-        self.kill.cancel();
+        self.phase.request_kill();
+    }
+
+    /// The child's current phase.
+    #[must_use]
+    pub fn phase(&self) -> ChildPhase {
+        self.phase.get()
     }
 
     /// Resolves once the process has been reaped.
     pub async fn wait_exited(&self) {
-        let mut exited = self.exited.clone();
-        let _ = exited.wait_for(|done| *done).await;
-    }
-
-    #[must_use]
-    pub fn kill_token(&self) -> CancellationToken {
-        self.kill.clone()
+        self.phase.exited().await;
     }
 }
 
@@ -241,8 +371,8 @@ impl Drop for ChildHandle {
     /// theoretical — but it is narrowed, not eliminated, and saying otherwise
     /// would be the kind of claim this chunk is not allowed to make.
     fn drop(&mut self) {
-        self.kill.cancel();
-        if !*self.exited.borrow() {
+        self.phase.request_kill();
+        if !self.phase.get().is_exited() {
             let _ = kill_group(self.pid);
         }
     }
@@ -308,17 +438,16 @@ pub fn spawn(
         counters.deadman_armed.fetch_add(1, Ordering::Relaxed);
     }
 
-    let kill = CancellationToken::new();
-    let (exited_tx, exited_rx) = watch::channel(false);
+    let phase = PhaseCell::new();
     let (stdin_tx, stdin_rx) = mpsc::channel(STDIN_QUEUE);
     let (events_tx, events_rx) = mpsc::channel(STDOUT_QUEUE);
 
-    tokio::spawn(write_stdin(stdin, stdin_rx, kill.clone()));
+    tokio::spawn(write_stdin(stdin, stdin_rx, phase.clone()));
     tokio::spawn(read_stdout(
         stdout,
         events_tx,
         config.message_limit,
-        kill.clone(),
+        phase.clone(),
         Arc::clone(counters),
     ));
     tokio::spawn(drain_stderr(
@@ -327,19 +456,27 @@ pub fn spawn(
         Arc::clone(counters),
     ));
     let supervisor_counters = Arc::clone(counters);
-    let supervisor_kill = kill.clone();
+    let mut supervised = ReapGuard {
+        phase: phase.clone(),
+        group,
+        reaped: false,
+        child,
+    };
     tokio::spawn(async move {
         tokio::select! {
-            _ = child.wait() => {}
-            () = supervisor_kill.cancelled() => {
+            _ = supervised.child.wait() => {}
+            () = supervised.phase.stop_requested() => {
                 supervisor_counters.killed.fetch_add(1, Ordering::Relaxed);
                 // Signal the group while its leader is still unreaped, so the
                 // group id cannot have been reissued to another process.
                 let _ = kill_group(group);
-                let _ = child.start_kill();
-                let _ = child.wait().await;
+                let _ = supervised.child.start_kill();
+                let _ = supervised.child.wait().await;
             }
         }
+        // The leader is reaped and the group signal follows with no await
+        // between: from here the guard must not signal the group again.
+        supervised.reaped = true;
         // Whatever ended the leader, no member of its group may outlive it.
         if kill_group(group) {
             supervisor_counters
@@ -388,18 +525,50 @@ pub fn spawn(
                     .fetch_add(1, Ordering::Relaxed);
             }
         }
-        let _ = exited_tx.send(true);
+        // The guard publishes `Reaped`, here and on no other orderly path.
+        drop(supervised);
     });
 
     Ok((
         ChildHandle {
             stdin: stdin_tx,
-            kill,
-            exited: exited_rx,
+            phase,
             pid: group,
         },
         events_rx,
     ))
+}
+
+/// Publishes the terminal phase when the supervising task ends, **however it
+/// ends**.
+///
+/// Every holder of the phase keeps the channel open, so a supervising task
+/// that is dropped instead of run to its end -- a runtime torn down, a panic
+/// -- would otherwise leave [`ChildHandle::wait_exited`] pending for ever.  The task
+/// owns this guard from the moment it is created, before it is first polled,
+/// so there is no way for the task to go away without the phase reaching
+/// `Exited`.
+///
+/// On that abnormal path the guard also signals the group, while the leader
+/// is still unreaped: `child` is a field, so it is dropped (and
+/// `kill_on_drop` kills the leader) only after this `Drop` has run.  The
+/// owner's handle skips its own group signal once the phase says exited, so
+/// the signal must not be left to it.
+struct ReapGuard {
+    phase: PhaseCell,
+    group: Option<u32>,
+    /// Whether the task reaped the leader; it signals the group itself then.
+    reaped: bool,
+    child: tokio::process::Child,
+}
+
+impl Drop for ReapGuard {
+    fn drop(&mut self) {
+        if !self.reaped {
+            let _ = kill_group(self.group);
+        }
+        let _ = self.phase.apply(ChildTransition::Reaped);
+    }
 }
 
 /// Send `SIGKILL` to the process group led by `leader`. Returns whether a
@@ -425,16 +594,16 @@ fn kill_group(_leader: Option<u32>) -> bool {
 async fn write_stdin(
     mut stdin: tokio::process::ChildStdin,
     mut lines: mpsc::Receiver<Bytes>,
-    kill: CancellationToken,
+    kill: PhaseCell,
 ) {
     loop {
         let line = tokio::select! {
-            () = kill.cancelled() => return,
+            () = kill.stop_requested() => return,
             line = lines.recv() => line,
         };
         let Some(line) = line else { return };
         let written = tokio::select! {
-            () = kill.cancelled() => return,
+            () = kill.stop_requested() => return,
             written = async {
                 stdin.write_all(&line).await?;
                 stdin.flush().await
@@ -450,7 +619,7 @@ async fn read_stdout(
     stdout: tokio::process::ChildStdout,
     events: mpsc::Sender<ChildEvent>,
     limit: u64,
-    kill: CancellationToken,
+    kill: PhaseCell,
     counters: Arc<ChildCounters>,
 ) {
     let limit = usize::try_from(limit).unwrap_or(usize::MAX);
@@ -458,7 +627,7 @@ async fn read_stdout(
     let mut line: Vec<u8> = Vec::new();
     let end = loop {
         let buffer = tokio::select! {
-            () = kill.cancelled() => break ChildEnd::Closed,
+            () = kill.stop_requested() => break ChildEnd::Closed,
             buffer = reader.fill_buf() => buffer,
         };
         let buffer = match buffer {
@@ -513,14 +682,14 @@ async fn read_stdout(
         ChildEnd::OversizedLine => {
             counters.oversized_output.fetch_add(1, Ordering::Relaxed);
             counters.invalid_output.fetch_add(1, Ordering::Relaxed);
-            kill.cancel();
+            kill.request_kill();
         }
         ChildEnd::InvalidLine(rule) => {
             if rule == AcpRule::BatchNotSupported {
                 counters.batch_output.fetch_add(1, Ordering::Relaxed);
             }
             counters.invalid_output.fetch_add(1, Ordering::Relaxed);
-            kill.cancel();
+            kill.request_kill();
         }
         ChildEnd::Closed | ChildEnd::ReadFailed => {}
     }
@@ -555,5 +724,119 @@ async fn drain_stderr(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod phase_tests {
+    use super::{ChildPhase, ChildTransition, IllegalChildTransition, PhaseCell};
+
+    const NATURAL: ChildPhase = ChildPhase::Exited {
+        stop_requested: false,
+    };
+    const STOPPED: ChildPhase = ChildPhase::Exited {
+        stop_requested: true,
+    };
+
+    #[test]
+    fn every_legal_transition_reaches_the_phase_it_names() {
+        use ChildTransition::{KillRequested, Reaped};
+        assert_eq!(
+            ChildPhase::Running.on_event(KillRequested),
+            Ok(ChildPhase::KillRequested)
+        );
+        assert_eq!(ChildPhase::Running.on_event(Reaped), Ok(NATURAL));
+        assert_eq!(ChildPhase::KillRequested.on_event(Reaped), Ok(STOPPED));
+        // A kill asked for after a natural exit is remembered, so an I/O task
+        // still waiting on an inherited pipe stops.
+        assert_eq!(NATURAL.on_event(KillRequested), Ok(STOPPED));
+    }
+
+    #[test]
+    fn a_repeated_request_and_a_second_reap_are_refused() {
+        use ChildTransition::{KillRequested, Reaped};
+        assert_eq!(
+            ChildPhase::KillRequested.on_event(KillRequested),
+            Err(IllegalChildTransition)
+        );
+        assert_eq!(STOPPED.on_event(KillRequested), Err(IllegalChildTransition));
+        assert_eq!(NATURAL.on_event(Reaped), Err(IllegalChildTransition));
+        assert_eq!(STOPPED.on_event(Reaped), Err(IllegalChildTransition));
+    }
+
+    #[test]
+    fn the_predicates_read_the_phase() {
+        assert!(!ChildPhase::Running.stop_requested());
+        assert!(!ChildPhase::Running.is_exited());
+        assert!(ChildPhase::KillRequested.stop_requested());
+        assert!(!ChildPhase::KillRequested.is_exited());
+        assert!(!NATURAL.stop_requested());
+        assert!(NATURAL.is_exited());
+        assert!(STOPPED.stop_requested());
+        assert!(STOPPED.is_exited());
+    }
+
+    #[test]
+    fn the_cell_applies_one_step_and_reports_a_refusal_as_no_change() {
+        let cell = PhaseCell::new();
+        assert_eq!(cell.get(), ChildPhase::Running);
+        assert!(cell.apply(ChildTransition::KillRequested));
+        assert!(!cell.apply(ChildTransition::KillRequested));
+        assert_eq!(cell.get(), ChildPhase::KillRequested);
+        assert!(cell.apply(ChildTransition::Reaped));
+        assert!(!cell.apply(ChildTransition::Reaped));
+        assert_eq!(cell.get(), STOPPED);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod supervisor_gone_tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    fn runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime")
+    }
+
+    /// Every holder of the phase keeps its channel open, so a supervising
+    /// task that is dropped rather than run to its end -- here, by tearing
+    /// its runtime down -- must still publish the terminal phase, or
+    /// `wait_exited` never resolves.  One child's supervisor has been polled
+    /// and is parked in its `select!`; the other's was never polled at all.
+    #[test]
+    fn waiters_resolve_when_the_supervising_task_is_dropped() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let counters = Arc::new(super::ChildCounters::default());
+        let config = super::ChildConfig {
+            command: "/bin/sh".into(),
+            args: vec!["-c".to_owned(), "exec sleep 180".to_owned()],
+            workspace: workspace.path().to_path_buf(),
+            inherit_env: Vec::new(),
+            env: std::collections::BTreeMap::new(),
+            message_limit: 1 << 20,
+            stderr_cap: 1 << 16,
+        };
+        let start = || super::spawn(&config, &counters).expect("started");
+        let first = runtime();
+        let (polled, unpolled) = first.block_on(async {
+            let polled = start();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            (polled, start())
+        });
+        assert!(!polled.0.phase().is_exited());
+        assert!(!unpolled.0.phase().is_exited());
+        drop(first);
+
+        runtime().block_on(async {
+            for (child, _events) in [&polled, &unpolled] {
+                tokio::time::timeout(Duration::from_secs(10), child.wait_exited())
+                    .await
+                    .expect("a dropped supervisor still publishes the terminal phase");
+                assert!(child.phase().is_exited());
+            }
+        });
     }
 }

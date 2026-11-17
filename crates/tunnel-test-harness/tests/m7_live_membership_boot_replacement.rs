@@ -34,7 +34,7 @@ use std::{
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use rcgen::KeyPair;
 use tokio::{
-    sync::RwLock,
+    sync::watch,
     time::{timeout, timeout_at},
 };
 use tokio_util::sync::CancellationToken;
@@ -94,24 +94,26 @@ struct DirectoryState {
     minimum_versions: BTreeMap<String, u64>,
 }
 
+/// The scenario is the directory's only writer: it publishes each complete
+/// replacement, and the membership runtime samples whichever is current.
 #[derive(Clone)]
 struct SignedDirectory {
-    state: Arc<RwLock<DirectoryState>>,
+    state: Arc<watch::Sender<DirectoryState>>,
 }
 
 impl SignedDirectory {
     fn new(records: Vec<tunnel_catalog::SignedMembershipRecord>) -> Self {
         Self {
-            state: Arc::new(RwLock::new(directory_state(records))),
+            state: Arc::new(watch::Sender::new(directory_state(records))),
         }
     }
 
     async fn replace(&self, records: Vec<tunnel_catalog::SignedMembershipRecord>) {
-        *self.state.write().await = directory_state(records);
+        self.state.send_replace(directory_state(records));
     }
 
     async fn snapshot(&self) -> DirectoryState {
-        self.state.read().await.clone()
+        self.state.borrow().clone()
     }
 }
 
@@ -125,7 +127,7 @@ impl MembershipRecordSource for SignedDirectory {
             tunnel_relay::membership_runtime::MembershipSourceError,
         >,
     > {
-        Box::pin(async move { Ok(self.state.read().await.records.clone()) })
+        Box::pin(async move { Ok(self.state.borrow().records.clone()) })
     }
 }
 

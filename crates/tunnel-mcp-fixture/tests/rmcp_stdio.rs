@@ -27,7 +27,7 @@ async fn discovery_echo_meta_progress_and_bytes(profile: &str, legacy: bool) {
     let workspace = tempfile::tempdir().expect("workspace");
     let export = stdio_export(profile, workspace.path(), 8);
     let gateway = gateway(export.clone(), workspace.path());
-    let (client, handler) = connect(&gateway, legacy).await;
+    let (client, mut handler) = connect(&gateway, legacy).await;
 
     let tools = within(client.list_all_tools()).await.expect("tools/list");
     let names: Vec<_> = tools.iter().map(|tool| tool.name.to_string()).collect();
@@ -76,7 +76,7 @@ async fn discovery_echo_meta_progress_and_bytes(profile: &str, legacy: bool) {
     within(handle.await_response())
         .await
         .expect("progress result");
-    let progress = handler.progress.lock().expect("lock").clone();
+    let progress = handler.drain();
     assert_eq!(progress, vec![1.0, 2.0, 3.0, 4.0], "{profile}");
 
     // A 300 KiB result is byte-exact.

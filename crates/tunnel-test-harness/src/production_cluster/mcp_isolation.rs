@@ -992,7 +992,8 @@ const FREEZE_RESENDS: u64 = (ISOLATION_ROTATION.handshake_timeout_seconds * 1_00
 struct FreezeRefusals {
     refusals: std::sync::atomic::AtomicU64,
     resends: std::sync::atomic::AtomicU64,
-    unexplained: std::sync::Mutex<Option<String>>,
+    /// The first refusal that coincided with no freeze, set once.
+    unexplained: std::sync::OnceLock<String>,
 }
 
 impl FreezeRefusals {
@@ -1001,10 +1002,7 @@ impl FreezeRefusals {
         (
             self.refusals.load(Ordering::SeqCst),
             self.resends.load(Ordering::SeqCst),
-            self.unexplained
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone(),
+            self.unexplained.get().cloned(),
         )
     }
 }
@@ -1053,9 +1051,7 @@ impl Consumer {
             if !self.freeze.coincides() {
                 self.refusals
                     .unexplained
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .get_or_insert_with(|| self.freeze.unexplained());
+                    .get_or_init(|| self.freeze.unexplained());
             }
             if resends >= FREEZE_RESENDS {
                 return Ok(answer);

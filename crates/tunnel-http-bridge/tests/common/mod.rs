@@ -7,14 +7,14 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
 use bytes::Bytes;
 use http::{HeaderMap, Request, Response};
 use http_body::{Body, Frame as BodyFrame, SizeHint};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tunnel_http_bridge::{
     BodyError, BridgeConfig, ChannelBody, ExchangeHandle, ExchangeReport, Frame, FrameReceiver,
@@ -291,6 +291,9 @@ where
     }
 }
 
+/// The reading side of a tap: `borrow()` is the log so far.
+pub type TapObserver = watch::Receiver<TapLog>;
+
 /// Everything a tap observed on one direction.
 #[derive(Debug, Default)]
 pub struct TapLog {
@@ -333,11 +336,7 @@ pub fn record_kinds(bytes: &[u8]) -> Vec<RecordKind> {
 
 /// Forward frames from `rx` to a fresh bounded direction, recording them and
 /// re-cutting DATA at the given absolute byte offsets.
-pub fn tap(
-    rx: FrameReceiver,
-    credit: usize,
-    cuts: Vec<usize>,
-) -> (FrameReceiver, Arc<Mutex<TapLog>>) {
+pub fn tap(rx: FrameReceiver, credit: usize, cuts: Vec<usize>) -> (FrameReceiver, TapObserver) {
     tap_with_reset_delay(rx, credit, cuts, Duration::ZERO)
 }
 
@@ -348,24 +347,25 @@ pub fn tap_with_reset_delay(
     credit: usize,
     cuts: Vec<usize>,
     reset_delay: Duration,
-) -> (FrameReceiver, Arc<Mutex<TapLog>>) {
+) -> (FrameReceiver, TapObserver) {
     let (out, out_rx, _) = channel(credit);
-    let log = Arc::new(Mutex::new(TapLog::default()));
-    let task_log = Arc::clone(&log);
+    // The tap task is the only writer; tests sample the latest log.
+    let (task_log, log) = watch::channel(TapLog::default());
     tokio::spawn(async move {
         let mut signal = rx.reset_signal();
         let mut offset = 0usize;
         loop {
             let Some(frame) = rx.recv().await else {
-                let mut log = task_log.lock().unwrap();
-                if !log.fin && log.reset.is_none() {
-                    log.closed_without_terminal = true;
-                }
+                task_log.send_modify(|log| {
+                    if !log.fin && log.reset.is_none() {
+                        log.closed_without_terminal = true;
+                    }
+                });
                 return;
             };
             match frame {
                 Frame::Data(mut bytes) => {
-                    task_log.lock().unwrap().bytes.extend_from_slice(&bytes);
+                    task_log.send_modify(|log| log.bytes.extend_from_slice(&bytes));
                     let end = offset + bytes.len();
                     let mut pieces = Vec::new();
                     for &cut in cuts.iter().filter(|cut| **cut > offset && **cut < end) {
@@ -383,7 +383,7 @@ pub fn tap_with_reset_delay(
                             // Only a RESET sent before the source's FIN: a
                             // FIN-then-RESET is forwarded in order, FIN first.
                             detail = signal.wait_before_fin() => {
-                                task_log.lock().unwrap().reset = Some(detail);
+                                task_log.send_modify(|log| log.reset = Some(detail));
                                 tokio::time::sleep(reset_delay).await;
                                 out.reset(detail);
                                 return;
@@ -392,11 +392,11 @@ pub fn tap_with_reset_delay(
                     }
                 }
                 Frame::Fin => {
-                    task_log.lock().unwrap().fin = true;
+                    task_log.send_modify(|log| log.fin = true);
                     let _ = out.finish();
                 }
                 Frame::Reset(detail) => {
-                    task_log.lock().unwrap().reset = Some(detail);
+                    task_log.send_modify(|log| log.reset = Some(detail));
                     tokio::time::sleep(reset_delay).await;
                     out.reset(detail);
                     return;

@@ -18,10 +18,12 @@ use std::{
 };
 
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, oneshot};
 use tunnel_catalog::{Catalog, CatalogError, OwnerClaim, OwnerToken, ServiceRecord, SharedCatalog};
 use tunnel_cluster::{envelope::REQUIRED_HOP_BUDGET, membership::VerifiedPeerBinding};
 use uuid::Uuid;
+
+use crate::owner_task::OwnerTask;
 
 /// The maximum time a route observation may be reused.
 pub const MAX_OWNER_ROUTE_CACHE: Duration = Duration::from_secs(5);
@@ -378,8 +380,150 @@ where
 {
     directory: Arc<D>,
     local: RelayIdentity,
-    cache: Arc<Mutex<HashMap<OwnerScope, CachedOwner>>>,
+    cache: Arc<RouteCache>,
     cache_ttl: Duration,
+}
+
+/// Commands queued for the route-cache task.  The queue is bounded: a
+/// resolver waits its turn while it is full, exactly as it waits for the
+/// answer, so admission backpressure reaches the caller instead of growing a
+/// queue.
+const ROUTE_CACHE_COMMANDS: usize = 64;
+
+enum RouteCacheCommand {
+    /// Return the entry for a scope, dropping it first when its owner lease
+    /// has expired at `now`.
+    Lookup {
+        scope: OwnerScope,
+        now: DateTime<Utc>,
+        reply: oneshot::Sender<Option<CachedOwner>>,
+    },
+    /// Offer a route observation; the generation fence decides whether it
+    /// replaces, is dropped, or evicts the entry.
+    Store {
+        scope: OwnerScope,
+        entry: CachedOwner,
+        now: DateTime<Utc>,
+    },
+    Invalidate(OwnerScope),
+    Clear,
+    /// The stored entry, untouched.
+    #[cfg(test)]
+    Peek {
+        scope: OwnerScope,
+        reply: oneshot::Sender<Option<CachedOwner>>,
+    },
+}
+
+/// The bounded route cache.  One task owns the map, so every lookup and
+/// every generation-fenced store is applied whole and in arrival order;
+/// clones of a router share the task.
+struct RouteCache {
+    owner: OwnerTask<RouteCacheCommand>,
+}
+
+impl RouteCache {
+    const fn new() -> Self {
+        Self {
+            owner: OwnerTask::new(),
+        }
+    }
+
+    async fn run(mut commands: mpsc::Receiver<RouteCacheCommand>) {
+        let mut cache: HashMap<OwnerScope, CachedOwner> = HashMap::new();
+        while let Some(command) = commands.recv().await {
+            match command {
+                RouteCacheCommand::Lookup { scope, now, reply } => {
+                    let entry = cache.get(&scope).cloned();
+                    let entry = match entry {
+                        Some(entry) if entry.owner.lease_expires_at <= now => {
+                            cache.remove(&scope);
+                            None
+                        }
+                        entry => entry,
+                    };
+                    let _ = reply.send(entry);
+                }
+                RouteCacheCommand::Store { scope, entry, now } => {
+                    store_route(&mut cache, scope, entry, now);
+                }
+                RouteCacheCommand::Invalidate(scope) => {
+                    cache.remove(&scope);
+                }
+                RouteCacheCommand::Clear => cache.clear(),
+                #[cfg(test)]
+                RouteCacheCommand::Peek { scope, reply } => {
+                    let _ = reply.send(cache.get(&scope).cloned());
+                }
+            }
+        }
+    }
+
+    /// A cache whose task is gone holds nothing: a lookup misses.
+    async fn lookup(&self, scope: OwnerScope, now: DateTime<Utc>) -> Option<CachedOwner> {
+        self.owner
+            .request(ROUTE_CACHE_COMMANDS, Self::run, |reply| {
+                RouteCacheCommand::Lookup { scope, now, reply }
+            })
+            .await
+            .flatten()
+    }
+
+    async fn store(&self, scope: OwnerScope, entry: CachedOwner, now: DateTime<Utc>) {
+        self.send(RouteCacheCommand::Store { scope, entry, now })
+            .await;
+    }
+
+    /// Commands from one caller are applied in the order it sent them, so a
+    /// later lookup by that caller observes this command.
+    async fn send(&self, command: RouteCacheCommand) {
+        let _ = self
+            .owner
+            .send(ROUTE_CACHE_COMMANDS, Self::run, command)
+            .await;
+    }
+
+    #[cfg(test)]
+    async fn peek(&self, scope: OwnerScope) -> Option<CachedOwner> {
+        self.owner
+            .request(ROUTE_CACHE_COMMANDS, Self::run, |reply| {
+                RouteCacheCommand::Peek { scope, reply }
+            })
+            .await
+            .flatten()
+    }
+}
+
+fn store_route(
+    cache: &mut HashMap<OwnerScope, CachedOwner>,
+    scope: OwnerScope,
+    entry: CachedOwner,
+    now: DateTime<Utc>,
+) {
+    // Catalog reads can complete out of order during a handover.  Never
+    // let a response for an older owner generation replace a newer route
+    // that was already observed.  An equal epoch with different fencing
+    // material is a conflict, so evict it and force the next admission
+    // to consult the authority rather than choosing either owner.
+    if let Some(existing) = cache.get(&scope) {
+        if existing.owner.lease_expires_at <= now {
+            cache.remove(&scope);
+        } else if existing.owner.token.epoch > entry.owner.token.epoch {
+            return;
+        } else if existing.owner.token.epoch == entry.owner.token.epoch
+            && existing.owner.token != entry.owner.token
+        {
+            cache.remove(&scope);
+            return;
+        }
+    }
+    if !cache.contains_key(&scope)
+        && cache.len() >= MAX_OWNER_ROUTE_CACHE_ENTRIES
+        && let Some(evicted) = cache.keys().next().copied()
+    {
+        cache.remove(&evicted);
+    }
+    cache.insert(scope, entry);
 }
 
 impl OwnerRouter<dyn Catalog> {
@@ -410,7 +554,7 @@ where
         Ok(Self {
             directory,
             local,
-            cache: Arc::new(Mutex::new(HashMap::new())),
+            cache: Arc::new(RouteCache::new()),
             cache_ttl,
         })
     }
@@ -531,23 +675,22 @@ where
     /// Drop one cached route.  This is used after a peer returns an
     /// authenticated `OWNER_CHANGED`/`NOT_DISPATCHED` admission result.
     pub async fn invalidate(&self, scope: OwnerScope) {
-        self.cache.lock().await.remove(&scope);
+        self.cache.send(RouteCacheCommand::Invalidate(scope)).await;
     }
 
     /// The owner epoch this router currently caches for `scope`, if any.
     #[cfg(test)]
     pub(crate) async fn cached_owner_epoch(&self, scope: OwnerScope) -> Option<u64> {
         self.cache
-            .lock()
+            .peek(scope)
             .await
-            .get(&scope)
             .map(|entry| entry.owner.token.epoch)
     }
 
     /// Drop all cached routes.  This is a local optimisation reset used when
     /// membership trust is invalidated; it does not mutate catalog authority.
     pub async fn invalidate_all(&self) {
-        self.cache.lock().await.clear();
+        self.cache.send(RouteCacheCommand::Clear).await;
     }
 
     async fn try_cached(
@@ -557,12 +700,8 @@ where
         destination: Option<&VerifiedPeerBinding>,
     ) -> Option<OwnerRoute> {
         let monotonic_now = Instant::now();
-        let mut cache = self.cache.lock().await;
-        let entry = cache.get(&scope)?.clone();
-        if entry.owner.lease_expires_at <= now {
-            cache.remove(&scope);
-            return None;
-        }
+        // The cache task drops an entry whose owner lease has expired.
+        let entry = self.cache.lookup(scope, now).await?;
         // Keep an expired observation as a generation fence until the owner
         // lease itself expires.  Otherwise a delayed, lower-epoch catalog
         // response could repopulate the cache after the short route TTL and
@@ -639,39 +778,17 @@ where
         let Some(expires_at) = Instant::now().checked_add(ttl) else {
             return;
         };
-        let mut cache = self.cache.lock().await;
-
-        // Catalog reads can complete out of order during a handover.  Never
-        // let a response for an older owner generation replace a newer route
-        // that was already observed.  An equal epoch with different fencing
-        // material is a conflict, so evict it and force the next admission
-        // to consult the authority rather than choosing either owner.
-        if let Some(existing) = cache.get(&scope) {
-            if existing.owner.lease_expires_at <= now {
-                cache.remove(&scope);
-            } else if existing.owner.token.epoch > owner.token.epoch {
-                return;
-            } else if existing.owner.token.epoch == owner.token.epoch
-                && existing.owner.token != owner.token
-            {
-                cache.remove(&scope);
-                return;
-            }
-        }
-        if !cache.contains_key(&scope)
-            && cache.len() >= MAX_OWNER_ROUTE_CACHE_ENTRIES
-            && let Some(evicted) = cache.keys().next().copied()
-        {
-            cache.remove(&evicted);
-        }
-        cache.insert(
-            scope,
-            CachedOwner {
-                owner,
-                expires_at,
-                trust_expires_at,
-            },
-        );
+        self.cache
+            .store(
+                scope,
+                CachedOwner {
+                    owner,
+                    expires_at,
+                    trust_expires_at,
+                },
+                now,
+            )
+            .await;
     }
 }
 
@@ -790,7 +907,7 @@ pub(crate) mod tests {
                 now + ChronoDuration::seconds(10),
             ))),
             local,
-            cache: Arc::new(Mutex::new(HashMap::new())),
+            cache: Arc::new(RouteCache::new()),
             cache_ttl: MAX_OWNER_ROUTE_CACHE,
         };
         let local_route = router
@@ -823,7 +940,7 @@ pub(crate) mod tests {
                 now + ChronoDuration::seconds(10),
             ))),
             local,
-            cache: Arc::new(Mutex::new(HashMap::new())),
+            cache: Arc::new(RouteCache::new()),
             cache_ttl: MAX_OWNER_ROUTE_CACHE,
         };
 
@@ -1138,14 +1255,23 @@ pub(crate) mod tests {
             Duration::from_secs(5),
         )
         .expect("cache policy");
-        router.cache.lock().await.insert(
-            scope,
-            CachedOwner {
-                owner: owner_with_epoch("node-a", "boot-a", 2, now + ChronoDuration::seconds(30)),
-                expires_at: Instant::now() - Duration::from_secs(1),
-                trust_expires_at: None,
-            },
-        );
+        router
+            .cache
+            .store(
+                scope,
+                CachedOwner {
+                    owner: owner_with_epoch(
+                        "node-a",
+                        "boot-a",
+                        2,
+                        now + ChronoDuration::seconds(30),
+                    ),
+                    expires_at: Instant::now() - Duration::from_secs(1),
+                    trust_expires_at: None,
+                },
+                now,
+            )
+            .await;
 
         router
             .cache_owner(
@@ -1156,19 +1282,19 @@ pub(crate) mod tests {
             )
             .await;
 
-        let cache = router.cache.lock().await;
         assert_eq!(
-            cache
-                .get(&scope)
+            router
+                .cache
+                .peek(scope)
+                .await
                 .expect("generation fence")
                 .owner
                 .token
                 .epoch,
             2
         );
-        drop(cache);
         assert!(router.try_cached(scope, now, None).await.is_none());
-        assert!(router.cache.lock().await.contains_key(&scope));
+        assert!(router.cache.peek(scope).await.is_some());
     }
 
     #[tokio::test]
@@ -1216,7 +1342,7 @@ pub(crate) mod tests {
             .await;
 
         assert!(
-            !router.cache.lock().await.contains_key(&scope),
+            router.cache.peek(scope).await.is_none(),
             "equal-epoch fencing conflict must fail closed"
         );
     }
@@ -1305,20 +1431,21 @@ pub(crate) mod tests {
     }
 
     struct TestDirectory {
-        owner: std::sync::Mutex<Option<OwnerClaim>>,
+        /// The test is the only writer; lookups sample the latest value.
+        owner: tokio::sync::watch::Sender<Option<OwnerClaim>>,
         lookups: AtomicUsize,
     }
 
     impl TestDirectory {
         fn new(owner: OwnerClaim) -> Self {
             Self {
-                owner: std::sync::Mutex::new(Some(owner)),
+                owner: tokio::sync::watch::Sender::new(Some(owner)),
                 lookups: AtomicUsize::new(0),
             }
         }
 
         fn set_owner(&self, owner: Option<OwnerClaim>) {
-            *self.owner.lock().expect("test owner lock") = owner;
+            self.owner.send_replace(owner);
         }
 
         fn lookups(&self) -> usize {
@@ -1334,7 +1461,7 @@ pub(crate) mod tests {
             _at: DateTime<Utc>,
         ) -> OwnerLookupFuture<'a> {
             self.lookups.fetch_add(1, Ordering::SeqCst);
-            Box::pin(async move { Ok(self.owner.lock().expect("test owner lock").clone()) })
+            Box::pin(async move { Ok(self.owner.borrow().clone()) })
         }
     }
 }

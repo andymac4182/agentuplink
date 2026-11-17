@@ -136,14 +136,14 @@ async fn request_half_close_ends_only_the_request_and_the_response_keeps_streami
         "upload-complete:16\n"
     );
     {
-        let request = request_log.lock().unwrap();
+        let request = request_log.borrow();
         assert!(request.fin, "request FIN was forwarded");
         assert!(request.reset.is_none());
         assert_eq!(
             request.record_kinds(),
             [RecordKind::RequestHead, RecordKind::Body, RecordKind::End]
         );
-        let response = response_log.lock().unwrap();
+        let response = response_log.borrow();
         assert!(
             !response.fin && response.reset.is_none(),
             "response still open"
@@ -161,7 +161,7 @@ async fn request_half_close_ends_only_the_request_and_the_response_keeps_streami
     assert_eq!(device.error, None);
     assert_eq!(device.request, Outcome::Complete);
     assert_eq!(device.response, Outcome::Complete);
-    let response = response_log.lock().unwrap();
+    let response = response_log.borrow();
     assert!(response.fin && response.reset.is_none());
     assert_eq!(response.record_kinds().last(), Some(&RecordKind::End));
 }
@@ -270,7 +270,7 @@ async fn sse_record_stream_cut_at_every_transport_offset_is_byte_exact() {
         ))
         .await;
         within(collect(response.into_body())).await.unwrap();
-        total += log.lock().unwrap().bytes.len();
+        total += log.borrow().bytes.len();
     }
     assert!(total > SSE.len());
     for cut in 1..total {
@@ -501,7 +501,7 @@ async fn consumer_drop_mid_body_resets_both_directions_and_the_handler_observes_
         }
     })
     .await;
-    let request = request_log.lock().unwrap();
+    let request = request_log.borrow();
     assert_eq!(
         request.record_kinds(),
         [RecordKind::RequestHead, RecordKind::End]
@@ -511,7 +511,7 @@ async fn consumer_drop_mid_body_resets_both_directions_and_the_handler_observes_
         request.reset.map(|detail| detail.code),
         Some(HttpErrorCode::Cancelled)
     );
-    let response = response_log.lock().unwrap();
+    let response = response_log.borrow();
     assert!(!response.fin);
     assert!(response.reset.is_some(), "response direction reset");
     assert!(
@@ -1206,13 +1206,13 @@ async fn a_release_after_the_final_event_and_before_end_is_recorded_as_released(
     // The consumer releases the body; END and FIN are still in transit.
     drop(response);
     within(async {
-        while request_log.lock().unwrap().reset.is_none() {
+        while request_log.borrow().reset.is_none() {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     })
     .await;
     assert_eq!(
-        request_log.lock().unwrap().reset.map(|detail| detail.code),
+        request_log.borrow().reset.map(|detail| detail.code),
         Some(HttpErrorCode::Cancelled),
         "the transport is still cancelled, so a handler still running is told"
     );

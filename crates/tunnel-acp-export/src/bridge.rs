@@ -48,14 +48,14 @@
 //! cross-tenant isolation are chunks 4 and 5.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use http::{Request, Response, StatusCode};
 use serde_json::{Value, json};
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 use tunnel_acp::lifecycle::{LifecycleRule, PermissionOutcome, RequestId};
 use tunnel_acp::message::{
@@ -81,6 +81,16 @@ pub const STREAM_BACKLOG: usize = 32;
 
 /// How often a connection's watchdog reads its clock.
 const WATCHDOG_TICK: Duration = Duration::from_millis(20);
+
+/// Commands queued towards one connection's owning task, which holds the
+/// connection's streams.  A sender waits for room; the owner serves commands
+/// even while it is tearing the connection down, so the queue always drains.
+const CONNECTION_COMMAND_QUEUE: usize = 32;
+
+/// Connections queued for listing by the export's registry task.  An
+/// `initialize` waits for room, and for the listing to be published, before
+/// it answers.
+const REGISTRY_QUEUE: usize = 32;
 
 /// ACP transport connections this export tracks at once.
 ///
@@ -274,56 +284,109 @@ pub struct AcpDiagnostics {
     pub live_connections: u64,
 }
 
-/// One SSE destination: a bounded queue whose receiving half the single
-/// subscriber takes.
+/// Where one SSE stream is in its life.
+///
+/// The queue's receiving half, the live body's sender and the two latches a
+/// stream used to carry are one value here, so the combinations that never
+/// meant anything -- subscribed with the receiving half still parked, a body
+/// watched on a stream nobody subscribed to -- cannot be written down.
 #[derive(Debug)]
-struct Target {
-    tx: mpsc::Sender<Bytes>,
-    /// `None` once a subscriber has taken it.  Taking is what makes "one
-    /// subscriber" a structural property rather than a flag someone has to
-    /// remember to check.
-    rx: Mutex<Option<mpsc::Receiver<Bytes>>>,
-    created: Instant,
-    subscribed: Mutex<bool>,
-    /// This stream is over: its subscriber went away, or its window expired.
-    ///
-    /// **It is per target, and that is the whole point.** A dropped SSE body
-    /// is an ordinary event — a client closing one session's stream, or this
-    /// bridge expiring a session whose GET never arrived — and before review
-    /// found it, the first such failure returned the connection's one
-    /// dispatcher task, which dropped the supervisor's forward channel, which
-    /// ended the supervisor's reader, which meant **every other session and
-    /// the connection stream itself stopped receiving and every outstanding
-    /// prompt hung until DELETE**. Marking one target closed and carrying on is
-    /// what stops one lost subscriber from silently disabling a connection.
-    closed: Mutex<bool>,
-    /// A clone of the live body's sender, parked here when a subscriber takes
-    /// the queue.
+enum TargetPhase {
+    /// No subscriber yet.  The receiving half waits here, and *taking* it is
+    /// what makes "one subscriber" structural: a second GET finds nothing to
+    /// take.
+    Awaiting(mpsc::Receiver<Bytes>),
+    /// The one subscriber took the queue.  A clone of its body's sender is
+    /// parked here.
     ///
     /// **This is what makes a broken established stream observable while the
     /// agent is silent.**  The stream's pump only discovers its body is gone
     /// when it next writes, so a connection with nothing to say would not
-    /// notice the break at all — and `docs/acp.md`'s policy is about the break,
-    /// not about the next message.  The watchdog asks this on its own tick.
-    body: Mutex<Option<StreamSender>>,
+    /// notice the break at all -- and `docs/acp.md`'s policy is about the
+    /// break, not about the next message.  The watchdog asks this on its own
+    /// tick.
+    Established(StreamSender),
+    /// This stream is over: its subscriber went away, its window expired, or
+    /// its connection closed.  `established` remembers which kind of ending
+    /// it was, because losing an established stream ends the transport and a
+    /// stream that never had a subscriber does not.
+    ///
+    /// **It is per stream, and that is the whole point.**  A dropped SSE body
+    /// is an ordinary event, and marking one stream over and carrying on is
+    /// what stops one lost subscriber from silently disabling a connection.
+    Over { established: bool },
+}
+
+/// What can happen to a stream.
+#[derive(Debug)]
+enum TargetEvent {
+    /// A GET asks to be the stream's subscriber, bringing its body's sender.
+    Subscribe(StreamSender),
+    /// The stream ended: lost, expired, or closed with its connection.
+    Close,
+}
+
+/// What a [`TargetEvent`] produced.
+#[derive(Debug)]
+enum TargetEffect {
+    /// The subscriber took the queue.
+    Granted(mpsc::Receiver<Bytes>),
+    /// The stream is now over.
+    Closed,
+    /// The event was refused and nothing changed: a second subscriber, a
+    /// subscriber to a stream that is over, or a second close.
+    Refused,
+}
+
+impl TargetPhase {
+    /// The only place a stream's phase changes.
+    fn on_event(self, event: TargetEvent) -> (Self, TargetEffect) {
+        match (self, event) {
+            (Self::Awaiting(queue), TargetEvent::Subscribe(body)) => {
+                (Self::Established(body), TargetEffect::Granted(queue))
+            }
+            // Nothing may subscribe to a stream that is over, so the
+            // receiving half goes with it: a later GET is refused 409 by the
+            // same rule that refuses a second subscriber.
+            (Self::Awaiting(_), TargetEvent::Close) => {
+                (Self::Over { established: false }, TargetEffect::Closed)
+            }
+            (Self::Established(_), TargetEvent::Close) => {
+                (Self::Over { established: true }, TargetEffect::Closed)
+            }
+            (phase @ (Self::Established(_) | Self::Over { .. }), TargetEvent::Subscribe(_))
+            | (phase @ Self::Over { .. }, TargetEvent::Close) => (phase, TargetEffect::Refused),
+        }
+    }
+}
+
+/// One SSE destination: a bounded queue whose receiving half the single
+/// subscriber takes.  Owned by its connection's task and by nothing else.
+#[derive(Debug)]
+struct Target {
+    tx: mpsc::Sender<Bytes>,
+    created: Instant,
+    phase: TargetPhase,
 }
 
 impl Target {
+    /// A fresh stream, and the sending half of its queue.
     fn new() -> Self {
         let (tx, rx) = mpsc::channel(STREAM_BACKLOG);
         Self {
             tx,
-            rx: Mutex::new(Some(rx)),
             created: Instant::now(),
-            subscribed: Mutex::new(false),
-            closed: Mutex::new(false),
-            body: Mutex::new(None),
+            phase: TargetPhase::Awaiting(rx),
         }
     }
 
-    /// Park the live body's sender at subscription time.
-    fn watch_body(&self, sender: StreamSender) {
-        *self.body.lock().unwrap_or_else(PoisonError::into_inner) = Some(sender);
+    fn apply(&mut self, event: TargetEvent) -> TargetEffect {
+        // The placeholder is never observed: `on_event` returns the phase
+        // that replaces it before anything else can look.
+        let phase = std::mem::replace(&mut self.phase, TargetPhase::Over { established: false });
+        let (next, effect) = phase.on_event(event);
+        self.phase = next;
+        effect
     }
 
     /// Whether this stream was established and has since broken.
@@ -331,71 +394,214 @@ impl Target {
     /// Deliberately **not** true for a stream that never had a subscriber:
     /// that is a subscription deadline, which is a different rule with a
     /// different consequence, and conflating them would let a slow consumer's
-    /// missing GET masquerade as a lost one.
-    /// **No guard case defeats the `is_subscribed` half, deliberately.**  It
-    /// is implied by the body test rather than load-bearing beside it: `body`
-    /// is parked only when a subscriber takes the queue, so a target that
-    /// never had one reads `None` here and is not broken either way.  A
-    /// guard-deletion run reported exactly that — removing it reddened
-    /// nothing — so it stays as a statement of the rule and is not claimed as
-    /// a guarded one.
+    /// missing GET masquerade as a lost one.  Not true for a stream that is
+    /// already over either: that ending was counted when it happened.
     fn established_and_broken(&self) -> bool {
-        if !self.is_subscribed() || self.is_closed() {
-            return false;
-        }
-        self.body
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .as_ref()
-            .is_some_and(StreamSender::is_closed)
+        matches!(&self.phase, TargetPhase::Established(body) if body.is_closed())
     }
 
-    fn close(&self) {
-        *self.closed.lock().unwrap_or_else(PoisonError::into_inner) = true;
-        // Nothing may subscribe to a stream that is over, so the receiving
-        // half is taken away as well: a later GET is refused 409 by the same
-        // mechanism that refuses a second subscriber.
-        let _ = self
-            .rx
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take();
+    const fn is_closed(&self) -> bool {
+        matches!(self.phase, TargetPhase::Over { .. })
     }
 
-    fn is_closed(&self) -> bool {
-        *self.closed.lock().unwrap_or_else(PoisonError::into_inner)
+    /// Whether a subscriber ever took this stream.
+    const fn is_subscribed(&self) -> bool {
+        matches!(
+            self.phase,
+            TargetPhase::Established(_) | TargetPhase::Over { established: true }
+        )
     }
 
-    fn take(&self) -> Option<mpsc::Receiver<Bytes>> {
-        if self.is_closed() {
-            return None;
-        }
-        let taken = self
-            .rx
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take();
-        if taken.is_some() {
-            *self
-                .subscribed
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner) = true;
-        }
-        taken
-    }
-
-    fn is_subscribed(&self) -> bool {
-        *self
-            .subscribed
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
+    /// Whether this stream is still waiting for its subscriber after `bound`.
+    fn unsubscribed_past(&self, bound: Duration) -> Option<Duration> {
+        let waited = self.created.elapsed();
+        (matches!(self.phase, TargetPhase::Awaiting(_)) && waited > bound).then_some(waited)
     }
 }
 
-struct ConnectionState {
-    connection: Arc<Target>,
-    sessions: BTreeMap<String, Arc<Target>>,
-    closed: bool,
+/// Where a message for one stream should go.
+enum Routing {
+    /// Onto this queue.
+    Open(mpsc::Sender<Bytes>),
+    /// Nowhere: that stream is over.
+    Over,
+    /// Nowhere: the connection itself is closed.
+    ConnectionClosed,
+}
+
+/// What a GET asking to subscribe was told.
+enum Subscription {
+    Granted(mpsc::Receiver<Bytes>),
+    /// The one-subscriber rule, or a stream that is over.
+    Refused,
+    ConnectionClosed,
+}
+
+/// What the connection's other tasks ask of the task that owns its streams.
+enum ConnectionCommand {
+    /// Where does a message for this stream go?  A session's stream is
+    /// created on first mention.
+    Route {
+        session: Option<String>,
+        reply: oneshot::Sender<Routing>,
+    },
+    /// Make this GET the stream's one subscriber.
+    Subscribe {
+        session: Option<String>,
+        body: StreamSender,
+        reply: oneshot::Sender<Subscription>,
+    },
+    /// A send to this stream failed: mark it over, and say whether it had
+    /// been established.
+    StreamLost {
+        session: Option<String>,
+        established: oneshot::Sender<bool>,
+    },
+    /// Close every stream.
+    Close { closed: oneshot::Sender<()> },
+}
+
+/// A connection's streams.  Owned by the connection's task; every other task
+/// reaches them through a [`ConnectionCommand`].
+enum ConnectionState {
+    Open {
+        connection: Target,
+        sessions: BTreeMap<String, Target>,
+    },
+    /// Closed.  The streams are gone with it, so nothing can be routed to or
+    /// subscribed on a closed connection.
+    Closed,
+}
+
+impl ConnectionState {
+    fn new(connection: Target) -> Self {
+        Self::Open {
+            connection,
+            sessions: BTreeMap::new(),
+        }
+    }
+
+    /// The stream a message or a subscriber names, creating a session's on
+    /// first mention.
+    ///
+    /// Both the dispatcher and the POST that created the session reach for a
+    /// session's stream, and which of them arrives first is a race the agent
+    /// decides: an update can be on the wire before `session/new`'s own
+    /// result has been read.  Creating on demand is what keeps that from
+    /// being delivered to the wrong stream.  A stream that is over stays
+    /// over: its entry is kept, so one that was expired or lost cannot be
+    /// resurrected by the next message that mentions its identifier.
+    fn target(&mut self, session: Option<String>) -> Option<&mut Target> {
+        match self {
+            Self::Closed => None,
+            Self::Open {
+                connection,
+                sessions,
+            } => Some(match session {
+                None => connection,
+                Some(session) => sessions.entry(session).or_insert_with(Target::new),
+            }),
+        }
+    }
+
+    /// The only place a connection's streams close together.  The caller has
+    /// already cancelled the connection's `shutdown`, so a stream's pump that
+    /// finds its queue ended reads a broken transport and not an orderly end.
+    fn close(&mut self) {
+        *self = Self::Closed;
+    }
+
+    fn serve(&mut self, command: ConnectionCommand, shutdown: &CancellationToken) {
+        match command {
+            ConnectionCommand::Route { session, reply } => {
+                let routing = match self.target(session) {
+                    None => Routing::ConnectionClosed,
+                    Some(target) if target.is_closed() => Routing::Over,
+                    Some(target) => Routing::Open(target.tx.clone()),
+                };
+                let _ = reply.send(routing);
+            }
+            ConnectionCommand::Subscribe {
+                session,
+                body,
+                reply,
+            } => {
+                let subscription = match self.target(session) {
+                    None => Subscription::ConnectionClosed,
+                    Some(target) => match target.apply(TargetEvent::Subscribe(body)) {
+                        TargetEffect::Granted(queue) => Subscription::Granted(queue),
+                        TargetEffect::Closed | TargetEffect::Refused => Subscription::Refused,
+                    },
+                };
+                let _ = reply.send(subscription);
+            }
+            ConnectionCommand::StreamLost {
+                session,
+                established,
+            } => {
+                let was_established = self.target(session).is_some_and(|target| {
+                    let _ = target.apply(TargetEvent::Close);
+                    target.is_subscribed()
+                });
+                let _ = established.send(was_established);
+            }
+            ConnectionCommand::Close { closed } => {
+                shutdown.cancel();
+                self.close();
+                let _ = closed.send(());
+            }
+        }
+    }
+
+    /// Whether an established required stream has broken.  Both the
+    /// connection stream and every session stream are required.
+    fn any_established_and_broken(&self) -> bool {
+        match self {
+            Self::Closed => false,
+            Self::Open {
+                connection,
+                sessions,
+            } => {
+                connection.established_and_broken()
+                    || sessions.values().any(Target::established_and_broken)
+            }
+        }
+    }
+
+    /// How long the connection stream has waited, if that is past `bound`
+    /// and its subscriber never arrived.
+    fn connection_unsubscribed_past(&self, bound: Duration) -> Option<Duration> {
+        match self {
+            Self::Closed => None,
+            Self::Open { connection, .. } => connection.unsubscribed_past(bound),
+        }
+    }
+
+    /// Close every session stream whose subscriber never arrived within
+    /// `bound`, returning how long each had waited.
+    ///
+    /// **An expiry happens once.**  This sweep runs on every watchdog tick,
+    /// and an expired stream is over, so it never matches again: the entry is
+    /// kept -- that is what lets a late session GET find a stream that is over
+    /// and be refused 409 rather than fall through to 404 -- but its phase is
+    /// no longer one that waits (M8-C25).
+    fn expire_sessions(&mut self, bound: Duration) -> Vec<Duration> {
+        let Self::Open { sessions, .. } = self else {
+            return Vec::new();
+        };
+        let mut expired = Vec::new();
+        for target in sessions.values_mut() {
+            if let Some(waited) = target.unsubscribed_past(bound) {
+                // Closing the stream is what stops a later GET from
+                // subscribing to a session whose window has closed: the same
+                // rule as the one-subscriber rule, so an expired session
+                // answers 409 and never silently reopens.
+                let _ = target.apply(TargetEvent::Close);
+                expired.push(waited);
+            }
+        }
+        expired
+    }
 }
 
 /// One live ACP transport connection: its child, its streams and its
@@ -413,7 +619,16 @@ struct Connection {
     /// separately (task row M8-C12).
     connection_subscribe_deadline: Duration,
     session_subscribe_deadline: Duration,
-    state: Mutex<ConnectionState>,
+    /// To the task that owns this connection's streams.  A send that fails
+    /// means that task is gone, which is the connection having closed.
+    commands: mpsc::Sender<ConnectionCommand>,
+    /// The connection stream's queue.  Its sending half never changes, so it
+    /// is held here; whether anything is still reading it is the owner's to
+    /// say.
+    stream: mpsc::Sender<Bytes>,
+    /// Whether the export still lists this connection.  Cleared exactly once,
+    /// by whichever path ends it.
+    listed: AtomicBool,
     counters: Arc<Counters>,
     shutdown: CancellationToken,
     /// A **weak** handle on the supervisor's transport channel, so a finished
@@ -436,33 +651,149 @@ struct Connection {
 }
 
 impl Connection {
-    fn with<R>(&self, apply: impl FnOnce(&mut ConnectionState) -> R) -> R {
-        let mut guard = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        apply(&mut guard)
+    /// End this connection's listing.  `true` for exactly one caller.
+    fn unlist(&self) -> bool {
+        self.listed.swap(false, Ordering::SeqCst)
     }
 
-    /// The session's queue, created on first mention.
-    ///
-    /// Both the dispatcher and the POST that created the session reach for it,
-    /// and which of them arrives first is a race the agent decides: an update
-    /// can be on the wire before `session/new`'s own result has been read.
-    /// Creating on demand is what keeps that from being delivered to the wrong
-    /// stream.
-    fn session_target(&self, session: &str) -> Option<Arc<Target>> {
-        self.with(|state| {
-            if state.closed {
-                return None;
+    fn is_listed(&self) -> bool {
+        self.listed.load(Ordering::SeqCst)
+    }
+
+    /// Where a message for `session`'s stream, or the connection's, goes.
+    async fn route(&self, session: Option<&str>) -> Routing {
+        let (reply, routed) = oneshot::channel();
+        let command = ConnectionCommand::Route {
+            session: session.map(ToOwned::to_owned),
+            reply,
+        };
+        if self.commands.send(command).await.is_err() {
+            return Routing::ConnectionClosed;
+        }
+        routed.await.unwrap_or(Routing::ConnectionClosed)
+    }
+
+    async fn subscribe(&self, session: Option<String>, body: StreamSender) -> Subscription {
+        let (reply, subscribed) = oneshot::channel();
+        let command = ConnectionCommand::Subscribe {
+            session,
+            body,
+            reply,
+        };
+        if self.commands.send(command).await.is_err() {
+            return Subscription::ConnectionClosed;
+        }
+        subscribed.await.unwrap_or(Subscription::ConnectionClosed)
+    }
+
+    /// Mark a stream a send just failed on as over.  `true` when it had been
+    /// established and its connection is still open.
+    async fn stream_lost(&self, session: Option<&str>) -> bool {
+        let (established, answer) = oneshot::channel();
+        let command = ConnectionCommand::StreamLost {
+            session: session.map(ToOwned::to_owned),
+            established,
+        };
+        if self.commands.send(command).await.is_err() {
+            return false;
+        }
+        answer.await.unwrap_or(false)
+    }
+
+    /// Ask the owner to close every stream, returning once it has -- or at
+    /// once, when the owner is already gone and there is nothing to close.
+    async fn close_streams(&self) {
+        let (closed, done) = oneshot::channel();
+        if self
+            .commands
+            .send(ConnectionCommand::Close { closed })
+            .await
+            .is_ok()
+        {
+            let _ = done.await;
+        }
+    }
+}
+
+/// The connections an export holds, as last published by its registry task.
+type Listing = Arc<BTreeMap<String, Arc<Connection>>>;
+
+/// One connection to list, and where to say it is visible.
+struct List {
+    connection: Arc<Connection>,
+    listed: oneshot::Sender<()>,
+}
+
+/// The export's handle on the task that owns its connection map.
+///
+/// **One task owns the map; everyone else reads what it published.**  A
+/// connection enters by being sent to that task, which publishes a new
+/// immutable listing before it answers.  A connection *leaves* by its own
+/// [`Connection::unlist`] latch: one atomic swap, so a synchronous caller
+/// ([`AcpExport::shutdown`]) can take it as well as an asynchronous one, and
+/// exactly one caller does.  The task is then nudged to drop the entry.  Every
+/// reader treats a published connection whose latch is cleared as absent.
+struct Registry {
+    additions: mpsc::Sender<List>,
+    published: watch::Receiver<Listing>,
+    /// Nudges the owning task to drop connections that were unlisted.
+    prune: Arc<Notify>,
+}
+
+impl Registry {
+    /// Start the owning task.  Called from an exchange, so a runtime is
+    /// running.
+    fn start() -> Self {
+        let (additions, inbox) = mpsc::channel(REGISTRY_QUEUE);
+        let (publish, published) = watch::channel(Listing::default());
+        let prune = Arc::new(Notify::new());
+        tokio::spawn(own_connections(inbox, publish, Arc::clone(&prune)));
+        Self {
+            additions,
+            published,
+            prune,
+        }
+    }
+
+    /// The connections as last published.  Entries may have been unlisted
+    /// since.
+    fn listing(&self) -> Listing {
+        Arc::clone(&self.published.borrow())
+    }
+}
+
+/// The registry task: the only writer of the connection map.
+///
+/// It ends when the last export handle is dropped, which drops every
+/// connection it still listed -- and a dropped connection's supervisor ends
+/// its child.
+async fn own_connections(
+    mut additions: mpsc::Receiver<List>,
+    publish: watch::Sender<Listing>,
+    prune: Arc<Notify>,
+) {
+    let mut connections: BTreeMap<String, Arc<Connection>> = BTreeMap::new();
+    loop {
+        let addition = tokio::select! {
+            addition = additions.recv() => match addition {
+                Some(addition) => Some(addition),
+                None => return,
+            },
+            () = prune.notified() => None,
+        };
+        connections.retain(|_, connection| connection.is_listed());
+        let listed = addition.map(|List { connection, listed }| {
+            // A connection that ended before it could be listed is dropped
+            // here rather than kept: nothing would ever nudge it out.
+            if connection.is_listed() {
+                connections.insert(connection.id.clone(), connection);
             }
-            // A closed session stays closed: the entry is kept so a target
-            // that was expired or lost cannot be resurrected by the next
-            // message that mentions its identifier.
-            Some(Arc::clone(
-                state
-                    .sessions
-                    .entry(session.to_owned())
-                    .or_insert_with(|| Arc::new(Target::new())),
-            ))
-        })
+            listed
+        });
+        publish.send_replace(Arc::new(connections.clone()));
+        if let Some(listed) = listed {
+            let _ = listed.send(());
+        }
     }
 }
 
@@ -474,7 +805,9 @@ pub struct AcpExport {
 
 struct Inner {
     validated: ValidatedAcp,
-    connections: Mutex<BTreeMap<String, Arc<Connection>>>,
+    /// The live connections.  Started by the first `initialize`, because an
+    /// export may be built where no runtime is running yet.
+    registry: OnceLock<Registry>,
     counters: Arc<Counters>,
     next: AtomicU64,
     epoch: u64,
@@ -499,7 +832,7 @@ impl AcpExport {
         Ok(Self {
             inner: Arc::new(Inner {
                 validated,
-                connections: Mutex::new(BTreeMap::new()),
+                registry: OnceLock::new(),
                 counters: Arc::new(Counters::default()),
                 next: AtomicU64::new(0),
                 epoch: std::time::SystemTime::now()
@@ -577,24 +910,27 @@ impl AcpExport {
             terminals_cancelled: counters.terminals_cancelled.load(Ordering::Acquire),
             terminals_failed: counters.terminals_failed.load(Ordering::Acquire),
             terminals_unknown: counters.terminals_unknown.load(Ordering::Acquire),
-            live_connections: self
-                .inner
-                .connections
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .len() as u64,
+            live_connections: self.listed().count() as u64,
         }
+    }
+
+    /// The connections this export still lists.
+    fn listed(&self) -> impl Iterator<Item = Arc<Connection>> + use<> {
+        let listing = self.inner.registry.get().map(Registry::listing);
+        let connections: Vec<Arc<Connection>> = listing
+            .iter()
+            .flat_map(|listing| listing.values())
+            .filter(|connection| connection.is_listed())
+            .cloned()
+            .collect();
+        connections.into_iter()
     }
 
     /// The child's process id for each live connection, so a test can read the
     /// process table rather than a counter.
     #[must_use]
     pub fn child_pids(&self) -> Vec<u32> {
-        self.inner
-            .connections
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .values()
+        self.listed()
             .filter_map(|connection| connection.supervisor.pid())
             .collect()
     }
@@ -606,24 +942,25 @@ impl AcpExport {
     /// supervisor's own `Drop`; this is the explicit form, for a connector
     /// that stops its handlers before dropping them.  Idempotent.
     ///
-    /// **The map is emptied under one lock, and exactly what was taken is
-    /// ended and counted** (M8-C33). This used to snapshot under one lock and
-    /// clear under a second, then count every snapshot entry, so a connection
-    /// [`Self::remove`]d between the two was counted closed twice, and one
-    /// inserted between them was cleared without being killed or counted.
-    /// Taking the map is the same removal [`Self::remove`] performs, for every
-    /// entry at once; no ending counter is released here, so the ordering rule
-    /// on `remove` has nothing further to order.
+    /// **Exactly what this call unlisted is ended and counted** (M8-C33).
+    /// This used to snapshot the map and clear it in two steps, then count
+    /// every snapshot entry, so a connection [`Self::remove`]d between the two
+    /// was counted closed twice, and one inserted between them was cleared
+    /// without being killed or counted.  Each connection now leaves by its own
+    /// latch, which one caller wins: a connection another path is ending is
+    /// not counted here, and one listed after this pass is still listed.  No
+    /// ending counter is released here, so the ordering rule on `remove` has
+    /// nothing further to order.
     pub fn shutdown(&self) {
-        let connections = std::mem::take(
-            &mut *self
-                .inner
-                .connections
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner),
-        );
-        for connection in connections.into_values() {
-            connection.with(|state| state.closed = true);
+        let Some(registry) = self.inner.registry.get() else {
+            return;
+        };
+        for connection in registry.listing().values() {
+            if !connection.unlist() {
+                continue;
+            }
+            // Cancelling is what closes the connection's streams: their owner
+            // stops serving and drops them as soon as it observes this.
             connection.shutdown.cancel();
             connection.supervisor.kill();
             self.inner
@@ -631,70 +968,76 @@ impl AcpExport {
                 .connections_closed
                 .fetch_add(1, Ordering::Relaxed);
         }
-    }
-
-    /// How many connections this principal holds.
-    fn held_by(&self, binding: Option<&String>) -> usize {
-        self.inner
-            .connections
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .values()
-            .filter(|connection| connection.principal.as_ref() == binding)
-            .count()
+        registry.prune.notify_one();
     }
 
     /// Whether a new connection for `binding` fits under **both** caps.
     fn has_room_for(&self, binding: Option<&String>) -> bool {
-        let live = self
-            .inner
-            .connections
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .len();
-        admits(live, self.held_by(binding))
+        let (mut live, mut held) = (0, 0);
+        for connection in self.listed() {
+            live += 1;
+            if connection.principal.as_ref() == binding {
+                held += 1;
+            }
+        }
+        admits(live, held)
     }
 
     fn connection(&self, id: &str) -> Option<Arc<Connection>> {
         self.inner
-            .connections
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
+            .registry
+            .get()?
+            .listing()
             .get(id)
+            .filter(|connection| connection.is_listed())
             .cloned()
     }
 
-    /// Take a connection out of the map, counting it closed once.
+    /// List a connection, returning once a lookup can find it.
+    ///
+    /// The connection's own tasks are already running when this is called,
+    /// so an exchange dropped while it waits here leaves a connection that
+    /// still expires, rather than a listed child nothing watches.
+    async fn list(&self, connection: Arc<Connection>) {
+        let registry = self.inner.registry.get_or_init(Registry::start);
+        let (listed, visible) = oneshot::channel();
+        let addition = List { connection, listed };
+        if registry.additions.send(addition).await.is_ok() {
+            let _ = visible.await;
+        }
+    }
+
+    /// Take a connection out of the export, counting it closed once.
     ///
     /// **Call this before releasing the counter that announces why the
     /// connection ended.** A reader waits on that counter (`output_stalls`,
     /// `connection_subscribe_expired`, `connections_ended_by_child`,
     /// `connections_ended_by_subscriber_loss`) with an `Acquire` load and then
-    /// reads `live_connections` under this same mutex, so a removal sequenced
-    /// before the `Release` is guaranteed visible to it. Released first, the
-    /// count announced an ended connection that was still listed live, and a
-    /// reader that landed in the gap saw both (M8-C31). Idempotent: a second
-    /// call finds nothing and counts nothing, and a caller that gets `None`
+    /// reads `live_connections`, which counts only connections whose latch is
+    /// still set, so an unlisting sequenced before the `Release` is
+    /// guaranteed visible to it. Released first, the count announced an ended
+    /// connection that was still listed live, and a reader that landed in the
+    /// gap saw both (M8-C31). Idempotent: a second call finds the latch
+    /// already cleared and counts nothing, and a caller that gets `false`
     /// back did not end the connection and must not count an ending for it
-    /// (M8-C32).
+    /// (M8-C32).  It takes the connection rather than its identifier, so it
+    /// does not matter whether the listing has been published yet.
     ///
-    /// [`Self::shutdown`] is the one path that does not call this: it takes
-    /// the whole map under one lock and counts exactly what it took, which is
-    /// the same removal for every entry at once (M8-C33).
-    fn remove(&self, id: &str) -> Option<Arc<Connection>> {
-        let removed = self
-            .inner
-            .connections
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .remove(id);
-        if removed.is_some() {
-            self.inner
-                .counters
-                .connections_closed
-                .fetch_add(1, Ordering::Relaxed);
+    /// [`Self::shutdown`] is the one path that does not call this: it clears
+    /// the same latch for every listed connection and counts exactly the ones
+    /// it cleared (M8-C33).
+    fn remove(&self, connection: &Connection) -> bool {
+        if !connection.unlist() {
+            return false;
         }
-        removed
+        self.inner
+            .counters
+            .connections_closed
+            .fetch_add(1, Ordering::Relaxed);
+        if let Some(registry) = self.inner.registry.get() {
+            registry.prune.notify_one();
+        }
+        true
     }
 
     /// Serve one exchange in process.
@@ -709,7 +1052,7 @@ impl AcpExport {
         let (parts, body) = request.into_parts();
         match parts.method {
             http::Method::POST => self.post(&parts.headers, body).await,
-            http::Method::GET => Ok(self.get(&parts.headers)),
+            http::Method::GET => Ok(self.get(&parts.headers).await),
             http::Method::DELETE => Ok(self.delete(&parts.headers).await),
             // The codec routes only these three; anything else never reaches
             // the handler.  Answering rather than panicking keeps a future
@@ -844,6 +1187,8 @@ impl AcpExport {
             return Ok(self.refuse(&rejected));
         }
 
+        let stream = Target::new();
+        let (commands, inbox) = mpsc::channel(CONNECTION_COMMAND_QUEUE);
         let connection = Arc::new(Connection {
             id: id.clone(),
             supervisor,
@@ -852,20 +1197,13 @@ impl AcpExport {
             limits: validated.limits,
             connection_subscribe_deadline: validated.connection_subscribe_deadline,
             session_subscribe_deadline: validated.session_subscribe_deadline,
-            state: Mutex::new(ConnectionState {
-                connection: Arc::new(Target::new()),
-                sessions: BTreeMap::new(),
-                closed: false,
-            }),
+            commands,
+            stream: stream.tx.clone(),
+            listed: AtomicBool::new(true),
             counters: Arc::clone(&self.inner.counters),
             shutdown: CancellationToken::new(),
             outbound,
         });
-        self.inner
-            .connections
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(id.clone(), Arc::clone(&connection));
         self.inner
             .counters
             .connections_opened
@@ -877,7 +1215,15 @@ impl AcpExport {
             forward_rx,
             validated.output_stall_deadline,
         ));
-        tokio::spawn(watch_deadlines(self.clone(), Arc::clone(&connection)));
+        tokio::spawn(own_connection(
+            self.clone(),
+            Arc::clone(&connection),
+            ConnectionState::new(stream),
+            inbox,
+        ));
+        // Listed after its tasks exist and before the identifier is
+        // returned: no request can name this connection until it is visible.
+        self.list(Arc::clone(&connection)).await;
 
         let body = serde_json::to_vec(&json!({
             "jsonrpc": "2.0",
@@ -969,15 +1315,14 @@ impl AcpExport {
             // Create the queue before publishing the identifier, so a host
             // that opens the session GET the instant it reads the result finds
             // a stream, and so anything the agent already said is in it.
-            let _ = connection.session_target(&session);
-            let target = connection.with(|state| Arc::clone(&state.connection));
+            let _ = connection.route(Some(&session)).await;
             let body = serde_json::to_vec(&json!({
                 "jsonrpc": "2.0",
                 "id": host_id,
                 "result": {"sessionId": session},
             }))
             .unwrap_or_default();
-            let _ = target.tx.send(Bytes::from(body)).await;
+            let _ = connection.stream.send(Bytes::from(body)).await;
         });
         no_body(StatusCode::ACCEPTED)
     }
@@ -995,10 +1340,10 @@ impl AcpExport {
                 "this method is session-scoped and requires Acp-Session-Id",
             ));
         };
-        if !connection.supervisor.has_session(&session) {
+        if !connection.supervisor.has_session(&session).await {
             return not_found();
         }
-        let ticket = match connection.supervisor.prompt_with(&session, params) {
+        let ticket = match connection.supervisor.prompt_with(&session, params).await {
             Ok(ticket) => ticket,
             Err(error) => {
                 if error.rule() == Some(LifecycleRule::SessionNotReady) {
@@ -1022,8 +1367,13 @@ impl AcpExport {
         let ordered = connection.outbound.upgrade();
         let stall_deadline = self.inner.validated.output_stall_deadline;
         tokio::spawn(async move {
-            let Some(target) = connection.session_target(&session) else {
-                return;
+            // The session's queue, asked for now: `None` when that stream is
+            // already over, in which case there is nowhere left for the
+            // fallback below to deliver.
+            let target = match connection.route(Some(&session)).await {
+                Routing::ConnectionClosed => return,
+                Routing::Over => None,
+                Routing::Open(queue) => Some(queue),
             };
             // `stop_reason` runs the pinned crate's own v1 turn-completion
             // reader: a v2 acknowledgement with no `stopReason` is refused by
@@ -1061,8 +1411,8 @@ impl AcpExport {
             // dispatcher delivers them first and applies the same stall and
             // loss rules to the result or the error.  Only when the dispatcher
             // is already gone -- the connection closed -- is the body handed
-            // to the target directly, still bounded by the stall deadline, and
-            // the target's own closed state then decides.
+            // to the stream's queue directly, still bounded by the stall
+            // deadline, and whether anything still reads that queue decides.
             let body = match ordered {
                 Some(ordered) => match ordered
                     .send(OutboundMessage {
@@ -1077,7 +1427,9 @@ impl AcpExport {
                 },
                 None => body,
             };
-            let _ = tokio::time::timeout(stall_deadline, target.tx.send(Bytes::from(body))).await;
+            if let Some(queue) = target {
+                let _ = tokio::time::timeout(stall_deadline, queue.send(Bytes::from(body))).await;
+            }
         });
         no_body(StatusCode::ACCEPTED)
     }
@@ -1111,7 +1463,7 @@ impl AcpExport {
         }
     }
 
-    fn get(&self, headers: &http::HeaderMap) -> Response<ExportBody> {
+    async fn get(&self, headers: &http::HeaderMap) -> Response<ExportBody> {
         if let Err(rejected) = validate_get(headers) {
             return self.refuse(&rejected);
         }
@@ -1125,39 +1477,36 @@ impl AcpExport {
             return not_found();
         }
         let session = header(headers, tunnel_acp::headers::ACP_SESSION_ID);
-        let target = match &session {
-            Some(session) => {
-                if !connection.supervisor.has_session(session) {
-                    return not_found();
-                }
-                match connection.session_target(session) {
-                    Some(target) => target,
-                    None => return not_found(),
-                }
-            }
-            None => connection.with(|state| Arc::clone(&state.connection)),
-        };
-        let Some(queue) = target.take() else {
-            // The one-subscriber rule, and it is structural: there is nothing
-            // left to take.
-            self.inner
-                .counters
-                .subscribers_refused
-                .fetch_add(1, Ordering::Relaxed);
-            return no_body(StatusCode::CONFLICT);
-        };
-        if let Some(session) = &session {
-            // A session admits its prompt only once its subscriber is ready,
-            // and this is the moment it becomes so.
-            let _ = connection.supervisor.subscriber_ready(session);
+        if let Some(session) = &session
+            && !connection.supervisor.has_session(session).await
+        {
+            return not_found();
         }
         let bytes = Arc::new(AtomicU64::new(0));
         let (sender, body) =
             ChannelResponseBody::channel(connection.limits.sse_response_body(), bytes);
-        // Park a clone so the connection's watchdog can see this stream break
-        // even if the agent never sends another message. Without it, a broken
-        // stream on a quiet connection is invisible until the next write.
-        target.watch_body(sender.clone());
+        // A clone of the body's sender goes with the request to subscribe, so
+        // the connection's watchdog can see this stream break even if the
+        // agent never sends another message. Without it, a broken stream on a
+        // quiet connection is invisible until the next write.
+        let queue = match connection.subscribe(session.clone(), sender.clone()).await {
+            Subscription::Granted(queue) => queue,
+            Subscription::ConnectionClosed if session.is_some() => return not_found(),
+            Subscription::Refused | Subscription::ConnectionClosed => {
+                // The one-subscriber rule, and it is structural: there is
+                // nothing left to take.
+                self.inner
+                    .counters
+                    .subscribers_refused
+                    .fetch_add(1, Ordering::Relaxed);
+                return no_body(StatusCode::CONFLICT);
+            }
+        };
+        if let Some(session) = &session {
+            // A session admits its prompt only once its subscriber is ready,
+            // and this is the moment it becomes so.
+            let _ = connection.supervisor.subscriber_ready(session).await;
+        }
         tokio::spawn(pump_stream(
             queue,
             sender,
@@ -1183,7 +1532,7 @@ impl AcpExport {
         if connection.principal != principal_binding(headers) {
             return not_found();
         }
-        self.remove(&id);
+        self.remove(&connection);
         // 202: accepted by the bridge.  Teardown — cancelling outstanding
         // permissions, killing the child's process group, reaping it — is not
         // finished when this status is written, which is exactly what
@@ -1226,29 +1575,26 @@ async fn dispatch_outbound(
 ) {
     let bound_us = u64::try_from(stall_deadline.as_micros()).unwrap_or(u64::MAX);
     while let Some(message) = inbox.recv().await {
-        let target = match message.session.as_deref() {
-            Some(session) => connection.session_target(session),
-            None => Some(connection.with(|state| Arc::clone(&state.connection))),
+        let queue = match connection.route(message.session.as_deref()).await {
+            Routing::Open(queue) => queue,
+            // The connection itself is closed; there is nothing left to
+            // route a session's message to and the child is on its way out.
+            Routing::ConnectionClosed if message.session.is_some() => return,
+            Routing::Over | Routing::ConnectionClosed => {
+                connection
+                    .counters
+                    .messages_dropped_on_closed_stream
+                    .fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
         };
-        // `None` means the connection itself is closed; there is nothing left
-        // to route to and the child is on its way out.
-        let Some(target) = target else { return };
-        if target.is_closed() {
-            connection
-                .counters
-                .messages_dropped_on_closed_stream
-                .fetch_add(1, Ordering::Relaxed);
-            continue;
-        }
         let waited = Instant::now();
-        match tokio::time::timeout(stall_deadline, target.tx.send(Bytes::from(message.compact)))
-            .await
-        {
+        match tokio::time::timeout(stall_deadline, queue.send(Bytes::from(message.compact))).await {
             Ok(Ok(())) => {}
             Ok(Err(_)) => {
                 // The body went away while this message was queued: the
                 // established stream broke.
-                target.close();
+                let established = connection.stream_lost(message.session.as_deref()).await;
                 connection
                     .counters
                     .streams_lost
@@ -1259,8 +1605,9 @@ async fn dispatch_outbound(
                 // reddens nothing. It is kept because ending at the moment a
                 // message could not be delivered is better than ending up to
                 // a tick later, not because anything depends on it.
-                if target.is_subscribed() {
+                if established {
                     end_with_subscriber_loss(&export, &connection).await;
+                    close_connection(&connection).await;
                     return;
                 }
             }
@@ -1272,8 +1619,9 @@ async fn dispatch_outbound(
                 // into the send future and is gone with it: nothing here
                 // skips it and continues.
                 let elapsed = u64::try_from(waited.elapsed().as_micros()).unwrap_or(u64::MAX);
-                // Out of the map before the counter: see [`AcpExport::remove`].
-                export.remove(&connection.id);
+                // Out of the listing before the counter: see
+                // [`AcpExport::remove`].
+                export.remove(&connection);
                 connection
                     .counters
                     .last_stall_elapsed_us
@@ -1287,6 +1635,7 @@ async fn dispatch_outbound(
                     .output_stalls
                     .fetch_add(1, Ordering::Release);
                 end_with_subscriber_loss(&export, &connection).await;
+                close_connection(&connection).await;
                 return;
             }
         }
@@ -1310,13 +1659,16 @@ async fn dispatch_outbound(
 /// 3. **Active turns are asked to cancel** — a real `session/cancel` per open
 ///    session, sent *before* the child is killed, because the policy says
 ///    request cancellation rather than merely stop.
-/// 4. **Streams close** — every open body is failed, not ended cleanly.
+/// 4. **Streams close** — every open body is failed, not ended cleanly. That
+///    step is the caller's, because who may close a connection's streams
+///    depends on who is asking: the task that owns them closes them itself,
+///    and any other task asks it to ([`close_connection`]).
 /// 5. **A reconnect must initialize anew** — there is no connection left to
 ///    reattach to, which is the same fact as (1) seen from the GET side.
 async fn end_with_subscriber_loss(export: &AcpExport, connection: &Arc<Connection>) {
     // (1) and (5): out of the map before anything slow happens, so no further
     // work is admitted while the teardown runs.
-    export.remove(&connection.id);
+    export.remove(connection);
     // (2): resolve, count, and tell the agent.
     let cancelled = connection.supervisor.cancel_all_permissions().await;
     connection
@@ -1326,7 +1678,7 @@ async fn end_with_subscriber_loss(export: &AcpExport, connection: &Arc<Connectio
     // (3): ask each open turn to cancel before the child is killed. A child
     // that is about to be killed cannot answer, which is exactly why this is a
     // request and not a claim that the turn ended cleanly.
-    for session in connection.supervisor.open_sessions() {
+    for session in connection.supervisor.open_sessions().await {
         let _ = connection
             .supervisor
             .cancel_session(&session, json!({"sessionId": session}))
@@ -1336,8 +1688,6 @@ async fn end_with_subscriber_loss(export: &AcpExport, connection: &Arc<Connectio
         .counters
         .connections_ended_by_subscriber_loss
         .fetch_add(1, Ordering::Release);
-    // (4) and the child: close every stream and drain.
-    close_connection(connection).await;
 }
 
 /// Drain one stream's queue into its SSE body, framing each message.
@@ -1381,12 +1731,66 @@ async fn pump_stream(
     }
 }
 
-/// Read the clock and expire a subscription that never arrived.
+/// Serve the connection's commands until `work` finishes.
 ///
-/// The deadline is **measured**, not assumed: the elapsed time it actually ran
-/// is recorded with the bound it exceeded, so a test reads what happened
+/// The owner of a connection's streams must keep answering while it does
+/// anything slow.  The dispatcher asks it where each message goes, and a
+/// dispatcher left waiting stops draining the supervisor's forward channel,
+/// which stops the supervisor's reader, which is the very task a teardown is
+/// waiting on to hear the child.
+async fn serve_while<W: Future>(
+    state: &mut ConnectionState,
+    inbox: &mut mpsc::Receiver<ConnectionCommand>,
+    shutdown: &CancellationToken,
+    work: W,
+) -> W::Output {
+    let mut work = std::pin::pin!(work);
+    loop {
+        tokio::select! {
+            output = &mut work => return output,
+            Some(command) = inbox.recv() => state.serve(command, shutdown),
+        }
+    }
+}
+
+/// The owner's own close: fail every open body, drop the streams, stop
+/// answering, and drain the child.
+async fn close_owned(
+    connection: &Connection,
+    mut state: ConnectionState,
+    inbox: mpsc::Receiver<ConnectionCommand>,
+) {
+    // Every open body is failed rather than ended cleanly: `docs/acp.md`
+    // refuses to let a broken ACP stream look like an orderly one, so a
+    // consumer sees an error and not an end of stream.  Cancelled before the
+    // streams are dropped, so a pump that finds its queue ended reads the
+    // cancellation with it.
+    connection.shutdown.cancel();
+    state.close();
+    // A command still queued, or sent later, finds its reply dropped and
+    // reads that as a closed connection.
+    drop(inbox);
+    connection.supervisor.drain().await;
+}
+
+/// One connection's owning task: it holds the connection's streams, answers
+/// the other tasks' questions about them, and is the watchdog that reads the
+/// clock.
+///
+/// The deadlines are **measured**, not assumed: the elapsed time one actually
+/// ran is recorded with the bound it exceeded, so a test reads what happened
 /// rather than the constant it was configured with.
-async fn watch_deadlines(export: AcpExport, connection: Arc<Connection>) {
+///
+/// **The streams are never dropped before `shutdown` is cancelled.**  A
+/// stream's pump reads an ended queue as an orderly end of stream unless the
+/// cancellation is already visible, so every path out of this task either
+/// follows a cancellation or cancels first.
+async fn own_connection(
+    export: AcpExport,
+    connection: Arc<Connection>,
+    mut state: ConnectionState,
+    mut inbox: mpsc::Receiver<ConnectionCommand>,
+) {
     // **Two windows, two bounds (M8-C12).** One configured value used to
     // bound both, so shortening the session window shortened the connection
     // window with it.
@@ -1397,19 +1801,45 @@ async fn watch_deadlines(export: AcpExport, connection: Arc<Connection>) {
     let mut ticker = tokio::time::interval(WATCHDOG_TICK);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
+        // A connection that was closed or shut down has no streams to own.
+        if connection.shutdown.is_cancelled() {
+            return;
+        }
         tokio::select! {
             () = connection.shutdown.cancelled() => return,
+            command = inbox.recv() => {
+                // Never `None`: this task holds the connection, which holds
+                // a sender.
+                if let Some(command) = command
+                    && !connection.shutdown.is_cancelled()
+                {
+                    state.serve(command, &connection.shutdown);
+                }
+                continue;
+            }
             // **A child that is gone ends its transport.** `docs/acp.md`: "A
             // child crash closes the transport and invalidates live sessions."
-            // This task used to simply return here, which left the connection
-            // in the export's map with a dead child behind it until someone
-            // sent a DELETE, and left every open stream hanging without an
-            // ending. A child can end for reasons that are the profile's own —
-            // a batch, a malformed line, an oversized line, each of which kills
-            // it by its own `AcpRule` — so this is the path those refusals
-            // reach the host on.
+            // Without this the connection would stay listed with a dead child
+            // behind it until someone sent a DELETE, and every open stream
+            // would hang without an ending. A child can end for reasons that
+            // are the profile's own — a batch, a malformed line, an oversized
+            // line, each of which kills it by its own `AcpRule` — so this is
+            // the path those refusals reach the host on.
             () = connection.supervisor.wait_exited() => {
-                end_with_child(&export, &connection).await;
+                if end_with_child(&export, &connection) {
+                    close_owned(&connection, state, inbox).await;
+                } else {
+                    // Some other ending owns this teardown and will cancel
+                    // `shutdown` when it closes the connection.  The streams
+                    // stay owned, and answered for, until it does.
+                    serve_while(
+                        &mut state,
+                        &mut inbox,
+                        &connection.shutdown,
+                        connection.shutdown.cancelled(),
+                    )
+                    .await;
+                }
                 return;
             }
             _ = ticker.tick() => {}
@@ -1419,26 +1849,25 @@ async fn watch_deadlines(export: AcpExport, connection: Arc<Connection>) {
         // still notices. Both the connection stream and every session stream
         // are required; `docs/acp.md` asks each to be broken independently and
         // each has the same consequence.
-        let broken = connection.with(|state| {
-            state.connection.established_and_broken()
-                || state
-                    .sessions
-                    .values()
-                    .any(|target| target.established_and_broken())
-        });
-        if broken {
-            end_with_subscriber_loss(&export, &connection).await;
+        if state.any_established_and_broken() {
+            serve_while(
+                &mut state,
+                &mut inbox,
+                &connection.shutdown,
+                end_with_subscriber_loss(&export, &connection),
+            )
+            .await;
+            close_owned(&connection, state, inbox).await;
             return;
         }
-        let target = connection.with(|state| Arc::clone(&state.connection));
-        if !target.is_subscribed() && target.created.elapsed() > connection_bound {
-            let elapsed = u64::try_from(target.created.elapsed().as_micros()).unwrap_or(u64::MAX);
+        if let Some(waited) = state.connection_unsubscribed_past(connection_bound) {
+            let elapsed = u64::try_from(waited.as_micros()).unwrap_or(u64::MAX);
             // The measurement is published **before** the counter that makes it
             // findable. A reader that sees the count and then reads a stale
             // elapsed would compare 0 against 0 and pass; that is not the
-            // observation this is for. The connection leaves the map before
-            // either, for the reason [`AcpExport::remove`] gives.
-            export.remove(&connection.id);
+            // observation this is for. The connection leaves the listing
+            // before either, for the reason [`AcpExport::remove`] gives.
+            export.remove(&connection);
             connection
                 .counters
                 .last_expiry_elapsed_us
@@ -1451,46 +1880,16 @@ async fn watch_deadlines(export: AcpExport, connection: Arc<Connection>) {
                 .counters
                 .connection_subscribe_expired
                 .fetch_add(1, Ordering::Release);
-            close_connection(&connection).await;
+            close_owned(&connection, state, inbox).await;
             return;
         }
-        // **An expiry is counted once, and `is_closed` is what makes that
-        // true.** The connection branch above fires once by construction: it
-        // returns. This one is a sweep over `state.sessions` and runs again on
-        // every 20 ms tick, so the filter itself has to stop re-matching a
-        // target it has already expired. `Target::close()` sets `closed` and
-        // takes the receiving half; it deliberately leaves `subscribed` false
-        // and deliberately leaves the entry in `state.sessions`, because that
-        // entry is what lets a late session GET find a closed target and be
-        // refused 409 rather than fall through to 404. Without the
-        // `is_closed()` term the same target matched on every tick for the
-        // life of the connection, so `session_subscribe_expired` counted
-        // **ticks, not expiries**, and `last_expiry_elapsed_us` /
-        // `last_expiry_bound_us` were rewritten 50 times a second after the
-        // first expiry -- which defeats the publish-before-count ordering
-        // below, since the pair a reader samples would then belong to an
-        // arbitrary later tick rather than to the expiry (M8-C25).
-        //
-        // The term masks nothing. A never-subscribed target's receiver is
-        // parked in `rx` until `close()` takes it, so a send cannot have
-        // failed on it first, and the only other closer is `close_connection`,
-        // after which this watchdog has returned. `established_and_broken`
-        // beside it already excludes closed targets; this sweep is now
-        // consistent with it.
-        let expired: Vec<Arc<Target>> = connection.with(|state| {
-            state
-                .sessions
-                .values()
-                .filter(|target| {
-                    !target.is_subscribed()
-                        && !target.is_closed()
-                        && target.created.elapsed() > session_bound
-                })
-                .cloned()
-                .collect()
-        });
-        for target in expired {
-            let elapsed = u64::try_from(target.created.elapsed().as_micros()).unwrap_or(u64::MAX);
+        // **An expiry is counted once**: `expire_sessions` closes each stream
+        // it reports, and a stream that is over never matches again, so
+        // `session_subscribe_expired` counts expiries and not ticks, and the
+        // measurement pair below belongs to the expiry rather than to an
+        // arbitrary later tick (M8-C25).
+        for waited in state.expire_sessions(session_bound) {
+            let elapsed = u64::try_from(waited.as_micros()).unwrap_or(u64::MAX);
             // Published before the counter, for the reason above.
             connection
                 .counters
@@ -1504,20 +1903,17 @@ async fn watch_deadlines(export: AcpExport, connection: Arc<Connection>) {
                 .counters
                 .session_subscribe_expired
                 .fetch_add(1, Ordering::Release);
-            // Closing the target is what stops a later GET from subscribing to
-            // a session whose window has closed: the same mechanism as the
-            // one-subscriber rule, so an expired session answers 409 and never
-            // silently reopens.
-            target.close();
         }
     }
 }
 
-/// End a connection because its child did, folding the child's own refusal
-/// counters in first so they outlive the connection that carried them.
-async fn end_with_child(export: &AcpExport, connection: &Arc<Connection>) {
-    // Out of the map before the counter a reader waits on is released, for
-    // the reason [`AcpExport::remove`] gives.
+/// Record that a connection ended because its child did, folding the child's
+/// own refusal counters in first so they outlive the connection that carried
+/// them.  `true` when this call is the one that ended the connection, and the
+/// caller must then close it.
+fn end_with_child(export: &AcpExport, connection: &Arc<Connection>) -> bool {
+    // Out of the listing before the counter a reader waits on is released,
+    // for the reason [`AcpExport::remove`] gives.
     //
     // **And only if this call is the one that removed it** (M8-C32). Every
     // other ending — a stall, a lost subscriber, an expiry, a DELETE,
@@ -1526,8 +1922,8 @@ async fn end_with_child(export: &AcpExport, connection: &Arc<Connection>) {
     // watchdog whose `select!` wakes with both of those ready may take this
     // branch for a connection the child did not end, and it used to count
     // `connections_ended_by_child` for it regardless.
-    if export.remove(&connection.id).is_none() {
-        return;
+    if !export.remove(connection) {
+        return false;
     }
     let child = connection.supervisor.diagnostics();
     connection
@@ -1544,17 +1940,13 @@ async fn end_with_child(export: &AcpExport, connection: &Arc<Connection>) {
         .counters
         .connections_ended_by_child
         .fetch_add(1, Ordering::Release);
-    close_connection(connection).await;
+    true
 }
 
+/// Close a connection from a task that does not own its streams: ask the
+/// owner to close them, then fail every open body and drain the child.
 async fn close_connection(connection: &Arc<Connection>) {
-    connection.with(|state| {
-        state.closed = true;
-        state.connection.close();
-        for target in state.sessions.values() {
-            target.close();
-        }
-    });
+    connection.close_streams().await;
     // Every open body is failed rather than ended cleanly: `docs/acp.md`
     // refuses to let a broken ACP stream look like an orderly one, so a
     // consumer sees an error and not an end of stream.
@@ -1741,9 +2133,10 @@ mod capacity_tests {
 /// How a connection's ending is counted: once, by the path that ended it.
 ///
 /// These build real connections around a real child, `/bin/cat`, which reads
-/// its stdin until it is killed and writes nothing on its own. The bridge's own
-/// tasks are never spawned, so each test drives exactly the ending it names
-/// and no watchdog or dispatcher can race it. Unix-only: the child is
+/// its stdin until it is killed and writes nothing on its own. A connection's
+/// own tasks are never spawned, so each test drives exactly the ending it names
+/// and no watchdog or dispatcher can race it; only the export's registry task
+/// runs, because listing a connection is asking it to. Unix-only: the child is
 /// `/bin/cat`, which Windows does not have.
 #[cfg(all(test, unix))]
 mod ending_tests {
@@ -1753,8 +2146,8 @@ mod ending_tests {
     use tokio_util::sync::CancellationToken;
 
     use super::{
-        AcpExport, Arc, Connection, ConnectionScope, ConnectionState, Mutex, Ordering, Supervisor,
-        SupervisorConfig, Target, end_with_child,
+        AcpExport, Arc, AtomicBool, Connection, ConnectionScope, Ordering, Supervisor,
+        SupervisorConfig, close_connection, end_with_child,
     };
     use crate::child::ChildConfig;
     use crate::config::AcpExportConfig;
@@ -1797,11 +2190,11 @@ mod ending_tests {
             limits: export.inner.validated.limits,
             connection_subscribe_deadline: export.inner.validated.connection_subscribe_deadline,
             session_subscribe_deadline: export.inner.validated.session_subscribe_deadline,
-            state: Mutex::new(ConnectionState {
-                connection: Arc::new(Target::new()),
-                sessions: std::collections::BTreeMap::new(),
-                closed: false,
-            }),
+            // No owning task in this fixture: its command queue and the
+            // connection stream are both already closed.
+            commands: tokio::sync::mpsc::channel(1).0,
+            stream: tokio::sync::mpsc::channel(1).0,
+            listed: AtomicBool::new(true),
             counters: Arc::clone(&export.inner.counters),
             shutdown: CancellationToken::new(),
             // No dispatcher in this fixture: a sender that is already gone.
@@ -1811,13 +2204,8 @@ mod ending_tests {
         })
     }
 
-    fn insert(export: &AcpExport, connection: &Arc<Connection>) {
-        export
-            .inner
-            .connections
-            .lock()
-            .expect("map")
-            .insert(connection.id.clone(), Arc::clone(connection));
+    async fn insert(export: &AcpExport, connection: &Arc<Connection>) {
+        export.list(Arc::clone(connection)).await;
         export
             .inner
             .counters
@@ -1833,9 +2221,10 @@ mod ending_tests {
         let workspace = tempfile::tempdir().expect("workspace");
         let export = export(workspace.path());
         let connection = connection(&export, workspace.path(), "c-1");
-        insert(&export, &connection);
+        insert(&export, &connection).await;
 
-        end_with_child(&export, &connection).await;
+        assert!(end_with_child(&export, &connection));
+        close_connection(&connection).await;
 
         let diagnostics = export.diagnostics();
         assert_eq!(diagnostics.connections_ended_by_child, 1, "{diagnostics:?}");
@@ -1852,12 +2241,15 @@ mod ending_tests {
         let workspace = tempfile::tempdir().expect("workspace");
         let export = export(workspace.path());
         let ended = connection(&export, workspace.path(), "c-1");
-        insert(&export, &ended);
+        insert(&export, &ended).await;
         // Another ending got there first.
-        assert!(export.remove(&ended.id).is_some());
+        assert!(export.remove(&ended));
         ended.supervisor.kill();
 
-        end_with_child(&export, &ended).await;
+        assert!(
+            !end_with_child(&export, &ended),
+            "a connection another path ended is not this call's to close"
+        );
 
         let diagnostics = export.diagnostics();
         assert_eq!(
@@ -1872,22 +2264,22 @@ mod ending_tests {
     }
 
     /// **`shutdown` counts a connection removed concurrently exactly once**
-    /// (M8-C33). It used to snapshot the map under one lock and clear it under
-    /// a second, then count every snapshot entry, so a `remove` between the
-    /// two was counted by both.
+    /// (M8-C33). It used to snapshot the map and clear it in two separate
+    /// steps, then count every snapshot entry, so a `remove` between the two
+    /// was counted by both.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn shutdown_and_a_concurrent_remove_count_a_connection_once() {
         let workspace = tempfile::tempdir().expect("workspace");
         let export = export(workspace.path());
         let first = connection(&export, workspace.path(), "c-1");
         let second = connection(&export, workspace.path(), "c-2");
-        insert(&export, &first);
-        insert(&export, &second);
+        insert(&export, &first).await;
+        insert(&export, &second).await;
 
         let stopping = export.clone();
         let shutdown = std::thread::spawn(move || stopping.shutdown());
         std::thread::sleep(Duration::from_millis(50));
-        let _ = export.remove(&first.id);
+        let _ = export.remove(&first);
         shutdown.join().expect("shutdown");
 
         let diagnostics = export.diagnostics();
@@ -1911,12 +2303,12 @@ mod ending_tests {
         let export = export(workspace.path());
         let first = connection(&export, workspace.path(), "c-1");
         let late = connection(&export, workspace.path(), "c-2");
-        insert(&export, &first);
+        insert(&export, &first).await;
 
         let stopping = export.clone();
         let shutdown = std::thread::spawn(move || stopping.shutdown());
         std::thread::sleep(Duration::from_millis(50));
-        insert(&export, &late);
+        insert(&export, &late).await;
         shutdown.join().expect("shutdown");
 
         let diagnostics = export.diagnostics();
@@ -1935,5 +2327,273 @@ mod ending_tests {
         first.supervisor.drain().await;
         late.supervisor.kill();
         late.supervisor.drain().await;
+    }
+}
+
+/// The stream and connection phases, as a transition table.
+#[cfg(test)]
+mod phase_tests {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicU64;
+    use std::time::Duration;
+
+    use tokio::sync::oneshot;
+    use tokio_util::sync::CancellationToken;
+
+    use super::{
+        ConnectionCommand, ConnectionState, Routing, Subscription, Target, TargetEffect,
+        TargetEvent, TargetPhase,
+    };
+    use crate::sse::{ChannelResponseBody, StreamSender};
+
+    /// A live body's sender, and the body that keeps it open.
+    fn body() -> (StreamSender, ChannelResponseBody) {
+        ChannelResponseBody::channel(1 << 20, Arc::new(AtomicU64::new(0)))
+    }
+
+    #[test]
+    fn a_waiting_stream_grants_its_queue_to_the_first_subscriber_only() {
+        let mut target = Target::new();
+        assert!(!target.is_subscribed());
+        assert!(!target.is_closed());
+        let (first, _first_body) = body();
+        assert!(matches!(
+            target.apply(TargetEvent::Subscribe(first)),
+            TargetEffect::Granted(_)
+        ));
+        assert!(matches!(target.phase, TargetPhase::Established(_)));
+        assert!(target.is_subscribed());
+        // The one-subscriber rule: there is nothing left to take.
+        let (second, _second_body) = body();
+        assert!(matches!(
+            target.apply(TargetEvent::Subscribe(second)),
+            TargetEffect::Refused
+        ));
+        assert!(matches!(target.phase, TargetPhase::Established(_)));
+    }
+
+    #[test]
+    fn a_stream_that_never_had_a_subscriber_closes_as_not_established() {
+        let mut target = Target::new();
+        assert!(matches!(
+            target.apply(TargetEvent::Close),
+            TargetEffect::Closed
+        ));
+        assert!(matches!(
+            target.phase,
+            TargetPhase::Over { established: false }
+        ));
+        assert!(target.is_closed());
+        assert!(!target.is_subscribed());
+        // Its queue went with it: a send finds nobody reading.
+        assert!(target.tx.is_closed());
+    }
+
+    #[test]
+    fn an_established_stream_closes_as_established() {
+        let mut target = Target::new();
+        let (sender, _body) = body();
+        let _queue = target.apply(TargetEvent::Subscribe(sender));
+        assert!(matches!(
+            target.apply(TargetEvent::Close),
+            TargetEffect::Closed
+        ));
+        assert!(matches!(
+            target.phase,
+            TargetPhase::Over { established: true }
+        ));
+        assert!(target.is_closed());
+        assert!(target.is_subscribed());
+    }
+
+    #[test]
+    fn a_stream_that_is_over_refuses_a_subscriber_and_a_second_close() {
+        for established in [false, true] {
+            let mut target = Target::new();
+            target.phase = TargetPhase::Over { established };
+            let (sender, _body) = body();
+            assert!(matches!(
+                target.apply(TargetEvent::Subscribe(sender)),
+                TargetEffect::Refused
+            ));
+            assert!(matches!(
+                target.apply(TargetEvent::Close),
+                TargetEffect::Refused
+            ));
+            assert!(
+                matches!(target.phase, TargetPhase::Over { established: kept } if kept == established)
+            );
+        }
+    }
+
+    #[test]
+    fn only_an_established_stream_whose_body_is_gone_is_broken() {
+        let mut target = Target::new();
+        assert!(!target.established_and_broken(), "never subscribed");
+        let (sender, live) = body();
+        let _queue = target.apply(TargetEvent::Subscribe(sender));
+        assert!(!target.established_and_broken(), "its body is alive");
+        drop(live);
+        assert!(target.established_and_broken());
+        let _ = target.apply(TargetEvent::Close);
+        assert!(
+            !target.established_and_broken(),
+            "an ending already counted is not counted again"
+        );
+    }
+
+    #[test]
+    fn only_a_stream_still_waiting_can_run_out_its_window() {
+        let mut target = Target::new();
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(target.unsubscribed_past(Duration::ZERO).is_some());
+        assert!(
+            target
+                .unsubscribed_past(Duration::from_secs(3600))
+                .is_none()
+        );
+        let (sender, _body) = body();
+        let _queue = target.apply(TargetEvent::Subscribe(sender));
+        assert!(target.unsubscribed_past(Duration::ZERO).is_none());
+        let _ = target.apply(TargetEvent::Close);
+        assert!(target.unsubscribed_past(Duration::ZERO).is_none());
+    }
+
+    fn route(state: &mut ConnectionState, session: Option<&str>) -> Routing {
+        let (reply, mut routed) = oneshot::channel();
+        state.serve(
+            ConnectionCommand::Route {
+                session: session.map(ToOwned::to_owned),
+                reply,
+            },
+            &CancellationToken::new(),
+        );
+        routed.try_recv().expect("the owner answers at once")
+    }
+
+    fn subscribe(state: &mut ConnectionState, session: Option<&str>) -> Subscription {
+        let (sender, live) = body();
+        // The body is leaked on purpose: these tests are about the phase, not
+        // about a stream breaking.
+        std::mem::forget(live);
+        let (reply, mut subscribed) = oneshot::channel();
+        state.serve(
+            ConnectionCommand::Subscribe {
+                session: session.map(ToOwned::to_owned),
+                body: sender,
+                reply,
+            },
+            &CancellationToken::new(),
+        );
+        subscribed.try_recv().expect("the owner answers at once")
+    }
+
+    fn lose(state: &mut ConnectionState, session: Option<&str>) -> bool {
+        let (established, mut answer) = oneshot::channel();
+        state.serve(
+            ConnectionCommand::StreamLost {
+                session: session.map(ToOwned::to_owned),
+                established,
+            },
+            &CancellationToken::new(),
+        );
+        answer.try_recv().expect("the owner answers at once")
+    }
+
+    #[test]
+    fn an_open_connection_creates_a_sessions_stream_on_first_mention() {
+        let mut state = ConnectionState::new(Target::new());
+        assert!(matches!(route(&mut state, None), Routing::Open(_)));
+        assert!(matches!(route(&mut state, Some("s-1")), Routing::Open(_)));
+        assert!(matches!(
+            subscribe(&mut state, Some("s-1")),
+            Subscription::Granted(_)
+        ));
+        assert!(matches!(
+            subscribe(&mut state, Some("s-1")),
+            Subscription::Refused
+        ));
+        // Another session's stream is its own.
+        assert!(matches!(
+            subscribe(&mut state, Some("s-2")),
+            Subscription::Granted(_)
+        ));
+    }
+
+    #[test]
+    fn a_lost_stream_stays_over_and_says_whether_it_was_established() {
+        let mut state = ConnectionState::new(Target::new());
+        assert!(matches!(
+            route(&mut state, Some("waiting")),
+            Routing::Open(_)
+        ));
+        assert!(!lose(&mut state, Some("waiting")), "never subscribed");
+        assert!(matches!(route(&mut state, Some("waiting")), Routing::Over));
+        assert!(matches!(
+            subscribe(&mut state, Some("waiting")),
+            Subscription::Refused
+        ));
+
+        assert!(matches!(
+            subscribe(&mut state, Some("live")),
+            Subscription::Granted(_)
+        ));
+        assert!(lose(&mut state, Some("live")), "it had a subscriber");
+        assert!(matches!(route(&mut state, Some("live")), Routing::Over));
+        // The connection's own stream is untouched by either.
+        assert!(matches!(route(&mut state, None), Routing::Open(_)));
+    }
+
+    #[test]
+    fn an_expired_session_stream_is_reported_once_and_then_refuses_a_subscriber() {
+        let mut state = ConnectionState::new(Target::new());
+        assert!(matches!(route(&mut state, Some("late")), Routing::Open(_)));
+        assert!(matches!(
+            subscribe(&mut state, Some("prompt")),
+            Subscription::Granted(_)
+        ));
+        std::thread::sleep(Duration::from_millis(5));
+        assert_eq!(state.expire_sessions(Duration::ZERO).len(), 1);
+        assert!(
+            state.expire_sessions(Duration::ZERO).is_empty(),
+            "an expiry is counted once, not once a tick"
+        );
+        assert!(matches!(
+            subscribe(&mut state, Some("late")),
+            Subscription::Refused
+        ));
+        // The connection stream's window is the connection's, not a session's.
+        assert!(state.connection_unsubscribed_past(Duration::ZERO).is_some());
+    }
+
+    #[test]
+    fn closing_cancels_first_and_a_closed_connection_refuses_everything() {
+        let mut state = ConnectionState::new(Target::new());
+        let Subscription::Granted(_queue) = subscribe(&mut state, None) else {
+            panic!("the first subscriber is granted");
+        };
+        let shutdown = CancellationToken::new();
+        let (closed, mut done) = oneshot::channel();
+        state.serve(ConnectionCommand::Close { closed }, &shutdown);
+        assert!(done.try_recv().is_ok());
+        assert!(shutdown.is_cancelled());
+        assert!(matches!(state, ConnectionState::Closed));
+
+        assert!(matches!(route(&mut state, None), Routing::ConnectionClosed));
+        assert!(matches!(
+            route(&mut state, Some("s-1")),
+            Routing::ConnectionClosed
+        ));
+        assert!(matches!(
+            subscribe(&mut state, None),
+            Subscription::ConnectionClosed
+        ));
+        assert!(!lose(&mut state, None));
+        assert!(!state.any_established_and_broken());
+        assert!(state.connection_unsubscribed_past(Duration::ZERO).is_none());
+        assert!(state.expire_sessions(Duration::ZERO).is_empty());
+        // Closing again changes nothing.
+        state.close();
+        assert!(matches!(state, ConnectionState::Closed));
     }
 }

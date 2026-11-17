@@ -84,7 +84,7 @@ impl Exchange {
             ))
             .await
             .expect("actual matching confirmation");
-        assert!(actor.streams[&STREAM].auth.confirmed);
+        assert!(actor.streams[&STREAM].auth.confirmed());
         assert_eq!(actor.fs_counters, crate::FsCounters::default());
         Self {
             actor,
@@ -288,8 +288,8 @@ impl Exchange {
         .expect("bounded normal provider FIN");
         // No task is polled between this actual Finish reply and retirement.
         self.receive_carrier();
-        assert!(self.actor.streams[&STREAM].output_fin);
-        assert!(!self.actor.streams[&STREAM].output_reset);
+        assert!(self.actor.streams[&STREAM].output.fin());
+        assert!(!self.actor.streams[&STREAM].output.reset());
         self.ack();
         assert_eq!(self.actor.fs_counters.exchanges, 0);
         assert!(self.actor.http_handlers.diagnostics().snapshot().is_empty());
@@ -501,7 +501,7 @@ async fn fs_forget_does_not_invent_a_report_before_provider_completion() {
     // Unlike provider-originated FIN, this actor-generated RESET does not
     // wait for serve() to return. Do not poll the provider before retirement.
     exchange.receive_carrier();
-    assert!(exchange.actor.streams[&STREAM].output_reset);
+    assert!(exchange.actor.streams[&STREAM].output.reset());
     exchange.ack();
     exchange.retire_without_yield();
     exchange.task_released().await;

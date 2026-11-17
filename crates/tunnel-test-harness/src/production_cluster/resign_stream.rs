@@ -142,7 +142,7 @@ struct InvalidationCounter {
     other: AtomicU64,
 }
 
-fn install_counter(cluster: &ProductionCluster, counter: &Arc<InvalidationCounter>) {
+async fn install_counter(cluster: &ProductionCluster, counter: &Arc<InvalidationCounter>) {
     for relay in &cluster.relays {
         let publish = super::fixture_pin_callback(
             &relay.membership,
@@ -161,11 +161,12 @@ fn install_counter(cluster: &ProductionCluster, counter: &Arc<InvalidationCounte
                     }
                 }
                 publish();
-            })));
+            })))
+            .await;
     }
 }
 
-fn restore_callbacks(cluster: &ProductionCluster) {
+async fn restore_callbacks(cluster: &ProductionCluster) {
     for relay in &cluster.relays {
         let publish = super::fixture_pin_callback(
             &relay.membership,
@@ -174,7 +175,8 @@ fn restore_callbacks(cluster: &ProductionCluster) {
         );
         relay
             .membership
-            .set_invalidation_callback(Some(Arc::new(move |_identity, _reason| publish())));
+            .set_invalidation_callback(Some(Arc::new(move |_identity, _reason| publish())))
+            .await;
     }
 }
 
@@ -186,7 +188,7 @@ async fn run(
     let mut client: Option<ConnectionHandle> = None;
     let mut stream: Option<ConsumerStream> = None;
     let counter = Arc::new(InvalidationCounter::default());
-    install_counter(cluster, &counter);
+    install_counter(cluster, &counter).await;
     let result = run_inner(
         cluster,
         harness,
@@ -196,7 +198,7 @@ async fn run(
         &counter,
     )
     .await;
-    restore_callbacks(cluster);
+    restore_callbacks(cluster).await;
     let mut cleanup_errors = Vec::new();
     if let Some(stream) = stream.as_mut()
         && let Err(error) = stream.close().await

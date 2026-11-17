@@ -1,12 +1,12 @@
 use crate::error::{HarnessError, Result};
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpSocket, TcpStream};
-use tokio::sync::{Notify, broadcast, mpsc, oneshot};
+use tokio::sync::{Notify, broadcast, mpsc, oneshot, watch};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{timeout, timeout_at};
 
@@ -62,7 +62,24 @@ const COMMAND_TIMEOUT: Duration = Duration::from_secs(1);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const PAUSE_TIMEOUT: Duration = Duration::from_secs(30);
 
-type ActiveConnections = Arc<std::sync::Mutex<HashMap<ConnectionId, ProxyConnection>>>;
+/// The accept loop's published connection bookkeeping.
+///
+/// The accept loop is the only writer: it records every accept and every
+/// completed connection, so the tail of recent IDs and the active peer records
+/// change together and a handle samples one consistent view.
+#[derive(Default)]
+struct ConnectionView {
+    recent_connection_ids: VecDeque<ConnectionId>,
+    active: HashMap<ConnectionId, ProxyConnection>,
+}
+
+/// What a finished connection task hands back to the accept loop: its ID, its
+/// outcome, and the reply of the `close` command that ended it, if any.
+type ConnectionOutcome = (
+    ConnectionId,
+    Result<()>,
+    Option<oneshot::Sender<Result<()>>>,
+);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Direction {
@@ -144,7 +161,6 @@ struct StatsInner {
     peak_active: AtomicU64,
     completed: AtomicU64,
     last_connection_id: AtomicU64,
-    recent_connection_ids: std::sync::Mutex<VecDeque<ConnectionId>>,
     bytes_client_to_target: AtomicU64,
     bytes_target_to_client: AtomicU64,
     dropped_client_to_target: AtomicU64,
@@ -209,7 +225,8 @@ impl std::ops::Deref for ProxyDiagnostics {
 }
 
 impl ProxyDiagnostics {
-    fn snapshot(inner: &StatsInner, active_connections: &ActiveConnections) -> Self {
+    fn snapshot(inner: &StatsInner, connections: &watch::Receiver<ConnectionView>) -> Self {
+        let view = connections.borrow();
         Self {
             stats: ProxyStats::snapshot(inner),
             peak_active: inner.peak_active.load(Ordering::Relaxed),
@@ -217,12 +234,8 @@ impl ProxyDiagnostics {
                 0 => None,
                 value => Some(ConnectionId(value)),
             },
-            recent_connection_ids: inner
-                .recent_connection_ids
-                .lock()
-                .map(|ids| ids.iter().copied().collect())
-                .unwrap_or_default(),
-            active_connections: snapshot_active_connections(active_connections),
+            recent_connection_ids: view.recent_connection_ids.iter().copied().collect(),
+            active_connections: sorted_active_connections(&view),
         }
     }
 }
@@ -264,7 +277,27 @@ enum ConnectionCommand {
     },
 }
 
-type CloseReply = Arc<std::sync::Mutex<Option<oneshot::Sender<Result<()>>>>>;
+/// Command replies one connection task still owes.
+///
+/// The task that runs a connection handles its commands and drives both of
+/// its copy directions, so it owns these outright.
+#[derive(Default)]
+struct PendingReplies {
+    /// The `close` that ended the connection; the accept loop answers it once
+    /// the connection is out of the active set.
+    close: Option<oneshot::Sender<Result<()>>>,
+    /// A pause accepted before its direction reached the pause barrier.
+    pause_client_to_target: Option<oneshot::Sender<Result<()>>>,
+    pause_target_to_client: Option<oneshot::Sender<Result<()>>>,
+}
+
+impl PendingReplies {
+    /// Answer every pending pause whose direction has since settled it.
+    fn settle(&mut self, client_to_target: &DirectionControl, target_to_client: &DirectionControl) {
+        client_to_target.settle_pause(&mut self.pause_client_to_target);
+        target_to_client.settle_pause(&mut self.pause_target_to_client);
+    }
+}
 
 #[derive(Clone)]
 struct GlobalPauseControls {
@@ -282,68 +315,127 @@ impl Default for GlobalPauseControls {
 }
 
 impl GlobalPauseControls {
+    /// Stop both directions and wait until no forwarding write is in flight.
+    ///
+    /// Only the accept loop calls this and [`Self::resume_all`], one command
+    /// at a time, so it is the single writer of both `paused` flags.
     async fn pause_all(&self) -> Result<()> {
-        let pause = async {
-            let client = self.client_to_target.barrier.write();
-            let target = self.target_to_client.barrier.write();
-            let (_client_guard, _target_guard) = tokio::join!(client, target);
-            self.client_to_target.paused.store(true, Ordering::Release);
-            self.target_to_client.paused.store(true, Ordering::Release);
+        let client_was = self.client_to_target.paused.swap(true, Ordering::SeqCst);
+        let target_was = self.target_to_client.paused.swap(true, Ordering::SeqCst);
+        self.client_to_target.changed.notify_waiters();
+        self.target_to_client.changed.notify_waiters();
+        let drained = async {
+            tokio::join!(
+                self.client_to_target.drained(),
+                self.target_to_client.drained()
+            );
+        };
+        if tokio::time::timeout(COMMAND_TIMEOUT, drained)
+            .await
+            .is_err()
+        {
+            // A write that could not finish in time keeps the barrier from
+            // being installed; leave the proxy as the command found it.
+            self.client_to_target
+                .paused
+                .store(client_was, Ordering::SeqCst);
+            self.target_to_client
+                .paused
+                .store(target_was, Ordering::SeqCst);
             self.client_to_target.changed.notify_waiters();
             self.target_to_client.changed.notify_waiters();
-        };
-        tokio::time::timeout(COMMAND_TIMEOUT, pause)
-            .await
-            .map_err(|_| HarnessError::Timeout("global proxy pause timed out".to_owned()))
+            return Err(HarnessError::Timeout(
+                "global proxy pause timed out".to_owned(),
+            ));
+        }
+        Ok(())
     }
 
     async fn resume_all(&self) -> Result<()> {
-        let resume = async {
-            let client = self.client_to_target.barrier.write();
-            let target = self.target_to_client.barrier.write();
-            let (_client_guard, _target_guard) = tokio::join!(client, target);
-            self.client_to_target.paused.store(false, Ordering::Release);
-            self.target_to_client.paused.store(false, Ordering::Release);
-            self.client_to_target.changed.notify_waiters();
-            self.target_to_client.changed.notify_waiters();
-        };
-        tokio::time::timeout(COMMAND_TIMEOUT, resume)
-            .await
-            .map_err(|_| HarnessError::Timeout("global proxy resume timed out".to_owned()))
+        self.client_to_target.paused.store(false, Ordering::SeqCst);
+        self.target_to_client.paused.store(false, Ordering::SeqCst);
+        self.client_to_target.changed.notify_waiters();
+        self.target_to_client.changed.notify_waiters();
+        Ok(())
     }
 }
 
+/// One direction's global pause barrier.
+///
+/// Forwarding never waits on other forwarding: each write only counts itself
+/// in and out. A pause raises `paused` and then waits for the count of writes
+/// already in flight to reach zero; a write that starts afterwards sees
+/// `paused` and backs off before touching the socket. Both sides use `SeqCst`
+/// so that either the pause sees the write's count or the write sees the
+/// pause.
 struct GlobalPauseGate {
-    barrier: tokio::sync::RwLock<()>,
     paused: AtomicBool,
     changed: Notify,
+    /// Forwarding writes of this direction currently inside the socket write.
+    forwarding: AtomicU64,
+    /// Signalled when `forwarding` reaches zero while a pause is being set.
+    quiet: Notify,
 }
 
 impl Default for GlobalPauseGate {
     fn default() -> Self {
         Self {
-            barrier: tokio::sync::RwLock::new(()),
             paused: AtomicBool::new(false),
             changed: Notify::new(),
+            forwarding: AtomicU64::new(0),
+            quiet: Notify::new(),
+        }
+    }
+}
+
+/// Marks one forwarding write as in flight until dropped, including when the
+/// connection is torn down in the middle of the write.
+struct ForwardInFlight<'a>(&'a GlobalPauseGate);
+
+impl Drop for ForwardInFlight<'_> {
+    fn drop(&mut self) {
+        if self.0.forwarding.fetch_sub(1, Ordering::SeqCst) == 1
+            && self.0.paused.load(Ordering::SeqCst)
+        {
+            self.0.quiet.notify_one();
         }
     }
 }
 
 impl GlobalPauseGate {
     fn is_paused(&self) -> bool {
-        self.paused.load(Ordering::Acquire)
+        self.paused.load(Ordering::SeqCst)
     }
 
-    async fn try_acquire_forward(&self) -> Option<tokio::sync::RwLockReadGuard<'_, ()>> {
-        let guard = self.barrier.read().await;
-        if self.is_paused() { None } else { Some(guard) }
+    /// Count a forwarding write in, unless a global pause is set.
+    fn begin_forward(&self) -> Option<ForwardInFlight<'_>> {
+        self.forwarding.fetch_add(1, Ordering::SeqCst);
+        let in_flight = ForwardInFlight(self);
+        if self.is_paused() {
+            None
+        } else {
+            Some(in_flight)
+        }
+    }
+
+    /// Wait until no forwarding write of this direction is in flight.
+    async fn drained(&self) {
+        loop {
+            let quiet = self.quiet.notified();
+            tokio::pin!(quiet);
+            quiet.as_mut().enable();
+            if self.forwarding.load(Ordering::SeqCst) == 0 {
+                return;
+            }
+            quiet.await;
+        }
     }
 }
 
 struct ConnectionControl {
     shutdown: broadcast::Receiver<()>,
     commands: mpsc::Receiver<ConnectionCommand>,
-    close_reply: CloseReply,
+    replies: PendingReplies,
 }
 
 struct ConnectionBuffers {
@@ -358,7 +450,7 @@ struct AcceptContext {
     read_buffer_bytes: usize,
     target_receive_buffer_bytes: Option<u32>,
     stats: Arc<StatsInner>,
-    active_connections: ActiveConnections,
+    connections: watch::Sender<ConnectionView>,
     global_pause: GlobalPauseControls,
 }
 
@@ -389,10 +481,9 @@ impl TcpProxy {
         let (shutdown_tx, _) = broadcast::channel(2);
         let (command_tx, command_rx) = mpsc::channel(PROXY_COMMAND_CAPACITY);
         let stats = Arc::new(StatsInner::default());
-        let active_connections: ActiveConnections = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let (publish_connections, connections) = watch::channel(ConnectionView::default());
         let global_pause = GlobalPauseControls::default();
         let accept_stats = Arc::clone(&stats);
-        let accept_connections = Arc::clone(&active_connections);
         let accept_global_pause = global_pause.clone();
         let accept_faults = config.fault_script.clone();
         let read_buffer_bytes = config.read_buffer_bytes;
@@ -407,7 +498,7 @@ impl TcpProxy {
                     read_buffer_bytes,
                     target_receive_buffer_bytes,
                     stats: accept_stats,
-                    active_connections: accept_connections,
+                    connections: publish_connections,
                     global_pause: accept_global_pause,
                 },
                 accept_shutdown,
@@ -419,7 +510,7 @@ impl TcpProxy {
             local_addr,
             target_addr,
             stats,
-            active_connections,
+            connections,
             shutdown_tx,
             command_tx,
             accept_task: Some(accept_task),
@@ -431,7 +522,7 @@ pub struct ProxyHandle {
     local_addr: SocketAddr,
     target_addr: SocketAddr,
     stats: Arc<StatsInner>,
-    active_connections: ActiveConnections,
+    connections: watch::Receiver<ConnectionView>,
     shutdown_tx: broadcast::Sender<()>,
     command_tx: mpsc::Sender<ProxyCommand>,
     accept_task: Option<JoinHandle<()>>,
@@ -462,14 +553,14 @@ impl ProxyHandle {
 
     /// Return a bounded diagnostic snapshot suitable for status endpoints.
     pub fn diagnostics(&self) -> ProxyDiagnostics {
-        ProxyDiagnostics::snapshot(&self.stats, &self.active_connections)
+        ProxyDiagnostics::snapshot(&self.stats, &self.connections)
     }
 
     /// Return the currently active accepted connections and their client peer
     /// addresses.  The result is bounded by the proxy's active-connection
     /// limit and contains no historical address mapping.
     pub fn connections(&self) -> Vec<ProxyConnection> {
-        snapshot_active_connections(&self.active_connections)
+        sorted_active_connections(&self.connections.borrow())
     }
 
     /// Close exactly one accepted connection.  The command is sent through a
@@ -646,17 +737,18 @@ async fn accept_loop(
         read_buffer_bytes,
         target_receive_buffer_bytes,
         stats,
-        active_connections,
+        connections: view,
         global_pause,
     } = context;
-    let mut connections = JoinSet::new();
+    let mut connections: JoinSet<ConnectionOutcome> = JoinSet::new();
     let mut routes = HashMap::new();
     loop {
         let accepted = tokio::select! {
             _ = shutdown.recv() => break,
             Some(joined) = connections.join_next() => {
-                if let Ok((connection_id, _result)) = joined {
-                    routes.remove(&connection_id);
+                if let Ok(outcome) = joined {
+                    routes.remove(&outcome.0);
+                    record_completion(&stats, &view, outcome);
                 }
                 continue;
             }
@@ -677,30 +769,27 @@ async fn accept_loop(
             }
         };
         let connection_stats = Arc::clone(&stats);
-        let connection_active = Arc::clone(&active_connections);
         let connection_faults = faults.clone();
-        let connection_id = record_accept(&stats, &active_connections, source_addr);
+        let connection_id = record_accept(&stats, &view, source_addr);
         let active = stats.active.load(Ordering::Relaxed);
         if active > MAX_ACTIVE_CONNECTIONS {
             // The listener has accepted the socket and assigned it a stable
             // ID, but refuses to retain an unbounded number of live routes.
             // Dropping the stream is the bounded overload behavior.
-            remove_active_connection(&active_connections, connection_id);
             stats.active.fetch_sub(1, Ordering::Relaxed);
             stats.completed.fetch_add(1, Ordering::Relaxed);
             continue;
         }
         let (connection_commands_tx, connection_commands_rx) =
             mpsc::channel(CONNECTION_COMMAND_CAPACITY);
-        let close_reply: CloseReply = Arc::new(std::sync::Mutex::new(None));
         let connection_shutdown = shutdown.resubscribe();
         let connection_global_pause = global_pause.clone();
         routes.insert(connection_id, connection_commands_tx);
         connections.spawn(async move {
-            let connection_control = ConnectionControl {
+            let mut connection_control = ConnectionControl {
                 shutdown: connection_shutdown,
                 commands: connection_commands_rx,
-                close_reply: Arc::clone(&close_reply),
+                replies: PendingReplies::default(),
             };
             let result = proxy_connection(
                 client,
@@ -711,33 +800,50 @@ async fn accept_loop(
                     target_receive_buffer_bytes,
                 },
                 Arc::clone(&connection_stats),
-                connection_control,
+                &mut connection_control,
                 connection_global_pause,
             )
             .await;
             if let Err(error) = &result {
                 eprintln!("tunnel-test-harness proxy connection ended: {error}");
             }
-            connection_stats.active.fetch_sub(1, Ordering::Relaxed);
-            remove_active_connection(&connection_active, connection_id);
-            connection_stats.completed.fetch_add(1, Ordering::Relaxed);
-            if let Ok(mut close_reply) = close_reply.lock()
-                && let Some(reply) = close_reply.take()
-            {
-                let _ = reply.send(Ok(()));
-            }
-            (connection_id, result)
+            (
+                connection_id,
+                result,
+                connection_control.replies.close.take(),
+            )
         });
     }
     // A shutdown signal is forwarded to every active connection.  Join all
     // of them before the listener task completes so a test cannot leave a
     // TLS-pass-through socket or its copy tasks behind.
-    while connections.join_next().await.is_some() {}
+    while let Some(joined) = connections.join_next().await {
+        if let Ok(outcome) = joined {
+            record_completion(&stats, &view, outcome);
+        }
+    }
+}
+
+/// Take one finished connection out of the books, then answer the `close`
+/// that ended it, so the caller's next snapshot no longer shows it.
+fn record_completion(
+    stats: &StatsInner,
+    view: &watch::Sender<ConnectionView>,
+    (connection_id, _result, close_reply): ConnectionOutcome,
+) {
+    stats.active.fetch_sub(1, Ordering::Relaxed);
+    view.send_modify(|view| {
+        view.active.remove(&connection_id);
+    });
+    stats.completed.fetch_add(1, Ordering::Relaxed);
+    if let Some(reply) = close_reply {
+        let _ = reply.send(Ok(()));
+    }
 }
 
 fn record_accept(
     stats: &StatsInner,
-    active_connections: &ActiveConnections,
+    view: &watch::Sender<ConnectionView>,
     source_addr: SocketAddr,
 ) -> ConnectionId {
     let connection_id = stats.accepted.load(Ordering::Relaxed) + 1;
@@ -746,31 +852,24 @@ fn record_accept(
         .store(connection_id, Ordering::Relaxed);
     let active = stats.active.fetch_add(1, Ordering::Relaxed) + 1;
     update_peak(&stats.peak_active, active);
-    if let Ok(mut recent) = stats.recent_connection_ids.lock() {
-        recent.push_back(ConnectionId(connection_id));
-        while recent.len() > MAX_RECENT_CONNECTION_IDS {
-            recent.pop_front();
+    view.send_modify(|view| {
+        view.recent_connection_ids
+            .push_back(ConnectionId(connection_id));
+        while view.recent_connection_ids.len() > MAX_RECENT_CONNECTION_IDS {
+            view.recent_connection_ids.pop_front();
         }
-    }
-    if active <= MAX_ACTIVE_CONNECTIONS
-        && let Ok(mut active_connections) = active_connections.lock()
-    {
-        active_connections.insert(
-            ConnectionId(connection_id),
-            ProxyConnection {
-                id: ConnectionId(connection_id),
-                source_addr,
-            },
-        );
-    }
+        if active <= MAX_ACTIVE_CONNECTIONS {
+            view.active.insert(
+                ConnectionId(connection_id),
+                ProxyConnection {
+                    id: ConnectionId(connection_id),
+                    source_addr,
+                },
+            );
+        }
+    });
     stats.accepted.store(connection_id, Ordering::Release);
     ConnectionId(connection_id)
-}
-
-fn remove_active_connection(active_connections: &ActiveConnections, connection_id: ConnectionId) {
-    if let Ok(mut active_connections) = active_connections.lock() {
-        active_connections.remove(&connection_id);
-    }
 }
 
 fn record_c11_proxy_snapshot(proxy: &ProxyHandle) -> Result<()> {
@@ -794,11 +893,8 @@ fn record_c11_proxy_snapshot(proxy: &ProxyHandle) -> Result<()> {
     crate::c11_capture::record_snapshot("tcp_proxy", text.as_bytes())
 }
 
-fn snapshot_active_connections(active_connections: &ActiveConnections) -> Vec<ProxyConnection> {
-    let mut snapshot: Vec<ProxyConnection> = active_connections
-        .lock()
-        .map(|connections| connections.values().copied().collect())
-        .unwrap_or_default();
+fn sorted_active_connections(view: &ConnectionView) -> Vec<ProxyConnection> {
+    let mut snapshot: Vec<ProxyConnection> = view.active.values().copied().collect();
     snapshot.sort_by_key(|connection| connection.id);
     snapshot
 }
@@ -884,15 +980,18 @@ async fn proxy_connection(
     faults: FaultScript,
     buffers: ConnectionBuffers,
     stats: Arc<StatsInner>,
-    mut control: ConnectionControl,
+    control: &mut ConnectionControl,
     global_pause: GlobalPauseControls,
 ) -> Result<()> {
     let ConnectionBuffers {
         read_buffer_bytes,
         target_receive_buffer_bytes,
     } = buffers;
-    let client_to_target = Arc::new(DirectionControl::default());
-    let target_to_client = Arc::new(DirectionControl::default());
+    // Raised by a copy direction when it settles a pause this task still owes
+    // a reply for.
+    let settled = Arc::new(Notify::new());
+    let client_to_target = Arc::new(DirectionControl::new(Arc::clone(&settled)));
+    let target_to_client = Arc::new(DirectionControl::new(Arc::clone(&settled)));
     let target_connect = async {
         if let Some(bytes) = target_receive_buffer_bytes {
             let socket = if target_addr.is_ipv4() {
@@ -927,7 +1026,7 @@ async fn proxy_connection(
                     &client_to_target,
                     &target_to_client,
                     false,
-                    &control.close_reply,
+                    &mut control.replies,
                 ) {
                     return Ok(());
                 }
@@ -976,82 +1075,128 @@ async fn proxy_connection(
         }
     };
     tokio::pin!(joined);
+    // Both copy directions run inside this task, so anything they settled
+    // happened before whichever branch is handled next; answer those pauses
+    // first so a command never overtakes an outcome that preceded it.
     loop {
         tokio::select! {
-            joined = &mut joined => return joined,
+            joined = &mut joined => {
+                control
+                    .replies
+                    .settle(&client_to_target, &target_to_client);
+                return joined;
+            },
             Some(command) = control.commands.recv() => {
+                control
+                    .replies
+                    .settle(&client_to_target, &target_to_client);
                 if handle_connection_command(
                     command,
                     &stats,
                     &client_to_target,
                     &target_to_client,
                     true,
-                    &control.close_reply,
+                    &mut control.replies,
                 ) {
                     return Ok(());
                 }
             },
-            _ = control.shutdown.recv() => return Ok(()),
+            _ = control.shutdown.recv() => {
+                control
+                    .replies
+                    .settle(&client_to_target, &target_to_client);
+                return Ok(());
+            },
+            _ = settled.notified() => {
+                control
+                    .replies
+                    .settle(&client_to_target, &target_to_client);
+            },
         }
     }
 }
 
+/// How a copy direction settled the pause its connection task is waiting on.
+const PAUSE_UNSETTLED: u8 = 0;
+const PAUSE_AT_BARRIER: u8 = 1;
+const PAUSE_EXPIRED: u8 = 2;
+
+/// One direction's pause switches.
+///
+/// The connection task and the copy direction it drives share only
+/// independent flags here. The reply a pause is waiting on stays with the
+/// connection task ([`PendingReplies`]); the copy direction records the first
+/// thing that settles it in `pause_outcome` and raises `settled`.
 struct DirectionControl {
     paused: AtomicBool,
     at_barrier: AtomicBool,
     ended: AtomicBool,
     changed: Notify,
-    pause_state: std::sync::Mutex<PauseState>,
+    /// Hard pause deadline in nanoseconds after `epoch`, plus one; zero when
+    /// no pause is armed.
+    deadline: AtomicU64,
+    epoch: Instant,
+    /// First settlement since the pending pause reply was stored.
+    pause_outcome: AtomicU8,
+    /// The error this direction ended with, set before `ended`.
+    end_error: OnceLock<String>,
+    settled: Arc<Notify>,
 }
 
-struct PauseState {
-    deadline: Option<Instant>,
-    reply: Option<oneshot::Sender<Result<()>>>,
-}
-
-impl Default for DirectionControl {
-    fn default() -> Self {
+impl DirectionControl {
+    fn new(settled: Arc<Notify>) -> Self {
         Self {
             paused: AtomicBool::new(false),
             at_barrier: AtomicBool::new(false),
             ended: AtomicBool::new(false),
             changed: Notify::new(),
-            pause_state: std::sync::Mutex::new(PauseState {
-                deadline: None,
-                reply: None,
-            }),
+            deadline: AtomicU64::new(0),
+            epoch: Instant::now(),
+            pause_outcome: AtomicU8::new(PAUSE_UNSETTLED),
+            end_error: OnceLock::new(),
+            settled,
         }
     }
-}
 
-impl DirectionControl {
-    fn pause(&self, reply: oneshot::Sender<Result<()>>, immediate: bool) {
+    fn arm_deadline(&self) {
+        let deadline = (Instant::now() + PAUSE_TIMEOUT).saturating_duration_since(self.epoch);
+        let nanos = u64::try_from(deadline.as_nanos()).unwrap_or(u64::MAX - 1);
+        self.deadline
+            .store(nanos.saturating_add(1), Ordering::Release);
+    }
+
+    fn pause(
+        &self,
+        pending: &mut Option<oneshot::Sender<Result<()>>>,
+        reply: oneshot::Sender<Result<()>>,
+        immediate: bool,
+    ) {
         if self.ended.load(Ordering::Acquire) {
             let _ = reply.send(Ok(()));
             return;
         }
         let mut reject = Some(reply);
-        if let Ok(mut state) = self.pause_state.lock() {
-            if self.paused.load(Ordering::Acquire) {
-                if self.at_barrier.load(Ordering::Acquire) {
-                    if let Some(reply) = reject.take() {
-                        let _ = reply.send(Ok(()));
-                    }
-                } else if state.reply.is_none() {
-                    state.reply = reject.take();
+        if self.paused.load(Ordering::Acquire) {
+            if self.at_barrier.load(Ordering::Acquire) {
+                if let Some(reply) = reject.take() {
+                    let _ = reply.send(Ok(()));
                 }
-            } else {
-                state.deadline = Some(Instant::now() + PAUSE_TIMEOUT);
-                if !immediate {
-                    state.reply = reject.take();
-                }
-                self.at_barrier.store(false, Ordering::Release);
-                self.paused.store(true, Ordering::Release);
-                if immediate {
-                    self.at_barrier.store(true, Ordering::Release);
-                    if let Some(reply) = reject.take() {
-                        let _ = reply.send(Ok(()));
-                    }
+            } else if pending.is_none() {
+                self.pause_outcome.store(PAUSE_UNSETTLED, Ordering::Release);
+                *pending = reject.take();
+            }
+        } else {
+            self.arm_deadline();
+            if !immediate {
+                self.pause_outcome.store(PAUSE_UNSETTLED, Ordering::Release);
+                *pending = reject.take();
+            }
+            self.at_barrier.store(false, Ordering::Release);
+            self.paused.store(true, Ordering::Release);
+            if immediate {
+                self.at_barrier.store(true, Ordering::Release);
+                if let Some(reply) = reject.take() {
+                    let _ = reply.send(Ok(()));
                 }
             }
         }
@@ -1063,32 +1208,44 @@ impl DirectionControl {
         self.changed.notify_one();
     }
 
-    fn resume(&self, reply: oneshot::Sender<Result<()>>) {
+    fn resume(
+        &self,
+        pending: &mut Option<oneshot::Sender<Result<()>>>,
+        reply: oneshot::Sender<Result<()>>,
+    ) {
         self.paused.store(false, Ordering::Release);
         self.at_barrier.store(false, Ordering::Release);
-        if let Ok(mut state) = self.pause_state.lock() {
-            state.deadline = None;
-            if let Some(pause_reply) = state.reply.take() {
-                let _ = pause_reply.send(Err(HarnessError::Proxy(
-                    "pause superseded by resume".to_owned(),
-                )));
-            }
+        self.deadline.store(0, Ordering::Release);
+        if let Some(pause_reply) = pending.take() {
+            let _ = pause_reply.send(Err(HarnessError::Proxy(
+                "pause superseded by resume".to_owned(),
+            )));
         }
         self.changed.notify_one();
         let _ = reply.send(Ok(()));
     }
 
+    /// Record the first thing that settles the pending pause reply.
+    fn settle(&self, outcome: u8) {
+        if self
+            .pause_outcome
+            .compare_exchange(
+                PAUSE_UNSETTLED,
+                outcome,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            self.settled.notify_one();
+        }
+    }
+
     fn expire_pause(&self) {
         self.paused.store(false, Ordering::Release);
         self.at_barrier.store(false, Ordering::Release);
-        if let Ok(mut state) = self.pause_state.lock() {
-            state.deadline = None;
-            if let Some(pause_reply) = state.reply.take() {
-                let _ = pause_reply.send(Err(HarnessError::Timeout(
-                    "proxy direction pause exceeded its hard timeout".to_owned(),
-                )));
-            }
-        }
+        self.deadline.store(0, Ordering::Release);
+        self.settle(PAUSE_EXPIRED);
         self.changed.notify_one();
     }
 
@@ -1097,11 +1254,10 @@ impl DirectionControl {
     }
 
     fn pause_remaining(&self) -> Option<Duration> {
-        self.pause_state
-            .lock()
-            .ok()
-            .and_then(|state| state.deadline)
-            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+        let deadline = self.deadline.load(Ordering::Acquire).checked_sub(1)?;
+        Some(
+            (self.epoch + Duration::from_nanos(deadline)).saturating_duration_since(Instant::now()),
+        )
     }
 
     fn reach_barrier(&self) {
@@ -1109,30 +1265,41 @@ impl DirectionControl {
             return;
         }
         self.at_barrier.store(true, Ordering::Release);
-        if let Ok(mut state) = self.pause_state.lock()
-            && let Some(reply) = state.reply.take()
-        {
-            let _ = reply.send(Ok(()));
-        }
+        self.settle(PAUSE_AT_BARRIER);
     }
 
     fn end(&self, result: &Result<()>) {
+        if let Err(error) = result {
+            let _ = self.end_error.set(error.to_string());
+        }
         self.ended.store(true, Ordering::Release);
-        if let Ok(mut state) = self.pause_state.lock()
-            && let Some(reply) = state.reply.take()
-        {
-            let outcome = match result {
-                Ok(()) => Ok(()),
-                Err(error) => Err(HarnessError::Proxy(error.to_string())),
-            };
+        self.settled.notify_one();
+    }
+
+    /// Answer the pending pause if this direction has settled it: reaching
+    /// the barrier, expiring, or (failing either) ending.
+    fn settle_pause(&self, pending: &mut Option<oneshot::Sender<Result<()>>>) {
+        if pending.is_none() {
+            return;
+        }
+        let outcome = match self.pause_outcome.load(Ordering::Acquire) {
+            PAUSE_AT_BARRIER => Ok(()),
+            PAUSE_EXPIRED => Err(HarnessError::Timeout(
+                "proxy direction pause exceeded its hard timeout".to_owned(),
+            )),
+            _ if self.ended.load(Ordering::Acquire) => match self.end_error.get() {
+                None => Ok(()),
+                Some(error) => Err(HarnessError::Proxy(error.clone())),
+            },
+            _ => return,
+        };
+        if let Some(reply) = pending.take() {
             let _ = reply.send(outcome);
         }
     }
 
-    fn cancel_pause(&self) {
-        if let Ok(mut state) = self.pause_state.lock()
-            && let Some(reply) = state.reply.take()
-        {
+    fn cancel_pause(pending: &mut Option<oneshot::Sender<Result<()>>>) {
+        if let Some(reply) = pending.take() {
             let _ = reply.send(Err(HarnessError::Proxy(
                 "connection closed while pause was pending".to_owned(),
             )));
@@ -1146,16 +1313,14 @@ fn handle_connection_command(
     client_to_target: &DirectionControl,
     target_to_client: &DirectionControl,
     immediate_pause: bool,
-    close_reply: &CloseReply,
+    replies: &mut PendingReplies,
 ) -> bool {
     match command {
         ConnectionCommand::Close { reply } => {
             stats.closes.fetch_add(1, Ordering::Relaxed);
-            client_to_target.cancel_pause();
-            target_to_client.cancel_pause();
-            if let Ok(mut close_reply) = close_reply.lock() {
-                *close_reply = Some(reply);
-            }
+            DirectionControl::cancel_pause(&mut replies.pause_client_to_target);
+            DirectionControl::cancel_pause(&mut replies.pause_target_to_client);
+            replies.close = Some(reply);
             true
         }
         ConnectionCommand::Pause { direction, reply } => {
@@ -1167,10 +1332,18 @@ fn handle_connection_command(
             increment_pause(stats, direction);
             match direction {
                 Direction::ClientToTarget => {
-                    client_to_target.pause(reply, immediate_pause);
+                    client_to_target.pause(
+                        &mut replies.pause_client_to_target,
+                        reply,
+                        immediate_pause,
+                    );
                 }
                 Direction::TargetToClient => {
-                    target_to_client.pause(reply, immediate_pause);
+                    target_to_client.pause(
+                        &mut replies.pause_target_to_client,
+                        reply,
+                        immediate_pause,
+                    );
                 }
             }
             false
@@ -1178,10 +1351,10 @@ fn handle_connection_command(
         ConnectionCommand::Resume { direction, reply } => {
             match direction {
                 Direction::ClientToTarget => {
-                    client_to_target.resume(reply);
+                    client_to_target.resume(&mut replies.pause_client_to_target, reply);
                 }
                 Direction::TargetToClient => {
-                    target_to_client.resume(reply);
+                    target_to_client.resume(&mut replies.pause_target_to_client, reply);
                 }
             }
             false
@@ -1375,7 +1548,7 @@ where
     let mut offset = 0_usize;
     while offset < bytes.len() {
         wait_if_paused(control, global_control).await?;
-        let Some(_forward_permit) = global_control.try_acquire_forward().await else {
+        let Some(_in_flight) = global_control.begin_forward() else {
             continue;
         };
         let written = writer.write(&bytes[offset..]).await?;

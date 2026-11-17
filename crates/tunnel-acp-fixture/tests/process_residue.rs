@@ -646,11 +646,15 @@ async fn a_setsid_descendant_escapes_even_with_the_sentinel_armed() {
     let session = within(supervisor.new_session("/workspace/demo"))
         .await
         .expect("session");
-    supervisor.subscriber_ready(&session).expect("subscriber");
+    supervisor
+        .subscriber_ready(&session)
+        .await
+        .expect("subscriber");
     let child_group = supervisor.pid().expect("a child pid").to_string();
     let pid_path = workspace.path().join("detached.pid");
     let ticket = supervisor
         .prompt(&session, "detach:detached.pid")
+        .await
         .expect("prompt");
     within(ticket.stop_reason()).await.expect("turn completed");
 

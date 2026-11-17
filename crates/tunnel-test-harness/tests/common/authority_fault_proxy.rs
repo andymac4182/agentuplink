@@ -8,15 +8,15 @@ use std::{
     net::SocketAddr,
     pin::Pin,
     sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
-    sync::{Notify, oneshot},
+    sync::{Notify, mpsc, oneshot},
     task::{JoinHandle, JoinSet},
     time::timeout,
 };
@@ -25,6 +25,11 @@ type Result<T = ()> = std::result::Result<T, &'static str>;
 const IO_BOUND: Duration = Duration::from_secs(5);
 const MAX_RESP_FRAME: usize = 256 * 1024;
 const MAX_RESP_ITEMS: usize = 256;
+/// Most publication attempts the fixture records; a connection that would
+/// exceed it is closed instead.
+const MAX_ATTEMPTS: usize = 128;
+/// Connections the proxy serves at once.
+const MAX_CONNECTIONS: usize = 16;
 
 #[derive(Clone)]
 struct Control {
@@ -32,14 +37,35 @@ struct Control {
     ever_armed: Arc<AtomicBool>,
     cuts: Arc<AtomicUsize>,
     cut: Arc<Notify>,
-    attempts: Arc<Mutex<Vec<(String, u64)>>>,
-    publication_gate: Arc<tokio::sync::Mutex<()>>,
-    cut_version: Arc<AtomicU64>,
+    /// Slots left in the attempt record. A connection takes one before it
+    /// reports an attempt, so `attempts` (sized to the same bound) is never
+    /// full when it sends.
+    attempt_slots: Arc<AtomicUsize>,
+    attempts: mpsc::Sender<(String, u64)>,
+    /// The publication lane. Each connection has at most one exchange
+    /// outstanding and the proxy serves `MAX_CONNECTIONS` connections, so a
+    /// queue of that size never makes a connection wait to enqueue.
+    publications: mpsc::Sender<Publication>,
+}
+
+/// One membership publication handed to the lane, with both of its sockets.
+struct Publication {
+    request: Vec<u8>,
+    version: u64,
+    client: TcpStream,
+    server: TcpStream,
+    /// The sockets come back when the exchange completed and the connection
+    /// should carry on; a dropped sender means the connection was severed.
+    done: oneshot::Sender<(TcpStream, TcpStream)>,
 }
 
 pub struct FaultProxy {
     address: SocketAddr,
     control: Control,
+    /// Publication attempts in the order connections reported them; the test
+    /// drains new ones into `seen_attempts` whenever it asks.
+    attempts: mpsc::Receiver<(String, u64)>,
+    seen_attempts: Vec<(String, u64)>,
     stop: Option<oneshot::Sender<()>>,
     task: Option<JoinHandle<()>>,
 }
@@ -53,20 +79,30 @@ impl FaultProxy {
             .await
             .map_err(|_| "bind fault proxy")?;
         let address = listener.local_addr().map_err(|_| "fault proxy address")?;
+        let (record_attempt, attempts) = mpsc::channel(MAX_ATTEMPTS);
+        let (publications, publication_queue) = mpsc::channel(MAX_CONNECTIONS);
         let control = Control {
             armed: Arc::new(AtomicBool::new(false)),
             ever_armed: Arc::new(AtomicBool::new(false)),
             cuts: Arc::new(AtomicUsize::new(0)),
             cut: Arc::new(Notify::new()),
-            attempts: Arc::new(Mutex::new(Vec::new())),
-            publication_gate: Arc::new(tokio::sync::Mutex::new(())),
-            cut_version: Arc::new(AtomicU64::new(0)),
+            attempt_slots: Arc::new(AtomicUsize::new(MAX_ATTEMPTS)),
+            attempts: record_attempt,
+            publications,
         };
         let (stop, stopped) = oneshot::channel();
-        let task = tokio::spawn(run(listener, upstream, control.clone(), stopped));
+        let task = tokio::spawn(run(
+            listener,
+            upstream,
+            control.clone(),
+            publication_queue,
+            stopped,
+        ));
         Ok(Self {
             address,
             control,
+            attempts,
+            seen_attempts: Vec::new(),
             stop: Some(stop),
             task: Some(task),
         })
@@ -84,12 +120,11 @@ impl FaultProxy {
     pub fn cut_count(&self) -> usize {
         self.control.cuts.load(Ordering::SeqCst)
     }
-    pub fn attempts(&self) -> Vec<(String, u64)> {
-        self.control
-            .attempts
-            .lock()
-            .expect("fixture attempt lock")
-            .clone()
+    pub fn attempts(&mut self) -> Vec<(String, u64)> {
+        while let Ok(attempt) = self.attempts.try_recv() {
+            self.seen_attempts.push(attempt);
+        }
+        self.seen_attempts.clone()
     }
     pub async fn wait_committed_cut(&self) -> Result {
         timeout(Duration::from_secs(10), async {
@@ -138,16 +173,20 @@ async fn run(
     listener: TcpListener,
     upstream: SocketAddr,
     control: Control,
+    publications: mpsc::Receiver<Publication>,
     mut stopped: oneshot::Receiver<()>,
 ) {
     let mut tasks = JoinSet::new();
+    // The lane lives in the same set so shutdown aborts and joins it with the
+    // connections; it is not counted against the connection bound below.
+    tasks.spawn(publication_lane(publications, control.clone()));
     loop {
         while tasks.try_join_next().is_some() {}
         tokio::select! {
             _ = &mut stopped => break,
             accepted = listener.accept() => {
                 let Ok((socket, _)) = accepted else { break; };
-                if tasks.len() >= 16 { continue; }
+                if tasks.len() > MAX_CONNECTIONS { continue; }
                 tasks.spawn(connection(socket, upstream, control.clone()));
             }
         }
@@ -172,26 +211,40 @@ async fn connection(mut client: TcpStream, upstream: SocketAddr, control: Contro
         };
         let publish = publication(&request);
         if let Some(attempt) = &publish {
-            let mut attempts = control.attempts.lock().expect("fixture attempt lock");
-            if attempts.len() >= 128 {
+            let slot =
+                control
+                    .attempt_slots
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |slots| {
+                        slots.checked_sub(1)
+                    });
+            if slot.is_err() || control.attempts.try_send(attempt.clone()).is_err() {
                 return;
             }
-            attempts.push(attempt.clone());
         }
-        // A failed round may have up to four concurrent requests. Serialize
-        // their forwarding so the selected commit is observable as a partial
-        // inventory, then sever its remaining version before forwarding it.
+        // A failed round may have up to four concurrent requests. Their
+        // forwarding goes through the one publication lane so the selected
+        // commit is observable as a partial inventory, and the lane severs
+        // that round's remaining version before forwarding it.
         // A strictly higher recovery round is unaffected. This avoids making
         // the partial-round witness depend on executor/connection scheduling.
-        let _publication = if let Some((_, version)) = &publish {
-            let permit = control.publication_gate.lock().await;
-            if control.cut_version.load(Ordering::SeqCst) == *version {
+        if let Some((_, version)) = publish {
+            let (done, exchanged) = oneshot::channel();
+            let publication = Publication {
+                request,
+                version,
+                client,
+                server,
+                done,
+            };
+            if control.publications.send(publication).await.is_err() {
                 return;
             }
-            Some(permit)
-        } else {
-            None
-        };
+            let Ok(sockets) = exchanged.await else {
+                return;
+            };
+            (client, server) = sockets;
+            continue;
+        }
         if !matches!(
             timeout(IO_BOUND, server.write_all(&request)).await,
             Ok(Ok(()))
@@ -201,26 +254,65 @@ async fn connection(mut client: TcpStream, upstream: SocketAddr, control: Contro
         let Ok(Ok(response)) = timeout(IO_BOUND, read_resp_frame(&mut server, 0)).await else {
             return;
         };
-        // This exact Lua success reply is received only after Redis committed.
-        // The one-shot exchange ensures other concurrent replies pass through.
-        if let Some((_, version)) = &publish
-            && response == b"*1\r\n$2\r\nok\r\n"
-            && control
-                .armed
-                .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
-                .is_ok()
-        {
-            control.cut_version.store(*version, Ordering::SeqCst);
-            control.cuts.fetch_add(1, Ordering::SeqCst);
-            control.cut.notify_one();
-            return;
-        }
         if !matches!(
             timeout(IO_BOUND, client.write_all(&response)).await,
             Ok(Ok(()))
         ) {
             return;
         }
+    }
+}
+
+/// Forward membership publications one at a time, in the order connections
+/// handed them over.
+///
+/// The lane alone decides which committed reply is cut and remembers that
+/// round's version, so "is this version already cut" and "cut this one" can
+/// never interleave between connections. A publication it severs is dropped
+/// with both sockets, which closes that connection.
+async fn publication_lane(mut publications: mpsc::Receiver<Publication>, control: Control) {
+    // No real publication uses version zero, so nothing matches before a cut.
+    let mut cut_version = 0_u64;
+    while let Some(publication) = publications.recv().await {
+        let Publication {
+            request,
+            version,
+            mut client,
+            mut server,
+            done,
+        } = publication;
+        if cut_version == version {
+            continue;
+        }
+        if !matches!(
+            timeout(IO_BOUND, server.write_all(&request)).await,
+            Ok(Ok(()))
+        ) {
+            continue;
+        }
+        let Ok(Ok(response)) = timeout(IO_BOUND, read_resp_frame(&mut server, 0)).await else {
+            continue;
+        };
+        // This exact Lua success reply is received only after Redis committed.
+        // The one-shot exchange ensures other concurrent replies pass through.
+        if response == b"*1\r\n$2\r\nok\r\n"
+            && control
+                .armed
+                .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+        {
+            cut_version = version;
+            control.cuts.fetch_add(1, Ordering::SeqCst);
+            control.cut.notify_one();
+            continue;
+        }
+        if !matches!(
+            timeout(IO_BOUND, client.write_all(&response)).await,
+            Ok(Ok(()))
+        ) {
+            continue;
+        }
+        let _ = done.send((client, server));
     }
 }
 

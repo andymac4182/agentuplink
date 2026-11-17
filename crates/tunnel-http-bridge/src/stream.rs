@@ -259,27 +259,48 @@ impl FrameSender {
     }
 }
 
+/// Whether a receiver can still return frames.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Receiving {
+    /// Frames are returned in order.  FIN does not end this: a RESET may
+    /// still follow it.
+    Open,
+    /// The peer's RESET was returned; nothing follows it.
+    Reset,
+}
+
+impl Receiving {
+    /// The only place the receiving phase changes: the phase after `frame`
+    /// is returned to the caller.
+    const fn after(self, frame: &Frame) -> Self {
+        match (self, frame) {
+            (Self::Open, Frame::Data(_) | Frame::Fin) => Self::Open,
+            (Self::Open | Self::Reset, Frame::Reset(_)) | (Self::Reset, _) => Self::Reset,
+        }
+    }
+}
+
 /// The receiving half.
 pub struct FrameReceiver {
     rx: mpsc::Receiver<Envelope>,
     signal: watch::Receiver<Option<SignaledReset>>,
-    terminated: bool,
+    phase: Receiving,
 }
 
 impl FrameReceiver {
     /// The next ordered frame.  `None` means the sender is gone without FIN
     /// or RESET (a carrier failure), or a RESET was already returned.
     pub async fn recv(&mut self) -> Option<Frame> {
-        if self.terminated {
-            return None;
+        match self.phase {
+            Receiving::Reset => None,
+            Receiving::Open => {
+                let mut envelope = self.rx.recv().await?;
+                let frame = envelope.frame.take()?;
+                drop(envelope);
+                self.phase = self.phase.after(&frame);
+                Some(frame)
+            }
         }
-        let mut envelope = self.rx.recv().await?;
-        let frame = envelope.frame.take()?;
-        drop(envelope);
-        if matches!(frame, Frame::Reset(_)) {
-            self.terminated = true;
-        }
-        Some(frame)
     }
 
     /// Terminal discard after a local failure: consume in-flight peer frames
@@ -391,7 +412,46 @@ pub fn channel(capacity_bytes: usize) -> (FrameSender, FrameReceiver, Arc<QueueS
     let receiver = FrameReceiver {
         rx,
         signal: signal_rx,
-        terminated: false,
+        phase: Receiving::Open,
     };
     (sender, receiver, stats)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::status::Execution;
+    use tunnel_http_forward::HttpErrorCode;
+
+    fn reset() -> Frame {
+        Frame::Reset(ResetDetail {
+            code: HttpErrorCode::Cancelled,
+            execution: Execution::Unknown,
+        })
+    }
+
+    #[test]
+    fn only_a_reset_ends_receiving_and_nothing_reopens_it() {
+        let data = Frame::Data(Bytes::from_static(b"x"));
+        for frame in [&data, &Frame::Fin] {
+            assert_eq!(Receiving::Open.after(frame), Receiving::Open);
+            assert_eq!(Receiving::Reset.after(frame), Receiving::Reset);
+        }
+        assert_eq!(Receiving::Open.after(&reset()), Receiving::Reset);
+        assert_eq!(Receiving::Reset.after(&reset()), Receiving::Reset);
+    }
+
+    #[tokio::test]
+    async fn a_reset_after_fin_is_returned_and_then_nothing() {
+        let (sender, mut receiver, _) = channel(8);
+        sender.finish().expect("fin");
+        assert!(sender.reset(ResetDetail {
+            code: HttpErrorCode::Cancelled,
+            execution: Execution::Unknown,
+        }));
+        assert_eq!(receiver.recv().await, Some(Frame::Fin));
+        assert_eq!(receiver.recv().await, Some(reset()));
+        assert_eq!(receiver.recv().await, None);
+        assert_eq!(receiver.recv().await, None);
+    }
 }

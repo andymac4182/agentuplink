@@ -192,7 +192,10 @@ async fn ready(config: SupervisorConfig) -> (Supervisor, mpsc::Receiver<AgentEve
     let session = within(supervisor.new_session("/workspace/demo"))
         .await
         .expect("session");
-    supervisor.subscriber_ready(&session).expect("subscriber");
+    supervisor
+        .subscriber_ready(&session)
+        .await
+        .expect("subscriber");
     (supervisor, events, session)
 }
 
@@ -203,7 +206,7 @@ async fn a_prompt_runs_a_turn_and_the_lifecycle_drives_it() {
     let workspace = tempfile::tempdir().expect("workspace");
     let (supervisor, mut events, session) = ready(config(workspace.path())).await;
 
-    let ticket = supervisor.prompt(&session, "ok").expect("prompt");
+    let ticket = supervisor.prompt(&session, "ok").await.expect("prompt");
     // The update arrives on the reader while the prompt is outstanding.
     assert!(matches!(
         next_event(&mut events).await,
@@ -214,7 +217,10 @@ async fn a_prompt_runs_a_turn_and_the_lifecycle_drives_it() {
 
     // A second turn may start, which is only true if the first one ended in
     // the state machine rather than in a flag this test set.
-    supervisor.prompt(&session, "ok").expect("a second turn");
+    supervisor
+        .prompt(&session, "ok")
+        .await
+        .expect("a second turn");
     supervisor.drain().await;
     assert_eq!(supervisor.lifecycle(), ChildLifecycle::Stopped);
     assert!(supervisor.diagnostics().group_kills >= 1);
@@ -227,7 +233,10 @@ async fn the_reader_handles_a_callback_while_a_prompt_is_pending() {
     let workspace = tempfile::tempdir().expect("workspace");
     let (supervisor, mut events, session) = ready(config(workspace.path())).await;
 
-    let ticket = supervisor.prompt(&session, "permission").expect("prompt");
+    let ticket = supervisor
+        .prompt(&session, "permission")
+        .await
+        .expect("prompt");
     let AgentEvent::Permission { id, session: on } = next_event(&mut events).await else {
         panic!("the agent's permission request must reach the host");
     };
@@ -277,7 +286,10 @@ async fn a_permission_timeout_resolves_as_cancelled_never_approved() {
     let (supervisor, mut events, session) = ready(config).await;
 
     let started = Instant::now();
-    let ticket = supervisor.prompt(&session, "permission").expect("prompt");
+    let ticket = supervisor
+        .prompt(&session, "permission")
+        .await
+        .expect("prompt");
     let AgentEvent::Permission { id, .. } = next_event(&mut events).await else {
         panic!("the permission request must arrive");
     };
@@ -339,7 +351,10 @@ async fn child_output_ends_with(directive: &str, message_limit: u64) -> (ChildEn
     let mut config = config(workspace.path());
     config.child.message_limit = message_limit;
     let (supervisor, mut events, session) = ready(config).await;
-    let _ticket = supervisor.prompt(&session, directive).expect("prompt");
+    let _ticket = supervisor
+        .prompt(&session, directive)
+        .await
+        .expect("prompt");
     loop {
         match next_event(&mut events).await {
             AgentEvent::Ended(end) => {
@@ -392,7 +407,7 @@ async fn a_malformed_stdout_line_kills_the_child_for_being_malformed() {
 async fn a_batch_line_from_the_child_is_refused_for_being_a_batch() {
     let workspace = tempfile::tempdir().expect("workspace");
     let (supervisor, mut events, session) = ready(config(workspace.path())).await;
-    let _ticket = supervisor.prompt(&session, "batch").expect("prompt");
+    let _ticket = supervisor.prompt(&session, "batch").await.expect("prompt");
     loop {
         if let AgentEvent::Ended(end) = next_event(&mut events).await {
             assert_eq!(end, ChildEnd::InvalidLine(AcpRule::BatchNotSupported));
@@ -421,6 +436,7 @@ async fn a_stderr_flood_is_drained_and_counted_without_blocking_child_exit() {
     const FLOOD: u64 = 4 << 20;
     let ticket = supervisor
         .prompt(&session, &format!("stderr-flood:{FLOOD}"))
+        .await
         .expect("prompt");
     // The turn still completes: the drain never backs the child up.
     let stop = within(ticket.stop_reason()).await.expect("turn completed");
@@ -479,9 +495,13 @@ async fn one_active_prompt_per_session_at_the_supervisor() {
     let workspace = tempfile::tempdir().expect("workspace");
     let (supervisor, _events, session) = ready(config(workspace.path())).await;
     // `silent` never answers, so the first turn stays active.
-    let _first = supervisor.prompt(&session, "silent").expect("first prompt");
+    let _first = supervisor
+        .prompt(&session, "silent")
+        .await
+        .expect("first prompt");
     let refused = supervisor
         .prompt(&session, "ok")
+        .await
         .expect_err("a second concurrent prompt");
     assert_eq!(refused.rule(), Some(LifecycleRule::PromptAlreadyActive));
     supervisor.drain().await;
@@ -505,6 +525,7 @@ async fn the_agent_callback_bound_is_exact_at_sixteen_against_a_real_child() {
 
     let _ticket = supervisor
         .prompt(&session, &format!("permission:{}", LIMIT + 1))
+        .await
         .expect("prompt");
 
     let mut accepted = 0;
@@ -542,7 +563,7 @@ async fn a_wrapper_grandchild_dies_with_the_process_group() {
         SupervisorConfig::new(child_config(workspace.path(), &script, &["agent"]), scope());
     config.child.command = script;
     let (supervisor, _events, session) = ready(config).await;
-    let ticket = supervisor.prompt(&session, "ok").expect("prompt");
+    let ticket = supervisor.prompt(&session, "ok").await.expect("prompt");
     within(ticket.stop_reason()).await.expect("turn completed");
 
     let pid = read_pid(&workspace.path().join("grandchild.pid")).await;
@@ -581,7 +602,7 @@ async fn a_grandchild_dies_when_the_child_exits_by_itself() {
     assert!(!pid.is_empty(), "the wrapper started a grandchild");
     assert!(alive(&pid), "the grandchild is running before the exit");
 
-    let _ticket = supervisor.prompt(&session, "exit:0").expect("prompt");
+    let _ticket = supervisor.prompt(&session, "exit:0").await.expect("prompt");
     loop {
         if let AgentEvent::Ended(end) = next_event(&mut events).await {
             assert_eq!(end, ChildEnd::Closed, "the child ended by itself");
@@ -618,7 +639,7 @@ async fn a_supervisor_dropped_without_draining_still_kills_the_group() {
     let pid;
     {
         let (supervisor, events, session) = ready(config).await;
-        let ticket = supervisor.prompt(&session, "ok").expect("prompt");
+        let ticket = supervisor.prompt(&session, "ok").await.expect("prompt");
         within(ticket.stop_reason()).await.expect("turn completed");
         child_pid = supervisor.pid().expect("a child pid");
         pid = read_pid(&workspace.path().join("grandchild.pid")).await;
@@ -656,7 +677,10 @@ async fn a_grandchild_dies_when_the_child_is_killed_for_bad_output() {
     // vacuously if `sleep` had already died for some unrelated reason.
     assert!(alive(&pid), "the grandchild is running before the kill");
 
-    let _ticket = supervisor.prompt(&session, "malformed").expect("prompt");
+    let _ticket = supervisor
+        .prompt(&session, "malformed")
+        .await
+        .expect("prompt");
     loop {
         if let AgentEvent::Ended(end) = next_event(&mut events).await {
             assert_eq!(end, ChildEnd::InvalidLine(AcpRule::NotStrictJson));
@@ -688,7 +712,7 @@ async fn a_grandchild_dies_when_the_child_is_killed_for_bad_output() {
 async fn nothing_holds_the_child_handle_once_the_child_is_gone() {
     let workspace = tempfile::tempdir().expect("workspace");
     let (supervisor, mut events, session) = ready(config(workspace.path())).await;
-    let ticket = supervisor.prompt(&session, "ok").expect("prompt");
+    let ticket = supervisor.prompt(&session, "ok").await.expect("prompt");
     within(ticket.stop_reason()).await.expect("turn completed");
     let before = supervisor.diagnostics();
     // Exactly two, not "more than none": `> 0` would pass with only one of the
@@ -772,7 +796,7 @@ fn tear_down_a_runtime_mid_flight(expect_armed: Option<u64>) {
         // Everything is moved into the runtime and never handed back, so the
         // only thing that can end the child is the teardown below.
         let (supervisor, events, session) = ready(config).await;
-        let ticket = supervisor.prompt(&session, "ok").expect("prompt");
+        let ticket = supervisor.prompt(&session, "ok").await.expect("prompt");
         within(ticket.stop_reason()).await.expect("turn completed");
         let pid = read_pid(&workspace.path().join("grandchild.pid")).await;
         if let Some(armed) = expect_armed {
@@ -892,6 +916,7 @@ async fn a_descendant_that_calls_setsid_survives_the_process_group_kill() {
     let pid_path = workspace.path().join("detached.pid");
     let ticket = supervisor
         .prompt(&session, "detach:detached.pid")
+        .await
         .expect("prompt");
     within(ticket.stop_reason()).await.expect("turn completed");
 
@@ -964,7 +989,10 @@ async fn a_session_before_initialize_is_refused_for_readiness() {
 async fn a_prompt_after_the_child_ended_reports_an_unknown_outcome() {
     let workspace = tempfile::tempdir().expect("workspace");
     let (supervisor, mut events, session) = ready(config(workspace.path())).await;
-    let _ticket = supervisor.prompt(&session, "malformed").expect("prompt");
+    let _ticket = supervisor
+        .prompt(&session, "malformed")
+        .await
+        .expect("prompt");
     loop {
         if let AgentEvent::Ended(_) = next_event(&mut events).await {
             break;
@@ -973,6 +1001,7 @@ async fn a_prompt_after_the_child_ended_reports_an_unknown_outcome() {
     within(supervisor.wait_exited()).await;
     let refused = supervisor
         .prompt(&session, "ok")
+        .await
         .expect_err("the connection is gone");
     // Never a silent restart, and never a replay of the prompt.
     assert!(matches!(

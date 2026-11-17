@@ -4,12 +4,19 @@
 //! for each role.  Transport error text, peer payloads, routes, and
 //! credentials never cross this diagnostic boundary.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, atomic::AtomicU64};
 
 use serde::Serialize;
 use uuid::Uuid;
 
 use crate::actor::CarrierKey;
+
+/// The shared wait-free cells every relay diagnostic in this crate records
+/// into; see the module for the consistency each reader gets.
+#[path = "diagnostics_cells.rs"]
+pub(crate) mod cells;
+
+use cells::{Arena, Entry, Ledger, Order, Place, WordReader, WordWriter, code_of, variant};
 
 /// The side of a forwarded device peer stream that produced the observation.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
@@ -22,6 +29,9 @@ pub enum PeerTransportDiagnosticRole {
 }
 
 impl PeerTransportDiagnosticRole {
+    /// In the order of the role counters.
+    const ALL: [Self; 2] = [Self::OwnerSend, Self::IngressReceive];
+
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -48,6 +58,19 @@ pub enum PeerTransportDiagnosticOutcome {
 }
 
 impl PeerTransportDiagnosticOutcome {
+    /// Every outcome, for decoding a recorded event.
+    pub(crate) const ALL: [Self; 9] = [
+        Self::TimedOut,
+        Self::GoAway,
+        Self::H3Error,
+        Self::QuicError,
+        Self::Cancelled,
+        Self::TrustExpired,
+        Self::Closed,
+        Self::ProtocolError,
+        Self::Other,
+    ];
+
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -89,25 +112,68 @@ pub struct PeerTransportDiagnosticSnapshot {
     pub last_owner_send: Option<PeerTransportDiagnosticEventSnapshot>,
     /// Latest owner-side ingress-receive observation, if any.
     pub last_ingress_receive: Option<PeerTransportDiagnosticEventSnapshot>,
+    /// True only when this snapshot could not be taken because too many
+    /// reads of these diagnostics were in progress at once.  Every other
+    /// field is then a placeholder and not an observation: the counts are
+    /// unknown, not zero.  Absent from the serialized snapshot otherwise.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub unavailable: bool,
 }
 
-#[derive(Default)]
+/// The cap on this diagnostic's storage: 2^14 blocks of 88 bytes, 1.4 MB.
+/// A handful of events is retained; the rest is head-room.
+const BLOCKS: usize = 1 << 14;
+
+/// The clock events are numbered from, and the ledger holding one counter
+/// and the latest event per role.
 struct PeerTransportDiagnosticState {
+    arena: Arena,
+    sequence: AtomicU64,
+    ledger: Ledger,
+}
+
+impl Default for PeerTransportDiagnosticState {
+    fn default() -> Self {
+        Self {
+            arena: Arena::new(BLOCKS),
+            sequence: AtomicU64::new(0),
+            ledger: Ledger::new(
+                PeerTransportDiagnosticRole::ALL.len(),
+                &[PeerTransportDiagnosticRole::ALL.len()],
+            ),
+        }
+    }
+}
+
+fn decode_event(
     sequence: u64,
-    owner_send_count: u64,
-    ingress_receive_count: u64,
-    last_owner_send: Option<PeerTransportDiagnosticEventSnapshot>,
-    last_ingress_receive: Option<PeerTransportDiagnosticEventSnapshot>,
+    mut record: WordReader,
+) -> Option<PeerTransportDiagnosticEventSnapshot> {
+    Some(PeerTransportDiagnosticEventSnapshot {
+        sequence,
+        device_id: record.uuid()?,
+        session_id: record.text()?,
+        epoch: record.u64()?,
+        generation: record.u64()?,
+        connection_id: record.text()?,
+        role: variant(&PeerTransportDiagnosticRole::ALL, record.u64()?)?,
+        outcome: variant(&PeerTransportDiagnosticOutcome::ALL, record.u64()?)?,
+    })
 }
 
 /// Cloneable, bounded state for forwarded device transport diagnostics.
 #[derive(Clone, Default)]
 pub(crate) struct PeerTransportDiagnostics {
-    state: Arc<Mutex<PeerTransportDiagnosticState>>,
+    state: Arc<PeerTransportDiagnosticState>,
 }
 
 impl PeerTransportDiagnostics {
     /// Record one static observation without retaining transport text.
+    ///
+    /// The role's count and its latest event change in one atomic step, and
+    /// the sequence is drawn by the step that installs them, so the latest
+    /// event is the one with the highest sequence and a snapshot never
+    /// shows a count without the event it counted.
     pub(crate) fn record(
         &self,
         device_id: Uuid,
@@ -115,45 +181,91 @@ impl PeerTransportDiagnostics {
         role: PeerTransportDiagnosticRole,
         outcome: PeerTransportDiagnosticOutcome,
     ) {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.sequence = state.sequence.saturating_add(1);
-        let event = PeerTransportDiagnosticEventSnapshot {
-            sequence: state.sequence,
-            device_id,
-            session_id: carrier.session.session_id.clone(),
-            epoch: carrier.session.epoch,
-            generation: carrier.generation,
-            connection_id: carrier.connection_id.clone(),
-            role,
-            outcome,
-        };
-        match role {
-            PeerTransportDiagnosticRole::OwnerSend => {
-                state.owner_send_count = state.owner_send_count.saturating_add(1);
-                state.last_owner_send = Some(event);
-            }
-            PeerTransportDiagnosticRole::IngressReceive => {
-                state.ingress_receive_count = state.ingress_receive_count.saturating_add(1);
-                state.last_ingress_receive = Some(event);
-            }
-        }
+        let state = &*self.state;
+        let mut event = WordWriter::new();
+        event.uuid(device_id);
+        event.text(&carrier.session.session_id);
+        event.u64(carrier.session.epoch);
+        event.u64(carrier.generation);
+        event.text(&carrier.connection_id);
+        let index = code_of(&PeerTransportDiagnosticRole::ALL, &role);
+        event.u64(index);
+        event.u64(code_of(&PeerTransportDiagnosticOutcome::ALL, &outcome));
+        let index = usize::try_from(index).unwrap_or(usize::MAX);
+        state.ledger.commit(
+            &state.arena,
+            Some(&state.sequence),
+            &[index],
+            vec![Entry {
+                place: Place::Key(0, index),
+                order: Order::Sequence,
+                record: event,
+            }],
+        );
     }
 
     /// Return the bounded redacted view used by a relay snapshot.
     #[must_use]
     pub(crate) fn snapshot(&self) -> PeerTransportDiagnosticSnapshot {
-        let state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        PeerTransportDiagnosticSnapshot {
-            owner_send_count: state.owner_send_count,
-            ingress_receive_count: state.ingress_receive_count,
-            last_owner_send: state.last_owner_send.clone(),
-            last_ingress_receive: state.last_ingress_receive.clone(),
+        let Some(view) = self.state.ledger.read(&self.state.arena) else {
+            return PeerTransportDiagnosticSnapshot {
+                unavailable: true,
+                ..PeerTransportDiagnosticSnapshot::default()
+            };
+        };
+        let mut snapshot = PeerTransportDiagnosticSnapshot {
+            owner_send_count: view.count(0),
+            ingress_receive_count: view.count(1),
+            ..PeerTransportDiagnosticSnapshot::default()
+        };
+        for retained in view.retained {
+            let Some(event) = decode_event(retained.order, retained.record) else {
+                continue;
+            };
+            match event.role {
+                PeerTransportDiagnosticRole::OwnerSend => snapshot.last_owner_send = Some(event),
+                PeerTransportDiagnosticRole::IngressReceive => {
+                    snapshot.last_ingress_receive = Some(event);
+                }
+            }
         }
+        snapshot
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PeerTransportDiagnosticOutcome, PeerTransportDiagnosticRole};
+
+    /// A recorded event names its role and outcome by table position, so a
+    /// variant missing from a table would not decode.
+    #[test]
+    fn every_role_and_outcome_is_in_its_decode_table() {
+        for role in PeerTransportDiagnosticRole::ALL {
+            match role {
+                PeerTransportDiagnosticRole::OwnerSend
+                | PeerTransportDiagnosticRole::IngressReceive => {}
+            }
+        }
+        for outcome in PeerTransportDiagnosticOutcome::ALL {
+            match outcome {
+                PeerTransportDiagnosticOutcome::TimedOut
+                | PeerTransportDiagnosticOutcome::GoAway
+                | PeerTransportDiagnosticOutcome::H3Error
+                | PeerTransportDiagnosticOutcome::QuicError
+                | PeerTransportDiagnosticOutcome::Cancelled
+                | PeerTransportDiagnosticOutcome::TrustExpired
+                | PeerTransportDiagnosticOutcome::Closed
+                | PeerTransportDiagnosticOutcome::ProtocolError
+                | PeerTransportDiagnosticOutcome::Other => {}
+            }
+        }
+        let mut labels: Vec<&str> = PeerTransportDiagnosticOutcome::ALL
+            .iter()
+            .map(|outcome| outcome.as_str())
+            .collect();
+        labels.sort_unstable();
+        labels.dedup();
+        assert_eq!(labels.len(), PeerTransportDiagnosticOutcome::ALL.len());
     }
 }

@@ -52,7 +52,7 @@ use std::{
     os::unix::process::CommandExt,
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Output, Stdio},
-    sync::{Arc, Mutex},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -411,9 +411,37 @@ impl Drop for Running {
     }
 }
 
+/// What a reader thread has collected so far, in arrival order.
+///
+/// The thread sends each item as it reads it; the one test that owns this
+/// value moves whatever has arrived into `seen` whenever it looks.
+struct Collected<T> {
+    incoming: std::sync::mpsc::Receiver<T>,
+    seen: Vec<T>,
+}
+
+impl<T> Collected<T> {
+    fn channel() -> (std::sync::mpsc::Sender<T>, Self) {
+        let (collect, incoming) = std::sync::mpsc::channel();
+        (
+            collect,
+            Self {
+                incoming,
+                seen: Vec::new(),
+            },
+        )
+    }
+
+    /// Everything collected up to now.
+    fn all(&mut self) -> &[T] {
+        self.seen.extend(self.incoming.try_iter());
+        &self.seen
+    }
+}
+
 struct Relay {
     process: Running,
-    lines: Arc<Mutex<Vec<String>>>,
+    lines: Collected<String>,
 }
 
 /// One provisioned relay and device, with nothing running yet.
@@ -655,20 +683,17 @@ impl Deployment {
                 .expect("spawn serve"),
         );
         let stderr = process.0.stderr.take().expect("serve stderr");
-        let lines = Arc::new(Mutex::new(Vec::new()));
+        let (collect, mut lines) = Collected::channel();
         let (tx, rx) = std::sync::mpsc::channel::<()>();
-        {
-            let lines = Arc::clone(&lines);
-            std::thread::spawn(move || {
-                for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-                    let listening = line.starts_with("tunnel-relay listening");
-                    lines.lock().expect("relay log").push(line);
-                    if listening {
-                        let _ = tx.send(());
-                    }
+        std::thread::spawn(move || {
+            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                let listening = line.starts_with("tunnel-relay listening");
+                let _ = collect.send(line);
+                if listening {
+                    let _ = tx.send(());
                 }
-            });
-        }
+            }
+        });
         let deadline = Instant::now() + STEP_DEADLINE;
         loop {
             if rx.recv_timeout(Duration::from_millis(100)).is_ok() {
@@ -677,7 +702,7 @@ impl Deployment {
             if let Ok(Some(status)) = process.0.try_wait() {
                 panic!(
                     "step {name}: serve exited {status} before listening: {:?}",
-                    lines.lock().expect("relay log")
+                    lines.all()
                 );
             }
             assert!(
@@ -703,28 +728,22 @@ impl Deployment {
             command.env("TUNNEL_CLIENT_TEST_HOLD", hold);
         }
         let mut child = command.spawn().expect("spawn connect");
-        let events = Arc::new(Mutex::new(Vec::new()));
-        let stderr_lines = Arc::new(Mutex::new(Vec::new()));
+        let (collect_events, events) = Collected::channel();
+        let (collect_stderr, stderr_lines) = Collected::channel();
         let stdout = child.stdout.take().expect("connect stdout");
         let stderr = child.stderr.take().expect("connect stderr");
-        {
-            let events = Arc::clone(&events);
-            std::thread::spawn(move || {
-                for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-                    let value = serde_json::from_str(&line)
-                        .unwrap_or_else(|_| Value::String(format!("non-JSON stdout: {line}")));
-                    events.lock().expect("events").push((Instant::now(), value));
-                }
-            });
-        }
-        {
-            let stderr_lines = Arc::clone(&stderr_lines);
-            std::thread::spawn(move || {
-                for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-                    stderr_lines.lock().expect("stderr").push(line);
-                }
-            });
-        }
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                let value = serde_json::from_str(&line)
+                    .unwrap_or_else(|_| Value::String(format!("non-JSON stdout: {line}")));
+                let _ = collect_events.send((Instant::now(), value));
+            }
+        });
+        std::thread::spawn(move || {
+            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                let _ = collect_stderr.send(line);
+            }
+        });
         Client {
             process: Running(child),
             events,
@@ -809,33 +828,28 @@ fn set_rotation(document: &str) -> String {
 /// A running `tunnel-client connect --json`: its events and stderr.
 struct Client {
     process: Running,
-    events: Arc<Mutex<Vec<(Instant, Value)>>>,
-    stderr: Arc<Mutex<Vec<String>>>,
+    events: Collected<(Instant, Value)>,
+    stderr: Collected<String>,
 }
 
 impl Client {
-    fn states(&self, state: &str) -> Vec<(Instant, Value)> {
+    fn states(&mut self, state: &str) -> Vec<(Instant, Value)> {
         self.events
-            .lock()
-            .expect("events")
+            .all()
             .iter()
             .filter(|(_, event)| event["result"]["state"] == state)
             .cloned()
             .collect()
     }
 
-    fn context(&self) -> String {
+    fn context(&mut self) -> String {
         let events: Vec<Value> = self
             .events
-            .lock()
-            .expect("events")
+            .all()
             .iter()
             .map(|(_, event)| event.clone())
             .collect();
-        format!(
-            "events {events:?} stderr {:?}",
-            self.stderr.lock().expect("stderr")
-        )
+        format!("events {events:?} stderr {:?}", self.stderr.all())
     }
 
     fn wait_for(&mut self, step_name: &str, state: &str, count: usize, within: Duration) {
@@ -999,7 +1013,7 @@ fn witness(
     deployment: &Deployment,
     side: Side,
     phase: &str,
-    client: &Client,
+    client: &mut Client,
 ) -> (Option<String>, Option<String>) {
     // A rotation starts 12 s after ready; an abort needs the 4 s handshake
     // budget on top.
@@ -1037,7 +1051,7 @@ async fn run_matrix(side: Side) {
         let mut client = deployment.connect(hold);
         client.wait_for(&case, "ready", 1, STEP_DEADLINE);
         deployment.echo(&format!("{case}-before")).await;
-        let (client_phase, relay_phase) = witness(&deployment, side, phase, &client);
+        let (client_phase, relay_phase) = witness(&deployment, side, phase, &mut client);
 
         // Work in flight at the signal.
         let payload = format!("m606-{case}-inflight-{}", deployment.nonce);
@@ -1115,7 +1129,7 @@ async fn run_matrix(side: Side) {
                 sigterm(pid);
                 let (status, latency) = wait_exit(&mut relay.process, signalled, "serve");
                 std::thread::sleep(Duration::from_millis(100));
-                let lines = relay.lines.lock().expect("relay log").clone();
+                let lines = relay.lines.all().to_vec();
                 assert_eq!(status.code(), Some(0), "case {case}: {lines:?}");
                 assert!(
                     lines

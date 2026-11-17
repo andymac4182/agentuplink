@@ -697,7 +697,7 @@ async fn handler_content_length_is_carried_and_checked_exactly() {
         let device = within(device).await.unwrap();
         assert_eq!(device.response, Outcome::Aborted);
         assert_eq!(device.error, Some(HttpErrorCode::LengthMismatch));
-        let log = log.lock().unwrap();
+        let log = log.borrow();
         assert!(
             !log.record_kinds().contains(&RecordKind::End),
             "no fabricated END"
@@ -814,7 +814,7 @@ async fn discovered_response_trailers_error_the_body_after_headers() {
     let error = within(collect(response.into_body())).await.unwrap_err();
     assert_eq!(error.code(), HttpErrorCode::UnsupportedFeature);
     assert_eq!(within(handle.report()).await.response, Outcome::Aborted);
-    let log = log.lock().unwrap();
+    let log = log.borrow();
     assert!(!log.record_kinds().contains(&RecordKind::End));
     assert_eq!(
         log.reset.map(|detail| detail.code),
@@ -916,7 +916,7 @@ async fn handler_body_error_after_headers_errors_the_stream_without_end() {
     assert_eq!(owner.execution, Execution::Dispatched);
     let device = within(device).await.unwrap();
     assert_eq!(device.response, Outcome::Aborted);
-    let log = log.lock().unwrap();
+    let log = log.borrow();
     assert_eq!(
         log.record_kinds(),
         [RecordKind::ResponseHead, RecordKind::Body]

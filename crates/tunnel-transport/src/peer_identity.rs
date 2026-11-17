@@ -16,10 +16,7 @@
 //! relay, which gates the switch on a verified signed membership record that
 //! approves the successor's SPKI (see `docs/cluster.md`).
 
-use std::{
-    fmt,
-    sync::{Arc, RwLock},
-};
+use std::{fmt, sync::Arc};
 
 use rustls::{
     SignatureScheme,
@@ -29,6 +26,8 @@ use rustls::{
     server::{ClientHello, ResolvesServerCert},
     sign::CertifiedKey,
 };
+
+use tokio::sync::watch;
 
 use crate::tls::{
     SanName, SpkiSha256, TlsConfigError, TlsIdentity, disable_server_resumption,
@@ -176,8 +175,13 @@ struct IdentitySlot {
 /// Every new handshake resolves the certificate through this slot, so an
 /// [`install`](Self::install) takes effect for the next handshake in either
 /// direction and never for one already completed.
+///
+/// The slot is a published snapshot: the relay's rotation step is its one
+/// logical writer, and every handshake -- including the synchronous rustls
+/// certificate resolvers below -- samples the latest immutable
+/// [`IdentitySlot`] without waiting for it.
 pub struct RotatingPeerIdentity {
-    slot: RwLock<Arc<IdentitySlot>>,
+    slot: watch::Sender<Arc<IdentitySlot>>,
 }
 
 impl fmt::Debug for RotatingPeerIdentity {
@@ -196,7 +200,7 @@ impl RotatingPeerIdentity {
     #[must_use]
     pub fn new(initial: StagedPeerIdentity) -> Arc<Self> {
         Arc::new(Self {
-            slot: RwLock::new(Arc::new(IdentitySlot {
+            slot: watch::Sender::new(Arc::new(IdentitySlot {
                 certified: initial.certified,
                 spki: initial.identity.spki_sha256(),
                 identity: Some(initial.identity),
@@ -233,7 +237,7 @@ impl RotatingPeerIdentity {
         let spki = crate::tls::spki_sha256_from_der(leaf.as_ref())
             .map_err(|error| PeerIdentityError::Unusable(error.to_string()))?;
         Ok(Arc::new(Self {
-            slot: RwLock::new(Arc::new(IdentitySlot {
+            slot: watch::Sender::new(Arc::new(IdentitySlot {
                 certified: Arc::new(certified),
                 spki,
                 identity: parse_leaf_identity(&chain).ok(),
@@ -252,12 +256,7 @@ impl RotatingPeerIdentity {
     }
 
     fn current_slot(&self) -> Arc<IdentitySlot> {
-        // A poisoned lock can only follow a panic inside `install`, which
-        // performs no fallible work while holding it; recover the value.
-        match self.slot.read() {
-            Ok(slot) => slot.clone(),
-            Err(poisoned) => poisoned.into_inner().clone(),
-        }
+        self.slot.borrow().clone()
     }
 
     /// The SPKI digest new handshakes present.
@@ -304,16 +303,19 @@ impl RotatingPeerIdentity {
     /// generation.  Established connections keep what they negotiated.
     pub fn install(&self, staged: StagedPeerIdentity) -> Result<u64, PeerIdentityError> {
         self.check_replacement(&staged)?;
-        let mut slot = match self.slot.write() {
-            Ok(slot) => slot,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        let generation = slot.generation.saturating_add(1);
-        *slot = Arc::new(IdentitySlot {
-            certified: staged.certified,
-            spki: staged.identity.spki_sha256(),
-            identity: Some(staged.identity),
-            generation,
+        let spki = staged.identity.spki_sha256();
+        let mut generation = 0;
+        // Publish the successor as one new snapshot.  The generation is
+        // derived from the snapshot being replaced inside the publication
+        // itself, so it increases by exactly one per install.
+        self.slot.send_modify(|slot| {
+            generation = slot.generation.saturating_add(1);
+            *slot = Arc::new(IdentitySlot {
+                certified: staged.certified,
+                spki,
+                identity: Some(staged.identity),
+                generation,
+            });
         });
         Ok(generation)
     }

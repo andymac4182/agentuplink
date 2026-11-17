@@ -5,6 +5,31 @@ Production follows `main`, with `site` as the root directory and files outside
 that root excluded. Pushes to the production branch trigger Vercel builds.
 Both pages offer System, Light and Dark themes with browser-local persistence.
 
+## Design system and themes
+
+`theme.css` is the single token file for the home page, the docs, the
+architecture explainer and the brand lab: surfaces, text levels, lines, accent,
+focus, code and diagram colours, plus the type and spacing scales and the shared
+header and footer. Components read tokens only; there are no per-component dark
+overrides. Light is the default. Dark applies automatically from the operating
+system through `prefers-color-scheme`, with CSS alone, and changes live when the
+system switches. `theme.js` is optional: it adds a System, Light and Dark control
+(stored in this browser under `agentuplink-theme`), mirrors the resolved theme
+on `<html data-theme>`, and forces light or dark when asked. The dark values in
+`theme.css` appear twice, once for the automatic path and once for the forced
+path; keep the two blocks identical.
+
+## Interactive architecture page
+
+`/docs/architecture` opens with an explainer of three scenes: the relay cluster,
+the daemon connection and an agent request. Its content (scenes, steps, part
+descriptions and diagram geometry) is plain data in `build-architecture.cjs`,
+which `build-docs.cjs` renders into the page as an inline SVG and ordinary
+ordered lists. `architecture.js` holds no content: it reads those lists and adds
+tabs, a stepper, moving packets, a detail panel and a linkable URL hash. Without
+JavaScript the page keeps the static diagram and every step as text. Correct a
+fact in `build-architecture.cjs` and regenerate; do not edit the engine for it.
+
 ## Documentation publishing
 
 The downloads/setup pages query public GitHub releases for the newest complete
@@ -48,3 +73,12 @@ Verified on 2026-09-22 in Chrome at 1440, 390 and 320 pixel widths: twenty
 options, one hundred swatches, loaded source image, no horizontal overflow,
 and shortlist filtering. The marketing site separately passed local and live
 verification at 1440, 1920, 390 and 320 pixels via `verify.cjs`.
+
+`verify.cjs` serves the site locally with the response headers from
+`vercel.json`, including the Content-Security-Policy, and fails on any console
+error, CSP violation or failed response. It covers the manual theme control,
+the automatic theme with and without JavaScript, the architecture explainer
+(scenes, stepping, relay choice, failure, rotation, keyboard panel, text size,
+hash links, reduced motion) and its no-JavaScript fallback. It needs Playwright
+or playwright-core resolvable by Node and a local Chrome; nothing is installed
+into this repository.

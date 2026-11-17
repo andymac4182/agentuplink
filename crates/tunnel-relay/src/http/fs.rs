@@ -623,10 +623,14 @@ async fn upgrade_session(
             "DEVICE_NOT_OWNED_HERE: gate 4 admits a filesystem session only at the owning relay",
         );
     }
-    let Some(scope_permit) = state.scoped_admission.try_acquire(OwnerScope::new(
-        admitted.grant.tenant_id,
-        admitted.device_id,
-    )) else {
+    let Some(scope_permit) = state
+        .scoped_admission
+        .try_acquire(OwnerScope::new(
+            admitted.grant.tenant_id,
+            admitted.device_id,
+        ))
+        .await
+    else {
         return fs_error(
             StatusCode::TOO_MANY_REQUESTS,
             "RESOURCE_EXHAUSTED",

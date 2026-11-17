@@ -121,6 +121,147 @@ impl FidState {
     }
 }
 
+/// What one fid number holds in a session.
+///
+/// A number that holds nothing is absent from the session's fid table, and a
+/// released one leaves it; a number is therefore reserved **or** bound, never
+/// both.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum FidSlot {
+    /// A request has claimed the number and no reply has bound it yet.
+    ///
+    /// Reserved at request time so two concurrent `Twalk`s cannot both claim
+    /// one `newfid`, and so the fid quota counts work already in flight.
+    Reserved(VirtualPath),
+    /// A reply bound the number.  Whether it is open is
+    /// [`FidState::open`].
+    Bound(FidState),
+}
+
+/// Everything that can change what a fid number holds.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum FidEvent {
+    /// A request claims the number for the path it would bind.
+    Reserve(VirtualPath),
+    /// The claiming request is over without binding.
+    Unreserve,
+    /// The claiming request's reply binds the number.
+    Bind {
+        path: VirtualPath,
+        qid: Qid,
+        generation: u64,
+    },
+    /// A walk in place moves the binding it was admitted against.
+    Rebind {
+        admitted: u64,
+        path: VirtualPath,
+        qid: Qid,
+        generation: u64,
+    },
+    /// An `Rlopen` for the binding the open was admitted against.
+    Open {
+        admitted: u64,
+        qid: Qid,
+        mode: OpenMode,
+    },
+    /// An `Rlcreate` rebinds the number to the child it made, open.
+    Create {
+        admitted: u64,
+        child: VirtualPath,
+        qid: Qid,
+        mode: OpenMode,
+        generation: u64,
+    },
+    /// A clunk or remove of the binding it was admitted against.
+    Release { admitted: u64 },
+}
+
+impl FidSlot {
+    /// The only place a fid number's contents change.  The first value is
+    /// what the number holds afterwards (`None` is nothing); the second is
+    /// whether the event applied.  A refused event changes nothing: it found
+    /// the number absent, or held by something other than what the event
+    /// was admitted against.
+    fn on_event(slot: Option<Self>, event: FidEvent) -> (Option<Self>, bool) {
+        match (slot, event) {
+            (None, FidEvent::Reserve(path)) => (Some(Self::Reserved(path)), true),
+            (Some(Self::Reserved(_)), FidEvent::Unreserve) => (None, true),
+            (
+                Some(Self::Reserved(_)),
+                FidEvent::Bind {
+                    path,
+                    qid,
+                    generation,
+                },
+            ) => (
+                Some(Self::Bound(FidState {
+                    path,
+                    qid,
+                    open: None,
+                    generation,
+                })),
+                true,
+            ),
+            (
+                Some(Self::Bound(state)),
+                FidEvent::Rebind {
+                    admitted,
+                    path,
+                    qid,
+                    generation,
+                },
+            ) if state.generation == admitted => (
+                Some(Self::Bound(FidState {
+                    path,
+                    qid,
+                    open: None,
+                    generation,
+                })),
+                true,
+            ),
+            (
+                Some(Self::Bound(state)),
+                FidEvent::Open {
+                    admitted,
+                    qid,
+                    mode,
+                },
+            ) if state.generation == admitted => (
+                Some(Self::Bound(FidState {
+                    qid,
+                    open: Some(mode),
+                    ..state
+                })),
+                true,
+            ),
+            (
+                Some(Self::Bound(state)),
+                FidEvent::Create {
+                    admitted,
+                    child,
+                    qid,
+                    mode,
+                    generation,
+                },
+            ) if state.generation == admitted => (
+                Some(Self::Bound(FidState {
+                    path: child,
+                    qid,
+                    open: Some(mode),
+                    generation,
+                })),
+                true,
+            ),
+            (Some(Self::Bound(state)), FidEvent::Release { admitted })
+                if state.generation == admitted =>
+            {
+                (None, true)
+            }
+            (slot, _) => (slot, false),
+        }
+    }
+}
+
 /// The virtual paths a request names.
 ///
 /// Every variant carries only already-validated [`VirtualPath`]s, so gate 4
@@ -231,24 +372,177 @@ enum Effect {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct TagState {
     message_type: MessageType,
-    effect: Effect,
-    /// Every `Tflush` currently outstanding against this tag.
+    /// This tag belongs to a `Tflush`, and this is the tag it flushes.  Fixed
+    /// when the tag is admitted.
+    flushing: Option<u16>,
+    phase: TagPhase,
+}
+
+/// Where one outstanding tag is between its request and its release.
+///
+/// A released tag has no phase: it leaves the session's tag table, which is
+/// the only place a tag can be found.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum TagPhase {
+    /// The request is outstanding and no `Tflush` names it.
+    Pending { effect: Effect },
+    /// The request is outstanding and at least one `Tflush` names it.
     ///
-    /// A **set**, not one tag: 9P allows several flushes of one request, and a
-    /// single slot meant the second flush overwrote the first.  Releasing then
-    /// keyed on the flush's own `flushing` field alone, so the first `Rflush`
-    /// freed the tag, the client could re-issue on it — and the second
-    /// `Rflush` then cancelled that new request and undid its reservation.
-    /// Membership is what makes a re-issued request safe: it carries an empty
-    /// set, so no stale `Rflush` can ever match it.
-    flushed_by: BTreeSet<u16>,
+    /// `by` is every `Tflush` currently outstanding against this tag, and is
+    /// never empty.  A **set**, not one tag: 9P allows several flushes of one
+    /// request, and a single slot meant the second flush overwrote the first.
+    /// Releasing then keyed on the flush's own `flushing` field alone, so the
+    /// first `Rflush` freed the tag, the client could re-issue on it — and
+    /// the second `Rflush` then cancelled that new request and undid its
+    /// reservation.  Membership is what makes a re-issued request safe: it is
+    /// `Pending`, with no set at all, so no stale `Rflush` can ever match it.
+    FlushRequested { effect: Effect, by: BTreeSet<u16> },
     /// The original reply arrived while a flush was still pending.
     ///
     /// `docs/filesystem-api.md`: "Respect a normal reply arriving before
-    /// `Rflush`, and reserve the flushed tag until the flush response."
-    answered: bool,
-    /// This tag belongs to a `Tflush`, and this is the tag it flushes.
-    flushing: Option<u16>,
+    /// `Rflush`, and reserve the flushed tag until the flush response."  The
+    /// reply's effect was applied, so none is carried; the tag is held, and
+    /// unusable, for the flushes in `by`, which is never empty.
+    Answered { by: BTreeSet<u16> },
+}
+
+/// Everything that can change a [`TagPhase`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum TagEvent {
+    /// A `Tflush` carrying this tag was admitted against the request.
+    FlushAdmitted(u16),
+    /// The request's own reply or `Rlerror` arrived.  `flush_live` says
+    /// whether a live `Tflush` still names the tag.
+    Replied { flush_live: bool },
+    /// The `Tflush` `flush` against this tag was answered with `Rflush`;
+    /// `remaining` is every other live flush still outstanding against it.
+    FlushAnswered {
+        flush: u16,
+        remaining: BTreeSet<u16>,
+    },
+    /// The `Tflush` `flush` against this tag ended without happening;
+    /// `remaining` is every other live flush still outstanding against it.
+    FlushCancelled {
+        flush: u16,
+        remaining: BTreeSet<u16>,
+    },
+}
+
+/// What a tag transition decided.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum TagOutcome {
+    /// The tag stays in the table.
+    Held,
+    /// The tag is released with nothing left to undo.
+    Released,
+    /// The tag is released by a flush before its own reply arrived: the
+    /// request is cancelled, and the reservation its effect made goes with
+    /// it.
+    Cancelled(Effect),
+    /// The event does not apply in this phase; nothing changed.
+    Refused,
+}
+
+impl TagPhase {
+    /// The effect a reply would apply, while the request is unanswered.
+    const fn effect(&self) -> Option<&Effect> {
+        match self {
+            Self::Pending { effect } | Self::FlushRequested { effect, .. } => Some(effect),
+            Self::Answered { .. } => None,
+        }
+    }
+
+    /// The flushes recorded against this tag.
+    const fn flushed_by(&self) -> Option<&BTreeSet<u16>> {
+        match self {
+            Self::Pending { .. } => None,
+            Self::FlushRequested { by, .. } | Self::Answered { by } => Some(by),
+        }
+    }
+
+    fn is_flushed_by(&self, flush: u16) -> bool {
+        self.flushed_by().is_some_and(|by| by.contains(&flush))
+    }
+
+    /// The only place a tag's phase changes.  `None` is a released tag.
+    fn on_event(self, event: TagEvent) -> (Option<Self>, TagOutcome) {
+        match (self, event) {
+            (Self::Pending { effect }, TagEvent::FlushAdmitted(flush)) => (
+                Some(Self::FlushRequested {
+                    effect,
+                    by: BTreeSet::from([flush]),
+                }),
+                TagOutcome::Held,
+            ),
+            (Self::FlushRequested { effect, mut by }, TagEvent::FlushAdmitted(flush)) => {
+                by.insert(flush);
+                (Some(Self::FlushRequested { effect, by }), TagOutcome::Held)
+            }
+            (Self::Answered { mut by }, TagEvent::FlushAdmitted(flush)) => {
+                by.insert(flush);
+                (Some(Self::Answered { by }), TagOutcome::Held)
+            }
+            // The original reply arrived before its `Rflush`.  It is honoured
+            // — its effect has already been applied — but the tag stays
+            // reserved, and unusable, until **every** flush outstanding
+            // against it has been answered.
+            (Self::FlushRequested { by, .. }, TagEvent::Replied { flush_live: true }) => {
+                (Some(Self::Answered { by }), TagOutcome::Held)
+            }
+            (Self::Pending { .. } | Self::FlushRequested { .. }, TagEvent::Replied { .. }) => {
+                (None, TagOutcome::Released)
+            }
+            // A second reply on a tag whose original answer already arrived.
+            (phase @ Self::Answered { .. }, TagEvent::Replied { .. }) => {
+                (Some(phase), TagOutcome::Refused)
+            }
+            (
+                phase,
+                TagEvent::FlushAnswered { flush, .. } | TagEvent::FlushCancelled { flush, .. },
+            ) if !phase.is_flushed_by(flush) => (Some(phase), TagOutcome::Refused),
+            // The contract's "reserve the flushed tag until the flush
+            // response" means the **last** response when there are several.
+            (
+                Self::FlushRequested { effect, .. },
+                TagEvent::FlushAnswered { remaining, .. }
+                | TagEvent::FlushCancelled { remaining, .. },
+            ) if !remaining.is_empty() => (
+                Some(Self::FlushRequested {
+                    effect,
+                    by: remaining,
+                }),
+                TagOutcome::Held,
+            ),
+            (
+                Self::Answered { .. },
+                TagEvent::FlushAnswered { remaining, .. }
+                | TagEvent::FlushCancelled { remaining, .. },
+            ) if !remaining.is_empty() => {
+                (Some(Self::Answered { by: remaining }), TagOutcome::Held)
+            }
+            // An `Rflush` releases the tag it flushed, whether or not the
+            // original reply ever arrived.
+            (Self::FlushRequested { effect, .. }, TagEvent::FlushAnswered { .. }) => {
+                (None, TagOutcome::Cancelled(effect))
+            }
+            // A cancelled flush is not an answered one: the request it named
+            // is still outstanding, now with no flush against it.
+            (Self::FlushRequested { effect, .. }, TagEvent::FlushCancelled { .. }) => {
+                (Some(Self::Pending { effect }), TagOutcome::Held)
+            }
+            // Held only for flushes, and the last of them is gone.
+            (
+                Self::Answered { .. },
+                TagEvent::FlushAnswered { .. } | TagEvent::FlushCancelled { .. },
+            ) => (None, TagOutcome::Released),
+            // Unreachable: a pending tag is flushed by nothing, so the
+            // membership guard above already refused these.
+            (
+                phase @ Self::Pending { .. },
+                TagEvent::FlushAnswered { .. } | TagEvent::FlushCancelled { .. },
+            ) => (Some(phase), TagOutcome::Refused),
+        }
+    }
 }
 
 /// How a retiring `Tflush` ended, which decides what happens to its victim.
@@ -272,12 +566,9 @@ pub struct Session {
     msize: u32,
     pending_msize: Option<u32>,
     tags: BTreeMap<u16, TagState>,
-    fids: BTreeMap<u32, FidState>,
-    /// Fids a request has claimed that no reply has bound yet.
-    ///
-    /// Reserved at request time so two concurrent `Twalk`s cannot both claim
-    /// one `newfid`, and so the fid quota counts work already in flight.
-    reserved_fids: BTreeMap<u32, VirtualPath>,
+    /// Every fid number that holds something: reserved by a request no
+    /// reply has bound yet, or bound.
+    fids: BTreeMap<u32, FidSlot>,
     /// Hands out the stamp on [`FidState::generation`].  Monotonic, never
     /// reused, and never zero, so a stale effect can be told from a live one.
     next_generation: u64,
@@ -305,7 +596,6 @@ impl Session {
             pending_msize: None,
             tags: BTreeMap::new(),
             fids: BTreeMap::new(),
-            reserved_fids: BTreeMap::new(),
             next_generation: 0,
         })
     }
@@ -343,13 +633,36 @@ impl Session {
     /// How many fids are live, counting those no reply has bound yet.
     #[must_use]
     pub fn live_fids(&self) -> usize {
-        self.fids.len() + self.reserved_fids.len()
+        self.fids.len()
     }
 
     /// The state of one bound fid.
     #[must_use]
     pub fn fid(&self, fid: u32) -> Option<&FidState> {
-        self.fids.get(&fid)
+        match self.fids.get(&fid) {
+            Some(FidSlot::Bound(state)) => Some(state),
+            Some(FidSlot::Reserved(_)) | None => None,
+        }
+    }
+
+    /// Apply one event to what `fid` holds.  False if it was refused.
+    fn fid_event(&mut self, fid: u32, event: FidEvent) -> bool {
+        let (slot, applied) = FidSlot::on_event(self.fids.remove(&fid), event);
+        if let Some(slot) = slot {
+            self.fids.insert(fid, slot);
+        }
+        applied
+    }
+
+    /// Whether `fid` is reserved by a request no reply has bound yet.
+    fn is_reserved(&self, fid: u32) -> bool {
+        matches!(self.fids.get(&fid), Some(FidSlot::Reserved(_)))
+    }
+
+    /// The binding of `fid` a request was admitted against, if the number
+    /// still carries it.
+    fn admitted_fid(&self, fid: u32, admitted: u64) -> Option<&FidState> {
+        self.fid(fid).filter(|state| state.generation == admitted)
     }
 
     /// Whether `tag` is outstanding.
@@ -367,7 +680,6 @@ impl Session {
         self.phase = Phase::Closed;
         self.tags.clear();
         self.fids.clear();
-        self.reserved_fids.clear();
     }
 
     /// The primitives a frame decodes to, without admitting it.
@@ -461,19 +773,15 @@ impl Session {
         if frame.message_type() == MessageType::Rversion {
             return self.complete_version(frame);
         }
-        let state = self
-            .tags
-            .get(&frame.tag)
-            .cloned()
-            .ok_or(SessionError::TagNotInUse)?;
-        if state.answered {
+        let state = self.tags.get(&frame.tag).ok_or(SessionError::TagNotInUse)?;
+        let Some(effect) = state.phase.effect().cloned() else {
             // A second reply on a tag whose original answer already arrived.
             return Err(SessionError::TagNotInUse);
-        }
+        };
         if reply_for(state.message_type) != frame.message_type() {
             return Err(SessionError::UnexpectedReply);
         }
-        let applied = self.apply_effect(&state.effect, &frame.message);
+        let applied = self.apply_effect(&effect, &frame.message);
         // Whatever the effect did or refused to do, the request is over: its
         // tag is released and any fid it had reserved but not bound goes with
         // it.  A reservation exists only for an outstanding request, so
@@ -481,8 +789,8 @@ impl Session {
         // is neither bound (so it cannot be clunked) nor free (so it cannot be
         // walked to).  After a successful bind this is a no-op, because
         // `apply_effect` consumed the reservation itself.
-        self.undo_reservation(&state.effect);
-        self.retire_tag(frame.tag, &state, FlushOutcome::Answered);
+        self.undo_reservation(&effect);
+        self.retire_tag(frame.tag, FlushOutcome::Answered);
         applied
     }
 
@@ -509,21 +817,17 @@ impl Session {
         if self.phase == Phase::Closed {
             return Err(SessionError::Closed);
         }
-        let state = self
-            .tags
-            .get(&tag)
-            .cloned()
-            .ok_or(SessionError::TagNotInUse)?;
-        if state.answered {
+        let state = self.tags.get(&tag).ok_or(SessionError::TagNotInUse)?;
+        let Some(effect) = state.phase.effect().cloned() else {
             return Err(SessionError::TagNotInUse);
-        }
-        match &state.effect {
+        };
+        match &effect {
             Effect::Release { fid, generation } => self.release_fid(*fid, *generation),
             other => self.undo_reservation(other),
         }
         // An `Rlerror` means the request did not happen, so a failed `Tflush`
         // is a **cancelled** flush rather than an answered one.
-        self.retire_tag(tag, &state, FlushOutcome::Cancelled);
+        self.retire_tag(tag, FlushOutcome::Cancelled);
         Ok(())
     }
 
@@ -555,10 +859,11 @@ impl Session {
             return Ok(());
         }
         if let Some(existing) = self.tags.get(&frame.tag) {
-            return Err(if !existing.flushed_by.is_empty() || existing.answered {
-                SessionError::TagReservedByFlush
-            } else {
-                SessionError::TagInUse
+            return Err(match existing.phase {
+                TagPhase::Pending { .. } => SessionError::TagInUse,
+                TagPhase::FlushRequested { .. } | TagPhase::Answered { .. } => {
+                    SessionError::TagReservedByFlush
+                }
             });
         }
         let quota = usize::try_from(self.limits.max_inflight_requests()).unwrap_or(usize::MAX);
@@ -569,43 +874,59 @@ impl Session {
             Message::Tflush { oldtag } => Some(*oldtag),
             _ => None,
         };
-        if let Some(oldtag) = flushing
-            && let Some(target) = self.tags.get_mut(&oldtag)
-        {
-            target.flushed_by.insert(frame.tag);
+        if let Some(oldtag) = flushing {
+            self.transition_tag(oldtag, TagEvent::FlushAdmitted(frame.tag));
         }
         self.tags.insert(
             frame.tag,
             TagState {
                 message_type: frame.message_type(),
-                effect,
-                flushed_by: BTreeSet::new(),
-                answered: false,
                 flushing,
+                phase: TagPhase::Pending { effect },
             },
         );
         Ok(())
     }
 
-    /// Release a tag, honouring the flush reservation.
-    fn retire_tag(&mut self, tag: u16, state: &TagState, outcome: FlushOutcome) {
-        if state
-            .flushed_by
-            .iter()
-            .any(|flush_tag| self.is_live_flush_of(*flush_tag, tag))
-        {
-            // The original reply arrived before its `Rflush`.  It is honoured —
-            // the effect above has already been applied — but the tag stays
-            // reserved, and unusable, until **every** flush outstanding
-            // against it has been answered.
-            if let Some(entry) = self.tags.get_mut(&tag) {
-                entry.answered = true;
-                entry.effect = Effect::None;
-            }
-            return;
+    /// Apply one event to an outstanding tag, releasing it from the table if
+    /// the transition says so.  `None` for a tag that is not outstanding;
+    /// otherwise what the transition decided and the flush target the tag
+    /// carried.
+    fn transition_tag(&mut self, tag: u16, event: TagEvent) -> Option<(TagOutcome, Option<u16>)> {
+        let TagState {
+            message_type,
+            flushing,
+            phase,
+        } = self.tags.remove(&tag)?;
+        let (next, outcome) = phase.on_event(event);
+        if let Some(phase) = next {
+            self.tags.insert(
+                tag,
+                TagState {
+                    message_type,
+                    flushing,
+                    phase,
+                },
+            );
         }
-        self.tags.remove(&tag);
-        if let Some(flushed) = state.flushing {
+        Some((outcome, flushing))
+    }
+
+    /// Release a tag, honouring the flush reservation.
+    fn retire_tag(&mut self, tag: u16, outcome: FlushOutcome) {
+        let flush_live = self.tags.get(&tag).is_some_and(|state| {
+            state.phase.flushed_by().is_some_and(|by| {
+                by.iter()
+                    .any(|flush_tag| self.is_live_flush_of(*flush_tag, tag))
+            })
+        });
+        let Some((TagOutcome::Released, flushing)) =
+            self.transition_tag(tag, TagEvent::Replied { flush_live })
+        else {
+            // Still reserved for a live flush (or not outstanding at all).
+            return;
+        };
+        if let Some(flushed) = flushing {
             match outcome {
                 FlushOutcome::Answered => self.release_flushed(flushed, tag),
                 // A flush that ended without happening leaves its victim's set
@@ -632,16 +953,17 @@ impl Session {
 
     /// The flushes still outstanding against `victim`, `excluded` aside.
     fn live_flushes_of(&self, victim: u16, excluded: u16) -> BTreeSet<u16> {
-        self.tags.get(&victim).map_or_else(BTreeSet::new, |target| {
-            target
-                .flushed_by
-                .iter()
-                .copied()
-                .filter(|candidate| {
-                    *candidate != excluded && self.is_live_flush_of(*candidate, victim)
-                })
-                .collect()
-        })
+        self.tags
+            .get(&victim)
+            .and_then(|target| target.phase.flushed_by())
+            .map_or_else(BTreeSet::new, |by| {
+                by.iter()
+                    .copied()
+                    .filter(|candidate| {
+                        *candidate != excluded && self.is_live_flush_of(*candidate, victim)
+                    })
+                    .collect()
+            })
     }
 
     /// Answer one `Tflush`: drop it from its target's set, and release the
@@ -655,42 +977,33 @@ impl Session {
     /// reply to close the session with a fatal unknown tag.  A re-issued
     /// request carries an empty set, so no stale `Rflush` can match it.
     fn release_flushed(&mut self, flushed: u16, flush_tag: u16) {
-        let Some(target) = self.tags.get(&flushed) else {
+        let event = TagEvent::FlushAnswered {
+            flush: flush_tag,
+            remaining: self.live_flushes_of(flushed, flush_tag),
+        };
+        let Some((outcome, flushing)) = self.transition_tag(flushed, event) else {
             return;
         };
-        if !target.flushed_by.contains(&flush_tag) {
-            return;
+        match outcome {
+            // Not a flush of this tag, or other flushes still hold it.
+            TagOutcome::Refused | TagOutcome::Held => return,
+            // An `Rflush` releases the tag it flushed, whether or not the
+            // original reply ever arrived — and the flushed request's
+            // **reservation** goes with it.  Without that, a flushed `Twalk`
+            // or `Tattach` strands its target fid for the life of the
+            // session: no reply will ever bind it and no `Tclunk` can release
+            // it, because it is not bound, and a client that flushes walks
+            // exhausts its own fid quota with nothing to clunk.
+            TagOutcome::Cancelled(effect) => self.undo_reservation(&effect),
+            // A tag already answered bound its fid and carried no effect, so
+            // it has nothing left to undo.
+            TagOutcome::Released => {}
         }
-        let remaining = self.live_flushes_of(flushed, flush_tag);
-        if let Some(target) = self.tags.get_mut(&flushed) {
-            target.flushed_by = remaining;
-            if !target.flushed_by.is_empty() {
-                // The contract's "reserve the flushed tag until the flush
-                // response" means the **last** response when there are
-                // several.
-                return;
-            }
-        }
-        if let Some(target) = self.tags.remove(&flushed) {
-            if !target.answered {
-                // An `Rflush` releases the tag it flushed, whether or not the
-                // original reply ever arrived — and the flushed request's
-                // **reservation** goes with it.  Without that, a flushed
-                // `Twalk` or `Tattach` strands its target fid for the life of
-                // the session: no reply will ever bind it and no `Tclunk` can
-                // release it, because it is not bound, and a client that
-                // flushes walks exhausts its own fid quota with nothing to
-                // clunk.  A tag already marked `answered` bound its fid and had
-                // its effect cleared, so it has nothing left to undo.
-                self.undo_reservation(&target.effect);
-            }
-            if let Some(victim) = target.flushing {
-                // The tag just removed was itself a `Tflush`, so removing it
-                // **cancels** that flush and it must leave its own victim's
-                // set — otherwise the victim keeps a member no reply will ever
-                // answer.
-                self.cancel_flush(victim, flushed);
-            }
+        if let Some(victim) = flushing {
+            // The tag just removed was itself a `Tflush`, so removing it
+            // **cancels** that flush and it must leave its own victim's set —
+            // otherwise the victim keeps a member no reply will ever answer.
+            self.cancel_flush(victim, flushed);
         }
     }
 
@@ -705,26 +1018,13 @@ impl Session {
     /// wait on, and leaving it would be the same permanent reservation this
     /// method exists to prevent.
     fn cancel_flush(&mut self, victim: u16, flush_tag: u16) {
-        let Some(target) = self.tags.get(&victim) else {
-            return;
+        let event = TagEvent::FlushCancelled {
+            flush: flush_tag,
+            remaining: self.live_flushes_of(victim, flush_tag),
         };
-        if !target.flushed_by.contains(&flush_tag) {
-            return;
-        }
-        let answered = target.answered;
-        let remaining = self.live_flushes_of(victim, flush_tag);
-        let Some(target) = self.tags.get_mut(&victim) else {
-            return;
-        };
-        target.flushed_by = remaining;
-        if !target.flushed_by.is_empty() || !answered {
-            return;
-        }
         // Held only for a flush that has now been cancelled, and already
-        // answered, so its effect was cleared and there is nothing to undo.
-        if let Some(target) = self.tags.remove(&victim)
-            && let Some(next) = target.flushing
-        {
+        // answered, so it carried no effect and there is nothing to undo.
+        if let Some((TagOutcome::Released, Some(next))) = self.transition_tag(victim, event) {
             // It was a flush itself, so cancel it against its own victim too.
             // The chain is finite: every step removes one tag.
             self.cancel_flush(next, victim);
@@ -766,15 +1066,14 @@ impl Session {
 
     fn undo_reservation(&mut self, effect: &Effect) {
         match effect {
-            Effect::Attach { fid } => {
-                self.reserved_fids.remove(fid);
-            }
-            Effect::Walk {
-                newfid,
+            Effect::Attach { fid }
+            | Effect::Walk {
+                newfid: fid,
                 reserved: true,
                 ..
             } => {
-                self.reserved_fids.remove(newfid);
+                // Refused, and harmless, once the reply has bound the fid.
+                self.fid_event(*fid, FidEvent::Unreserve);
             }
             _ => {}
         }
@@ -784,14 +1083,14 @@ impl Session {
         if fid == NOFID {
             return Err(SessionError::UnknownFid);
         }
-        if self.fids.contains_key(&fid) || self.reserved_fids.contains_key(&fid) {
+        if self.fids.contains_key(&fid) {
             return Err(SessionError::FidInUse);
         }
         let quota = usize::try_from(self.limits.max_fids()).unwrap_or(usize::MAX);
         if self.live_fids() >= quota {
             return Err(SessionError::FidQuotaExhausted);
         }
-        self.reserved_fids.insert(fid, path);
+        self.fid_event(fid, FidEvent::Reserve(path));
         Ok(())
     }
 
@@ -815,7 +1114,7 @@ impl Session {
     fn attach_outstanding(&self) -> bool {
         self.tags
             .values()
-            .any(|tag| matches!(tag.effect, Effect::Attach { .. }))
+            .any(|tag| matches!(tag.phase.effect(), Some(Effect::Attach { .. })))
     }
 
     /// Release `fid`, but only if it still carries the binding the request
@@ -826,20 +1125,19 @@ impl Session {
     /// the one apply path that deletes rather than writes, and it needs the
     /// generation for exactly the same reason the others do.
     fn release_fid(&mut self, fid: u32, generation: u64) {
-        if self
-            .fids
-            .get(&fid)
-            .is_some_and(|state| state.generation == generation)
-        {
-            self.fids.remove(&fid);
-        }
+        self.fid_event(
+            fid,
+            FidEvent::Release {
+                admitted: generation,
+            },
+        );
     }
 
     fn require_fid(&self, fid: u32) -> Result<&FidState, SessionError> {
         if fid == NOFID {
             return Err(SessionError::UnknownFid);
         }
-        self.fids.get(&fid).ok_or(SessionError::UnknownFid)
+        self.fid(fid).ok_or(SessionError::UnknownFid)
     }
 
     // ------------------------------------------------------- classification
@@ -1205,22 +1503,22 @@ impl Session {
             (Effect::Attach { fid }, Message::Rattach { qid }) => {
                 // A flushed attach released its reservation, so a late
                 // `Rattach` binds nothing and leaves the session unattached.
-                let Some(path) = self.reserved_fids.remove(fid) else {
+                let Some(FidSlot::Reserved(path)) = self.fids.get(fid).cloned() else {
                     return Ok(());
                 };
                 if qid.kind != QidKind::Directory {
                     // The export root is a directory.  A provider claiming
                     // otherwise has bound the session to something this profile
                     // cannot serve.
+                    self.fid_event(*fid, FidEvent::Unreserve);
                     return Err(SessionError::MalformedReply);
                 }
                 let generation = self.fresh_generation();
-                self.fids.insert(
+                self.fid_event(
                     *fid,
-                    FidState {
+                    FidEvent::Bind {
                         path,
                         qid: *qid,
-                        open: None,
                         generation,
                     },
                 );
@@ -1272,7 +1570,7 @@ impl Session {
                     // A partial walk binds nothing.  The reservation is
                     // released, and `newfid` is as unused as before.
                     if *reserved {
-                        self.reserved_fids.remove(newfid);
+                        self.fid_event(*newfid, FidEvent::Unreserve);
                     }
                     return Ok(());
                 }
@@ -1283,7 +1581,7 @@ impl Session {
                     // qid is the origin's — and if the origin was clunked
                     // while this walk was outstanding there is nothing left to
                     // clone, so the reply applies nothing.
-                    match self.fids.get(origin) {
+                    match self.fid(*origin) {
                         Some(state) if state.generation == *origin_generation => state.qid,
                         // Gone, or the number carries a different binding now:
                         // either way there is nothing left to clone.
@@ -1291,35 +1589,44 @@ impl Session {
                     }
                 };
                 if *reserved {
-                    if self.reserved_fids.remove(newfid).is_none() {
+                    if !self.is_reserved(*newfid) {
                         // The reservation was released — flushed, or the
                         // request already failed — so there is nothing to bind.
                         return Ok(());
                     }
-                } else if !matches!(
-                    self.fids.get(newfid),
-                    Some(state) if state.generation == *origin_generation
-                ) {
-                    // A walk in place reserves nothing, so it may bind only the
-                    // **binding** it was admitted against.  Re-creating a fid
-                    // clunked while the walk was outstanding would put a number
-                    // back into the table that the quota had already released,
-                    // and `live_fids()` could then exceed `maxFids`; moving a
-                    // number the client has since re-bound to something else
-                    // would leave this session's path and gate 4's descriptor
-                    // for that fid disagreeing.
-                    return Ok(());
+                    let generation = self.fresh_generation();
+                    self.fid_event(
+                        *newfid,
+                        FidEvent::Bind {
+                            path: destination.clone(),
+                            qid,
+                            generation,
+                        },
+                    );
+                } else {
+                    if self.admitted_fid(*newfid, *origin_generation).is_none() {
+                        // A walk in place reserves nothing, so it may bind only
+                        // the **binding** it was admitted against.  Re-creating
+                        // a fid clunked while the walk was outstanding would
+                        // put a number back into the table that the quota had
+                        // already released, and `live_fids()` could then exceed
+                        // `maxFids`; moving a number the client has since
+                        // re-bound to something else would leave this session's
+                        // path and gate 4's descriptor for that fid
+                        // disagreeing.
+                        return Ok(());
+                    }
+                    let generation = self.fresh_generation();
+                    self.fid_event(
+                        *newfid,
+                        FidEvent::Rebind {
+                            admitted: *origin_generation,
+                            path: destination.clone(),
+                            qid,
+                            generation,
+                        },
+                    );
                 }
-                let generation = self.fresh_generation();
-                self.fids.insert(
-                    *newfid,
-                    FidState {
-                        path: destination.clone(),
-                        qid,
-                        open: None,
-                        generation,
-                    },
-                );
                 Ok(())
             }
             (
@@ -1335,13 +1642,9 @@ impl Session {
                 // generation; either way the reply applies nothing rather than
                 // failing, because a reply is not a request and gate 4 has no
                 // `Rlerror` to send for it.
-                let Some(state) = self
-                    .fids
-                    .get_mut(fid)
-                    .filter(|state| state.generation == *generation)
-                else {
+                if self.admitted_fid(*fid, *generation).is_none() {
                     return Ok(());
-                };
+                }
                 let mut mode = *mode;
                 // The provider's qid is the authority on the node's kind, so an
                 // open that the flags called a file and the host calls a
@@ -1351,8 +1654,14 @@ impl Session {
                 if mode.directory && (mode.write || !mode.read) {
                     return Err(SessionError::MalformedReply);
                 }
-                state.qid = *qid;
-                state.open = Some(mode);
+                self.fid_event(
+                    *fid,
+                    FidEvent::Open {
+                        admitted: *generation,
+                        qid: *qid,
+                        mode,
+                    },
+                );
                 Ok(())
             }
             (
@@ -1368,19 +1677,20 @@ impl Session {
                     return Err(SessionError::MalformedReply);
                 }
                 let fresh = self.fresh_generation();
-                let Some(state) = self
-                    .fids
-                    .get_mut(fid)
-                    .filter(|state| state.generation == *generation)
-                else {
-                    return Ok(());
-                };
                 // A create rebinds the fid to the child it made, so the number
-                // now carries a new binding.
-                state.path = child.clone();
-                state.qid = *qid;
-                state.open = Some(*mode);
-                state.generation = fresh;
+                // now carries a new binding.  Refused, applying nothing, if the
+                // number no longer carries the binding the create was admitted
+                // against.
+                self.fid_event(
+                    *fid,
+                    FidEvent::Create {
+                        admitted: *generation,
+                        child: child.clone(),
+                        qid: *qid,
+                        mode: *mode,
+                        generation: fresh,
+                    },
+                );
                 Ok(())
             }
             (Effect::Release { fid, generation }, _) => {
@@ -1432,5 +1742,293 @@ const fn reply_for(request: MessageType) -> MessageType {
         MessageType::Tclunk => MessageType::Rclunk,
         MessageType::Tremove => MessageType::Rremove,
         other => other,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn walk_effect() -> Effect {
+        Effect::Attach { fid: 7 }
+    }
+
+    fn set(tags: &[u16]) -> BTreeSet<u16> {
+        tags.iter().copied().collect()
+    }
+
+    fn pending() -> TagPhase {
+        TagPhase::Pending {
+            effect: walk_effect(),
+        }
+    }
+
+    fn flush_requested(by: &[u16]) -> TagPhase {
+        TagPhase::FlushRequested {
+            effect: walk_effect(),
+            by: set(by),
+        }
+    }
+
+    fn answered(by: &[u16]) -> TagPhase {
+        TagPhase::Answered { by: set(by) }
+    }
+
+    fn flush_answered(flush: u16, remaining: &[u16]) -> TagEvent {
+        TagEvent::FlushAnswered {
+            flush,
+            remaining: set(remaining),
+        }
+    }
+
+    fn flush_cancelled(flush: u16, remaining: &[u16]) -> TagEvent {
+        TagEvent::FlushCancelled {
+            flush,
+            remaining: set(remaining),
+        }
+    }
+
+    #[test]
+    fn a_flush_is_recorded_against_every_phase() {
+        assert_eq!(
+            pending().on_event(TagEvent::FlushAdmitted(2)),
+            (Some(flush_requested(&[2])), TagOutcome::Held)
+        );
+        assert_eq!(
+            flush_requested(&[2]).on_event(TagEvent::FlushAdmitted(3)),
+            (Some(flush_requested(&[2, 3])), TagOutcome::Held)
+        );
+        assert_eq!(
+            answered(&[2]).on_event(TagEvent::FlushAdmitted(3)),
+            (Some(answered(&[2, 3])), TagOutcome::Held)
+        );
+    }
+
+    #[test]
+    fn a_reply_releases_the_tag_unless_a_live_flush_still_names_it() {
+        for flush_live in [false, true] {
+            assert_eq!(
+                pending().on_event(TagEvent::Replied { flush_live }),
+                (None, TagOutcome::Released)
+            );
+        }
+        // Only stale flushes are recorded: nothing holds the tag.
+        assert_eq!(
+            flush_requested(&[2]).on_event(TagEvent::Replied { flush_live: false }),
+            (None, TagOutcome::Released)
+        );
+        // The reply is honoured and the tag stays reserved for the flush,
+        // carrying no effect any more.
+        let (next, outcome) =
+            flush_requested(&[2, 3]).on_event(TagEvent::Replied { flush_live: true });
+        assert_eq!(
+            (next.clone(), outcome),
+            (Some(answered(&[2, 3])), TagOutcome::Held)
+        );
+        assert_eq!(next.and_then(|phase| phase.effect().cloned()), None);
+        // A second reply is refused.
+        for flush_live in [false, true] {
+            assert_eq!(
+                answered(&[2]).on_event(TagEvent::Replied { flush_live }),
+                (Some(answered(&[2])), TagOutcome::Refused)
+            );
+        }
+    }
+
+    #[test]
+    fn the_last_rflush_releases_the_tag_and_cancels_an_unanswered_request() {
+        // Another live flush remains: the tag is held for it.
+        assert_eq!(
+            flush_requested(&[2, 3]).on_event(flush_answered(2, &[3])),
+            (Some(flush_requested(&[3])), TagOutcome::Held)
+        );
+        assert_eq!(
+            answered(&[2, 3]).on_event(flush_answered(2, &[3])),
+            (Some(answered(&[3])), TagOutcome::Held)
+        );
+        // The last one: an unanswered request is cancelled and hands back its
+        // effect so its reservation is undone; an answered one has nothing
+        // left to undo.
+        assert_eq!(
+            flush_requested(&[2]).on_event(flush_answered(2, &[])),
+            (None, TagOutcome::Cancelled(walk_effect()))
+        );
+        assert_eq!(
+            answered(&[2]).on_event(flush_answered(2, &[])),
+            (None, TagOutcome::Released)
+        );
+    }
+
+    #[test]
+    fn a_cancelled_flush_never_cancels_the_request_it_named() {
+        assert_eq!(
+            flush_requested(&[2, 3]).on_event(flush_cancelled(2, &[3])),
+            (Some(flush_requested(&[3])), TagOutcome::Held)
+        );
+        // The request is still outstanding, with no flush against it.
+        assert_eq!(
+            flush_requested(&[2]).on_event(flush_cancelled(2, &[])),
+            (Some(pending()), TagOutcome::Held)
+        );
+        assert_eq!(
+            answered(&[2, 3]).on_event(flush_cancelled(2, &[3])),
+            (Some(answered(&[3])), TagOutcome::Held)
+        );
+        // Held only for that flush and already answered: collected.
+        assert_eq!(
+            answered(&[2]).on_event(flush_cancelled(2, &[])),
+            (None, TagOutcome::Released)
+        );
+    }
+
+    /// Membership is what makes a re-issued request safe: an `Rflush` (or a
+    /// cancelled flush) that is not recorded against the tag changes nothing.
+    #[test]
+    fn a_flush_that_does_not_name_the_tag_is_refused() {
+        for phase in [pending(), flush_requested(&[2]), answered(&[2])] {
+            for event in [
+                flush_answered(9, &[]),
+                flush_answered(9, &[2]),
+                flush_cancelled(9, &[]),
+                flush_cancelled(9, &[2]),
+            ] {
+                assert_eq!(
+                    phase.clone().on_event(event),
+                    (Some(phase.clone()), TagOutcome::Refused)
+                );
+            }
+        }
+    }
+
+    fn path() -> VirtualPath {
+        VirtualPath::root()
+    }
+
+    fn qid(kind: QidKind) -> Qid {
+        Qid {
+            kind,
+            version: 0,
+            path: 1,
+        }
+    }
+
+    fn bound(generation: u64, open: Option<OpenMode>) -> FidSlot {
+        FidSlot::Bound(FidState {
+            path: path(),
+            qid: qid(QidKind::Directory),
+            open,
+            generation,
+        })
+    }
+
+    fn fid_events(admitted: u64) -> Vec<FidEvent> {
+        vec![
+            FidEvent::Reserve(path()),
+            FidEvent::Unreserve,
+            FidEvent::Bind {
+                path: path(),
+                qid: qid(QidKind::Directory),
+                generation: 9,
+            },
+            FidEvent::Rebind {
+                admitted,
+                path: path(),
+                qid: qid(QidKind::File),
+                generation: 9,
+            },
+            FidEvent::Open {
+                admitted,
+                qid: qid(QidKind::File),
+                mode: OpenMode {
+                    read: true,
+                    ..OpenMode::default()
+                },
+            },
+            FidEvent::Create {
+                admitted,
+                child: path(),
+                qid: qid(QidKind::File),
+                mode: OpenMode {
+                    write: true,
+                    ..OpenMode::default()
+                },
+                generation: 9,
+            },
+            FidEvent::Release { admitted },
+        ]
+    }
+
+    #[test]
+    fn an_absent_fid_can_only_be_reserved() {
+        for event in fid_events(1) {
+            let reserve = matches!(event, FidEvent::Reserve(_));
+            let (slot, applied) = FidSlot::on_event(None, event);
+            assert_eq!(applied, reserve);
+            assert_eq!(slot, reserve.then(|| FidSlot::Reserved(path())));
+        }
+    }
+
+    #[test]
+    fn a_reserved_fid_is_bound_or_released_and_nothing_else() {
+        for event in fid_events(1) {
+            let reserved = Some(FidSlot::Reserved(path()));
+            let (slot, applied) = FidSlot::on_event(reserved.clone(), event.clone());
+            match event {
+                FidEvent::Unreserve => assert_eq!((slot, applied), (None, true)),
+                FidEvent::Bind { .. } => assert_eq!((slot, applied), (Some(bound(9, None)), true)),
+                // In particular a second reservation of the number is refused.
+                _ => assert_eq!((slot, applied), (reserved, false)),
+            }
+        }
+    }
+
+    #[test]
+    fn a_bound_fid_changes_only_for_the_binding_a_request_was_admitted_against() {
+        let open = Some(OpenMode {
+            read: true,
+            ..OpenMode::default()
+        });
+        for start in [bound(1, None), bound(1, open)] {
+            // A stale request (admitted against another binding) applies
+            // nothing, whatever it is.
+            for event in fid_events(2) {
+                assert_eq!(
+                    FidSlot::on_event(Some(start.clone()), event),
+                    (Some(start.clone()), false)
+                );
+            }
+            for event in fid_events(1) {
+                let (slot, applied) = FidSlot::on_event(Some(start.clone()), event.clone());
+                let state = |slot: Option<FidSlot>| match slot {
+                    Some(FidSlot::Bound(state)) => state,
+                    other => panic!("not bound: {other:?}"),
+                };
+                match event {
+                    // A bound number cannot be reserved, unreserved or bound
+                    // again by a claim.
+                    FidEvent::Reserve(_) | FidEvent::Unreserve | FidEvent::Bind { .. } => {
+                        assert_eq!((slot, applied), (Some(start.clone()), false));
+                    }
+                    FidEvent::Rebind { .. } => {
+                        assert!(applied);
+                        let state = state(slot);
+                        assert_eq!((state.generation, state.open), (9, None));
+                        assert_eq!(state.qid.kind, QidKind::File);
+                    }
+                    FidEvent::Open { mode, .. } => {
+                        assert!(applied);
+                        let state = state(slot);
+                        // Opening keeps the binding.
+                        assert_eq!((state.generation, state.open), (1, Some(mode)));
+                    }
+                    FidEvent::Create { mode, .. } => {
+                        assert!(applied);
+                        let state = state(slot);
+                        assert_eq!((state.generation, state.open), (9, Some(mode)));
+                    }
+                    FidEvent::Release { .. } => assert_eq!((slot, applied), (None, true)),
+                }
+            }
+        }
     }
 }

@@ -40,7 +40,11 @@ impl Fixture {
         stream.auth.operation_deadline = DualDeadline::new(now, wall, Duration::from_secs(60))
             .expect("live echo-stream operation");
         actor.streams.insert(STREAM, stream);
-        actor.writes_frozen = frozen;
+        actor.admission.apply(if frozen {
+            AdmissionEvent::Freeze
+        } else {
+            AdmissionEvent::Resume
+        });
         Self {
             actor,
             key,
@@ -87,7 +91,9 @@ impl Fixture {
                 .expired_at(Instant::now(), SystemTime::now())
         );
         assert!(
-            !stream.auth.confirmed && stream.auth.refresh_in_flight && !stream.auth.invalidated
+            !stream.auth.confirmed()
+                && stream.auth.refresh_in_flight()
+                && !stream.auth.invalidated()
         );
         assert_eq!(self.actor.auth_expired_streams, 0);
         assert_eq!(self.actor.expire_stream_calls, 0);
@@ -204,25 +210,25 @@ fn snapshot(actor: &M2Actor) -> Snapshot {
             stream.auth.grant_revision,
         ),
         auth_flags: [
-            stream.auth.confirmed,
-            stream.auth.refresh_in_flight,
-            stream.auth.invalidated,
+            stream.auth.confirmed(),
+            stream.auth.refresh_in_flight(),
+            stream.auth.invalidated(),
         ],
         auth_deadlines: [
             deadline(stream.auth.deadline),
             deadline(stream.auth.operation_deadline),
         ],
         terminals: [
-            stream.input_fin,
-            stream.input_reset,
-            stream.output_fin,
-            stream.output_reset,
-            stream.reset_queued,
+            stream.input.fin(),
+            stream.input.reset(),
+            stream.output.fin(),
+            stream.output.reset(),
+            stream.output.reset_queued(),
         ],
         feedback: actor.active.pending_controls.clone(),
         aggregate: actor.aggregate_retained_bytes(),
         carrier_bytes: actor.data_budget.current(),
-        writes_frozen: actor.writes_frozen,
+        writes_frozen: actor.admission.writes_frozen(),
     }
 }
 
@@ -364,7 +370,7 @@ async fn c240_accepted_data_dispatches_once_only_after_matching_confirmation() {
         .expect("live matching confirmation dispatches accepted record");
     assert!(fixture.actor.streams[&STREAM].pending.is_empty());
     assert_eq!(fixture.actor.streams[&STREAM].pending_bytes, 0);
-    assert!(fixture.actor.streams[&STREAM].auth.confirmed);
+    assert!(fixture.actor.streams[&STREAM].auth.confirmed());
     let mut data = Vec::new();
     while let Ok(command) = fixture.carrier.try_recv() {
         if let CarrierCommand::Frame(queued) = command {
@@ -401,7 +407,7 @@ async fn c240_explicit_revocation_clears_real_input_and_preserves_frozen_termina
             ))
             .await
             .expect("explicit live authorization invalidation");
-        assert!(fixture.actor.streams[&STREAM].auth.invalidated);
+        assert!(fixture.actor.streams[&STREAM].auth.invalidated());
         assert!(fixture.actor.streams[&STREAM].pending.is_empty());
         assert_eq!(fixture.actor.streams[&STREAM].pending_bytes, 0);
         assert_eq!(fixture.actor.pending_output_bytes, 0);
@@ -428,7 +434,7 @@ async fn c240_explicit_revocation_clears_real_input_and_preserves_frozen_termina
                     .last_emitted(),
                 0
             );
-            fixture.actor.writes_frozen = false;
+            fixture.actor.admission.apply(AdmissionEvent::Resume);
             fixture
                 .actor
                 .flush_pending_outputs()

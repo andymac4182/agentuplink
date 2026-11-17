@@ -98,7 +98,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
@@ -117,6 +117,7 @@ use super::acp_real_path::{
     MIN_RETRY_HINT_MS, PROMPT_CONTEXT, RefusalLedger, acp_request, device_config_text,
     fixture_binary_path, json_stream, process_alive, session_id, stop_reason,
 };
+use super::append_log::AppendLog;
 use super::membership_hint_drop::{INCOMING_SPKI, TARGET_NODE, target_peer_spki};
 
 mod genuine_rekey;
@@ -954,14 +955,9 @@ impl Gate<'_> {
         if coincides {
             self.ledger.retries.fetch_add(1, Ordering::SeqCst);
         } else {
-            let mut slot = self
-                .ledger
+            self.ledger
                 .unexplained
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            if slot.is_none() {
-                *slot = Some(self.freeze.unexplained());
-            }
+                .get_or_init(|| self.freeze.unexplained());
         }
         coincides
     }
@@ -1814,33 +1810,47 @@ struct KeyRotationArm {
 /// nowhere else.
 #[derive(Debug, Default)]
 struct InvalidationLedger {
-    /// `(observing relay, invalidated peer, reason label)`, in order.
-    seen: std::sync::Mutex<Vec<(String, String, &'static str)>>,
+    /// `(observing relay, invalidated peer, reason label)`, in order, each
+    /// under the round it was recorded in.
+    seen: AppendLog<InvalidationRecord>,
+    /// The current round.  Clearing the ledger starts a new one, and only
+    /// the current round's records are read.
+    round: AtomicU64,
+}
+
+#[derive(Debug)]
+struct InvalidationRecord {
+    round: u64,
+    observer: String,
+    peer: String,
+    reason: &'static str,
 }
 
 impl InvalidationLedger {
     fn clear(&self) {
-        self.seen
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .clear();
+        self.round.fetch_add(1, Ordering::SeqCst);
     }
 
     fn record(&self, observer: &str, peer: &str, reason: PeerInvalidationReason) {
-        self.seen
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .push((observer.to_owned(), peer.to_owned(), reason_label(reason)));
+        self.seen.push(InvalidationRecord {
+            round: self.round.load(Ordering::SeqCst),
+            observer: observer.to_owned(),
+            peer: peer.to_owned(),
+            reason: reason_label(reason),
+        });
     }
 
     /// The distinct reason labels `observer` latched for admissions of `peer`,
     /// sorted, so the set is stable whatever order the dispatcher ran in.
     fn labels_for(&self, observer: &str, peer: &str) -> Vec<String> {
-        let seen = self.seen.lock().unwrap_or_else(|error| error.into_inner());
-        let mut labels: Vec<String> = seen
+        let round = self.round.load(Ordering::SeqCst);
+        let mut labels: Vec<String> = self
+            .seen
             .iter()
-            .filter(|(node, invalidated, _)| node == observer && invalidated == peer)
-            .map(|(_, _, reason)| (*reason).to_owned())
+            .filter(|record| {
+                record.round == round && record.observer == observer && record.peer == peer
+            })
+            .map(|record| record.reason.to_owned())
             .collect();
         labels.sort();
         labels.dedup();
@@ -1888,7 +1898,7 @@ const fn reason_label(reason: PeerInvalidationReason) -> &'static str {
 /// changes what the fixture records and nothing about what it does. A recorder
 /// that replaced the pin publication would have quietly turned this case into
 /// a second hint-drop gate.
-fn install_reason_recorder(relay: &ProductionRelay, ledger: &Arc<InvalidationLedger>) {
+async fn install_reason_recorder(relay: &ProductionRelay, ledger: &Arc<InvalidationLedger>) {
     let membership = Arc::clone(&relay.membership);
     let pins = relay.pins.clone();
     let pending = Arc::clone(&relay.pin_publication_pending);
@@ -1905,7 +1915,8 @@ fn install_reason_recorder(relay: &ProductionRelay, ledger: &Arc<InvalidationLed
             } else {
                 pending.store(false, Ordering::SeqCst);
             }
-        })));
+        })))
+        .await;
 }
 
 impl Gate<'_> {
@@ -2509,7 +2520,7 @@ impl Gate<'_> {
         let old_spki = target_peer_spki(self.cluster)?;
         let ledger = Arc::new(InvalidationLedger::default());
         for relay in &self.cluster.relays {
-            install_reason_recorder(relay, &ledger);
+            install_reason_recorder(relay, &ledger).await;
         }
 
         // ---- stage the overlap ------------------------------------------
@@ -4213,12 +4224,7 @@ async fn run(
     evidence.boundary_route_probes = gate.boundary_route_probes;
     evidence.not_dispatched_refusals = gate.ledger.refusals.load(Ordering::SeqCst);
     evidence.not_dispatched_retries = gate.ledger.retries.load(Ordering::SeqCst);
-    evidence.unexplained_refusal = gate
-        .ledger
-        .unexplained
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone();
+    evidence.unexplained_refusal = gate.ledger.unexplained.get().cloned();
     evidence.not_covered = not_covered(evidence.rotation_span_ms, evidence.rotations_across_span);
     if let Some(client) = &gate.client {
         let status = client.status_snapshot();

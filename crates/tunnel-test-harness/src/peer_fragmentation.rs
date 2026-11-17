@@ -20,7 +20,7 @@ use chrono::{DateTime, Utc};
 use http::{Request, StatusCode};
 use sha2::{Digest, Sha256};
 use tokio::{
-    sync::Mutex,
+    sync::mpsc,
     task::JoinHandle,
     time::{Instant, timeout, timeout_at},
 };
@@ -142,6 +142,51 @@ struct DispatchState {
     records: Vec<RecordDigest>,
 }
 
+/// One owner-side dispatch, reported in the order the owner made it.
+enum DispatchEvent {
+    /// The first record of a request the owner accepted.
+    Accepted(RecordDigest),
+    /// A later record of an accepted request.
+    Record(RecordDigest),
+}
+
+/// The scenario's own view of what the owner dispatched.
+///
+/// The owner callback reports each dispatch before it echoes the record, so
+/// by the time the scenario has read an echo the matching event is already
+/// queued here. A snapshot folds every queued event into the running totals,
+/// which makes it the same "everything dispatched so far" reading as before.
+/// The queue is a test recorder drained by the one scenario task; each case
+/// queues at most a handful of digests between snapshots.
+struct DispatchLog {
+    events: mpsc::UnboundedReceiver<DispatchEvent>,
+    state: DispatchState,
+}
+
+impl DispatchLog {
+    fn drain(&mut self) {
+        while let Ok(event) = self.events.try_recv() {
+            match event {
+                DispatchEvent::Accepted(digest) => {
+                    self.state.accepted_requests += 1;
+                    self.state.records.push(digest);
+                }
+                DispatchEvent::Record(digest) => self.state.records.push(digest),
+            }
+        }
+    }
+
+    fn state_snapshot(&mut self) -> (usize, Vec<RecordDigest>) {
+        self.drain();
+        (self.state.accepted_requests, self.state.records.clone())
+    }
+
+    fn dispatch_snapshot(&mut self) -> usize {
+        self.drain();
+        self.state.records.len()
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct RecordDigest {
     kind: PeerRecordKind,
@@ -191,7 +236,6 @@ struct RunningFixture {
     deployment_incarnation: String,
     cancel: CancellationToken,
     server_task: JoinHandle<std::result::Result<(), PeerTransportError>>,
-    state: Arc<Mutex<DispatchState>>,
 }
 
 impl RunningFixture {
@@ -296,8 +340,13 @@ async fn verify_inner() -> Result<PeerFragmentationEvidence> {
         .release_ports();
 
     let source_binding = verified_binding(&cluster, SOURCE_NODE_ID)?;
-    let running = start_fixture(&cluster, source_binding, owner_socket)?;
-    let run_result = match timeout(CASE_TIMEOUT.saturating_mul(16), run_cases(&running)).await {
+    let (running, mut log) = start_fixture(&cluster, source_binding, owner_socket)?;
+    let run_result = match timeout(
+        CASE_TIMEOUT.saturating_mul(16),
+        run_cases(&running, &mut log),
+    )
+    .await
+    {
         Ok(result) => result,
         Err(_) => Err(HarnessError::Timeout(
             "peer-fragmentation fixture exceeded its bounded run".to_owned(),
@@ -337,7 +386,7 @@ async fn verify_inner() -> Result<PeerFragmentationEvidence> {
     Ok(evidence)
 }
 
-async fn run_cases(running: &RunningFixture) -> Result<RunCounters> {
+async fn run_cases(running: &RunningFixture, log: &mut DispatchLog) -> Result<RunCounters> {
     let mut counters = RunCounters {
         exact_bytes: true,
         order_preserved: true,
@@ -356,6 +405,7 @@ async fn run_cases(running: &RunningFixture) -> Result<RunCounters> {
         ];
         let result = run_valid_case(
             running,
+            log,
             fragments,
             vec![(PeerRecordKind::ConsumerChunk, Vec::new())],
         )
@@ -378,6 +428,7 @@ async fn run_cases(running: &RunningFixture) -> Result<RunCounters> {
     .concat();
     let result = run_valid_case(
         running,
+        log,
         vec![envelope_record, coalesced],
         vec![
             (PeerRecordKind::ConsumerChunk, Vec::new()),
@@ -401,6 +452,7 @@ async fn run_cases(running: &RunningFixture) -> Result<RunCounters> {
     let fragments = record_fragments(&envelope_record, &record, &cuts);
     let result = run_valid_case(
         running,
+        log,
         fragments,
         vec![(PeerRecordKind::ConsumerChunk, framed_body)],
     )
@@ -417,9 +469,9 @@ async fn run_cases(running: &RunningFixture) -> Result<RunCounters> {
     // inheriting a terminal connection state.
     close_malformed_connection(running, "preflight", "before malformed cases").await?;
     for malformed in malformed_cases(running)? {
-        let before = dispatch_snapshot(&running.state).await;
+        let before = log.dispatch_snapshot();
         let rejected = run_malformed_case(running, malformed.name, malformed.fragments).await?;
-        let after = dispatch_snapshot(&running.state).await;
+        let after = log.dispatch_snapshot();
         let dispatched = after.saturating_sub(before);
         counters.malformed_cases += 1;
         counters.malformed_rejections += usize::from(rejected);
@@ -438,6 +490,7 @@ async fn run_cases(running: &RunningFixture) -> Result<RunCounters> {
     );
     let result = run_valid_case(
         running,
+        log,
         fragments,
         vec![(PeerRecordKind::ConsumerChunk, maximum_body)],
     )
@@ -519,12 +572,13 @@ fn malformed_cases(running: &RunningFixture) -> Result<Vec<MalformedCase>> {
 
 async fn run_valid_case(
     running: &RunningFixture,
+    log: &mut DispatchLog,
     fragments: Vec<Vec<u8>>,
     expected: Vec<(PeerRecordKind, Vec<u8>)>,
 ) -> Result<ValidCaseResult> {
     timeout(
         CASE_TIMEOUT,
-        run_valid_case_inner(running, fragments, expected),
+        run_valid_case_inner(running, log, fragments, expected),
     )
     .await
     .map_err(|_| HarnessError::Timeout("peer-fragmentation valid case timed out".to_owned()))?
@@ -532,10 +586,11 @@ async fn run_valid_case(
 
 async fn run_valid_case_inner(
     running: &RunningFixture,
+    log: &mut DispatchLog,
     fragments: Vec<Vec<u8>>,
     expected: Vec<(PeerRecordKind, Vec<u8>)>,
 ) -> Result<ValidCaseResult> {
-    let before = state_snapshot(&running.state).await;
+    let before = log.state_snapshot();
     let connection = running
         .client
         .connect(running.destination.clone())
@@ -613,7 +668,7 @@ async fn run_valid_case_inner(
     let budget_reclaimed =
         connection_budget.reserved_bytes() == 0 && connection_budget.active_streams() == 0;
 
-    let after = state_snapshot(&running.state).await;
+    let after = log.state_snapshot();
     let accepted_request = after.0 == before.0 + 1
         && after.1.len() == before.1.len() + expected.len()
         && expected.iter().enumerate().all(|(offset, (kind, body))| {
@@ -748,7 +803,7 @@ fn start_fixture(
     cluster: &ClusterFixture,
     source_binding: VerifiedPeerBinding,
     owner_socket: std::net::UdpSocket,
-) -> Result<RunningFixture> {
+) -> Result<(RunningFixture, DispatchLog)> {
     let owner = cluster
         .node(OWNER_NODE_ID)
         .ok_or_else(|| HarnessError::InvalidInput("peer-fragmentation owner missing".to_owned()))?;
@@ -797,11 +852,14 @@ fn start_fixture(
         owner.node_id.clone(),
         owner.boot_id.clone(),
     ));
-    let state = Arc::new(Mutex::new(DispatchState::default()));
-    let callback_state = state.clone();
+    let (dispatched, events) = mpsc::unbounded_channel();
+    let log = DispatchLog {
+        events,
+        state: DispatchState::default(),
+    };
     let callback = move |request: InboundPeerRequest| {
-        let state = callback_state.clone();
-        async move { owner_echo(request, state).await }
+        let dispatched = dispatched.clone();
+        async move { owner_echo(request, dispatched).await }
     };
     let (policy, handler) = runtime.server_components(callback);
     let server = PeerServer::new_with_pin_provider(
@@ -816,7 +874,7 @@ fn start_fixture(
     let destination = PeerDestination::new(owner.addresses.udp, SERVER_NAME);
     let cancel = CancellationToken::new();
     let server_task = tokio::spawn(server.serve(cancel.clone()));
-    Ok(RunningFixture {
+    let running = RunningFixture {
         client,
         destination,
         runtime,
@@ -825,13 +883,13 @@ fn start_fixture(
         deployment_incarnation: cluster.deployment_incarnation.clone(),
         cancel,
         server_task,
-        state,
-    })
+    };
+    Ok((running, log))
 }
 
 async fn owner_echo(
     request: InboundPeerRequest,
-    state: Arc<Mutex<DispatchState>>,
+    dispatched: mpsc::UnboundedSender<DispatchEvent>,
 ) -> std::result::Result<(), PeerRuntimeError> {
     if request.envelope().route != InternalRoute::ConsumerStreams
         || request.envelope().request.route() != InternalRoute::ConsumerStreams
@@ -845,38 +903,25 @@ async fn owner_echo(
     if first.kind() != PeerRecordKind::ConsumerChunk {
         return Err(PeerRuntimeError::UnexpectedRecord(first.kind()));
     }
-    accepted_dispatch(&state, &first).await;
+    // A send fails only once the scenario has dropped its log, after which
+    // nothing reads the dispatch record any more.
+    let _ = dispatched.send(DispatchEvent::Accepted(RecordDigest::of(
+        first.kind(),
+        first.body(),
+    )));
     send.respond(StatusCode::OK).await?;
     send.send_message(first.kind(), first.body()).await?;
     while let Some(record) = recv.recv_message().await? {
         if record.kind() != PeerRecordKind::ConsumerChunk {
             return Err(PeerRuntimeError::UnexpectedRecord(record.kind()));
         }
-        record_dispatch(&state, &record).await;
+        let _ = dispatched.send(DispatchEvent::Record(RecordDigest::of(
+            record.kind(),
+            record.body(),
+        )));
         send.send_message(record.kind(), record.body()).await?;
     }
     send.finish().await
-}
-
-async fn record_dispatch(
-    state: &Arc<Mutex<DispatchState>>,
-    record: &tunnel_cluster::peer_frame::PeerRecord,
-) {
-    let mut state = state.lock().await;
-    state
-        .records
-        .push(RecordDigest::of(record.kind(), record.body()));
-}
-
-async fn accepted_dispatch(
-    state: &Arc<Mutex<DispatchState>>,
-    record: &tunnel_cluster::peer_frame::PeerRecord,
-) {
-    let mut state = state.lock().await;
-    state.accepted_requests += 1;
-    state
-        .records
-        .push(RecordDigest::of(record.kind(), record.body()));
 }
 
 fn make_client(
@@ -1030,15 +1075,6 @@ fn framed_inner_body() -> Vec<u8> {
     body.extend_from_slice(&(INNER_BODY_LEN as u32).to_be_bytes());
     body.extend(vec![0x5a; INNER_BODY_LEN]);
     body
-}
-
-async fn state_snapshot(state: &Arc<Mutex<DispatchState>>) -> (usize, Vec<RecordDigest>) {
-    let state = state.lock().await;
-    (state.accepted_requests, state.records.clone())
-}
-
-async fn dispatch_snapshot(state: &Arc<Mutex<DispatchState>>) -> usize {
-    state.lock().await.records.len()
 }
 
 fn peer_http_error(context: &str, error: impl std::fmt::Display) -> HarnessError {

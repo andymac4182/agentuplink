@@ -4131,8 +4131,8 @@ impl Catalog for FlakyCatalog {
 
 /// An H3 fixture whose production owner handler reads `FlakyCatalog`.
 async fn flaky_owner_fixture() -> (H3PeerFixture, Arc<FlakyCatalog>) {
-    let slot: Arc<std::sync::Mutex<Option<Arc<FlakyCatalog>>>> =
-        Arc::new(std::sync::Mutex::new(None));
+    // Set once, by the one handler factory call the fixture makes.
+    let slot: Arc<std::sync::OnceLock<Arc<FlakyCatalog>>> = Arc::default();
     let captured = Arc::clone(&slot);
     let fixture = H3PeerFixture::new_with(
         move |runtime, handle, catalog, oidc, _device, returned_errors| {
@@ -4142,7 +4142,10 @@ async fn flaky_owner_fixture() -> (H3PeerFixture, Arc<FlakyCatalog>) {
                 list_down: std::sync::atomic::AtomicBool::new(false),
                 consumer_down: std::sync::atomic::AtomicBool::new(false),
             });
-            *captured.lock().expect("flaky slot") = Some(Arc::clone(&flaky));
+            assert!(
+                captured.set(Arc::clone(&flaky)).is_ok(),
+                "the handler factory runs once"
+            );
             let shared: tunnel_catalog::SharedCatalog = flaky;
             let production_handler = peer_ingress_handler(
                 handle,
@@ -4158,11 +4161,7 @@ async fn flaky_owner_fixture() -> (H3PeerFixture, Arc<FlakyCatalog>) {
         },
     )
     .await;
-    let flaky = slot
-        .lock()
-        .expect("flaky slot")
-        .take()
-        .expect("flaky catalog built");
+    let flaky = Arc::clone(slot.get().expect("flaky catalog built"));
     (fixture, flaky)
 }
 

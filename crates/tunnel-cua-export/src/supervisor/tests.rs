@@ -12,40 +12,68 @@
 use super::*;
 
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use tunnel_cua::capture::Captures;
 use tunnel_cua::lease::{GrantRevision, InputLeases, SessionId, TargetSession};
 
-/// A device's input registries, behind one lock, implementing the authority a
-/// restart must be handed.
+/// A device's input registries, reduced to what these tests put in them: one
+/// target, held by one session with one capture, or not held.
+///
+/// [`InputAuthority::invalidate`] takes `&self`, so whatever implements it has
+/// to be shared rather than owned. Everything this double has to remember is
+/// one independent flag, so that is all it shares: the real registries are
+/// rebuilt from the flag for each question and handed to the real
+/// [`tunnel_cua::supervision::invalidate`], which is what decides what was
+/// freed.
 #[derive(Debug, Default)]
 struct Registries {
-    inner: Mutex<(InputLeases, Captures)>,
+    /// The one target a test holds. Set by the first `hold`.
+    target: OnceLock<TargetSession>,
+    /// Whether that target's lease and capture are currently held.
+    held: AtomicBool,
+}
+
+impl Registries {
+    /// The registries as they stand: empty, or holding the target.
+    fn registries(&self, held: bool) -> (InputLeases, Captures) {
+        let mut leases = InputLeases::default();
+        let mut captures = Captures::default();
+        if held && let Some(target) = self.target.get() {
+            leases
+                .acquire(target, SessionId::new(1), GrantRevision::new(0))
+                .expect("free");
+            captures.record(target, 0, 128, 96, 100).expect("geometry");
+        }
+        (leases, captures)
+    }
 }
 
 impl InputAuthority for Registries {
-    fn invalidate(&self, generation: BackendGeneration) -> Invalidation {
-        let mut guard = self.inner.lock().expect("never poisoned by test code");
-        let (leases, captures) = &mut *guard;
-        tunnel_cua::supervision::invalidate(leases, captures, generation)
+    async fn invalidate(&self, generation: BackendGeneration) -> Invalidation {
+        // Taking the flag is the invalidation: nothing is held afterwards.
+        let held = self.held.swap(false, Ordering::SeqCst);
+        let (mut leases, mut captures) = self.registries(held);
+        tunnel_cua::supervision::invalidate(&mut leases, &mut captures, generation)
     }
 }
 
 impl Registries {
     fn hold(&self, target: &TargetSession) {
-        let mut guard = self.inner.lock().expect("never poisoned by test code");
-        let (leases, captures) = &mut *guard;
-        leases
-            .acquire(target, SessionId::new(1), GrantRevision::new(0))
-            .expect("free");
-        captures.record(target, 0, 128, 96, 100).expect("geometry");
+        assert_eq!(
+            self.target.get_or_init(|| target.clone()),
+            target,
+            "this double holds one target"
+        );
+        assert!(
+            !self.held.swap(true, Ordering::SeqCst),
+            "the target is free"
+        );
     }
 
     fn holder(&self, target: &TargetSession) -> Option<SessionId> {
-        self.inner
-            .lock()
-            .expect("never poisoned by test code")
+        self.registries(self.held.load(Ordering::SeqCst))
             .0
             .holder(target)
     }

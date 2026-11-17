@@ -32,6 +32,10 @@ use tunnel_http_bridge::{PauseController, PauseSignal};
 use tunnel_http_forward::{RecordTracker, TrackerSnapshot};
 use tunnel_protocol::{ResultDetail, reset_reason};
 
+#[path = "actor_http_stream_state.rs"]
+mod half_close;
+
+use self::half_close::{OnceLatch, ReceiveEvent, ReceiveHalf, SendEvent, SendHalf};
 use super::*;
 use crate::http_forward_diagnostics::{
     HttpForgetRecord, HttpOwnerStreamRecord, HttpRecordPosition, HttpRotationObservation,
@@ -140,26 +144,23 @@ pub(crate) struct HttpStreamState {
     /// data queue refused the WINDOW_UPDATE.
     credit_owed: u64,
     reader: Option<oneshot::Sender<HttpRead>>,
-    peer_fin: bool,
-    fin_delivered: bool,
-    peer_reset: Option<u16>,
-    local_fin: bool,
-    local_reset: Option<u16>,
+    /// The connector→owner half-close (FIN buffered/delivered, RESET).
+    receive: ReceiveHalf,
+    /// The owner→connector half-close: what was requested, what was
+    /// sequenced, and whether a RESET waited behind a rotation freeze.
+    send: SendHalf,
     reset_tx: watch::Sender<Option<HttpPeerReset>>,
     /// Why the owner actor tore this stream down, when it is a cause an
     /// ingress may accurately report.  See [`StreamTeardownCause`].
     terminal_tx: watch::Sender<Option<StreamTeardownCause>>,
     status_tx: watch::Sender<Option<ResultDetail>>,
     freeze_tx: PauseController,
-    recorded: bool,
+    recorded: OnceLatch,
     /// Framing of the owner→device bytes actually sequenced.
     request_tracker: RecordTracker,
     /// Framing of the device→owner bytes received in order.
     response_tracker: RecordTracker,
-    request_fin_sequenced: bool,
-    reset_sequence: Option<(u64, u64)>,
-    reset_deferred_by_freeze: bool,
-    cancel_sent: bool,
+    cancel_sent: OnceLatch,
     freeze_capture: Option<HttpFreezeCapture>,
     /// M3-22: this stream's own most recent rotation observations, newest
     /// last, at most [`STREAM_ROTATION_OBSERVATIONS`].  The relay-wide ring
@@ -327,22 +328,16 @@ impl HttpStreamState {
                 delivered_bytes: 0,
                 credit_owed: 0,
                 reader: None,
-                peer_fin: false,
-                fin_delivered: false,
-                peer_reset: None,
-                local_fin: false,
-                local_reset: None,
+                receive: ReceiveHalf::Open,
+                send: SendHalf::default(),
                 reset_tx,
                 terminal_tx,
                 status_tx,
                 freeze_tx,
-                recorded: false,
+                recorded: OnceLatch::default(),
                 request_tracker: RecordTracker::new(),
                 response_tracker: RecordTracker::new(),
-                request_fin_sequenced: false,
-                reset_sequence: None,
-                reset_deferred_by_freeze: false,
-                cancel_sent: false,
+                cancel_sent: OnceLatch::default(),
                 freeze_capture: None,
                 recent_observations: VecDeque::new(),
                 trace: HttpStreamTrace::new(),
@@ -357,16 +352,24 @@ impl HttpStreamState {
     }
 
     pub(crate) const fn local_terminal(&self) -> bool {
-        self.local_fin || self.local_reset.is_some()
+        self.send.terminal_requested()
     }
 
     /// The owner reset this stream locally.
     pub(crate) const fn local_reset_sent(&self) -> bool {
-        self.local_reset.is_some()
+        self.send.reset_requested().is_some()
     }
 
-    pub(crate) fn mark_local_reset(&mut self, reason: u16) {
-        self.local_reset.get_or_insert(reason);
+    /// Record the owner's FIN request.  Returns whether it was newly
+    /// recorded; a stream with a local terminal already keeps it.
+    pub(crate) fn mark_local_fin(&mut self) -> bool {
+        self.send.apply(SendEvent::RequestFin)
+    }
+
+    /// Record the owner's local RESET.  The first reason wins; returns
+    /// whether this call recorded it.
+    pub(crate) fn mark_local_reset(&mut self, reason: u16) -> bool {
+        self.send.apply(SendEvent::RequestReset(reason))
     }
 
     pub(crate) fn note_parked(&mut self, parked_bytes: usize) {
@@ -390,28 +393,29 @@ impl HttpStreamState {
         sequence: u64,
         generation: u64,
     ) {
-        match terminal {
-            Terminal::Fin => self.request_fin_sequenced = true,
-            Terminal::Reset(_) => {
-                self.reset_sequence.get_or_insert((sequence, generation));
-            }
-        }
+        // A repeat is refused by the machine and changes nothing: the first
+        // sequenced RESET keeps its position.
+        self.send.apply(SendEvent::TerminalSequenced {
+            terminal,
+            sequence,
+            generation,
+        });
     }
 
     /// A RESET was deferred behind the rotation freeze.
     pub(crate) fn note_reset_deferred(&mut self) {
-        self.reset_deferred_by_freeze = true;
+        self.send.apply(SendEvent::ResetDeferredByFreeze);
     }
 
     /// Whether a local cancellation still needs the device to learn of it
     /// out of band: the device has neither finished nor reset its direction
     /// and no CANCEL was sent yet.
     pub(crate) const fn cancel_needed(&self) -> bool {
-        !self.cancel_sent && !self.peer_fin && self.peer_reset.is_none()
+        !self.cancel_sent.is_set() && !self.receive.ended()
     }
 
     pub(crate) fn note_cancel(&mut self) {
-        self.cancel_sent = true;
+        self.cancel_sent.set();
     }
 
     /// Publish this owner's writer-freeze state to the exchange task.
@@ -428,9 +432,9 @@ impl HttpStreamState {
     ) {
         self.freeze_capture = Some(HttpFreezeCapture {
             request: self.request_tracker.snapshot(),
-            request_fin_sequenced: self.request_fin_sequenced,
+            request_fin_sequenced: self.send.fin_sequenced(),
             response: self.response_tracker.snapshot(),
-            response_fin_received: self.peer_fin,
+            response_fin_received: self.receive.fin_received(),
             parked_bytes,
             receive_buffered: self.buffered,
             deferred_terminal: terminal_label(pending_terminal),
@@ -445,7 +449,7 @@ impl HttpStreamState {
     /// Whether a close can end this stream with FIN only: the owner already
     /// sent its terminal and the connector finished or reset its direction.
     pub(crate) fn completed(&self) -> bool {
-        self.local_terminal() && (self.peer_fin || self.peer_reset.is_some())
+        self.local_terminal() && self.receive.ended()
     }
 
     /// Accept one ordered connector DATA payload.  Returns `false` when it
@@ -479,7 +483,8 @@ impl HttpStreamState {
     }
 
     pub(crate) fn accept_fin(&mut self) {
-        self.peer_fin = true;
+        // A repeated FIN is refused by the machine and changes nothing.
+        self.receive.apply(ReceiveEvent::Fin);
         self.wake_reader();
     }
 
@@ -507,9 +512,9 @@ impl HttpStreamState {
     /// Accept the connector RESET: undelivered bytes are discarded (their
     /// charge is returned by the caller) and the reader learns of it.
     pub(crate) fn accept_reset(&mut self, reason: u16) -> usize {
-        if self.peer_reset.is_none() {
-            self.peer_reset = Some(reason);
-            let after_fin = self.peer_fin;
+        let after_fin = self.receive.fin_received();
+        // Only the first RESET is recorded and published.
+        if self.receive.apply(ReceiveEvent::Reset(reason)) {
             self.reset_tx
                 .send_replace(Some(HttpPeerReset { reason, after_fin }));
         }
@@ -536,10 +541,10 @@ impl HttpStreamState {
     /// to the owed receive credit; the caller advertises that credit and
     /// calls [`Self::settle_credit`] once the WINDOW_UPDATE is queued.
     pub(crate) fn next_read(&mut self, stream_terminal: bool) -> ReadStep {
-        if let Some(reason) = self.peer_reset {
+        if let Some(reason) = self.receive.reset() {
             return ReadStep::Reply(HttpRead::Reset(reason));
         }
-        if self.local_reset.is_some() {
+        if self.send.reset_requested().is_some() {
             return ReadStep::Reply(HttpRead::Closed);
         }
         if let Some(chunk) = self.chunks.pop_front() {
@@ -549,8 +554,8 @@ impl HttpStreamState {
             self.credit_owed = self.credit_owed.saturating_add(len as u64);
             return ReadStep::Chunk(chunk);
         }
-        if self.peer_fin && !self.fin_delivered {
-            self.fin_delivered = true;
+        // Legal only with a FIN buffered and not yet delivered.
+        if self.receive.apply(ReceiveEvent::DeliverFin) {
             return ReadStep::Reply(HttpRead::Fin);
         }
         if stream_terminal {
@@ -601,20 +606,20 @@ impl HttpStreamState {
     ) -> RelayHttpStreamSnapshot {
         RelayHttpStreamSnapshot {
             request: HttpRecordPosition::from(self.request_tracker.snapshot()),
-            request_fin_sequenced: self.request_fin_sequenced,
+            request_fin_sequenced: self.send.fin_sequenced(),
             response: HttpRecordPosition::from(self.response_tracker.snapshot()),
-            response_fin_received: self.peer_fin,
+            response_fin_received: self.receive.fin_received(),
             parked_bytes,
             receive_buffered_bytes: self.buffered,
             send_credit,
             sent_bytes,
             deferred_terminal: terminal_label(pending_terminal),
-            local_reset: self.local_reset,
-            peer_reset: self.peer_reset,
-            cancel_sent: self.cancel_sent,
-            reset_sequence: self.reset_sequence.map(|(sequence, _)| sequence),
-            reset_generation: self.reset_sequence.map(|(_, generation)| generation),
-            reset_deferred_by_freeze: self.reset_deferred_by_freeze,
+            local_reset: self.send.reset_requested(),
+            peer_reset: self.receive.reset(),
+            cancel_sent: self.cancel_sent.is_set(),
+            reset_sequence: self.send.reset_sequence().map(|(sequence, _)| sequence),
+            reset_generation: self.send.reset_sequence().map(|(_, generation)| generation),
+            reset_deferred_by_freeze: self.send.reset_deferred_by_freeze(),
             frozen,
             rotation_observations: self.recent_observations.iter().cloned().collect(),
         }
@@ -661,7 +666,7 @@ impl RelayActor {
             let _ = response.send(HttpRead::Closed);
             return;
         };
-        let data_tx = session.data_tx.clone();
+        let data_tx = session.data_tx().cloned();
         let queue_budget = session.queue_budget.clone();
         let generation = session.generation;
         let epoch = session.key.epoch;
@@ -801,7 +806,7 @@ impl RelayActor {
         let Some(session) = self.session_mut(key) else {
             return;
         };
-        let Some(data_tx) = session.data_tx.clone() else {
+        let Some(data_tx) = session.data_tx().cloned() else {
             return;
         };
         let queue_budget = session.queue_budget.clone();
@@ -872,16 +877,18 @@ impl RelayActor {
             let Some(stream) = session.streams.get_mut(&stream_id) else {
                 return false;
             };
-            if stream.operation_id != operation_id || stream.terminal || stream.open_pending {
+            if stream.operation_id != operation_id
+                || stream.terminal
+                || stream.admission.open_pending()
+            {
                 return false;
             }
             let Some(http) = stream.http.as_mut() else {
                 return false;
             };
-            if http.local_terminal() {
+            if !http.mark_local_fin() {
                 return false;
             }
-            http.local_fin = true;
             if frozen || !stream.pending_records.is_empty() {
                 stream.pending_terminal.get_or_insert(Terminal::Fin);
                 return true;
@@ -977,17 +984,19 @@ impl RelayActor {
             let Some(stream) = session.streams.get_mut(&stream_id) else {
                 return outcome;
             };
-            if stream.operation_id != operation_id || stream.terminal || stream.open_pending {
+            if stream.operation_id != operation_id
+                || stream.terminal
+                || stream.admission.open_pending()
+            {
                 return outcome;
             }
             let Some(http) = stream.http.as_mut() else {
                 return outcome;
             };
             outcome.accepted = true;
-            if http.local_reset.is_some() {
+            if !http.mark_local_reset(reason) {
                 return outcome;
             }
-            http.local_reset = Some(reason);
             let discarded = http.release();
             release_m2_bytes(&queue_budget, stream, discarded);
             let parked = stream.pending_record_bytes;
@@ -1053,7 +1062,7 @@ impl RelayActor {
     pub(super) fn retry_failed_terminals(&mut self, key: &SessionKey) {
         let stream_ids = self
             .session_for(key)
-            .filter(|session| session.terminal_fin_failure_deadline.is_some())
+            .filter(|session| session.terminal_fin_failure_deadline.is_armed())
             .map(|session| {
                 let mut ids = session
                     .streams
@@ -1278,7 +1287,7 @@ impl RelayActor {
             authorization_in_flight: stream.authorization_in_flight,
             authorized: stream.authorized_until.is_some(),
             authorization_failure: stream.authorization_failure_code,
-            open_pending: stream.open_pending,
+            open_pending: stream.admission.open_pending(),
             credit_held: stream.credit_held,
             pending_records: stream.pending_records.len(),
             pending_record_bytes: stream.pending_record_bytes,
@@ -1288,13 +1297,14 @@ impl RelayActor {
         let Some(http) = stream.http.as_mut() else {
             return;
         };
-        if http.recorded {
+        if !http.recorded.set() {
             return;
         }
-        http.recorded = true;
-        let (release, reset_reason) = match (http.local_reset, http.peer_reset) {
+        let (release, reset_reason) = match (http.send.reset_requested(), http.receive.reset()) {
             (Some(reason), _) | (None, Some(reason)) => ("reset", Some(reason)),
-            (None, None) if http.local_fin && http.peer_fin => ("fin", None),
+            (None, None) if http.send.fin_requested() && http.receive.fin_received() => {
+                ("fin", None)
+            }
             _ => ("closed", None),
         };
         let record = HttpOwnerStreamRecord {
@@ -1311,10 +1321,10 @@ impl RelayActor {
             reset_reason,
             request: HttpRecordPosition::from(http.request_tracker.snapshot()),
             response: HttpRecordPosition::from(http.response_tracker.snapshot()),
-            reset_sequence: http.reset_sequence.map(|(sequence, _)| sequence),
-            reset_generation: http.reset_sequence.map(|(_, generation)| generation),
-            reset_deferred_by_freeze: http.reset_deferred_by_freeze,
-            cancel_sent: http.cancel_sent,
+            reset_sequence: http.send.reset_sequence().map(|(sequence, _)| sequence),
+            reset_generation: http.send.reset_sequence().map(|(_, generation)| generation),
+            reset_deferred_by_freeze: http.send.reset_deferred_by_freeze(),
+            cancel_sent: http.cancel_sent.is_set(),
         };
         if record.release != "fin" && crate::http_forward_diagnostics::exchange_log_enabled() {
             log_unfinished_owner_stream(&record, &live, http);
@@ -1369,9 +1379,9 @@ fn log_unfinished_owner_stream(
         send_credit = live.send_credit,
         credit_owed = http.credit_owed,
         receive_buffered = http.buffered,
-        peer_fin = http.peer_fin,
-        local_fin = http.local_fin,
-        request_fin_sequenced = http.request_fin_sequenced,
+        peer_fin = http.receive.fin_received(),
+        local_fin = http.send.fin_requested(),
+        request_fin_sequenced = http.send.fin_sequenced(),
     );
 }
 
@@ -1478,7 +1488,8 @@ mod tests {
         // FIN is delivered once; a released stream then reads as closed.
         assert_eq!(http.next_read(false), ReadStep::Park);
         assert_eq!(http.next_read(true), ReadStep::Reply(HttpRead::Closed));
-        http.local_fin = true;
+        // Rebuilt through the transition (was a direct `local_fin` write).
+        assert!(http.mark_local_fin());
         assert!(http.completed());
     }
 
@@ -1536,7 +1547,7 @@ mod tests {
         let (mut http, watchers) = state();
         http.mark_local_reset(reset_reason::CANCELLED);
         http.mark_local_reset(reset_reason::ADAPTER_FAILURE);
-        assert_eq!(http.local_reset, Some(reset_reason::CANCELLED));
+        assert_eq!(http.send.reset_requested(), Some(reset_reason::CANCELLED));
         assert_eq!(http.next_read(false), ReadStep::Reply(HttpRead::Closed));
         http.accept_status(ResultDetail {
             code: "HTTP_CANCELLED".into(),

@@ -20,7 +20,7 @@
 //! through the peer-hop RESET record.
 
 use std::future::Future;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, OnceLock};
 
 use bytes::Bytes;
 use tokio::sync::watch;
@@ -35,28 +35,18 @@ use super::hold::{HttpRelayHoldPoint, HttpRelayInterposer};
 /// The first owner-side validation failure of one relayed exchange.
 #[derive(Debug, Default)]
 pub(crate) struct OwnerVerdict {
-    detail: Mutex<Option<ResetDetail>>,
+    /// Set once: only the first failure is the verdict.
+    detail: OnceLock<ResetDetail>,
 }
 
 impl OwnerVerdict {
     /// Record the first failure; returns whether this call recorded it.
     fn set(&self, detail: ResetDetail) -> bool {
-        let mut slot = self
-            .detail
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if slot.is_some() {
-            return false;
-        }
-        *slot = Some(detail);
-        true
+        self.detail.set(detail).is_ok()
     }
 
     pub(crate) fn get(&self) -> Option<ResetDetail> {
-        *self
-            .detail
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        self.detail.get().copied()
     }
 }
 
@@ -330,41 +320,88 @@ mod tests {
         encode_record, encode_request_head, encode_response_head,
     };
 
-    /// A carrier writer that records what reached it.
-    #[derive(Clone, Default)]
+    /// What a [`Recorder`] saw, in order.
+    enum Recorded {
+        Data(Bytes),
+        Fin,
+        Reset(ResetDetail),
+    }
+
+    /// A carrier writer that records what reached it.  Every clone reports to
+    /// the one handle the test kept, which drains the reports on each read.
     struct Recorder {
-        events: Arc<Mutex<Vec<String>>>,
-        bytes: Arc<Mutex<Vec<u8>>>,
+        reports: tokio::sync::mpsc::UnboundedSender<Recorded>,
+        drain: Option<tokio::sync::mpsc::UnboundedReceiver<Recorded>>,
+        events: Vec<String>,
+        bytes: Vec<u8>,
+    }
+
+    impl Default for Recorder {
+        fn default() -> Self {
+            let (reports, drain) = tokio::sync::mpsc::unbounded_channel();
+            Self {
+                reports,
+                drain: Some(drain),
+                events: Vec::new(),
+                bytes: Vec::new(),
+            }
+        }
+    }
+
+    impl Clone for Recorder {
+        /// A writing clone: it reports to the original and reads nothing.
+        fn clone(&self) -> Self {
+            Self {
+                reports: self.reports.clone(),
+                drain: None,
+                events: Vec::new(),
+                bytes: Vec::new(),
+            }
+        }
     }
 
     impl Recorder {
-        fn events(&self) -> Vec<String> {
-            self.events.lock().unwrap().clone()
+        fn drain(&mut self) {
+            let drain = self
+                .drain
+                .as_mut()
+                .expect("read from the original recorder");
+            while let Ok(recorded) = drain.try_recv() {
+                match recorded {
+                    Recorded::Data(data) => {
+                        self.events.push(format!("data:{}", data.len()));
+                        self.bytes.extend_from_slice(&data);
+                    }
+                    Recorded::Fin => self.events.push("fin".into()),
+                    Recorded::Reset(detail) => self.events.push(format!(
+                        "reset:{}:{}",
+                        detail.code.as_str(),
+                        detail.execution.as_str()
+                    )),
+                }
+            }
         }
-        fn bytes(&self) -> Vec<u8> {
-            self.bytes.lock().unwrap().clone()
+        fn events(&mut self) -> Vec<String> {
+            self.drain();
+            self.events.clone()
+        }
+        fn bytes(&mut self) -> Vec<u8> {
+            self.drain();
+            self.bytes.clone()
         }
     }
 
     impl CarrierWriter for Recorder {
         fn data(&mut self, data: Bytes) -> impl Future<Output = Result<(), CarrierClosed>> + Send {
-            self.events
-                .lock()
-                .unwrap()
-                .push(format!("data:{}", data.len()));
-            self.bytes.lock().unwrap().extend_from_slice(&data);
+            let _ = self.reports.send(Recorded::Data(data));
             async { Ok(()) }
         }
         fn finish(&mut self) -> impl Future<Output = Result<(), CarrierClosed>> + Send {
-            self.events.lock().unwrap().push("fin".into());
+            let _ = self.reports.send(Recorded::Fin);
             async { Ok(()) }
         }
         fn reset(&mut self, detail: ResetDetail) -> impl Future<Output = ()> + Send {
-            self.events.lock().unwrap().push(format!(
-                "reset:{}:{}",
-                detail.code.as_str(),
-                detail.execution.as_str()
-            ));
+            let _ = self.reports.send(Recorded::Reset(detail));
             async {}
         }
     }
@@ -411,7 +448,7 @@ mod tests {
     #[tokio::test]
     async fn a_forged_head_injected_past_ingress_never_reaches_the_device() {
         let (request_policy, _) = policies();
-        let actor = Recorder::default();
+        let mut actor = Recorder::default();
         let (method_tx, _method_rx) = watch::channel(None);
         let verdict = Arc::new(OwnerVerdict::default());
         let (to_ingress, mut from_owner, _) = channel(1 << 16);
@@ -485,7 +522,7 @@ mod tests {
         // Another principal's binding, and no binding at all, are both
         // refused before a byte is forwarded.
         for value in [Some(forged), None] {
-            let actor = Recorder::default();
+            let mut actor = Recorder::default();
             let (to_ingress, _rx, _) = channel(1 << 16);
             let verdict = Arc::new(OwnerVerdict::default());
             let mut writer = OwnerRequestWriter::new(
@@ -527,7 +564,7 @@ mod tests {
             encode_record(RecordKind::RequestHead, json.as_bytes(), &mut out).unwrap();
             out
         };
-        let actor = Recorder::default();
+        let mut actor = Recorder::default();
         let (to_ingress, _rx, _) = channel(1 << 16);
         let verdict = Arc::new(OwnerVerdict::default());
         let mut writer = OwnerRequestWriter::new(
@@ -553,7 +590,7 @@ mod tests {
         );
 
         // The owner's own value passes, so the rule is not vacuous.
-        let actor = Recorder::default();
+        let mut actor = Recorder::default();
         let (to_ingress, _rx, _) = channel(1 << 16);
         let mut writer = OwnerRequestWriter::new(
             actor.clone(),
@@ -569,7 +606,7 @@ mod tests {
         // A profile without the header carries no binding to check, and a
         // head that names it is refused by the allowlist anyway.
         let (request_policy, _) = policies();
-        let actor = Recorder::default();
+        let mut actor = Recorder::default();
         let (to_ingress, _rx, _) = channel(1 << 16);
         let mut writer = OwnerRequestWriter::new(
             actor.clone(),
@@ -591,7 +628,7 @@ mod tests {
     async fn grammar_and_fin_violations_are_rejected_at_the_owner() {
         let (request_policy, _) = policies();
         // BODY before HEAD.
-        let actor = Recorder::default();
+        let mut actor = Recorder::default();
         let (to_ingress, _rx, _) = channel(1 << 16);
         let mut writer = OwnerRequestWriter::new(
             actor.clone(),
@@ -607,7 +644,7 @@ mod tests {
         assert_eq!(writer.data(Bytes::from(body)).await, Err(CarrierClosed));
         assert!(actor.bytes().is_empty());
         // FIN before END, after a forwarded head: execution is unknown.
-        let actor = Recorder::default();
+        let mut actor = Recorder::default();
         let (to_ingress, _rx, _) = channel(1 << 16);
         let verdict = Arc::new(OwnerVerdict::default());
         let mut writer = OwnerRequestWriter::new(
@@ -636,7 +673,7 @@ mod tests {
     #[tokio::test]
     async fn valid_records_pass_through_byte_for_byte_and_unbuffered() {
         let (request_policy, response_policy) = policies();
-        let actor = Recorder::default();
+        let mut actor = Recorder::default();
         let (method_tx, method_rx) = watch::channel(None);
         let (to_ingress, _rx, _) = channel(1 << 16);
         let verdict = Arc::new(OwnerVerdict::default());
@@ -661,7 +698,7 @@ mod tests {
         assert!(verdict.get().is_none());
 
         // The response is validated against the method the owner saw.
-        let hop = Recorder::default();
+        let mut hop = Recorder::default();
         let (to_device, _rx, _) = channel(1 << 16);
         let mut response = OwnerResponseWriter::new(
             hop.clone(),
@@ -687,7 +724,7 @@ mod tests {
     #[tokio::test]
     async fn a_response_length_violation_resets_both_directions_at_the_owner() {
         let (_, response_policy) = policies();
-        let hop = Recorder::default();
+        let mut hop = Recorder::default();
         let (to_device, mut device_rx, _) = channel(1 << 16);
         let verdict = Arc::new(OwnerVerdict::default());
         let mut response = OwnerResponseWriter::new(
@@ -716,7 +753,7 @@ mod tests {
         );
         assert!(matches!(device_rx.recv().await, Some(Frame::Reset(_))));
         // A response before any validated request head is a bad record.
-        let hop = Recorder::default();
+        let mut hop = Recorder::default();
         let (to_device, _rx, _) = channel(1 << 16);
         let mut early = OwnerResponseWriter::new(
             hop.clone(),
@@ -737,21 +774,50 @@ mod tests {
 
     /// A minimal interposer for this unit test.  The gate's one-shot hold
     /// with its self-release ceiling lives in `tunnel-test-harness`.
+    ///
+    /// Its whole state is one word: idle, held, or armed at one point.  Every
+    /// change is a single compare-and-swap of that word.
     #[derive(Default)]
     struct TestHold {
-        state: Mutex<(Option<HttpRelayHoldPoint>, bool)>,
+        state: std::sync::atomic::AtomicU32,
         reached: tokio::sync::Notify,
         release: tokio::sync::Notify,
     }
 
+    const HOLD_IDLE: u32 = 0;
+    const HOLD_HELD: u32 = 1;
+
+    /// The word for "armed at `point`"; never `HOLD_IDLE` or `HOLD_HELD`.
+    fn armed_word(point: HttpRelayHoldPoint) -> u32 {
+        match point {
+            HttpRelayHoldPoint::InsideBodyPayload => 2,
+            HttpRelayHoldPoint::BeforeRequestFin => 3,
+            HttpRelayHoldPoint::InsideBodyHeader { bytes } => 0x100 | u32::from(bytes),
+        }
+    }
+
+    fn armed_point_of(word: u32) -> Option<HttpRelayHoldPoint> {
+        match word {
+            2 => Some(HttpRelayHoldPoint::InsideBodyPayload),
+            3 => Some(HttpRelayHoldPoint::BeforeRequestFin),
+            word if word & 0x100 != 0 => Some(HttpRelayHoldPoint::InsideBodyHeader {
+                bytes: (word & 0xff) as u8,
+            }),
+            _ => None,
+        }
+    }
+
     impl TestHold {
         fn arm(&self, point: HttpRelayHoldPoint) -> bool {
-            let mut state = self.state.lock().unwrap();
-            if state.0.is_some() || state.1 {
-                return false;
-            }
-            state.0 = Some(point);
-            true
+            use std::sync::atomic::Ordering;
+            self.state
+                .compare_exchange(
+                    HOLD_IDLE,
+                    armed_word(point),
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
         }
 
         async fn reached(&self) {
@@ -759,7 +825,7 @@ mod tests {
                 let notified = self.reached.notified();
                 tokio::pin!(notified);
                 notified.as_mut().enable();
-                if self.state.lock().unwrap().1 {
+                if self.state.load(std::sync::atomic::Ordering::Acquire) == HOLD_HELD {
                     return;
                 }
                 notified.await;
@@ -767,14 +833,21 @@ mod tests {
         }
 
         fn release(&self) {
-            self.state.lock().unwrap().1 = false;
+            use std::sync::atomic::Ordering;
+            // Only a held interposer is released; an armed point stays armed.
+            let _ = self.state.compare_exchange(
+                HOLD_HELD,
+                HOLD_IDLE,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
             self.release.notify_waiters();
         }
     }
 
     impl HttpRelayInterposer for TestHold {
         fn armed_point(&self) -> Option<HttpRelayHoldPoint> {
-            self.state.lock().unwrap().0
+            armed_point_of(self.state.load(std::sync::atomic::Ordering::Acquire))
         }
 
         fn hold_at(
@@ -782,15 +855,21 @@ mod tests {
             point: HttpRelayHoldPoint,
         ) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send + '_>> {
             Box::pin(async move {
+                use std::sync::atomic::Ordering;
                 let released = self.release.notified();
                 tokio::pin!(released);
                 released.as_mut().enable();
+                if self
+                    .state
+                    .compare_exchange(
+                        armed_word(point),
+                        HOLD_HELD,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_err()
                 {
-                    let mut state = self.state.lock().unwrap();
-                    if state.0 != Some(point) {
-                        return;
-                    }
-                    *state = (None, true);
+                    return;
                 }
                 self.reached.notify_waiters();
                 released.await;
@@ -801,7 +880,7 @@ mod tests {
     #[tokio::test]
     async fn an_armed_hold_stops_the_relay_inside_a_body_header_and_before_fin() {
         let (request_policy, _) = policies();
-        let actor = Recorder::default();
+        let mut actor = Recorder::default();
         let hold = Arc::new(TestHold::default());
         let (to_ingress, _rx, _) = channel(1 << 16);
         let mut writer = OwnerRequestWriter::new(

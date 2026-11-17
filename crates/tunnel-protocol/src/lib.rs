@@ -11,6 +11,7 @@ pub mod frame;
 pub mod open_refusal;
 pub mod owner_fencing;
 pub mod rotation;
+mod rotation_attempt;
 pub mod rotation_control;
 pub mod sequence;
 

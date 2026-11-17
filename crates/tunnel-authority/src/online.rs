@@ -59,7 +59,17 @@ pub fn run(config: Config) -> Result<()> {
     let engine = Engine::open(config.clone(), Arc::clone(&fatal))?;
     let inventory = engine.inventory();
     let expected_run = engine.expected_run();
-    let coordinator = Coordinator::new(engine, Arc::clone(&fatal));
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .max_blocking_threads(2)
+        .enable_all()
+        .build()
+        .map_err(|_| "cannot start authority runtime")?;
+    let coordinator = {
+        // The engine's owning actor is a task of this runtime.
+        let _runtime = runtime.enter();
+        Coordinator::new(engine, Arc::clone(&fatal))
+    };
     let application = Arc::new(Application {
         node_permits: inventory
             .nodes
@@ -69,26 +79,19 @@ pub fn run(config: Config) -> Result<()> {
         inventory,
         coordinator,
     });
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .max_blocking_threads(2)
-        .enable_all()
-        .build()
-        .map_err(|_| "cannot start authority runtime")?;
     let result = runtime.block_on(async {
         let listener = TcpListener::bind(config.bind).await.map_err(|_| "cannot bind private authority listener")?;
         let acceptor = TlsAcceptor::from(tls);
         let connections = Arc::new(Semaphore::new(CONNECTION_LIMIT));
         let mut tasks = JoinSet::new();
-        let mut publisher = tokio::spawn(publish_loop(Arc::clone(&application), redis_url, redis_tls, expected_run));
-        let mut publisher_completed = false;
+        let mut publisher = PublisherTask::Running(tokio::spawn(publish_loop(Arc::clone(&application), redis_url, redis_tls, expected_run)));
         let stop = shutdown_signal();
         tokio::pin!(stop);
         eprintln!("authority_started: readiness=pending_publication");
         let outcome = loop {
             tokio::select! {
                 _ = &mut stop => break Ok(()),
-                result = &mut publisher => { publisher_completed = true; break result.unwrap_or(Err("publisher task failed")); },
+                result = publisher.completion() => break result,
                 Some(result) = tasks.join_next() => {
                     if result.is_err() { break Err("authority connection task failed"); }
                 }
@@ -121,7 +124,7 @@ pub fn run(config: Config) -> Result<()> {
                 }
             }
         };
-        if !publisher_completed { publisher.abort(); let _ = publisher.await; }
+        publisher.stop().await;
         tasks.abort_all();
         while tasks.join_next().await.is_some() {}
         outcome
@@ -130,6 +133,42 @@ pub fn run(config: Config) -> Result<()> {
     // bound runtime shutdown rather than waiting forever on a blocking worker.
     runtime.shutdown_timeout(Duration::from_secs(2));
     result
+}
+
+/// The publisher task as the accept loop sees it.
+enum PublisherTask {
+    /// Still publishing; its handle has not been joined.
+    Running(tokio::task::JoinHandle<Result<()>>),
+    /// The task ended and its result was taken. Nothing is left to stop.
+    Completed,
+}
+
+impl PublisherTask {
+    /// Wait for the publisher to end and take its result. This is the only
+    /// `Running` -> `Completed` transition, so a joined handle is never
+    /// polled or aborted again. Cancel-safe: the phase changes in the same
+    /// poll that takes the result. A completed publisher never ends again.
+    async fn completion(&mut self) -> Result<()> {
+        match self {
+            Self::Running(task) => {
+                let result = task.await.unwrap_or(Err("publisher task failed"));
+                *self = Self::Completed;
+                result
+            }
+            Self::Completed => std::future::pending().await,
+        }
+    }
+
+    /// Abort and reap a publisher that is still running.
+    async fn stop(self) {
+        match self {
+            Self::Running(task) => {
+                task.abort();
+                let _ = task.await;
+            }
+            Self::Completed => {}
+        }
+    }
 }
 
 async fn handle(

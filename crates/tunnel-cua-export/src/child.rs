@@ -133,14 +133,71 @@ pub struct ChildCounters {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SpawnError;
 
+/// Where one backend process is in its life.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ChildPhase {
+    /// Spawned; nobody has asked for it to end and it has not been reaped.
+    Running,
+    /// The owner asked for it to be killed, or dropped its handle, and the
+    /// reap has not happened yet.
+    KillRequested,
+    /// Killed or ended on its own, reaped, its group signalled and its
+    /// sentinel resolved -- or its supervising task was dropped before it
+    /// could do that (a runtime torn down), which kills the leader and
+    /// signals the group on the way out.
+    Exited,
+}
+
+/// What can happen to a backend's phase.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ChildTransition {
+    /// The owner asked for the backend to be killed, or dropped its handle.
+    KillRequested,
+    /// The supervising task reaped the process.
+    Reaped,
+}
+
+/// A transition the phase refuses: a repeated kill request, a kill request
+/// for a backend that is already gone, or a second reap.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IllegalChildTransition;
+
+impl ChildPhase {
+    /// The only place a backend's phase changes.
+    ///
+    /// # Errors
+    /// [`IllegalChildTransition`] when the event changes nothing.
+    pub const fn on_event(self, event: ChildTransition) -> Result<Self, IllegalChildTransition> {
+        match (self, event) {
+            (Self::Running, ChildTransition::KillRequested) => Ok(Self::KillRequested),
+            (Self::Running | Self::KillRequested, ChildTransition::Reaped) => Ok(Self::Exited),
+            (Self::KillRequested | Self::Exited, ChildTransition::KillRequested)
+            | (Self::Exited, ChildTransition::Reaped) => Err(IllegalChildTransition),
+        }
+    }
+}
+
+/// Apply one transition to the published phase. Returns whether it changed.
+///
+/// Every writer does exactly this one step and nothing else under the
+/// channel, so a reader samples a phase and never a half-applied one.
+fn apply(phase: &watch::Sender<ChildPhase>, event: ChildTransition) -> bool {
+    phase.send_if_modified(|phase| match phase.on_event(event) {
+        Ok(next) => {
+            *phase = next;
+            true
+        }
+        Err(IllegalChildTransition) => false,
+    })
+}
+
 /// The owner's handle on one running backend. **Dropping it kills the
 /// backend**, which is the safe direction: an unexpected drop ends the process
 /// group rather than leaking it.
 #[derive(Debug)]
 pub struct BackendChild {
     pid: u32,
-    kill: tokio::sync::watch::Sender<bool>,
-    exited: watch::Receiver<bool>,
+    phase: watch::Sender<ChildPhase>,
 }
 
 impl BackendChild {
@@ -153,26 +210,32 @@ impl BackendChild {
     /// Ask for the backend to be killed. Returns immediately; use
     /// [`BackendChild::wait_exited`] to wait for the reap.
     pub fn kill(&self) {
-        let _ = self.kill.send(true);
+        let _ = apply(&self.phase, ChildTransition::KillRequested);
     }
 
     /// Resolves once the process has been killed, reaped and its group
     /// signalled, and its sentinel resolved.
     pub async fn wait_exited(&self) {
-        let mut exited = self.exited.clone();
-        let _ = exited.wait_for(|done| *done).await;
+        let mut phase = self.phase.subscribe();
+        let _ = phase.wait_for(|phase| *phase == ChildPhase::Exited).await;
     }
 
     /// Whether the backend has already ended.
     #[must_use]
     pub fn has_exited(&self) -> bool {
-        *self.exited.borrow()
+        self.phase() == ChildPhase::Exited
+    }
+
+    /// The backend's current phase.
+    #[must_use]
+    pub fn phase(&self) -> ChildPhase {
+        *self.phase.borrow()
     }
 }
 
 impl Drop for BackendChild {
     fn drop(&mut self) {
-        let _ = self.kill.send(true);
+        let _ = apply(&self.phase, ChildTransition::KillRequested);
     }
 }
 
@@ -229,8 +292,13 @@ pub fn spawn(
         counters.deadman_armed.fetch_add(1, Ordering::Relaxed);
     }
 
-    let (kill_tx, mut kill_rx) = watch::channel(false);
-    let (exited_tx, exited_rx) = watch::channel(false);
+    let phase = watch::Sender::new(ChildPhase::Running);
+    let mut supervised = ReapGuard {
+        phase: phase.clone(),
+        pid,
+        reaped: false,
+        child,
+    };
 
     tokio::spawn(drain(stdout, Arc::clone(counters), Drained::Stdout));
     tokio::spawn(drain(stderr, Arc::clone(counters), Drained::Stderr));
@@ -242,8 +310,8 @@ pub fn spawn(
         // dropped, which is on every path out of this task.
         let stdin = stdin;
         tokio::select! {
-            _ = child.wait() => {}
-            () = asked_to_kill(&mut kill_rx) => {
+            _ = supervised.child.wait() => {}
+            () = asked_to_kill(&supervised.phase) => {
                 supervisor_counters.killed.fetch_add(1, Ordering::Relaxed);
                 // **This one** is pre-reap: the leader is still unreaped, so
                 // POSIX keeps the group id from being reissued and the signal
@@ -251,10 +319,13 @@ pub fn spawn(
                 // `select!` relies on the sentinel's pin for the same
                 // guarantee -- see the module docs.
                 let _ = kill_group(pid);
-                let _ = child.start_kill();
-                let _ = child.wait().await;
+                let _ = supervised.child.start_kill();
+                let _ = supervised.child.wait().await;
             }
         }
+        // The leader is reaped and the group signal follows with no await
+        // between: from here the guard must not signal the group again.
+        supervised.reaped = true;
         drop(stdin);
         // Whatever ended the leader, no member of its group may outlive it.
         //
@@ -289,30 +360,55 @@ pub fn spawn(
                     .fetch_add(1, Ordering::Relaxed);
             }
         }
-        let _ = exited_tx.send(true);
+        // The guard publishes `Reaped`, here and on no other orderly path.
+        drop(supervised);
     });
 
-    Ok(BackendChild {
-        pid,
-        kill: kill_tx,
-        exited: exited_rx,
-    })
+    Ok(BackendChild { pid, phase })
+}
+
+/// Publishes the terminal phase when the supervising task ends, **however it
+/// ends**.
+///
+/// Every holder of the phase keeps the channel open, so a supervising task
+/// that is dropped instead of run to its end -- a runtime torn down, a panic
+/// -- would otherwise leave [`BackendChild::wait_exited`] pending for ever.  The task
+/// owns this guard from the moment it is created, before it is first polled,
+/// so there is no way for the task to go away without the phase reaching
+/// `Exited`.
+///
+/// On that abnormal path the guard also signals the group, while the leader
+/// is still unreaped: `child` is a field, so it is dropped (and
+/// `kill_on_drop` kills the leader) only after this `Drop` has run.  Nothing
+/// else would signal the group on that path: the owner's handle only asks.
+struct ReapGuard {
+    phase: watch::Sender<ChildPhase>,
+    pid: u32,
+    /// Whether the task reaped the leader; it signals the group itself then.
+    reaped: bool,
+    child: tokio::process::Child,
+}
+
+impl Drop for ReapGuard {
+    fn drop(&mut self) {
+        if !self.reaped {
+            let _ = kill_group(self.pid);
+        }
+        let _ = apply(&self.phase, ChildTransition::Reaped);
+    }
 }
 
 /// Resolve once the owner has asked for the backend to be killed.
 ///
-/// A dropped sender resolves it too, and that is the safe direction: the
-/// owner's handle is gone, so nothing will ever ask again, and leaving the
-/// backend running would leak a process that can drive a desktop.
-async fn asked_to_kill(kill: &mut watch::Receiver<bool>) {
-    loop {
-        if *kill.borrow_and_update() {
-            return;
-        }
-        if kill.changed().await.is_err() {
-            return;
-        }
-    }
+/// A dropped handle resolves it too, because dropping one *is* a kill
+/// request, and that is the safe direction: the owner's handle is gone, so
+/// nothing will ever ask again, and leaving the backend running would leak a
+/// process that can drive a desktop.
+async fn asked_to_kill(phase: &watch::Sender<ChildPhase>) {
+    let mut phase = phase.subscribe();
+    let _ = phase
+        .wait_for(|phase| *phase == ChildPhase::KillRequested)
+        .await;
 }
 
 /// Send `SIGKILL` to the process group led by `leader`. Returns whether a

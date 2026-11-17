@@ -413,7 +413,7 @@ impl Stage {
         });
 
         assert_eq!(admission.available_permits(), limits.max_pending_operations);
-        assert_eq!(scoped.tracked_scopes(), 0);
+        assert_eq!(scoped.tracked_scopes().await, 0);
         Self {
             address,
             handle,
@@ -437,7 +437,7 @@ impl Stage {
     async fn wait_drained(&self, what: &str) {
         timeout(POLL_BUDGET, async {
             while self.admission.available_permits() != self.global_permits
-                || self.scoped.tracked_scopes() != 0
+                || self.scoped.tracked_scopes().await != 0
             {
                 tokio::task::yield_now().await;
             }
@@ -538,12 +538,12 @@ async fn one_tenant_at_its_per_owner_bound_cannot_refuse_another_tenant() {
         "every tenant A attempt above its bound must be refused"
     );
     assert_eq!(
-        stage.scoped.in_flight(tenants[0].scope()),
+        stage.scoped.in_flight(tenants[0].scope()).await,
         per_owner_permits,
         "tenant A must hold exactly its per-owner allowance"
     );
     assert_eq!(
-        stage.scoped.in_flight(tenants[1].scope()),
+        stage.scoped.in_flight(tenants[1].scope()).await,
         1,
         "tenant B holds its own per-owner permit"
     );
@@ -553,7 +553,7 @@ async fn one_tenant_at_its_per_owner_bound_cannot_refuse_another_tenant() {
         "a refused attempt must release the relay-global permit it reserved"
     );
     assert_eq!(
-        stage.scoped.tracked_scopes(),
+        stage.scoped.tracked_scopes().await,
         2,
         "exactly the two live owner scopes are tracked"
     );
@@ -562,7 +562,7 @@ async fn one_tenant_at_its_per_owner_bound_cannot_refuse_another_tenant() {
     // scope, and tenant A is admitted again.
     drop(held.pop().expect("a held tenant A socket"));
     timeout(POLL_BUDGET, async {
-        while stage.scoped.in_flight(tenants[0].scope()) != per_owner_permits - 1 {
+        while stage.scoped.in_flight(tenants[0].scope()).await != per_owner_permits - 1 {
             tokio::task::yield_now().await;
         }
     })
@@ -607,12 +607,12 @@ async fn the_relay_global_admission_bound_still_protects_the_process() {
     let refused = stage.attempt(&tenants, 1).await;
     assert_admission_refusal(&refused, "tenant B beyond the relay-global bound");
     assert_eq!(
-        stage.scoped.in_flight(tenants[1].scope()),
+        stage.scoped.in_flight(tenants[1].scope()).await,
         0,
         "tenant B never reached its own scope bound"
     );
     assert_eq!(
-        stage.scoped.tracked_scopes(),
+        stage.scoped.tracked_scopes().await,
         1,
         "a refusal at the relay-global bound must not create a scope entry"
     );
@@ -670,7 +670,7 @@ async fn an_abandoned_upgrade_releases_its_per_owner_permit_exactly_once() {
         .expect("upgrade barrier reached");
     assert!(barrier.is_held());
     assert_eq!(
-        stage.scoped.in_flight(tenants[0].scope()),
+        stage.scoped.in_flight(tenants[0].scope()).await,
         1,
         "the held handler owns its per-owner permit"
     );
@@ -685,7 +685,7 @@ async fn an_abandoned_upgrade_releases_its_per_owner_permit_exactly_once() {
 
     stage.wait_drained("abandoned upgrade").await;
     assert_eq!(
-        stage.scoped.in_flight(tenants[0].scope()),
+        stage.scoped.in_flight(tenants[0].scope()).await,
         0,
         "the cancelled handler must release its per-owner permit"
     );
@@ -698,7 +698,7 @@ async fn an_abandoned_upgrade_releases_its_per_owner_permit_exactly_once() {
     let second = stage.attempt(&tenants, 0).await;
     assert_admission_refusal(&second, "a second stream beyond the one-permit bound");
     assert_eq!(
-        stage.scoped.in_flight(tenants[0].scope()),
+        stage.scoped.in_flight(tenants[0].scope()).await,
         1,
         "the per-owner bound must still be exactly one permit"
     );
@@ -725,17 +725,18 @@ async fn scoped_admission_releases_exactly_one_permit_per_cancelled_acquisition(
         let task = tokio::spawn(async move {
             let _permit = registry
                 .try_acquire(scope)
+                .await
                 .expect("a cancelled round must not leak its permit");
             observed.notify_one();
             // Cancelled while holding the permit.
             std::future::pending::<()>().await;
         });
         ready.notified().await;
-        assert_eq!(scoped.in_flight(scope), 1, "round {round}");
+        assert_eq!(scoped.in_flight(scope).await, 1, "round {round}");
         task.abort();
         let _ = task.await;
         timeout(POLL_BUDGET, async {
-            while scoped.in_flight(scope) != 0 || scoped.tracked_scopes() != 0 {
+            while scoped.in_flight(scope).await != 0 || scoped.tracked_scopes().await != 0 {
                 tokio::task::yield_now().await;
             }
         })
@@ -744,33 +745,34 @@ async fn scoped_admission_releases_exactly_one_permit_per_cancelled_acquisition(
     }
 
     // A double release would let a third concurrent permit through.
-    let first = scoped.try_acquire(scope).expect("first permit");
-    let second = scoped.try_acquire(scope).expect("second permit");
-    assert_eq!(scoped.in_flight(scope), 2);
+    let first = scoped.try_acquire(scope).await.expect("first permit");
+    let second = scoped.try_acquire(scope).await.expect("second permit");
+    assert_eq!(scoped.in_flight(scope).await, 2);
     assert!(
-        scoped.try_acquire(scope).is_none(),
+        scoped.try_acquire(scope).await.is_none(),
         "the bound must refuse a third permit for the same scope"
     );
     let sibling = scoped
         .try_acquire(other)
+        .await
         .expect("an unrelated scope keeps its own allowance");
-    assert_eq!(scoped.tracked_scopes(), 2);
+    assert_eq!(scoped.tracked_scopes().await, 2);
     drop(first);
     assert_eq!(
-        scoped.in_flight(scope),
+        scoped.in_flight(scope).await,
         1,
         "one release must return exactly one permit"
     );
     drop(second);
-    assert_eq!(scoped.in_flight(scope), 0);
+    assert_eq!(scoped.in_flight(scope).await, 0);
     assert_eq!(
-        scoped.tracked_scopes(),
+        scoped.tracked_scopes().await,
         1,
         "an idle scope entry must be reclaimed"
     );
     drop(sibling);
     assert_eq!(
-        scoped.tracked_scopes(),
+        scoped.tracked_scopes().await,
         0,
         "no scope entry may outlive its permits"
     );
@@ -850,7 +852,7 @@ async fn a_normal_consumer_close_is_answered_once_within_a_bound_and_frees_its_p
     assert_eq!(accepted.status, 101, "the consumer stream upgraded");
     let mut socket = accepted.socket.take().expect("upgraded consumer socket");
     assert_eq!(
-        stage.scoped.in_flight(tenants[0].scope()),
+        stage.scoped.in_flight(tenants[0].scope()).await,
         1,
         "the live stream holds its per-owner permit"
     );
@@ -903,7 +905,7 @@ async fn a_normal_consumer_close_is_answered_once_within_a_bound_and_frees_its_p
 
     stage.wait_drained("normally closed consumer stream").await;
     assert_eq!(
-        stage.scoped.in_flight(tenants[0].scope()),
+        stage.scoped.in_flight(tenants[0].scope()).await,
         0,
         "a normal close must release the stream's per-owner permit"
     );

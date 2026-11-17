@@ -22,7 +22,7 @@ use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex,
+        Arc,
         atomic::{AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
@@ -1956,8 +1956,9 @@ struct ImpostorServer {
     endpoint: quinn::Endpoint,
     counters: Arc<ImpostorCounters>,
     cancellation: CancellationToken,
-    task: Option<tokio::task::JoinHandle<()>>,
-    connections: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    /// The supervisor owns its connection tasks and hands them back when it
+    /// stops, so `stop` can join every one of them.
+    task: Option<tokio::task::JoinHandle<Vec<tokio::task::JoinHandle<()>>>>,
 }
 
 impl ImpostorServer {
@@ -1976,20 +1977,17 @@ impl ImpostorServer {
         let endpoint = quinn::Endpoint::server(server_config, bind)?;
         let counters = Arc::new(ImpostorCounters::default());
         let cancellation = CancellationToken::new();
-        let connections = Arc::new(Mutex::new(Vec::new()));
         let task = tokio::spawn(run_impostor(
             endpoint.clone(),
             counters.clone(),
             cancellation.clone(),
             relay_a_spki,
-            connections.clone(),
         ));
         Ok(Self {
             endpoint,
             counters,
             cancellation,
             task: Some(task),
-            connections,
         })
     }
 
@@ -2009,18 +2007,13 @@ impl ImpostorServer {
         self.cancellation.cancel();
         self.endpoint
             .close(quinn::VarInt::from_u32(0), b"impostor stopped");
-        if let Some(task) = self.task.take() {
-            timeout(Duration::from_secs(3), task)
+        let handles = match self.task.take() {
+            Some(task) => timeout(Duration::from_secs(3), task)
                 .await
                 .map_err(|_| HarnessError::Timeout("impostor supervisor join".into()))?
-                .map_err(|error| HarnessError::Process(format!("impostor supervisor: {error}")))?;
-        }
-        let handles = std::mem::take(
-            &mut *self
-                .connections
-                .lock()
-                .map_err(|_| HarnessError::Process("impostor connection list poisoned".into()))?,
-        );
+                .map_err(|error| HarnessError::Process(format!("impostor supervisor: {error}")))?,
+            None => Vec::new(),
+        };
         for handle in handles {
             timeout(Duration::from_secs(3), handle)
                 .await
@@ -2050,14 +2043,14 @@ async fn run_impostor(
     counters: Arc<ImpostorCounters>,
     cancellation: CancellationToken,
     relay_a_spki: SpkiSha256,
-    connections: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
-) {
+) -> Vec<tokio::task::JoinHandle<()>> {
+    let mut connections = Vec::new();
     loop {
         let incoming = tokio::select! {
-            _ = cancellation.cancelled() => return,
+            _ = cancellation.cancelled() => return connections,
             incoming = endpoint.accept() => match incoming {
                 Some(incoming) => incoming,
-                None => return,
+                None => return connections,
             },
         };
         let counters = counters.clone();
@@ -2097,9 +2090,7 @@ async fn run_impostor(
                 }
             }
         });
-        if let Ok(mut connections) = connections.lock() {
-            connections.push(handle);
-        }
+        connections.push(handle);
     }
 }
 

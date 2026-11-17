@@ -23,12 +23,12 @@ use futures_util::{SinkExt, StreamExt};
 use std::{
     net::SocketAddr,
     sync::{
-        Arc, Mutex,
+        Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
-use tokio::sync::Notify;
+use tokio::sync::{Notify, watch};
 use tokio::time::{sleep, timeout};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
@@ -765,7 +765,9 @@ struct AuthorizationScope {
 }
 
 struct AuthorizationDelayState {
-    scope: Mutex<Option<AuthorizationScope>>,
+    /// The scope the scenario armed the gate for.  The scenario is the only
+    /// writer; the catalog wrapper samples it on every authorize call.
+    scope: watch::Sender<Option<AuthorizationScope>>,
     armed: AtomicBool,
     entered: AtomicBool,
     released: AtomicBool,
@@ -784,7 +786,7 @@ impl Default for AuthorizationDelayGate {
     fn default() -> Self {
         Self {
             state: Arc::new(AuthorizationDelayState {
-                scope: Mutex::new(None),
+                scope: watch::Sender::new(None),
                 armed: AtomicBool::new(false),
                 entered: AtomicBool::new(false),
                 released: AtomicBool::new(false),
@@ -799,10 +801,7 @@ impl Default for AuthorizationDelayGate {
 
 impl AuthorizationDelayGate {
     fn arm(&self, scope: AuthorizationScope) -> Result<()> {
-        let mut current = self.state.scope.lock().map_err(|_| {
-            HarnessError::Process("timing authorization gate scope lock poisoned".into())
-        })?;
-        *current = Some(scope);
+        self.state.scope.send_replace(Some(scope));
         self.state.armed.store(true, Ordering::Release);
         self.state.entered.store(false, Ordering::Release);
         self.state.released.store(false, Ordering::Release);
@@ -818,11 +817,7 @@ impl AuthorizationDelayGate {
         if self.state.released.load(Ordering::Acquire) {
             return false;
         }
-        self.state
-            .scope
-            .lock()
-            .map(|current| current.as_ref() == Some(&scope))
-            .unwrap_or(false)
+        *self.state.scope.borrow() == Some(scope)
     }
 
     fn record_matching_call(&self) -> u64 {

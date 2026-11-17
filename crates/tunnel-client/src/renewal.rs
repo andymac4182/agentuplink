@@ -236,6 +236,22 @@ pub struct Renewed {
 }
 
 /// Whether a renewal is pending or interrupted, for `doctor`.
+///
+/// This is the renewal's explicit phase, and it is deliberately *derived*
+/// rather than stored: the durable state is which of the renewal files exist
+/// and which key matches which certificate (see the module table and
+/// [`SwapStep`]), so a crash at any step leaves a phase that [`inspect`]
+/// recomputes from disk and that cannot disagree with it.
+///
+/// * `None`: no pending key, and the installed key matches the installed
+///   certificate (or nothing here can resolve a mismatch).
+/// * `Pending`: [`begin`] wrote the pending key; [`complete`] has not swapped.
+/// * `Interrupted`: the swap stopped between [`SwapStep`]s: the installed
+///   pair does not match, and either the pending key matches the installed
+///   certificate (roll forward) or the installed key matches the kept
+///   previous certificate (roll back); see [`Recovery`].
+///
+/// `Interrupted` takes precedence over `Pending`: both can hold on disk.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RenewalStatus {
     None,

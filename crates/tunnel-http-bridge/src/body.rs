@@ -100,12 +100,42 @@ impl fmt::Debug for BodySender {
     }
 }
 
+/// Whether a body can still yield frames.  The queue exists only while it
+/// can.
+enum Reading {
+    Streaming(mpsc::Receiver<Bytes>),
+    /// The terminal frame (a clean end or the error) was returned.
+    Done,
+}
+
+/// What the pump left behind once its queue closed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Ending {
+    Clean,
+    Error(HttpErrorCode),
+}
+
+impl Reading {
+    /// The only place a body's reading phase changes: the queue closed with
+    /// `terminal` recorded by the pump.  A queue that closed with nothing
+    /// recorded was dropped, which is never a successful end.
+    fn close(&mut self, terminal: Option<Terminal>) -> Option<Ending> {
+        match std::mem::replace(self, Self::Done) {
+            Self::Done => None,
+            Self::Streaming(_) => Some(match terminal {
+                Some(Terminal::End) => Ending::Clean,
+                Some(Terminal::Error(code)) => Ending::Error(code),
+                None => Ending::Error(HttpErrorCode::StreamInterrupted),
+            }),
+        }
+    }
+}
+
 /// A streaming body backed by a bounded queue.  `Debug` prints no bytes.
 pub struct ChannelBody {
-    rx: Option<mpsc::Receiver<Bytes>>,
+    reading: Reading,
     shared: Arc<Shared>,
     length: Option<u64>,
-    done: bool,
     /// Octets handed to the reader so far.
     delivered: u64,
     on_drop: Option<CancellationToken>,
@@ -128,10 +158,9 @@ impl ChannelBody {
             shared: Arc::clone(&shared),
         };
         let body = Self {
-            rx: Some(rx),
+            reading: Reading::Streaming(rx),
             shared,
             length,
-            done: false,
             delivered: 0,
             on_drop,
         };
@@ -166,10 +195,13 @@ impl fmt::Debug for ChannelBody {
             .debug_struct("ChannelBody")
             .field(
                 "queued_chunks",
-                &self.rx.as_ref().map_or(0, mpsc::Receiver::len),
+                &match &self.reading {
+                    Reading::Streaming(rx) => rx.len(),
+                    Reading::Done => 0,
+                },
             )
             .field("length", &self.length)
-            .field("done", &self.done)
+            .field("done", &self.is_end_stream())
             .finish()
     }
 }
@@ -183,14 +215,10 @@ impl Body for ChannelBody {
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Bytes>, BodyError>>> {
         let this = &mut *self;
-        if this.done {
-            return Poll::Ready(None);
-        }
         // Chunks queued before a failure were received in order and are
         // delivered first; the queue is bounded, so the error follows
         // promptly.  `fail` drops the sender, which closes the queue.
-        let Some(rx) = this.rx.as_mut() else {
-            this.done = true;
+        let Reading::Streaming(rx) = &mut this.reading else {
             return Poll::Ready(None);
         };
         match rx.poll_recv(cx) {
@@ -201,22 +229,17 @@ impl Body for ChannelBody {
                 Poll::Ready(Some(Ok(Frame::data(data))))
             }
             Poll::Ready(None) => {
-                this.done = true;
-                match this.shared.terminal.get() {
-                    Some(Terminal::End) => Poll::Ready(None),
-                    Some(Terminal::Error(code)) => {
-                        Poll::Ready(Some(Err(BodyError { code: *code })))
-                    }
-                    None => Poll::Ready(Some(Err(BodyError {
-                        code: HttpErrorCode::StreamInterrupted,
-                    }))),
+                let terminal = this.shared.terminal.get().copied();
+                match this.reading.close(terminal) {
+                    None | Some(Ending::Clean) => Poll::Ready(None),
+                    Some(Ending::Error(code)) => Poll::Ready(Some(Err(BodyError { code }))),
                 }
             }
         }
     }
 
     fn is_end_stream(&self) -> bool {
-        self.done
+        matches!(self.reading, Reading::Done)
     }
 
     fn size_hint(&self) -> SizeHint {
@@ -272,5 +295,42 @@ mod tests {
         let (_sender, body) = ChannelBody::channel(2, None, Some(token.clone()));
         drop(body);
         assert!(token.is_cancelled(), "an unknown length ends only at FIN");
+    }
+
+    #[test]
+    fn a_closed_queue_ends_reading_once_with_what_the_pump_recorded() {
+        let code = HttpErrorCode::BodyLimit;
+        for (terminal, ending) in [
+            (Some(Terminal::End), Ending::Clean),
+            (Some(Terminal::Error(code)), Ending::Error(code)),
+            (None, Ending::Error(HttpErrorCode::StreamInterrupted)),
+        ] {
+            let (_tx, rx) = mpsc::channel(1);
+            let mut reading = Reading::Streaming(rx);
+            assert_eq!(reading.close(terminal), Some(ending));
+            assert!(matches!(reading, Reading::Done));
+            // Done is final: a second close reports nothing.
+            assert_eq!(reading.close(terminal), None);
+            assert!(matches!(reading, Reading::Done));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_body_yields_its_terminal_frame_once() {
+        let (sender, mut body) = ChannelBody::channel(2, None, None);
+        sender.send(Bytes::from_static(b"abc")).await.expect("send");
+        sender.fail(HttpErrorCode::Cancelled);
+        assert!(body.frame().await.expect("frame").is_ok());
+        assert!(!body.is_end_stream());
+        let error = body.frame().await.expect("frame").expect_err("failure");
+        assert_eq!(error.code(), HttpErrorCode::Cancelled);
+        assert!(body.is_end_stream());
+        assert!(body.frame().await.is_none());
+
+        let (sender, mut body) = ChannelBody::channel(2, None, None);
+        drop(sender);
+        let error = body.frame().await.expect("frame").expect_err("dropped");
+        assert_eq!(error.code(), HttpErrorCode::StreamInterrupted);
+        assert!(body.frame().await.is_none());
     }
 }

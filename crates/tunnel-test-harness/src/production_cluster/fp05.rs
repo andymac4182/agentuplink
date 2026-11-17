@@ -21,6 +21,7 @@ use rustls::pki_types::{CertificateDer, ServerName};
 use std::{net::SocketAddr, panic::AssertUnwindSafe, sync::Arc, time::Duration};
 use tokio::{
     net::TcpStream,
+    sync::oneshot,
     task::JoinHandle,
     time::{Instant, sleep, sleep_until, timeout, timeout_at},
 };
@@ -831,23 +832,54 @@ struct PostRequest {
     body: Vec<u8>,
 }
 
-type ConnectionTaskSlot = Arc<tokio::sync::Mutex<Option<JoinHandle<()>>>>;
+/// The POST's HTTP connection task, owned by the POST task until it has
+/// joined it.
+///
+/// A POST task that ends without joining its connection -- it was aborted at
+/// the observer's deadline, or it panicked -- hands the connection task to
+/// the scenario as it is dropped, so the scenario's cleanup still joins it.
+/// The handle therefore has exactly one owner at every moment.
+struct ConnectionTaskSlot {
+    task: Option<JoinHandle<()>>,
+    handoff: Option<oneshot::Sender<JoinHandle<()>>>,
+}
+
+impl ConnectionTaskSlot {
+    fn new() -> (Self, oneshot::Receiver<JoinHandle<()>>) {
+        let (handoff, unjoined) = oneshot::channel();
+        (
+            Self {
+                task: None,
+                handoff: Some(handoff),
+            },
+            unjoined,
+        )
+    }
+}
+
+impl Drop for ConnectionTaskSlot {
+    fn drop(&mut self) {
+        if let (Some(task), Some(handoff)) = (self.task.take(), self.handoff.take()) {
+            let _ = handoff.send(task);
+        }
+    }
+}
 
 struct PostTask {
     task: JoinHandle<PostOutcome>,
-    connection: ConnectionTaskSlot,
+    /// The connection task the POST task did not join, if it left one.
+    connection: oneshot::Receiver<JoinHandle<()>>,
 }
 
 fn spawn_public_echo_post(request: PostRequest) -> PostTask {
-    let connection = Arc::new(tokio::sync::Mutex::new(None));
-    let task_connection = connection.clone();
-    let task = tokio::spawn(public_echo_post(request, task_connection));
+    let (slot, connection) = ConnectionTaskSlot::new();
+    let task = tokio::spawn(public_echo_post(request, slot));
     PostTask { task, connection }
 }
 
 async fn public_echo_post(
     request: PostRequest,
-    connection_slot: ConnectionTaskSlot,
+    mut connection_slot: ConnectionTaskSlot,
 ) -> PostOutcome {
     if !request.body.is_empty()
         && crate::c11_capture::record_sentinel("application_payload", &request.body).is_err()
@@ -919,16 +951,9 @@ async fn public_echo_post(
         Ok(Err(_)) => return transport_outcome(),
         Ok(Ok(value)) => value,
     };
-    let mut connection_task = tokio::spawn(async move {
+    connection_slot.task = Some(tokio::spawn(async move {
         let _ = connection.await;
-    });
-    if let Ok(mut slot) = connection_slot.try_lock() {
-        *slot = Some(connection_task);
-    } else {
-        connection_task.abort();
-        let _ = timeout(POST_CLEANUP_TIMEOUT, &mut connection_task).await;
-        return transport_outcome();
-    }
+    }));
     let uri = format!(
         "https://localhost:{}/v1/devices/{}/services/{}/echo",
         request.consumer_addr.port(),
@@ -946,7 +971,7 @@ async fn public_echo_post(
         Ok(request) => request,
         Err(_) => {
             drop(sender);
-            let joined = join_connection_slot(&connection_slot, deadline).await;
+            let joined = join_connection_slot(&mut connection_slot, deadline).await;
             return PostOutcome {
                 terminal: PostTerminal::TransportError,
                 status: None,
@@ -959,7 +984,7 @@ async fn public_echo_post(
     let response = match timeout_at(deadline, sender.send_request(http_request)).await {
         Err(_) => {
             drop(sender);
-            let joined = join_connection_slot(&connection_slot, deadline).await;
+            let joined = join_connection_slot(&mut connection_slot, deadline).await;
             return PostOutcome {
                 terminal: PostTerminal::ObserverDeadline,
                 status: None,
@@ -970,7 +995,7 @@ async fn public_echo_post(
         }
         Ok(Err(_)) => {
             drop(sender);
-            let joined = join_connection_slot(&connection_slot, deadline).await;
+            let joined = join_connection_slot(&mut connection_slot, deadline).await;
             return PostOutcome {
                 terminal: PostTerminal::TransportError,
                 status: None,
@@ -990,7 +1015,7 @@ async fn public_echo_post(
     {
         Err(_) => {
             drop(sender);
-            let joined = join_connection_slot(&connection_slot, deadline).await;
+            let joined = join_connection_slot(&mut connection_slot, deadline).await;
             return PostOutcome {
                 terminal: PostTerminal::ObserverDeadline,
                 status: Some(status),
@@ -1001,7 +1026,7 @@ async fn public_echo_post(
         }
         Ok(Err(_)) => {
             drop(sender);
-            let joined = join_connection_slot(&connection_slot, deadline).await;
+            let joined = join_connection_slot(&mut connection_slot, deadline).await;
             return PostOutcome {
                 terminal: PostTerminal::TransportError,
                 status: Some(status),
@@ -1025,7 +1050,7 @@ async fn public_echo_post(
         PostTerminal::HttpFailure
     };
     drop(sender);
-    let connection_joined = join_connection_slot(&connection_slot, deadline).await;
+    let connection_joined = join_connection_slot(&mut connection_slot, deadline).await;
     PostOutcome {
         terminal,
         status: Some(status),
@@ -1035,14 +1060,27 @@ async fn public_echo_post(
     }
 }
 
-async fn join_connection_slot(slot: &ConnectionTaskSlot, deadline: Instant) -> bool {
-    let mut guard = slot.lock().await;
-    let Some(task) = guard.as_mut() else {
+async fn join_connection_slot(slot: &mut ConnectionTaskSlot, deadline: Instant) -> bool {
+    let Some(task) = slot.task.as_mut() else {
         return true;
     };
     let joined = join_connection(task, deadline).await;
-    let _ = guard.take();
+    let _ = slot.task.take();
     joined
+}
+
+/// Join the connection task a finished POST task left unjoined, if any.
+///
+/// Called only once the POST task has ended, so the hand-off has either
+/// happened or never will.
+async fn join_unjoined_connection(
+    unjoined: &mut oneshot::Receiver<JoinHandle<()>>,
+    deadline: Instant,
+) -> bool {
+    match unjoined.try_recv() {
+        Ok(mut task) => join_connection(&mut task, deadline).await,
+        Err(_) => true,
+    }
 }
 
 async fn join_connection(task: &mut JoinHandle<()>, deadline: Instant) -> bool {
@@ -1068,15 +1106,22 @@ async fn await_post(slot: &mut Option<PostTask>) -> Result<PostOutcome> {
     .await
     {
         Ok(Ok(mut outcome)) => {
-            if !join_connection_slot(&post.connection, Instant::now() + POST_CLEANUP_TIMEOUT).await
+            if !join_unjoined_connection(
+                &mut post.connection,
+                Instant::now() + POST_CLEANUP_TIMEOUT,
+            )
+            .await
             {
                 outcome.connection_joined = false;
             }
             Ok(outcome)
         }
         Ok(Err(error)) => {
-            let connection_joined =
-                join_connection_slot(&post.connection, Instant::now() + POST_CLEANUP_TIMEOUT).await;
+            let connection_joined = join_unjoined_connection(
+                &mut post.connection,
+                Instant::now() + POST_CLEANUP_TIMEOUT,
+            )
+            .await;
             if connection_joined {
                 Err(HarnessError::Process(format!(
                     "FP-05 POST task failed: {error}"
@@ -1090,8 +1135,11 @@ async fn await_post(slot: &mut Option<PostTask>) -> Result<PostOutcome> {
         Err(_) => {
             post.task.abort();
             let _ = post.task.await;
-            let connection_joined =
-                join_connection_slot(&post.connection, Instant::now() + POST_CLEANUP_TIMEOUT).await;
+            let connection_joined = join_unjoined_connection(
+                &mut post.connection,
+                Instant::now() + POST_CLEANUP_TIMEOUT,
+            )
+            .await;
             Ok(PostOutcome {
                 terminal: PostTerminal::ObserverDeadline,
                 status: None,
@@ -1119,7 +1167,7 @@ async fn cleanup_post(slot: Option<PostTask>) -> Result<()> {
         }
     };
     let connection =
-        join_connection_slot(&post.connection, Instant::now() + POST_CLEANUP_TIMEOUT).await;
+        join_unjoined_connection(&mut post.connection, Instant::now() + POST_CLEANUP_TIMEOUT).await;
     match (outer, connection) {
         (Ok(()), true) => Ok(()),
         (Err(primary), true) => Err(primary),

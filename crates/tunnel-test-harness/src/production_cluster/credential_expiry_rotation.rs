@@ -26,14 +26,14 @@ use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
 use sha2::{Digest, Sha256};
 use std::{
     sync::{
-        Arc, Mutex,
+        Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
 use tempfile::{TempDir, tempdir};
 use tokio::{
-    sync::Notify,
+    sync::{Notify, watch},
     time::{sleep, timeout},
 };
 use tokio_tungstenite::tungstenite::Message;
@@ -112,9 +112,11 @@ struct AuthorizationScope {
 }
 
 struct AuthorizationDelayState {
-    scope: Mutex<Option<AuthorizationScope>>,
-    device_spki: Mutex<Option<String>>,
-    token_expires_at: Mutex<Option<DateTime<Utc>>>,
+    // The scenario is the only writer of the three values below; the catalog
+    // wrapper samples each on the calls it gates.
+    scope: watch::Sender<Option<AuthorizationScope>>,
+    device_spki: watch::Sender<Option<String>>,
+    token_expires_at: watch::Sender<Option<DateTime<Utc>>>,
     armed: AtomicBool,
     entered: AtomicBool,
     released: AtomicBool,
@@ -145,9 +147,9 @@ impl Default for AuthorizationDelayGate {
     fn default() -> Self {
         Self {
             state: Arc::new(AuthorizationDelayState {
-                scope: Mutex::new(None),
-                device_spki: Mutex::new(None),
-                token_expires_at: Mutex::new(None),
+                scope: watch::Sender::new(None),
+                device_spki: watch::Sender::new(None),
+                token_expires_at: watch::Sender::new(None),
                 armed: AtomicBool::new(false),
                 entered: AtomicBool::new(false),
                 released: AtomicBool::new(false),
@@ -168,16 +170,11 @@ impl Default for AuthorizationDelayGate {
 
 impl AuthorizationDelayGate {
     fn arm(&self, scope: AuthorizationScope, token_expires_at: DateTime<Utc>) -> Result<()> {
-        let mut current = self.state.scope.lock().map_err(|_| {
-            HarnessError::Process("credential-expiry authorization gate lock poisoned".into())
-        })?;
-        *current = Some(scope);
-        *self.state.device_spki.lock().map_err(|_| {
-            HarnessError::Process("credential-expiry authorization gate lock poisoned".into())
-        })? = None;
-        *self.state.token_expires_at.lock().map_err(|_| {
-            HarnessError::Process("credential-expiry authorization gate lock poisoned".into())
-        })? = Some(token_expires_at);
+        self.state.scope.send_replace(Some(scope));
+        self.state.device_spki.send_replace(None);
+        self.state
+            .token_expires_at
+            .send_replace(Some(token_expires_at));
         self.state.armed.store(true, Ordering::Release);
         self.state.entered.store(false, Ordering::Release);
         self.state.released.store(false, Ordering::Release);
@@ -191,28 +188,16 @@ impl AuthorizationDelayGate {
     }
 
     fn set_device_spki(&self, spki: &str) -> Result<()> {
-        *self.state.device_spki.lock().map_err(|_| {
-            HarnessError::Process("credential-expiry authorization gate lock poisoned".into())
-        })? = Some(spki.to_owned());
+        self.state.device_spki.send_replace(Some(spki.to_owned()));
         Ok(())
     }
 
     fn matches(&self, scope: AuthorizationScope, at: DateTime<Utc>) -> bool {
-        let scope_matches = self
-            .state
-            .scope
-            .lock()
-            .map(|current| current.as_ref() == Some(&scope))
-            .unwrap_or(false);
-        let token_window_matches = self
-            .state
-            .token_expires_at
-            .lock()
-            .ok()
-            .and_then(|expires_at| expires_at.as_ref().copied())
-            .is_some_and(|expires_at| {
-                expires_at > at && remaining_ms(expires_at, at) <= GATE_ARM_REMAINING_MS
-            });
+        let scope_matches = *self.state.scope.borrow() == Some(scope);
+        let token_expires_at = *self.state.token_expires_at.borrow();
+        let token_window_matches = token_expires_at.is_some_and(|expires_at| {
+            expires_at > at && remaining_ms(expires_at, at) <= GATE_ARM_REMAINING_MS
+        });
         !self.state.released.load(Ordering::Acquire) && scope_matches && token_window_matches
     }
 
@@ -245,18 +230,12 @@ impl AuthorizationDelayGate {
     }
 
     fn record_owner_followup(&self, tenant_id: Uuid, device_id: Uuid) {
-        let matches_scope = self.state.released.load(Ordering::Acquire)
-            && self.state.completed.load(Ordering::Acquire)
-            && self
-                .state
-                .scope
-                .lock()
-                .map(|scope| {
-                    scope.as_ref().is_some_and(|scope| {
-                        scope.tenant_id == tenant_id && scope.device_id == device_id
-                    })
-                })
-                .unwrap_or(false);
+        let matches_scope =
+            self.state.released.load(Ordering::Acquire)
+                && self.state.completed.load(Ordering::Acquire)
+                && self.state.scope.borrow().as_ref().is_some_and(|scope| {
+                    scope.tenant_id == tenant_id && scope.device_id == device_id
+                });
         if matches_scope {
             self.state
                 .owner_followup_calls
@@ -268,12 +247,7 @@ impl AuthorizationDelayGate {
     fn record_device_followup(&self, spki: &str) {
         let matches_scope = self.state.released.load(Ordering::Acquire)
             && self.state.completed.load(Ordering::Acquire)
-            && self
-                .state
-                .device_spki
-                .lock()
-                .map(|expected| expected.as_deref() == Some(spki))
-                .unwrap_or(false);
+            && self.state.device_spki.borrow().as_deref() == Some(spki);
         if matches_scope {
             self.state
                 .device_followup_calls

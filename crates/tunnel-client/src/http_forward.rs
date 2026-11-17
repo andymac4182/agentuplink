@@ -20,7 +20,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use bytes::Bytes;
 use http::{Request, Response};
@@ -127,31 +127,58 @@ pub struct DeviceHttpExchangeRecord {
 }
 
 /// Shared bounded device diagnostics.
-#[derive(Clone, Debug, Default)]
+///
+/// A published snapshot: a writer replaces the bounded ring whole, and every
+/// clone samples the latest ring.  The session actor serving these handlers
+/// is the only writer there is, but nothing here depends on that: see
+/// [`DeviceHttpDiagnostics::record`].
+#[derive(Clone, Debug)]
 pub struct DeviceHttpDiagnostics {
-    records: Arc<Mutex<VecDeque<DeviceHttpExchangeRecord>>>,
+    records: tokio::sync::watch::Sender<Arc<VecDeque<DeviceHttpExchangeRecord>>>,
+}
+
+impl Default for DeviceHttpDiagnostics {
+    fn default() -> Self {
+        Self {
+            records: tokio::sync::watch::Sender::new(Arc::default()),
+        }
+    }
 }
 
 impl DeviceHttpDiagnostics {
+    /// Append one record, dropping the oldest past the bound.
+    ///
+    /// The next ring is built from the ring this call read, off to the side,
+    /// and is installed only if that ring is still the published one -- one
+    /// pointer comparison and one pointer store.  If another writer got in
+    /// between, nothing is overwritten: the ring is rebuilt from what that
+    /// writer published.  So no record is lost however many handles write,
+    /// and no writer ever waits for another; with the one writer there is
+    /// today, the first attempt always lands.
     pub(crate) fn record(&self, record: DeviceHttpExchangeRecord) {
-        let mut records = self
-            .records
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if records.len() >= MAX_DEVICE_HTTP_RECORDS {
-            records.pop_front();
+        loop {
+            let seen = Arc::clone(&self.records.borrow());
+            let mut next = VecDeque::with_capacity(seen.len().min(MAX_DEVICE_HTTP_RECORDS) + 1);
+            let keep = seen.len().min(MAX_DEVICE_HTTP_RECORDS.saturating_sub(1));
+            next.extend(seen.iter().skip(seen.len() - keep).cloned());
+            next.push_back(record.clone());
+            let next = Arc::new(next);
+            let installed = self.records.send_if_modified(|published| {
+                let current = Arc::ptr_eq(published, &seen);
+                if current {
+                    *published = Arc::clone(&next);
+                }
+                current
+            });
+            if installed {
+                return;
+            }
         }
-        records.push_back(record);
     }
 
     #[must_use]
     pub fn snapshot(&self) -> Vec<DeviceHttpExchangeRecord> {
-        self.records
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .iter()
-            .cloned()
-            .collect()
+        self.records.borrow().iter().cloned().collect()
     }
 }
 
@@ -700,7 +727,7 @@ mod stranded_reply_tests {
     //! is gone must end with the typed closed outcome, not wait forever.
 
     use std::future::Future;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
     use std::time::Duration;
 
     use tokio::sync::mpsc;
@@ -718,28 +745,33 @@ mod stranded_reply_tests {
     #[derive(Clone)]
     struct StrandingSink {
         tx: mpsc::Sender<HttpActorRequest>,
-        owner: Arc<Mutex<Option<mpsc::Receiver<HttpActorRequest>>>>,
+        /// Tells the owner task, which holds the receiver, to end.
+        end_owner: Arc<tokio::sync::Notify>,
     }
 
     impl StrandingSink {
         fn new() -> Self {
             let (tx, rx) = mpsc::channel(4);
-            Self {
-                tx,
-                owner: Arc::new(Mutex::new(Some(rx))),
-            }
+            let end_owner = Arc::new(tokio::sync::Notify::new());
+            let ended = Arc::clone(&end_owner);
+            tokio::spawn(async move {
+                ended.notified().await;
+                drop(rx);
+            });
+            Self { tx, end_owner }
         }
     }
 
     impl ActorSink for StrandingSink {
         fn send(&self, request: HttpActorRequest) -> impl Future<Output = bool> + Send {
             let tx = self.tx.clone();
-            let owner = Arc::clone(&self.owner);
+            let end_owner = Arc::clone(&self.end_owner);
             async move {
                 let Ok(permit) = tx.reserve().await else {
                     return false;
                 };
-                drop(owner.lock().expect("owner slot").take());
+                end_owner.notify_one();
+                tx.closed().await;
                 permit.send(request);
                 true
             }

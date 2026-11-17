@@ -1,12 +1,13 @@
 use crate::error::{HarnessError, Result};
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tempfile::TempDir;
 use tokio::io::AsyncReadExt;
 use tokio::process::{Child, Command};
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, timeout, timeout_at};
 
@@ -55,8 +56,11 @@ pub struct ManagedProcess {
     pid: Option<u32>,
     child: Child,
     output_dir: TempDir,
-    stdout: Arc<Mutex<Vec<u8>>>,
-    stderr: Arc<Mutex<Vec<u8>>>,
+    // Each stream's bounded capture has exactly one writer, its drain task,
+    // which publishes the bytes read so far; the process handle only samples
+    // the latest published capture.
+    stdout: watch::Receiver<Vec<u8>>,
+    stderr: watch::Receiver<Vec<u8>>,
     stdout_overflow: Arc<AtomicBool>,
     stderr_overflow: Arc<AtomicBool>,
     stdout_read_error: Arc<AtomicBool>,
@@ -108,21 +112,21 @@ impl ManagedProcess {
                 spec.program.display()
             ))
         })?;
-        let stdout = Arc::new(Mutex::new(Vec::new()));
-        let stderr = Arc::new(Mutex::new(Vec::new()));
+        let (stdout_capture, stdout) = watch::channel(Vec::new());
+        let (stderr_capture, stderr) = watch::channel(Vec::new());
         let stdout_overflow = Arc::new(AtomicBool::new(false));
         let stderr_overflow = Arc::new(AtomicBool::new(false));
         let stdout_read_error = Arc::new(AtomicBool::new(false));
         let stderr_read_error = Arc::new(AtomicBool::new(false));
         let stdout_task = spawn_drain(
             child.stdout.take(),
-            Arc::clone(&stdout),
+            stdout_capture,
             Arc::clone(&stdout_overflow),
             Arc::clone(&stdout_read_error),
         );
         let stderr_task = spawn_drain(
             child.stderr.take(),
-            Arc::clone(&stderr),
+            stderr_capture,
             Arc::clone(&stderr_overflow),
             Arc::clone(&stderr_read_error),
         );
@@ -188,17 +192,11 @@ impl ManagedProcess {
     }
 
     pub fn stdout(&self) -> Vec<u8> {
-        self.stdout
-            .lock()
-            .map(|output| output.clone())
-            .unwrap_or_default()
+        self.stdout.borrow().clone()
     }
 
     pub fn stderr(&self) -> Vec<u8> {
-        self.stderr
-            .lock()
-            .map(|output| output.clone())
-            .unwrap_or_default()
+        self.stderr.borrow().clone()
     }
 
     pub fn try_wait(&mut self) -> Result<Option<std::process::ExitStatus>> {
@@ -397,7 +395,7 @@ impl Drop for ManagedProcess {
 
 fn spawn_drain(
     reader: Option<impl tokio::io::AsyncRead + Unpin + Send + 'static>,
-    output: Arc<Mutex<Vec<u8>>>,
+    output: watch::Sender<Vec<u8>>,
     overflow: Arc<AtomicBool>,
     read_error: Arc<AtomicBool>,
 ) -> Option<JoinHandle<()>> {
@@ -412,22 +410,22 @@ fn spawn_drain(
                         break;
                     }
                     Ok(read) => {
-                        if let Ok(mut output) = output.lock() {
-                            // Keep diagnostics bounded even if a broken child
-                            // floods stderr while the test is failing.
-                            const MAX_CAPTURE: usize = 1024 * 1024;
+                        // Keep diagnostics bounded even if a broken child
+                        // floods stderr while the test is failing.
+                        const MAX_CAPTURE: usize = 1024 * 1024;
+                        let mut accepted = 0;
+                        // This drain task is the capture's only writer.
+                        output.send_modify(|output| {
                             let remaining = MAX_CAPTURE.saturating_sub(output.len());
-                            let accepted = read.min(remaining);
+                            accepted = read.min(remaining);
                             output.extend_from_slice(&buffer[..accepted]);
-                            if accepted != read {
-                                // Keep draining after the exact bound. The
-                                // first extra byte marks overflow while the
-                                // remaining bytes are discarded, preventing a
-                                // still-running child from blocking on a full pipe.
-                                overflow.store(true, Ordering::Release);
-                            }
-                        } else {
-                            read_error.store(true, Ordering::Release);
+                        });
+                        if accepted != read {
+                            // Keep draining after the exact bound. The
+                            // first extra byte marks overflow while the
+                            // remaining bytes are discarded, preventing a
+                            // still-running child from blocking on a full pipe.
+                            overflow.store(true, Ordering::Release);
                         }
                     }
                 }

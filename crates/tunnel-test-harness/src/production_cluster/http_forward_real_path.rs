@@ -20,7 +20,7 @@
 use std::collections::BTreeSet;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -49,6 +49,7 @@ use tunnel_relay::{
     HttpForwardExport, HttpForwardExports, PEER_HOP_WINDOW_BYTES, PEER_HOP_WINDOW_RECORDS,
 };
 
+use super::append_log::AppendLog;
 use super::{
     CLEANUP_TIMEOUT, ProductionCluster, RunningHarness, SCENARIO_TIMEOUT, STARTUP_TIMEOUT,
     finish_scenario_with_cleanup, push_cleanup_error,
@@ -579,12 +580,16 @@ pub(super) fn synthetic_chunk(offset: usize, len: usize) -> Bytes {
 #[derive(Default)]
 struct HandlerState {
     invocations: AtomicUsize,
-    headers: Mutex<Vec<(String, String)>>,
+    /// Every header of every request the handler saw, in arrival order.
+    headers: AppendLog<(String, String)>,
     received: AtomicU64,
-    digest: Mutex<Option<[u8; 32]>>,
+    /// The digest of each `/echo` request body the handler read to its end;
+    /// the last one is the one the gate compares.
+    digests: AppendLog<[u8; 32]>,
     events_started: Notify,
     events_started_flag: AtomicBool,
-    cancellation: Mutex<Option<Instant>>,
+    /// When the first `/events` handler cancellation was observed.
+    cancellation: OnceLock<Instant>,
     cancelled: Notify,
     /// Every `/events` handler cancellation observed, for M7-C85's loop.
     cancellations: AtomicU64,
@@ -614,17 +619,11 @@ fn handler(state: Arc<HandlerState>) -> Arc<dyn HttpHandler> {
             let state = Arc::clone(&state);
             Box::pin(async move {
                 state.invocations.fetch_add(1, Ordering::SeqCst);
-                {
-                    let mut headers = state
-                        .headers
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    for (name, value) in request.headers() {
-                        headers.push((
-                            name.as_str().to_owned(),
-                            String::from_utf8_lossy(value.as_bytes()).into_owned(),
-                        ));
-                    }
+                for (name, value) in request.headers() {
+                    state.headers.push((
+                        name.as_str().to_owned(),
+                        String::from_utf8_lossy(value.as_bytes()).into_owned(),
+                    ));
                 }
                 let cancellation = request.extensions().get::<HandlerCancellation>().cloned();
                 match request.uri().path() {
@@ -646,11 +645,7 @@ fn handler(state: Arc<HandlerState>) -> Arc<dyn HttpHandler> {
                                     }
                                 }
                             }
-                            *state
-                                .digest
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                                Some(hasher.finalize().into());
+                            state.digests.push(hasher.finalize().into());
                         });
                         http::Response::builder()
                             .status(200)
@@ -667,11 +662,7 @@ fn handler(state: Arc<HandlerState>) -> Arc<dyn HttpHandler> {
                             state.events_started.notify_waiters();
                             if let Some(HandlerCancellation(token)) = cancellation {
                                 token.cancelled().await;
-                                state
-                                    .cancellation
-                                    .lock()
-                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                    .get_or_insert_with(Instant::now);
+                                state.cancellation.get_or_init(Instant::now);
                                 state.cancellations.fetch_add(1, Ordering::SeqCst);
                                 state.cancelled.notify_waiters();
                             }
@@ -1238,11 +1229,7 @@ async fn exercise(
         let observed = timeout(CANCELLATION_LATENCY_BOUND * 2, async {
             loop {
                 let notified = state.cancelled.notified();
-                if let Some(at) = *state
-                    .cancellation
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                {
+                if let Some(at) = state.cancellation.get().copied() {
                     return at;
                 }
                 notified.await;
@@ -1348,20 +1335,12 @@ async fn exercise(
     let echo_digest: [u8; 32] = hasher.finalize().into();
     evidence.echo_digest_matches_upload = echo_digest == upload_digest;
     evidence.handler_received_bytes = state.received.load(Ordering::SeqCst);
-    evidence.handler_digest_matches_upload = *state
-        .digest
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        == Some(upload_digest);
+    evidence.handler_digest_matches_upload = state.digests.last() == Some(&upload_digest);
     drop(echo_sender);
     echo_task.abort();
 
     // (d) Headers.
-    let handler_headers = state
-        .headers
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .clone();
+    let handler_headers = state.headers.snapshot();
     let (forbidden, value_leak) = header_leaks(&handler_headers, &secrets, &private_addresses);
     evidence.handler_saw_forbidden_header = forbidden;
     evidence.handler_header_value_leak = value_leak;

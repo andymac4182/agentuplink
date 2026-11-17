@@ -33,7 +33,7 @@ use std::{
     path::{Path, PathBuf},
     pin::Pin,
     sync::{
-        Arc, Mutex,
+        Arc, OnceLock,
         atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant},
@@ -289,6 +289,7 @@ mod timing_boundaries;
 pub use timing_boundaries::{
     TimingBoundaryEvidence, validate_timing_boundary_evidence, verify as verify_timing_boundaries,
 };
+mod append_log;
 mod udp_proxy;
 use udp_proxy::UdpFaultProxy;
 mod chaos;
@@ -1548,7 +1549,7 @@ struct ProductionCluster {
     /// First error the re-signer hit, if any.  A re-signer that died silently
     /// would turn into flakiness in whatever gate relied on it, so the failure
     /// is kept and surfaced instead of logged and forgotten.
-    membership_resign_error: Arc<Mutex<Option<String>>>,
+    membership_resign_error: Arc<OnceLock<String>>,
 }
 
 /// Startup-captured inputs for the membership re-signer.
@@ -2700,7 +2701,7 @@ impl ProductionCluster {
             membership_resign_inputs: resign_inputs,
             membership_resign_cancel: CancellationToken::new(),
             membership_resign: None,
-            membership_resign_error: Arc::new(Mutex::new(None)),
+            membership_resign_error: Arc::new(OnceLock::new()),
         };
         if let Err(error) = cluster.wait_for_peer_readiness(STARTUP_TIMEOUT).await {
             let cleanup_deadline = tokio::time::Instant::now() + CLEANUP_TIMEOUT;
@@ -5245,10 +5246,7 @@ impl ProductionCluster {
 
     /// The first error the membership re-signer hit, if it hit one.
     fn membership_resign_failure(&self) -> Option<String> {
-        self.membership_resign_error
-            .lock()
-            .ok()
-            .and_then(|guard| guard.clone())
+        self.membership_resign_error.get().cloned()
     }
 
     fn republish_peer_pins(&self) -> Result<()> {
@@ -5752,18 +5750,20 @@ async fn start_relay(
     let pin_updates = pins.clone();
     let pin_publication_pending = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let pending = Arc::clone(&pin_publication_pending);
-    membership.set_invalidation_callback(Some(Arc::new(move |_identity, _reason| {
-        if let Err(error) = publish_verified_pins(&pin_membership, &pin_updates) {
-            tracing::warn!(
-                ?error,
-                "production membership pin publication failed closed"
-            );
-            let _ = pin_updates.replace(std::iter::empty::<SpkiSha256>());
-            pending.store(true, std::sync::atomic::Ordering::SeqCst);
-        } else {
-            pending.store(false, std::sync::atomic::Ordering::SeqCst);
-        }
-    })));
+    membership
+        .set_invalidation_callback(Some(Arc::new(move |_identity, _reason| {
+            if let Err(error) = publish_verified_pins(&pin_membership, &pin_updates) {
+                tracing::warn!(
+                    ?error,
+                    "production membership pin publication failed closed"
+                );
+                let _ = pin_updates.replace(std::iter::empty::<SpkiSha256>());
+                pending.store(true, std::sync::atomic::Ordering::SeqCst);
+            } else {
+                pending.store(false, std::sync::atomic::Ordering::SeqCst);
+            }
+        })))
+        .await;
 
     // These are the listeners the gate-6 driver of `verify-m4-fs-client-e2e`
     // dials, and it dials them by loopback address: every endpoint in its plan
@@ -5968,6 +5968,7 @@ async fn start_relay(
     }
     if let Err(error) = peer_readiness
         .replace_required_routes(required_peer_routes(&membership, &node.node_id))
+        .await
         .map_err(|error| HarnessError::Process(format!("peer readiness routes: {error}")))
     {
         let cleanup = shutdown_membership_until(membership_handle, startup_cleanup_deadline).await;
@@ -6480,15 +6481,12 @@ async fn membership_resign_loop<P: MembershipSink>(
     inputs: MembershipResignInputs,
     publisher: P,
     interval: Duration,
-    failure: Arc<Mutex<Option<String>>>,
+    failure: Arc<OnceLock<String>>,
     shutdown: CancellationToken,
 ) {
+    // Set once: the first failure is the one kept.
     let record_failure = |message: String| {
-        if let Ok(mut guard) = failure.lock()
-            && guard.is_none()
-        {
-            *guard = Some(message);
-        }
+        let _ = failure.set(message);
     };
     let mut ticker = tokio::time::interval(interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -6600,17 +6598,17 @@ async fn peer_refresh_loop(
                 if pins.snapshot().is_empty() {
                     // No approved peer key material is published, so there is
                     // no trust evidence to admit any peer.
-                    peer.withdraw_peer_trust();
+                    peer.withdraw_peer_trust().await;
                     continue;
                 }
                 if !matches!(membership.readiness(), MembershipReadiness::Ready) {
                     // Readiness and admission fail closed, but the verified
                     // route and pin set stays installed so an authenticated
                     // peer's bounded reachability probe is still answered.
-                    peer.withdraw_peer_readiness();
+                    peer.withdraw_peer_readiness().await;
                     continue;
                 }
-                peer.set_peer_capacity(configured_capacity);
+                peer.set_peer_capacity(configured_capacity).await;
                 let targets = required_peer_routes(&membership, &local_node_id);
                 tokio::select! {
                     _ = shutdown.cancelled() => break,
@@ -8536,65 +8534,155 @@ mod resign_loop_tests {
     use std::collections::BTreeMap;
     use std::future::Future;
     use std::sync::{
-        Arc, Mutex,
+        Arc, OnceLock,
         atomic::{AtomicU64, AtomicUsize, Ordering},
     };
     use std::time::Duration;
+    use tokio::sync::{mpsc, oneshot};
     use tokio_util::sync::CancellationToken;
     use tunnel_catalog::CatalogError;
 
     const NODES: [&str; 3] = ["relay-a", "relay-b", "relay-c"];
     const INTERVAL: Duration = Duration::from_secs(15);
 
+    /// How many directory commands may wait.  The re-signer publishes one
+    /// record at a time and the test asks one question at a time, so the
+    /// queue never holds more than two; a full queue makes the sender wait.
+    const DIRECTORY_QUEUE: usize = 8;
+
+    enum DirectoryCommand {
+        Publish {
+            node_id: String,
+            version: u64,
+            bytes: Vec<u8>,
+            reply: oneshot::Sender<Result<(), CatalogError>>,
+        },
+        Versions {
+            reply: oneshot::Sender<Vec<u64>>,
+        },
+    }
+
     /// A membership directory with the publish script's rules: a newer
     /// version replaces, the same version with the same bytes is idempotent,
     /// the same version with different bytes is a conflict, and an older one
     /// is stale.  `lost_replies` publishes commit and then report the timeout
     /// a caller sees when the reply is lost (a paused Redis socket).
-    #[derive(Default)]
+    ///
+    /// The records are owned by one task, which applies each publish whole,
+    /// as the directory's script does.
+    #[derive(Clone)]
     struct ScriptedDirectory {
-        records: Mutex<BTreeMap<String, (u64, Vec<u8>)>>,
-        lost_replies: AtomicUsize,
-        refused: AtomicUsize,
+        commands: mpsc::Sender<DirectoryCommand>,
+        lost_replies: Arc<AtomicUsize>,
+        refused: Arc<AtomicUsize>,
     }
 
-    impl MembershipSink for Arc<ScriptedDirectory> {
+    impl ScriptedDirectory {
+        fn start() -> Self {
+            let (commands, mut queue) = mpsc::channel(DIRECTORY_QUEUE);
+            let lost_replies = Arc::new(AtomicUsize::new(0));
+            let refused = Arc::new(AtomicUsize::new(0));
+            let directory = Self {
+                commands,
+                lost_replies: Arc::clone(&lost_replies),
+                refused: Arc::clone(&refused),
+            };
+            tokio::spawn(async move {
+                let mut records = BTreeMap::<String, (u64, Vec<u8>)>::new();
+                while let Some(command) = queue.recv().await {
+                    match command {
+                        DirectoryCommand::Publish {
+                            node_id,
+                            version,
+                            bytes,
+                            reply,
+                        } => {
+                            let outcome = publish_scripted(
+                                &mut records,
+                                &lost_replies,
+                                &refused,
+                                node_id,
+                                version,
+                                bytes,
+                            );
+                            let _ = reply.send(outcome);
+                        }
+                        DirectoryCommand::Versions { reply } => {
+                            let _ = reply.send(
+                                NODES
+                                    .iter()
+                                    .map(|node| {
+                                        records.get(*node).map_or(0, |(version, _)| *version)
+                                    })
+                                    .collect(),
+                            );
+                        }
+                    }
+                }
+            });
+            directory
+        }
+    }
+
+    fn publish_scripted(
+        records: &mut BTreeMap<String, (u64, Vec<u8>)>,
+        lost_replies: &AtomicUsize,
+        refused: &AtomicUsize,
+        node_id: String,
+        version: u64,
+        bytes: Vec<u8>,
+    ) -> Result<(), CatalogError> {
+        if let Some((held_version, held_bytes)) = records.get(&node_id) {
+            if *held_version > version {
+                refused.fetch_add(1, Ordering::Relaxed);
+                return Err(CatalogError::Conflict("signed membership version"));
+            }
+            if *held_version == version {
+                if *held_bytes == bytes {
+                    return Ok(());
+                }
+                refused.fetch_add(1, Ordering::Relaxed);
+                return Err(CatalogError::Conflict("signed membership contents"));
+            }
+        }
+        records.insert(node_id, (version, bytes));
+        if lost_replies
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |left| {
+                left.checked_sub(1)
+            })
+            .is_ok()
+        {
+            // Committed, but the caller never learns it.
+            return Err(CatalogError::WriteOutcomeUnknown(
+                tunnel_catalog::UnknownWriteCause::ReplyTimeout,
+            ));
+        }
+        Ok(())
+    }
+
+    impl MembershipSink for ScriptedDirectory {
         fn publish(
             &self,
             node_id: &str,
             record: &CatalogSignedMembershipRecord,
         ) -> impl Future<Output = Result<(), CatalogError>> + Send {
-            let outcome = (|| {
-                let mut records = self.records.lock().expect("directory lock");
-                if let Some((version, bytes)) = records.get(node_id) {
-                    if *version > record.version {
-                        self.refused.fetch_add(1, Ordering::Relaxed);
-                        return Err(CatalogError::Conflict("signed membership version"));
-                    }
-                    if *version == record.version {
-                        if *bytes == record.bytes {
-                            return Ok(());
-                        }
-                        self.refused.fetch_add(1, Ordering::Relaxed);
-                        return Err(CatalogError::Conflict("signed membership contents"));
-                    }
-                }
-                records.insert(node_id.to_owned(), (record.version, record.bytes.clone()));
-                if self
-                    .lost_replies
-                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |left| {
-                        left.checked_sub(1)
+            let commands = self.commands.clone();
+            let node_id = node_id.to_owned();
+            let version = record.version;
+            let bytes = record.bytes.clone();
+            async move {
+                let (reply, outcome) = oneshot::channel();
+                commands
+                    .send(DirectoryCommand::Publish {
+                        node_id,
+                        version,
+                        bytes,
+                        reply,
                     })
-                    .is_ok()
-                {
-                    // Committed, but the caller never learns it.
-                    return Err(CatalogError::WriteOutcomeUnknown(
-                        tunnel_catalog::UnknownWriteCause::ReplyTimeout,
-                    ));
-                }
-                Ok(())
-            })();
-            std::future::ready(outcome)
+                    .await
+                    .expect("scripted directory is running");
+                outcome.await.expect("scripted directory answers")
+            }
         }
     }
 
@@ -8633,12 +8721,14 @@ mod resign_loop_tests {
         })
     }
 
-    fn versions(directory: &ScriptedDirectory) -> Vec<u64> {
-        let records = directory.records.lock().expect("directory lock");
-        NODES
-            .iter()
-            .map(|node| records.get(*node).map_or(0, |(version, _)| *version))
-            .collect()
+    async fn versions(directory: &ScriptedDirectory) -> Vec<u64> {
+        let (reply, versions) = oneshot::channel();
+        directory
+            .commands
+            .send(DirectoryCommand::Versions { reply })
+            .await
+            .expect("scripted directory is running");
+        versions.await.expect("scripted directory answers")
     }
 
     /// The first scheduled publish commits but its reply is lost, as a
@@ -8649,14 +8739,14 @@ mod resign_loop_tests {
     /// write and `relay-b`/`relay-c` were never refreshed until they lapsed.
     #[tokio::test(start_paused = true)]
     async fn a_committed_publish_with_a_lost_reply_never_stalls_the_resigner() {
-        let directory = Arc::new(ScriptedDirectory::default());
+        let directory = ScriptedDirectory::start();
         directory.lost_replies.store(1, Ordering::Release);
-        let failure = Arc::new(Mutex::new(None));
+        let failure = Arc::new(OnceLock::new());
         let shutdown = CancellationToken::new();
         let task = tokio::spawn(membership_resign_loop(
             authority(),
             inputs(),
-            Arc::clone(&directory),
+            directory.clone(),
             INTERVAL,
             Arc::clone(&failure),
             shutdown.clone(),
@@ -8669,7 +8759,7 @@ mod resign_loop_tests {
         // Past the quick retry: every node now holds a record, and the retry
         // used a newer version than the committed lost write.
         tokio::time::sleep(Duration::from_secs(2)).await;
-        let after_retry = versions(&directory);
+        let after_retry = versions(&directory).await;
         assert!(
             after_retry.iter().all(|version| *version > 2),
             "the retry must publish every node with a version newer than the lost write: \
@@ -8680,7 +8770,7 @@ mod resign_loop_tests {
         let mut previous = after_retry;
         for round in 0..3 {
             tokio::time::sleep(INTERVAL).await;
-            let current = versions(&directory);
+            let current = versions(&directory).await;
             assert!(
                 current
                     .iter()
@@ -8698,6 +8788,6 @@ mod resign_loop_tests {
             0,
             "no publish may be refused as a same-version conflict or a stale version"
         );
-        assert_eq!(*failure.lock().expect("failure lock"), None);
+        assert_eq!(failure.get(), None);
     }
 }

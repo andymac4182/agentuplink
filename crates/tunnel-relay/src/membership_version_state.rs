@@ -15,7 +15,7 @@ use std::{
     fs::{self, File, Metadata, OpenOptions, TryLockError},
     io::{self, Read, Write},
     path::{Component, Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{Arc, mpsc},
 };
 
 use serde::{Deserialize, Serialize};
@@ -138,16 +138,46 @@ impl Error for MembershipVersionStateStoreError {}
 /// `open` requires an existing valid file.  A new deployment must call
 /// `bootstrap` explicitly; it creates an empty fence only when the target did
 /// not already exist.  Callers should serialize writes through one store
-/// instance (clones share an internal writer lock); each write is still
-/// committed with a temporary file, fsync, and atomic rename.  The configured
+/// instance: clones share one writer thread that owns the write path and
+/// applies each save whole, in arrival order, so two writes never interleave.
+/// Each write is still committed with a temporary file, fsync, and atomic
+/// rename, and a save returns only after that thread reports the outcome.
+/// The configured
 /// parent directory must be an existing owner-only (`0700`) directory with no
 /// symlink components.
 #[derive(Clone, Debug)]
 pub struct MembershipVersionStateStore {
+    file: MembershipFenceFile,
+    _lock: Arc<File>,
+    writer: mpsc::SyncSender<SaveRequest>,
+}
+
+/// Saves queued for the writer thread.  The queue is bounded: a caller
+/// whose save does not fit blocks until it does, as it blocks for the
+/// outcome.
+const WRITER_QUEUE: usize = 16;
+
+/// One save and where its outcome goes.
+struct SaveRequest {
+    state: MembershipVersionState,
+    outcome: mpsc::SyncSender<Result<(), MembershipVersionStateStoreError>>,
+}
+
+/// The fence file itself: its path and the identity it is bound to.
+#[derive(Clone, Debug)]
+struct MembershipFenceFile {
     path: PathBuf,
     identity: MembershipVersionStateIdentity,
-    _lock: Arc<File>,
-    writer: Arc<Mutex<()>>,
+}
+
+/// The writer thread: it alone runs the read-compare-replace of a save, one
+/// request at a time.  It reports an outcome only after the replacement is
+/// durable (or refused), and ends when the last store clone is dropped.
+fn run_writer(file: MembershipFenceFile, requests: mpsc::Receiver<SaveRequest>) {
+    for SaveRequest { state, outcome } in requests {
+        // A caller that stopped waiting still has its save applied whole.
+        let _ = outcome.send(file.save(&state));
+    }
 }
 
 impl MembershipVersionStateStore {
@@ -174,25 +204,22 @@ impl MembershipVersionStateStore {
         identity: MembershipVersionStateIdentity,
     ) -> Result<Self, MembershipVersionStateStoreError> {
         let store = Self::new(path, identity)?;
-        let envelope = PersistedMembershipVersionState::empty(&store.identity);
+        let envelope = PersistedMembershipVersionState::empty(&store.file.identity);
         let bytes = encode_envelope(&envelope)?;
-        store.create_initial(&bytes)?;
+        store.file.create_initial(&bytes)?;
         Ok(store)
     }
 
     /// Return the configured state path for operator diagnostics.
     #[must_use]
     pub fn path(&self) -> &Path {
-        &self.path
+        &self.file.path
     }
 
     /// Load the current high-water state after revalidating its identity and
     /// file restrictions.
     pub fn load(&self) -> Result<MembershipVersionState, MembershipVersionStateStoreError> {
-        let bytes = read_bounded_file(&self.path)?;
-        let envelope = decode_envelope(&bytes)?;
-        self.validate_envelope(&envelope)?;
-        Ok(envelope.state)
+        self.file.load()
     }
 
     /// Persist a state whose fences are at least as high as the current file.
@@ -201,14 +228,66 @@ impl MembershipVersionStateStore {
     /// durable fence.  The state is encoded canonically, written to a
     /// same-directory mode-0600 temporary file, synced, atomically renamed,
     /// and followed by a parent-directory sync on Unix.
+    ///
+    /// The save is handed to the store's writer thread and this call blocks
+    /// the calling thread until that thread reports the durable outcome.  It
+    /// performs file I/O either way, so call it from a blocking context
+    /// (`spawn_blocking` or a synchronous command), never from an
+    /// asynchronous task's worker thread.
     pub fn save(
         &self,
         state: &MembershipVersionState,
     ) -> Result<(), MembershipVersionStateStoreError> {
-        let _writer = self
-            .writer
-            .lock()
+        let (outcome, durable) = mpsc::sync_channel(1);
+        self.writer
+            .send(SaveRequest {
+                state: state.clone(),
+                outcome,
+            })
             .map_err(|_| MembershipVersionStateStoreError::Io)?;
+        durable
+            .recv()
+            .map_err(|_| MembershipVersionStateStoreError::Io)?
+    }
+
+    fn new(
+        path: impl Into<PathBuf>,
+        identity: MembershipVersionStateIdentity,
+    ) -> Result<Self, MembershipVersionStateStoreError> {
+        let path = path.into();
+        validate_path(&path)?;
+        validate_identifier(&identity.deployment_id)?;
+        validate_identifier(&identity.deployment_incarnation)?;
+        validate_identifier(&identity.node_id)?;
+        let lock = Arc::new(open_lock_file(&lock_path(&path)?)?);
+        let file = MembershipFenceFile { path, identity };
+        let (writer, requests) = mpsc::sync_channel(WRITER_QUEUE);
+        let writer_file = file.clone();
+        std::thread::Builder::new()
+            .name("membership-fence-writer".to_owned())
+            .spawn(move || run_writer(writer_file, requests))
+            .map_err(|_| MembershipVersionStateStoreError::Io)?;
+        Ok(Self {
+            file,
+            _lock: lock,
+            writer,
+        })
+    }
+}
+
+impl MembershipFenceFile {
+    /// Load the current high-water state after revalidating its identity and
+    /// file restrictions.
+    fn load(&self) -> Result<MembershipVersionState, MembershipVersionStateStoreError> {
+        let bytes = read_bounded_file(&self.path)?;
+        let envelope = decode_envelope(&bytes)?;
+        self.validate_envelope(&envelope)?;
+        Ok(envelope.state)
+    }
+
+    /// The whole save: validate, compare against the durable fence, replace.
+    /// Only the writer thread runs it.
+    fn save(&self, state: &MembershipVersionState) -> Result<(), MembershipVersionStateStoreError> {
         validate_state(state)?;
         let current = self.load()?;
         if state_rolls_back(&current, state) {
@@ -223,24 +302,6 @@ impl MembershipVersionStateStore {
         };
         let bytes = encode_envelope(&envelope)?;
         self.replace_atomically(&bytes)
-    }
-
-    fn new(
-        path: impl Into<PathBuf>,
-        identity: MembershipVersionStateIdentity,
-    ) -> Result<Self, MembershipVersionStateStoreError> {
-        let path = path.into();
-        validate_path(&path)?;
-        validate_identifier(&identity.deployment_id)?;
-        validate_identifier(&identity.deployment_incarnation)?;
-        validate_identifier(&identity.node_id)?;
-        let lock = Arc::new(open_lock_file(&lock_path(&path)?)?);
-        Ok(Self {
-            path,
-            identity,
-            _lock: lock,
-            writer: Arc::new(Mutex::new(())),
-        })
     }
 
     fn validate_envelope(
