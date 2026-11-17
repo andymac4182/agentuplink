@@ -52,8 +52,8 @@ use crate::health::Health;
 
 /// The device-side state a restart must invalidate.
 ///
-/// A trait rather than the registries themselves, because the registries live
-/// behind the device's own locks and this crate must not own them — and
+/// A trait rather than the registries themselves, because the registries are
+/// owned by the device's own task and this crate must not own them — and
 /// because `std::env::set_var` is `unsafe` since the 2024 edition, so every
 /// predicate this crate needs is injected rather than reached for.
 ///
@@ -61,10 +61,26 @@ use crate::health::Health;
 /// [`tunnel_cua::supervision::invalidate`] over both registries and report
 /// what it freed. It is **not** a hook with a choice in it: there is no
 /// correct implementation that keeps a lease.
+///
+/// # What the returned future must mean
+///
+/// The registries' owner is a task, so invalidating is a request to it. Two
+/// things are required of an implementation, and [`Supervisor::stop`] relies
+/// on both:
+///
+/// * **No input is planned between the request and its effect.** Everything
+///   that plans an input operation must go through the same owner, in request
+///   order, so an operation planned after this request is planned against
+///   registries it has already emptied.
+/// * **The future resolves only once the invalidation has been applied**, and
+///   a request already made is applied even if the future is dropped.
 pub trait InputAuthority {
     /// Drop every input lease and forget every capture identity, stamping the
     /// new generation, and report what was freed.
-    fn invalidate(&self, generation: BackendGeneration) -> Invalidation;
+    fn invalidate(
+        &self,
+        generation: BackendGeneration,
+    ) -> impl core::future::Future<Output = Invalidation> + Send;
 }
 
 /// A [`LifecycleEpoch`] a dispatcher can read while the supervisor owning it
@@ -336,7 +352,15 @@ impl Supervisor {
     /// backend that died on its own, and a supervisor that only invalidated
     /// on the paths it drove would leave exactly the crashed-backend case
     /// uncovered.
-    pub async fn stop(&mut self, authority: &(dyn InputAuthority + Sync)) -> Invalidation {
+    ///
+    /// **It returns only after the invalidation has taken effect**: the
+    /// authority's future is awaited to completion, so by the time a caller
+    /// (or [`Supervisor::restart`]) goes on to start a replacement, no lease
+    /// or capture identity from the stopped backend is left to present to it.
+    pub async fn stop<A>(&mut self, authority: &A) -> Invalidation
+    where
+        A: InputAuthority + Sync + ?Sized,
+    {
         // **Before the kill, and unconditionally.** Every exchange that could
         // see this backend's socket die must be guaranteed to read a changed
         // epoch afterwards, and an exchange racing us reads its "after" value
@@ -357,7 +381,7 @@ impl Supervisor {
             running.child.kill();
             running.child.wait_exited().await;
         }
-        authority.invalidate(self.generation)
+        authority.invalidate(self.generation).await
     }
 
     /// Stop, then start again, invalidating in between.
@@ -371,10 +395,13 @@ impl Supervisor {
     /// Any [`StartError`] the new start produces. The invalidation has
     /// already happened when it does, and is returned alongside, because a
     /// failed restart leaves *more* to invalidate rather than less.
-    pub async fn restart(
+    pub async fn restart<A>(
         &mut self,
-        authority: &(dyn InputAuthority + Sync),
-    ) -> (Invalidation, Result<BackendEndpoint, StartError>) {
+        authority: &A,
+    ) -> (Invalidation, Result<BackendEndpoint, StartError>)
+    where
+        A: InputAuthority + Sync + ?Sized,
+    {
         let invalidation = self.stop(authority).await;
         let started = self.start().await;
         (invalidation, started)

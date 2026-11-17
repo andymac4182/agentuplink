@@ -105,7 +105,10 @@ async fn a_drag_records_the_start_of_its_path_through_the_display_scale() {
     backend.capture_scale().set(200);
     let (state, agent, _idle) = two_agents(&backend);
     state.declare_scale_percent(Some(200));
-    agent.acquire_input_lease().expect("the target is free");
+    agent
+        .acquire_input_lease()
+        .await
+        .expect("the target is free");
     let identity = capture(&agent).await;
 
     agent
@@ -154,7 +157,10 @@ async fn a_drag_records_the_start_of_its_path_through_the_display_scale() {
 async fn a_click_happens_once_and_the_double_click_control_reads_two() {
     let backend = FixtureBackend::start().await.unwrap();
     let (_state, agent, _idle) = two_agents(&backend);
-    agent.acquire_input_lease().expect("the target is free");
+    agent
+        .acquire_input_lease()
+        .await
+        .expect("the target is free");
     let identity = capture(&agent).await;
 
     assert_eq!(backend.ledger().pointer_clicks(), 0, "nothing has clicked");
@@ -220,8 +226,11 @@ async fn a_second_agent_is_refused_only_while_the_first_genuinely_holds_the_leas
     let (state, first, second) = two_agents(&backend);
 
     // Leg 1: the first agent holds the lease, and proves it by clicking.
-    let grant = first.acquire_input_lease().expect("the target is free");
-    assert_eq!(state.holder(&target()), Some(first.session()));
+    let grant = first
+        .acquire_input_lease()
+        .await
+        .expect("the target is free");
+    assert_eq!(state.holder(&target()).await, Some(first.session()));
     let identity = capture(&first).await;
     assert!(matches!(
         first.handle(&click(identity, 1, 1), LIMIT).await,
@@ -240,7 +249,7 @@ async fn a_second_agent_is_refused_only_while_the_first_genuinely_holds_the_leas
     // Leg 3: the second agent is refused for input, at acquisition and at use,
     // and **nothing reaches the backend**.
     assert_eq!(
-        second.acquire_input_lease().map(|_| ()),
+        second.acquire_input_lease().await.map(|_| ()),
         Err(LeaseRefusal::HeldByAnotherSession)
     );
     let clicks_before = backend.ledger().pointer_clicks();
@@ -261,11 +270,13 @@ async fn a_second_agent_is_refused_only_while_the_first_genuinely_holds_the_leas
     // lease, not the agent.
     first
         .release_input_lease(&grant)
+        .await
         .expect("the first holds it");
     second
         .acquire_input_lease()
+        .await
         .expect("the target is free now");
-    assert_eq!(state.holder(&target()), Some(second.session()));
+    assert_eq!(state.holder(&target()).await, Some(second.session()));
     assert!(matches!(
         second.handle(&click(second_identity, 1, 1), LIMIT).await,
         Dispatch::Dispatched(Completion::Ok(_))
@@ -285,7 +296,7 @@ async fn a_second_agent_is_refused_only_while_the_first_genuinely_holds_the_leas
 async fn a_rotation_leaves_the_lease_held_and_never_repeats_a_click() {
     let backend = FixtureBackend::start().await.unwrap();
     let (state, mut agent, _idle) = two_agents(&backend);
-    let grant = agent.acquire_input_lease().unwrap();
+    let grant = agent.acquire_input_lease().await.unwrap();
     let identity = capture(&agent).await;
 
     backend.faults().set("left_click", Fault::DropAfterLedger);
@@ -311,9 +322,9 @@ async fn a_rotation_leaves_the_lease_held_and_never_repeats_a_click() {
     assert_eq!(agent.carrier_generation(), before + 1);
 
     // The lease survives: same holder, same holding.
-    assert_eq!(state.holder(&target()), Some(agent.session()));
+    assert_eq!(state.holder(&target()).await, Some(agent.session()));
     assert!(
-        agent.release_input_lease(&grant).is_ok(),
+        agent.release_input_lease(&grant).await.is_ok(),
         "the holding the agent took before the rotation is still the current one"
     );
 
@@ -339,7 +350,7 @@ async fn a_rotation_leaves_the_lease_held_and_never_repeats_a_click() {
 async fn an_input_operation_that_reached_the_backend_is_never_retryable() {
     let backend = FixtureBackend::start().await.unwrap();
     let (_state, agent, _idle) = two_agents(&backend);
-    agent.acquire_input_lease().unwrap();
+    agent.acquire_input_lease().await.unwrap();
     let identity = capture(&agent).await;
 
     // The read: dispatched and failed, and a retry is permitted.
@@ -400,7 +411,7 @@ async fn a_capture_identity_and_its_display_scale_flow_into_the_click() {
     backend.capture_scale().set(200);
     let (state, agent, _idle) = two_agents(&backend);
     state.declare_scale_percent(Some(200));
-    agent.acquire_input_lease().unwrap();
+    agent.acquire_input_lease().await.unwrap();
 
     let dispatch = agent
         .handle(&request_body("capture", json!({})), LIMIT)
@@ -456,7 +467,7 @@ async fn a_capture_whose_scale_nobody_declared_refuses_every_coordinate() {
     backend.capture_scale().set(200);
     let (state, agent, _idle) = two_agents(&backend);
     state.declare_scale_percent(None);
-    agent.acquire_input_lease().unwrap();
+    agent.acquire_input_lease().await.unwrap();
     let identity = capture(&agent).await;
     let clicks = backend.ledger().pointer_clicks();
 
@@ -536,7 +547,7 @@ async fn a_capture_whose_scale_nobody_declared_refuses_every_coordinate() {
 async fn a_cancelled_click_reports_what_is_known_and_is_never_repeated() {
     let backend = FixtureBackend::start().await.unwrap();
     let (_state, agent, _idle) = two_agents(&backend);
-    agent.acquire_input_lease().unwrap();
+    agent.acquire_input_lease().await.unwrap();
     let identity = capture(&agent).await;
     let before = backend.ledger().pointer_clicks();
 
@@ -607,7 +618,7 @@ async fn a_cancelled_click_reports_what_is_known_and_is_never_repeated() {
 async fn a_stale_or_mismatched_capture_coordinate_never_reaches_the_backend() {
     let backend = FixtureBackend::start().await.unwrap();
     let (_state, agent, _idle) = two_agents(&backend);
-    agent.acquire_input_lease().unwrap();
+    agent.acquire_input_lease().await.unwrap();
 
     let stale = capture(&agent).await;
     let fresh = capture(&agent).await;
@@ -685,8 +696,11 @@ async fn a_capture_from_another_target_does_not_authorize_a_click() {
         SessionId::new(2),
         TargetSession::new("console:2"),
     );
-    here.acquire_input_lease().unwrap();
-    there.acquire_input_lease().expect("a different target");
+    here.acquire_input_lease().await.unwrap();
+    there
+        .acquire_input_lease()
+        .await
+        .expect("a different target");
 
     let theirs = capture(&there).await;
     let mine = capture(&here).await;
@@ -724,7 +738,7 @@ async fn a_capture_from_another_target_does_not_authorize_a_click() {
 async fn a_revoked_grant_stops_the_lease_being_honoured_the_moment_the_device_learns_of_it() {
     let backend = FixtureBackend::start().await.unwrap();
     let (state, mut first, second) = two_agents(&backend);
-    first.acquire_input_lease().unwrap();
+    first.acquire_input_lease().await.unwrap();
     let identity = capture(&first).await;
     assert!(matches!(
         first.handle(&click(identity, 1, 1), LIMIT).await,
@@ -737,20 +751,20 @@ async fn a_revoked_grant_stops_the_lease_being_honoured_the_moment_the_device_le
     // holds it, so the release below is a change and not a lease that was
     // never held.
     assert_eq!(
-        second.acquire_input_lease().map(|_| ()),
+        second.acquire_input_lease().await.map(|_| ()),
         Err(LeaseRefusal::HeldByAnotherSession)
     );
-    assert_eq!(state.holder(&target()), Some(first.session()));
+    assert_eq!(state.holder(&target()).await, Some(first.session()));
 
     // The device learns that the grant behind the lease has moved on, and
     // the lease it authorized is released in the same step.
-    let freed = first.note_grant_revision(GrantRevision::new(1));
+    let freed = first.note_grant_revision(GrantRevision::new(1)).await;
     assert_eq!(
         freed,
         vec![target()],
         "learning the revision must free the target"
     );
-    assert_eq!(state.holder(&target()), None);
+    assert_eq!(state.holder(&target()).await, None);
 
     // Use: the superseded holder is refused and nothing is dispatched. It is
     // `NotHeld` now rather than `GrantRevoked`, because there is no holding
@@ -768,6 +782,7 @@ async fn a_revoked_grant_stops_the_lease_being_honoured_the_moment_the_device_le
     // reconcile anywhere in this test, and acts on it.
     second
         .acquire_input_lease()
+        .await
         .expect("the target must be free as soon as the device learned the revision");
     let theirs = capture(&second).await;
     assert!(matches!(
@@ -778,7 +793,7 @@ async fn a_revoked_grant_stops_the_lease_being_honoured_the_moment_the_device_le
 
     // And the superseded session cannot take it back while it is held.
     assert_eq!(
-        first.acquire_input_lease().map(|_| ()),
+        first.acquire_input_lease().await.map(|_| ()),
         Err(LeaseRefusal::HeldByAnotherSession)
     );
     backend.stop();
@@ -792,16 +807,17 @@ async fn a_stale_grant_revision_is_ignored_and_frees_nothing() {
     let backend = FixtureBackend::start().await.unwrap();
     let (state, mut first, _second) = two_agents(&backend);
     assert_eq!(
-        first.note_grant_revision(GrantRevision::new(5)),
+        first.note_grant_revision(GrantRevision::new(5)).await,
         Vec::<TargetSession>::new()
     );
     assert_eq!(first.grant_revision(), GrantRevision::new(5));
-    first.acquire_input_lease().unwrap();
+    first.acquire_input_lease().await.unwrap();
 
     for stale in [4, 5, 0] {
         assert!(
             first
                 .note_grant_revision(GrantRevision::new(stale))
+                .await
                 .is_empty(),
             "revision {stale} is not an advance"
         );
@@ -810,13 +826,13 @@ async fn a_stale_grant_revision_is_ignored_and_frees_nothing() {
             GrantRevision::new(5),
             "revision {stale}"
         );
-        assert_eq!(state.holder(&target()), Some(first.session()));
+        assert_eq!(state.holder(&target()).await, Some(first.session()));
     }
 
     // The control: an advance still frees the lease, so the ignores above are
     // the monotonicity rule and not a method that frees nothing.
     assert_eq!(
-        first.note_grant_revision(GrantRevision::new(6)),
+        first.note_grant_revision(GrantRevision::new(6)).await,
         vec![target()]
     );
     assert_eq!(first.grant_revision(), GrantRevision::new(6));
@@ -831,7 +847,7 @@ async fn a_stale_grant_revision_is_ignored_and_frees_nothing() {
 async fn ending_a_session_releases_its_lease_and_only_its_lease() {
     let backend = FixtureBackend::start().await.unwrap();
     let (state, first, second) = two_agents(&backend);
-    first.acquire_input_lease().unwrap();
+    first.acquire_input_lease().await.unwrap();
     let other = TargetSession::new("console:2");
     let elsewhere = SessionFacade::new(
         Arc::clone(&state),
@@ -842,19 +858,23 @@ async fn ending_a_session_releases_its_lease_and_only_its_lease() {
         second.session(),
         other.clone(),
     );
-    elsewhere.acquire_input_lease().unwrap();
+    elsewhere.acquire_input_lease().await.unwrap();
 
     // Ending the second session frees only what the second session held.
-    assert_eq!(state.end_session(second.session()), vec![other.clone()]);
-    assert_eq!(state.holder(&other), None);
-    assert_eq!(state.holder(&target()), Some(first.session()));
+    assert_eq!(
+        state.end_session(second.session()).await,
+        vec![other.clone()]
+    );
+    assert_eq!(state.holder(&other).await, None);
+    assert_eq!(state.holder(&target()).await, Some(first.session()));
 
     // Ending the first frees the target, and a session that held nothing
     // frees nothing -- so the first call above was a measurement.
-    assert_eq!(state.end_session(first.session()), vec![target()]);
-    assert!(state.end_session(first.session()).is_empty());
+    assert_eq!(state.end_session(first.session()).await, vec![target()]);
+    assert!(state.end_session(first.session()).await.is_empty());
     second
         .acquire_input_lease()
+        .await
         .expect("the target is free once its holder's session ended");
     backend.stop();
 }
@@ -870,7 +890,7 @@ async fn ending_a_session_releases_its_lease_and_only_its_lease() {
 async fn the_typed_text_reaches_the_backend_and_appears_in_no_diagnostic() {
     let backend = FixtureBackend::start().await.unwrap();
     let (_state, agent, _idle) = two_agents(&backend);
-    agent.acquire_input_lease().unwrap();
+    agent.acquire_input_lease().await.unwrap();
 
     let secret = "correct horse battery staple";
     let dispatch = agent
@@ -904,7 +924,7 @@ async fn the_typed_text_reaches_the_backend_and_appears_in_no_diagnostic() {
 async fn the_ledger_agrees_with_the_client_for_every_input_operation() {
     let backend = FixtureBackend::start().await.unwrap();
     let (_state, agent, unleased) = two_agents(&backend);
-    agent.acquire_input_lease().unwrap();
+    agent.acquire_input_lease().await.unwrap();
     let identity = capture(&agent).await;
     let c = identity;
 

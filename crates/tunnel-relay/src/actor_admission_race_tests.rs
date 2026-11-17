@@ -166,7 +166,6 @@ impl PendingOpenFixture {
             .expect("fixture session present");
         session.profile = RuntimeProfile::M2;
         session.connection_id = carrier.connection_id.clone();
-        session.data_tx = Some(data_tx.clone());
         session.active_carrier = Some(DataCarrier {
             context: carrier.context(),
             tx: data_tx,
@@ -240,8 +239,11 @@ impl PendingOpenFixture {
     fn assert_untouched_pending(&self, stream_id: u64, operation_id: &str) {
         let stream = self.stream(stream_id);
         assert_eq!(stream.operation_id, operation_id);
-        assert!(stream.open_pending, "sibling OPEN must remain pending");
-        assert!(!stream.registration_dropped);
+        assert!(
+            stream.admission.open_pending(),
+            "sibling OPEN must remain pending"
+        );
+        assert!(!stream.admission.registration_dropped());
         assert!(!stream.terminal);
         assert!(!stream.terminal_fin_failure);
         assert!(!stream.closed.is_cancelled());
@@ -321,10 +323,10 @@ impl PendingOpenFixture {
         let stream = self.stream(stream_id);
         assert_eq!(stream.operation_id, operation_id);
         assert!(
-            stream.open_pending,
+            stream.admission.open_pending(),
             "the OPEN stays pending until the owner proves OPENED or REJECTED"
         );
-        assert!(stream.registration_dropped);
+        assert!(stream.admission.registration_dropped());
         assert!(
             !stream.terminal,
             "pre-admission abandonment must not create terminal state"
@@ -551,8 +553,8 @@ async fn abandoned_pending_open_admitted_late_closes_once_with_exact_fin_then_fo
     assert_eq!(fin.ack, 0);
     {
         let stream = fixture.stream(abandoned_id);
-        assert!(!stream.open_pending);
-        assert!(stream.registration_dropped);
+        assert!(!stream.admission.open_pending());
+        assert!(stream.admission.registration_dropped());
         assert!(stream.terminal);
         assert!(!stream.terminal_fin_failure);
         let snapshot = stream.sequence.snapshot();
@@ -710,7 +712,7 @@ async fn unclaimed_pending_open_expiry_defers_to_owner_outcome_then_fails_closed
     assert!(drain_data(&mut fixture.data_rx).is_empty());
     assert!(fixture.actor.stream_terminal_events.is_empty());
     assert!(
-        fixture.session().terminal_fin_failure_deadline.is_none(),
+        fixture.session().terminal_fin_failure_deadline.is_idle(),
         "no FIN was attempted, so no failed-FIN debt exists"
     );
     assert_eq!(fixture.budget_used(), 0);
@@ -843,9 +845,9 @@ impl CandidateFixture {
         {
             let session = actor.sessions.get_mut(&key.scope()).expect("session");
             session.profile = RuntimeProfile::M2;
-            session.cluster_profile = true;
+            session.owner_fencing =
+                super::OwnerFencing::fenced_for_test(&session.key, &session.owner);
             session.connection_id = attempt.old_connection_id.clone();
-            session.data_tx = Some(data_tx.clone());
             session.active_carrier = Some(DataCarrier {
                 context: CarrierContext::new(
                     key.session_id.clone(),
@@ -912,7 +914,7 @@ impl CandidateFixture {
         ));
         {
             let ticket = fixture.ticket_entry();
-            assert!(ticket.catalog_backed && ticket.candidate && !ticket.consuming);
+            assert!(ticket.is_catalog_backed() && ticket.is_candidate() && !ticket.is_consuming());
             assert_eq!(ticket.generation, fixture.attempt.new_generation);
             assert_eq!(ticket.connection_id, fixture.attempt.new_connection_id);
         }
@@ -1146,7 +1148,7 @@ async fn concurrent_candidate_ticket_presentations_attach_exactly_once() {
     // The first presentation reserves the ticket while the authoritative
     // consume is in flight.
     let winner = fixture.present(device.clone(), &spki, &ticket);
-    assert!(fixture.ticket_entry().consuming);
+    assert!(fixture.ticket_entry().is_consuming());
 
     // A concurrent presentation of the same ticket loses immediately with a
     // typed rejection and starts no background work.
@@ -1156,7 +1158,7 @@ async fn concurrent_candidate_ticket_presentations_attach_exactly_once() {
         Err(RelayError::Unauthorized)
     ));
     assert!(
-        fixture.ticket_entry().consuming,
+        fixture.ticket_entry().is_consuming(),
         "the loser must not release the winner's reservation"
     );
     assert!(drain_control(&mut fixture.control.rx).is_empty());
@@ -1224,7 +1226,7 @@ async fn concurrent_candidate_ticket_presentations_attach_exactly_once() {
             .session()
             .streams
             .get(&stream_id)
-            .is_some_and(|stream| !stream.terminal && !stream.open_pending)
+            .is_some_and(|stream| !stream.terminal && !stream.admission.open_pending())
     );
 
     // Late presentations of the spent ticket are refused before any
@@ -1258,7 +1260,7 @@ async fn candidate_ticket_in_flight_during_active_carrier_loss_cannot_attach_to_
     let old_connection_id = fixture.attempt.old_connection_id.clone();
 
     let pending = fixture.present(device.clone(), &spki, &ticket);
-    assert!(fixture.ticket_entry().consuming);
+    assert!(fixture.ticket_entry().is_consuming());
 
     // The active carrier is lost while the candidate consume is outstanding.
     // The coordinator reserves a fresh generation for recovery and fences the
@@ -1313,7 +1315,7 @@ async fn candidate_ticket_in_flight_during_active_carrier_loss_cannot_attach_to_
     assert!(drain_data(&mut fixture.data_rx).is_empty());
     {
         let session = fixture.session();
-        assert!(session.data_tx.is_none());
+        assert!(session.data_tx().is_none());
         assert!(session.active_carrier.is_none());
         assert_eq!(session.generation, 1);
         let rotation = session.rotation.as_ref().expect("rotation");
@@ -1325,7 +1327,8 @@ async fn candidate_ticket_in_flight_during_active_carrier_loss_cannot_attach_to_
                 .recovery
                 .as_ref()
                 .expect("recovery runtime")
-                .candidate_ready
+                .progress
+                .candidate_attached()
         );
         assert_eq!(rotation.state.generation_high_watermark(), 3);
     }
@@ -1354,7 +1357,7 @@ async fn candidate_ticket_in_flight_during_owner_abort_cannot_attach() {
     let state_before = fixture.logical_state();
 
     let pending = fixture.present(device.clone(), &spki, &ticket);
-    assert!(fixture.ticket_entry().consuming);
+    assert!(fixture.ticket_entry().is_consuming());
 
     // The coordinator decides to abort the attempt before the attachment
     // result is applied.  This is the same owner decision the handshake
@@ -1381,7 +1384,7 @@ async fn candidate_ticket_in_flight_during_owner_abort_cannot_attach() {
     {
         let rotation = fixture.rotation();
         assert_eq!(rotation.state.phase(), RotationPhase::Aborting);
-        assert!(rotation.abort_message_id.is_some());
+        assert!(rotation.abort.is_sent());
         assert!(rotation.candidate.is_none());
     }
     assert!(
@@ -1426,7 +1429,7 @@ async fn candidate_ticket_result_after_session_epoch_change_installs_nothing_on_
     let old_key = fixture.key.clone();
 
     let pending = fixture.present(device.clone(), &spki, &ticket);
-    assert!(fixture.ticket_entry().consuming);
+    assert!(fixture.ticket_entry().is_consuming());
 
     // Control is lost while the consume is in flight: the owner session ends
     // and every ticket bound to its session/epoch is fenced.
@@ -1474,7 +1477,8 @@ async fn candidate_ticket_result_after_session_epoch_change_installs_nothing_on_
         .remove(&successor_key.scope())
         .expect("successor session");
     successor.profile = RuntimeProfile::M2;
-    successor.cluster_profile = true;
+    successor.owner_fencing =
+        super::OwnerFencing::fenced_for_test(&successor.key, &successor.owner);
     assert_eq!(successor.owner, successor_claim.token);
     fixture
         .actor
@@ -1495,7 +1499,7 @@ async fn candidate_ticket_result_after_session_epoch_change_installs_nothing_on_
             .get(&successor_key.scope())
             .expect("successor remains live");
         assert_eq!(successor.key, successor_key);
-        assert!(successor.data_tx.is_none());
+        assert!(successor.data_tx().is_none());
         assert!(successor.active_carrier.is_none());
         assert_eq!(successor.generation, 1);
         assert!(successor.rotation.is_none());
@@ -1547,7 +1551,7 @@ async fn ticket_bound_to_other_identity_or_connection_is_rejected_without_burnin
         Err(RelayError::Unauthorized)
     ));
     fixture.assert_no_pending_mailbox_work();
-    assert!(!fixture.ticket_entry().consuming);
+    assert!(!fixture.ticket_entry().is_consuming());
 
     // (b) The same certificate enrolled in another tenant cannot consume it.
     let other_tenant_device = fixture
@@ -1563,7 +1567,7 @@ async fn ticket_bound_to_other_identity_or_connection_is_rejected_without_burnin
         Err(RelayError::Unauthorized)
     ));
     fixture.assert_no_pending_mailbox_work();
-    assert!(!fixture.ticket_entry().consuming);
+    assert!(!fixture.ticket_entry().is_consuming());
     assert!(drain_control(&mut fixture.control.rx).is_empty());
 
     // (c) A ticket for the same session and generation but a different
@@ -1608,14 +1612,14 @@ async fn ticket_bound_to_other_identity_or_connection_is_rejected_without_burnin
             issued_at_wall: now,
             expires_at_wall: stale_issued.expires_at,
             expires_at: Instant::now() + wire::TICKET_TTL,
-            consuming: false,
+            phase: super::TicketPhase::Issued,
             owner: fixture.owner.clone(),
-            candidate: true,
+            kind: super::TicketKind::Candidate,
             attachment_purpose: DataAttachmentPurpose::RotationCandidate,
             catalog_purpose: CANDIDATE_PURPOSE.to_owned(),
             binding_digest: stale_binding,
             locator_digest: stale_issued.locator.digest.clone(),
-            catalog_backed: true,
+            authority: super::TicketAuthority::Catalog,
         },
     );
     let stale = fixture.present(device.clone(), &spki, &stale_issued.ticket);
@@ -1643,7 +1647,7 @@ async fn ticket_bound_to_other_identity_or_connection_is_rejected_without_burnin
     assert!(drain_control(&mut fixture.control.rx).is_empty());
 
     // (d) The correctly bound ticket still attaches exactly once afterwards.
-    assert!(!fixture.ticket_entry().consuming);
+    assert!(!fixture.ticket_entry().is_consuming());
     let bound = fixture.present(device, &spki, &ticket);
     fixture.apply_next_attach_result().await;
     let registration = bound
@@ -1715,7 +1719,7 @@ async fn stale_generation_initial_ticket_is_rejected_before_data_ready() {
         session.profile = RuntimeProfile::M2;
         session.generation = 2;
         session.connection_id = "committed-connection".to_owned();
-        assert!(session.data_tx.is_none());
+        assert!(session.data_tx().is_none());
     }
     let now = Utc::now();
     let stale_ticket = "stale-initial-ticket".to_owned();
@@ -1734,14 +1738,14 @@ async fn stale_generation_initial_ticket_is_rejected_before_data_ready() {
             issued_at_wall: now,
             expires_at_wall: now + Duration::seconds(10),
             expires_at: Instant::now() + wire::TICKET_TTL,
-            consuming: false,
+            phase: super::TicketPhase::Issued,
             owner: owner.clone(),
-            candidate: false,
+            kind: super::TicketKind::Initial,
             attachment_purpose: DataAttachmentPurpose::RotationCandidate,
             catalog_purpose: String::new(),
             binding_digest: String::new(),
             locator_digest: String::new(),
-            catalog_backed: false,
+            authority: super::TicketAuthority::Relay,
         },
     );
 
@@ -1765,7 +1769,7 @@ async fn stale_generation_initial_ticket_is_rejected_before_data_ready() {
         .sessions
         .get(&key.scope())
         .expect("session remains live");
-    assert!(session.data_tx.is_none());
+    assert!(session.data_tx().is_none());
     assert!(session.active_carrier.is_none());
     assert_eq!(session.generation, 2);
     assert_eq!(session.connection_id, "committed-connection");

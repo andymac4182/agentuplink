@@ -40,7 +40,7 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 use tokio::{
-    sync::{Mutex, mpsc, watch},
+    sync::{mpsc, oneshot, watch},
     task::JoinHandle,
 };
 use tokio_tungstenite::{
@@ -144,15 +144,65 @@ pub(crate) mod test_hooks {
         /// deadline tick, immediately before it retries pending
         /// `STREAM_FORGET` barriers (task row M7-C84).  It lets a test force
         /// a stop to land inside that tick body on the real loop.
-        pub(crate) forget_tick: std::sync::Mutex<Option<ForgetTickHook>>,
+        pub(crate) forget_tick: std::sync::OnceLock<ForgetTickHook>,
         /// Every change of the M2 control-read gate as the session loop saw
         /// it: `true` when reads stopped, `false` when they resumed, with the
-        /// instant the retention give-up clock used (task row M6-C148).
-        pub(crate) read_gate_events: std::sync::Mutex<Vec<(bool, std::time::Instant)>>,
+        /// instant the retention give-up clock used (task row M6-C148).  The
+        /// session loop is the only writer; the test drains the receiver
+        /// through [`ReadGateLog`].
+        pub(crate) read_gate_events: tokio::sync::mpsc::UnboundedSender<(bool, std::time::Instant)>,
     }
 
-    /// Seeds actor state; the argument is the M2 actor as `dyn Any`.
-    pub(crate) type ForgetTickSeed = Box<dyn FnOnce(&mut dyn std::any::Any) + Send>;
+    impl ControlWriterGate {
+        /// Build a gate and the test-side log of its read-gate changes.
+        pub(crate) fn new(
+            block_once: bool,
+            forget_tick: Option<ForgetTickHook>,
+        ) -> (std::sync::Arc<Self>, ReadGateLog) {
+            let (read_gate_events, receiver) = tokio::sync::mpsc::unbounded_channel();
+            let hook = std::sync::OnceLock::new();
+            if let Some(forget_tick) = forget_tick {
+                let _ = hook.set(forget_tick);
+            }
+            (
+                std::sync::Arc::new(Self {
+                    block_once: AtomicBool::new(block_once),
+                    entered: Notify::new(),
+                    release: Notify::new(),
+                    forget_tick: hook,
+                    read_gate_events,
+                }),
+                ReadGateLog {
+                    receiver,
+                    seen: Vec::new(),
+                },
+            )
+        }
+    }
+
+    /// The ordered history of read-gate changes one test owns.
+    pub(crate) struct ReadGateLog {
+        receiver: tokio::sync::mpsc::UnboundedReceiver<(bool, std::time::Instant)>,
+        seen: Vec<(bool, std::time::Instant)>,
+    }
+
+    impl ReadGateLog {
+        /// The first recorded change to `stopped`, if the loop has reported
+        /// one yet.
+        pub(crate) fn first(&mut self, stopped: bool) -> Option<std::time::Instant> {
+            while let Ok(event) = self.receiver.try_recv() {
+                self.seen.push(event);
+            }
+            self.seen
+                .iter()
+                .find(|(event, _)| *event == stopped)
+                .map(|(_, at)| *at)
+        }
+    }
+
+    /// Seeds actor state; the argument is the M2 actor as `dyn Any`.  The
+    /// session loop runs it at most once.
+    pub(crate) type ForgetTickSeed = Box<dyn Fn(&mut dyn std::any::Any) + Send + Sync>;
 
     /// Runs its seed, then signals `entered` and waits for `release` before
     /// the tick continues.
@@ -177,9 +227,59 @@ fn socket_local_addr(socket: &ClientWebSocket) -> Option<SocketAddr> {
     socket.get_ref().get_ref().local_addr().ok()
 }
 
+/// Stop requests the supervisor joiner may hold unread.  A `stop` that finds
+/// the queue full waits for room; it never fails or drops a request.
+const SUPERVISOR_STOP_QUEUE: usize = 8;
+
+type SupervisorStopReply = oneshot::Sender<Result<(), ClientError>>;
+
 struct ConnectionLifecycle {
     cancellation: CancellationToken,
-    join: Mutex<Option<SupervisorJoin>>,
+    /// Requests to the task that owns the one supervisor join handle.
+    stops: mpsc::Sender<SupervisorStopReply>,
+    /// Stop requests the joiner has taken off its queue.
+    #[cfg(test)]
+    stops_received: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl ConnectionLifecycle {
+    /// Hand the supervisor join handle to a joiner task that owns it by
+    /// value.  The joiner serves stop requests strictly in order: the first
+    /// awaits the supervisor to completion, so every later request is
+    /// answered only after the supervisor has finished.  The supervisor's
+    /// result goes to the first requester still waiting for it; a requester
+    /// that was cancelled leaves it for the next one, and every request
+    /// after it was delivered is answered `Ok(())`.
+    fn spawn(cancellation: CancellationToken, join: SupervisorJoin) -> Arc<Self> {
+        let (stops, mut requests) = mpsc::channel::<SupervisorStopReply>(SUPERVISOR_STOP_QUEUE);
+        #[cfg(test)]
+        let stops_received = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        #[cfg(test)]
+        let received = stops_received.clone();
+        tokio::spawn(async move {
+            let mut join = Some(join);
+            let mut undelivered: Option<Result<(), ClientError>> = None;
+            while let Some(reply) = requests.recv().await {
+                #[cfg(test)]
+                received.fetch_add(1, Ordering::Release);
+                if let Some(handle) = join.take() {
+                    undelivered = Some(match handle.await {
+                        Ok(result) => result,
+                        Err(_) => Err(ClientError::SupervisorPanicked),
+                    });
+                }
+                if let Err(unsent) = reply.send(undelivered.take().unwrap_or(Ok(()))) {
+                    undelivered = Some(unsent);
+                }
+            }
+        });
+        Arc::new(Self {
+            cancellation,
+            stops,
+            #[cfg(test)]
+            stops_received,
+        })
+    }
 }
 
 /// Options for establishing one M1 connector session.
@@ -572,23 +672,18 @@ impl ConnectionHandle {
     /// Stop both sockets and join the supervisor and writer tasks.
     pub async fn stop(&self) -> Result<(), ClientError> {
         self.lifecycle.cancellation.cancel();
-        // Keep the lifecycle mutex held until the one supervisor join has
-        // completed. A second concurrent stop therefore waits for the first
-        // caller instead of observing `None` and returning early.
-        let mut lifecycle_join = self.lifecycle.join.lock().await;
-        let result = match lifecycle_join.as_mut() {
-            // Await through the option while holding the mutex. The handle is
-            // only removed after completion, so cancellation of this stop
-            // future leaves it available for a later caller to join.
-            Some(join) => match join.await {
-                Ok(result) => result.map(|_| ()),
-                Err(_) => Err(ClientError::SupervisorPanicked),
-            },
-            None => Ok(()),
-        };
-        let _ = lifecycle_join.take();
-        drop(lifecycle_join);
-        result
+        // The joiner task owns the one supervisor join handle and answers
+        // requests in order, so a second concurrent stop waits for the first
+        // caller's join instead of returning early.  Dropping this future
+        // before the reply leaves the result with the joiner for a later
+        // caller.
+        let (reply, result) = oneshot::channel();
+        self.lifecycle
+            .stops
+            .send(reply)
+            .await
+            .map_err(|_| ClientError::Cancelled)?;
+        result.await.map_err(|_| ClientError::Cancelled)?
     }
 
     /// Alias used by callers that model supervisor lifecycle as shutdown.
@@ -724,10 +819,7 @@ pub async fn connect(options: ConnectOptions) -> Result<ConnectionHandle, Client
     readiness_tx
         .send(Readiness::Ready(ready_info))
         .map_err(|_| ClientError::Cancelled)?;
-    let lifecycle = Arc::new(ConnectionLifecycle {
-        cancellation,
-        join: Mutex::new(Some(join)),
-    });
+    let lifecycle = ConnectionLifecycle::spawn(cancellation, join);
     Ok(ConnectionHandle {
         readiness: readiness_rx,
         status: status_rx,
@@ -1417,13 +1509,152 @@ struct AuthContext {
     grant_revision: u64,
     deadline: DualDeadline,
     operation_deadline: DualDeadline,
-    confirmed: bool,
-    /// A fresh challenge is awaiting confirmation.  M2 sets this again for
-    /// each long-lived stream authorization refresh; the operation deadline
-    /// remains independent and is never extended by a confirmation.
-    refresh_in_flight: bool,
-    invalidated: bool,
+    /// Where this stream's authorization stands.
+    state: AuthLifecycle,
 }
+
+impl AuthContext {
+    /// See [`AuthLifecycle::transition`].
+    fn transition(&mut self, event: AuthEvent) -> Result<(), IllegalAuthTransition> {
+        self.state.transition(event)
+    }
+
+    /// See [`AuthLifecycle::confirmed`].
+    fn confirmed(&self) -> bool {
+        self.state.confirmed()
+    }
+
+    /// See [`AuthLifecycle::refresh_in_flight`].
+    fn refresh_in_flight(&self) -> bool {
+        self.state.refresh_in_flight()
+    }
+
+    /// See [`AuthLifecycle::invalidated`].
+    fn invalidated(&self) -> bool {
+        self.state.invalidated()
+    }
+
+    /// See [`AuthLifecycle::is_current`].
+    fn is_current(&self) -> bool {
+        self.state.is_current()
+    }
+}
+
+/// A stream authorization's lifecycle.
+///
+/// ```text
+/// Unconfirmed --confirm--> Confirmed --refresh--> Refreshing --confirm--> Confirmed
+/// any of those --invalidate--> Invalidated (terminal)
+/// ```
+mod auth_lifecycle {
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(crate) enum AuthState {
+        /// The OPEN's first challenge is awaiting its confirmation.
+        Unconfirmed,
+        /// The current challenge was confirmed and no newer one is
+        /// outstanding.
+        Confirmed,
+        /// A long-lived stream's fresh challenge is awaiting confirmation.
+        /// The operation deadline is independent and is never extended by
+        /// it.
+        Refreshing,
+        /// The authorization was cancelled, expired or revoked and can never
+        /// be confirmed again.  `was_confirmed` records whether the stream
+        /// held a confirmed grant with no refresh outstanding at that
+        /// moment.
+        Invalidated { was_confirmed: bool },
+    }
+
+    /// What moves a stream authorization from one state to the next.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(crate) enum AuthEvent {
+        /// The relay confirmed the outstanding challenge.
+        Confirm,
+        /// A fresh challenge for a confirmed stream was sent.
+        Refresh,
+        /// The authorization was cancelled, expired or revoked.
+        Invalidate,
+    }
+
+    /// An event the authorization's current state does not accept; the
+    /// state is unchanged.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(crate) struct IllegalAuthTransition {
+        pub(crate) from: AuthState,
+        pub(crate) event: AuthEvent,
+    }
+
+    /// The state itself is private to this module, so
+    /// [`AuthLifecycle::transition`] is the only place it changes.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(crate) struct AuthLifecycle(AuthState);
+
+    impl AuthLifecycle {
+        /// An authorization whose first challenge has just been sent.
+        pub(crate) fn unconfirmed() -> Self {
+            Self(AuthState::Unconfirmed)
+        }
+
+        #[cfg(test)]
+        pub(crate) fn state(self) -> AuthState {
+            self.0
+        }
+
+        pub(crate) fn transition(&mut self, event: AuthEvent) -> Result<(), IllegalAuthTransition> {
+            self.0 = match (self.0, event) {
+                (AuthState::Unconfirmed | AuthState::Refreshing, AuthEvent::Confirm) => {
+                    AuthState::Confirmed
+                }
+                (AuthState::Confirmed, AuthEvent::Refresh) => AuthState::Refreshing,
+                (AuthState::Confirmed, AuthEvent::Invalidate) => AuthState::Invalidated {
+                    was_confirmed: true,
+                },
+                (AuthState::Unconfirmed | AuthState::Refreshing, AuthEvent::Invalidate) => {
+                    AuthState::Invalidated {
+                        was_confirmed: false,
+                    }
+                }
+                (from, event) => return Err(IllegalAuthTransition { from, event }),
+            };
+            Ok(())
+        }
+
+        /// The stream holds (or, once invalidated, last held) a confirmed
+        /// grant with no newer challenge outstanding.
+        pub(crate) fn confirmed(self) -> bool {
+            matches!(
+                self.0,
+                AuthState::Confirmed
+                    | AuthState::Invalidated {
+                        was_confirmed: true
+                    }
+            )
+        }
+
+        /// A challenge is (or, once invalidated, was) awaiting confirmation.
+        pub(crate) fn refresh_in_flight(self) -> bool {
+            matches!(
+                self.0,
+                AuthState::Unconfirmed
+                    | AuthState::Refreshing
+                    | AuthState::Invalidated {
+                        was_confirmed: false
+                    }
+            )
+        }
+
+        pub(crate) fn invalidated(self) -> bool {
+            matches!(self.0, AuthState::Invalidated { .. })
+        }
+
+        /// Confirmed, with no refresh outstanding and not invalidated:
+        /// exactly `confirmed() && !refresh_in_flight() && !invalidated()`.
+        pub(crate) fn is_current(self) -> bool {
+            self.0 == AuthState::Confirmed
+        }
+    }
+}
+use auth_lifecycle::{AuthEvent, AuthLifecycle, IllegalAuthTransition};
 
 #[derive(Debug)]
 enum BufferedInput {
@@ -1760,9 +1991,7 @@ impl SessionActor {
                 grant_revision,
                 deadline,
                 operation_deadline,
-                confirmed: false,
-                refresh_in_flight: true,
-                invalidated: false,
+                state: AuthLifecycle::unconfirmed(),
             },
             inbound_sequence: 0,
             outbound_sequence: 0,
@@ -1809,7 +2038,7 @@ impl SessionActor {
             };
             let now = Instant::now();
             let wall_now = SystemTime::now();
-            if context.auth.confirmed {
+            if context.auth.confirmed() {
                 // A confirmation is one-shot. Ignore a replay rather than
                 // allowing the same nonce to move the deadline again.
                 return Ok(());
@@ -1818,7 +2047,7 @@ impl SessionActor {
                 && context.auth.nonce == confirmed.nonce
                 && context.auth.permission_digest == confirmed.permission_digest
                 && context.auth.grant_revision == confirmed.grant_revision
-                && !context.auth.invalidated
+                && !context.auth.invalidated()
                 && (1..=5_000).contains(&confirmed.remaining_ms)
                 && !context.auth.deadline.expired_at(now, wall_now)
                 && !context.auth.operation_deadline.expired_at(now, wall_now);
@@ -1841,7 +2070,9 @@ impl SessionActor {
                 {
                     (false, VecDeque::new(), 0)
                 } else {
-                    context.auth.confirmed = true;
+                    // Not confirmed and not invalidated (both checked
+                    // above), so the confirmation is always accepted.
+                    let _ = context.auth.transition(AuthEvent::Confirm);
                     context.auth.nonce.clear();
                     let pending = std::mem::take(&mut context.pending);
                     let pending_bytes = context.pending_bytes;
@@ -1991,7 +2222,7 @@ impl SessionActor {
                         Err(())
                     } else {
                         context.inbound_sequence = frame.sequence;
-                        let confirmed = context.auth.confirmed;
+                        let confirmed = context.auth.confirmed();
                         let exceeds = !confirmed
                             && (context.pending_bytes.saturating_add(payload_len)
                                 > self.config.limits.max_queue_bytes
@@ -2034,7 +2265,7 @@ impl SessionActor {
                     } else {
                         context.inbound_sequence = frame.sequence;
                         context.inbound_fin = true;
-                        let confirmed = context.auth.confirmed;
+                        let confirmed = context.auth.confirmed();
                         if !confirmed {
                             context.pending.push_back(BufferedInput::Fin);
                         }
@@ -2112,7 +2343,7 @@ impl SessionActor {
             let Some(context) = self.streams.get(&stream_id) else {
                 return Ok(());
             };
-            if !context.auth.confirmed || context.auth.invalidated {
+            if !context.auth.confirmed() || context.auth.invalidated() {
                 return Ok(());
             }
             if context.outbound_fin {
@@ -2183,7 +2414,7 @@ impl SessionActor {
             let Some(context) = self.streams.get(&stream_id) else {
                 return Ok(());
             };
-            if !context.auth.confirmed || context.auth.invalidated || context.outbound_fin {
+            if !context.auth.confirmed() || context.auth.invalidated() || context.outbound_fin {
                 return Ok(());
             }
             (
@@ -3149,6 +3380,131 @@ mod tests {
             .expect("budget released after dequeue");
     }
 
+    /// The stream authorization's whole transition table, and the three
+    /// flags every decision used to read, state by state.
+    #[test]
+    fn auth_lifecycle_transition_table_and_flags_are_exact() {
+        use auth_lifecycle::AuthState;
+        let reach = |events: &[AuthEvent]| {
+            let mut auth = AuthLifecycle::unconfirmed();
+            for event in events {
+                auth.transition(*event).expect("legal path");
+            }
+            auth
+        };
+        let unconfirmed = reach(&[]);
+        let confirmed = reach(&[AuthEvent::Confirm]);
+        let refreshing = reach(&[AuthEvent::Confirm, AuthEvent::Refresh]);
+        let invalidated_unconfirmed = reach(&[AuthEvent::Invalidate]);
+        let invalidated_confirmed = reach(&[AuthEvent::Confirm, AuthEvent::Invalidate]);
+        assert_eq!(unconfirmed.state(), AuthState::Unconfirmed);
+        assert_eq!(confirmed.state(), AuthState::Confirmed);
+        assert_eq!(refreshing.state(), AuthState::Refreshing);
+        assert_eq!(
+            reach(&[AuthEvent::Confirm, AuthEvent::Refresh, AuthEvent::Confirm]).state(),
+            AuthState::Confirmed
+        );
+        assert_eq!(
+            invalidated_unconfirmed.state(),
+            AuthState::Invalidated {
+                was_confirmed: false
+            }
+        );
+        assert_eq!(
+            invalidated_confirmed.state(),
+            AuthState::Invalidated {
+                was_confirmed: true
+            }
+        );
+        assert_eq!(
+            reach(&[
+                AuthEvent::Confirm,
+                AuthEvent::Refresh,
+                AuthEvent::Invalidate
+            ]),
+            invalidated_unconfirmed
+        );
+
+        // (state, confirmed, refresh_in_flight, invalidated): the flag
+        // triples the three booleans held before they became one state.
+        for (auth, flags) in [
+            (unconfirmed, (false, true, false)),
+            (confirmed, (true, false, false)),
+            (refreshing, (false, true, false)),
+            (invalidated_unconfirmed, (false, true, true)),
+            (invalidated_confirmed, (true, false, true)),
+        ] {
+            assert_eq!(
+                (
+                    auth.confirmed(),
+                    auth.refresh_in_flight(),
+                    auth.invalidated()
+                ),
+                flags,
+                "{auth:?}"
+            );
+            assert_eq!(
+                auth.is_current(),
+                auth.confirmed() && !auth.refresh_in_flight() && !auth.invalidated(),
+                "{auth:?}"
+            );
+            // The dispatch guards read `!confirmed || invalidated`, which
+            // is the same refusal.
+            assert_eq!(
+                !auth.is_current(),
+                !auth.confirmed() || auth.invalidated(),
+                "{auth:?}"
+            );
+        }
+
+        // Every other (state, event) pair is refused and changes nothing.
+        let legal = |state: AuthState, event: AuthEvent| {
+            matches!(
+                (state, event),
+                (
+                    AuthState::Unconfirmed | AuthState::Refreshing,
+                    AuthEvent::Confirm | AuthEvent::Invalidate
+                ) | (
+                    AuthState::Confirmed,
+                    AuthEvent::Refresh | AuthEvent::Invalidate
+                )
+            )
+        };
+        let mut refused = 0;
+        for auth in [
+            unconfirmed,
+            confirmed,
+            refreshing,
+            invalidated_unconfirmed,
+            invalidated_confirmed,
+        ] {
+            for event in [
+                AuthEvent::Confirm,
+                AuthEvent::Refresh,
+                AuthEvent::Invalidate,
+            ] {
+                let mut next = auth;
+                let outcome = next.transition(event);
+                if legal(auth.state(), event) {
+                    assert_eq!(outcome, Ok(()), "{auth:?} on {event:?}");
+                    assert_ne!(next, auth);
+                } else {
+                    refused += 1;
+                    assert_eq!(
+                        outcome,
+                        Err(IllegalAuthTransition {
+                            from: auth.state(),
+                            event,
+                        }),
+                        "{auth:?} must refuse {event:?}"
+                    );
+                    assert_eq!(next, auth, "a refused event changes nothing");
+                }
+            }
+        }
+        assert_eq!(refused, 9, "invalidated is terminal; six legal transitions");
+    }
+
     #[tokio::test]
     async fn concurrent_stop_waits_for_existing_supervisor_join() {
         let cancellation = CancellationToken::new();
@@ -3163,10 +3519,7 @@ mod tests {
             supervisor_release.notified().await;
             Ok(())
         });
-        let lifecycle = Arc::new(ConnectionLifecycle {
-            cancellation,
-            join: Mutex::new(Some(join)),
-        });
+        let lifecycle = ConnectionLifecycle::spawn(cancellation, join);
         let handle = ConnectionHandle {
             readiness: readiness_rx,
             status: status_rx,
@@ -3175,15 +3528,15 @@ mod tests {
 
         let first_handle = handle.clone();
         let first = tokio::spawn(async move { first_handle.stop().await });
-        let mut first_holds_join_lock = false;
+        let mut first_is_joining = false;
         for _ in 0..1_000 {
-            if lifecycle.join.try_lock().is_err() {
-                first_holds_join_lock = true;
+            if lifecycle.stops_received.load(Ordering::Acquire) == 1 {
+                first_is_joining = true;
                 break;
             }
             tokio::task::yield_now().await;
         }
-        assert!(first_holds_join_lock, "first stop did not begin joining");
+        assert!(first_is_joining, "first stop did not begin joining");
 
         let second_handle = handle.clone();
         let mut second = tokio::spawn(async move { second_handle.stop().await });
@@ -3213,10 +3566,7 @@ mod tests {
             supervisor_release.notified().await;
             Ok(())
         });
-        let lifecycle = Arc::new(ConnectionLifecycle {
-            cancellation,
-            join: Mutex::new(Some(join)),
-        });
+        let lifecycle = ConnectionLifecycle::spawn(cancellation, join);
         let handle = ConnectionHandle {
             readiness: readiness_rx,
             status: status_rx,
@@ -3225,15 +3575,15 @@ mod tests {
 
         let first_handle = handle.clone();
         let first = tokio::spawn(async move { first_handle.stop().await });
-        let mut first_holds_join_lock = false;
+        let mut first_is_joining = false;
         for _ in 0..1_000 {
-            if lifecycle.join.try_lock().is_err() {
-                first_holds_join_lock = true;
+            if lifecycle.stops_received.load(Ordering::Acquire) == 1 {
+                first_is_joining = true;
                 break;
             }
             tokio::task::yield_now().await;
         }
-        assert!(first_holds_join_lock, "first stop did not begin joining");
+        assert!(first_is_joining, "first stop did not begin joining");
 
         first.abort();
         let first_error = first.await.expect_err("first stop should be cancelled");

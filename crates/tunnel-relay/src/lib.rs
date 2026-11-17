@@ -23,6 +23,7 @@ pub mod http_forward_diagnostics;
 pub mod membership_runtime;
 pub mod membership_version_state;
 mod metrics;
+mod owner_task;
 pub mod ownership_surrender;
 mod peer_consumer_transport_diagnostics;
 pub mod peer_fault_diagnostics;

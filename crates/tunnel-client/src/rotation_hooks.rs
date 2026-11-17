@@ -27,32 +27,33 @@ compile_error!(
 #[cfg(feature = "test-hooks")]
 mod enabled {
     use std::{
-        collections::BTreeSet,
-        sync::{Mutex, OnceLock},
+        collections::BTreeMap,
+        sync::{
+            OnceLock,
+            atomic::{AtomicBool, Ordering},
+        },
     };
 
-    fn configured() -> &'static BTreeSet<String> {
-        static HOLDS: OnceLock<BTreeSet<String>> = OnceLock::new();
+    /// The held kinds, each with whether it has been reported yet.
+    fn configured() -> &'static BTreeMap<String, AtomicBool> {
+        static HOLDS: OnceLock<BTreeMap<String, AtomicBool>> = OnceLock::new();
         HOLDS.get_or_init(|| {
             std::env::var("TUNNEL_CLIENT_TEST_HOLD")
                 .unwrap_or_default()
                 .split(',')
                 .map(str::trim)
                 .filter(|kind| !kind.is_empty())
-                .map(str::to_owned)
+                .map(|kind| (kind.to_owned(), AtomicBool::new(false)))
                 .collect()
         })
     }
 
     /// Whether this step is held; reports each held kind once.
     pub(crate) fn holds(kind: &str) -> bool {
-        if !configured().contains(kind) {
+        let Some(reported) = configured().get(kind) else {
             return false;
-        }
-        static REPORTED: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
-        if let Ok(mut reported) = REPORTED.lock()
-            && reported.insert(kind.to_owned())
-        {
+        };
+        if !reported.swap(true, Ordering::AcqRel) {
             eprintln!("tunnel-client: test hook holding {kind}");
         }
         true

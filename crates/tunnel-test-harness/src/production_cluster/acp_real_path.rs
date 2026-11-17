@@ -77,6 +77,7 @@ use tunnel_client::http_forward::{AcpExportDiagnostics, HttpHandlers};
 use tunnel_client::{ConnectOptions, ConnectionHandle};
 use tunnel_core::RotationConfig;
 
+use super::append_log::AppendLog;
 use super::http_forward_real_path::{ConsumerStream, empty_stream};
 use super::{
     CLEANUP_TIMEOUT, Harness, HarnessError, HarnessOptions, ProductionCluster, Result,
@@ -379,7 +380,8 @@ pub struct LossEvidence {
 pub(super) struct RefusalLedger {
     pub(super) refusals: AtomicU64,
     pub(super) retries: AtomicU64,
-    pub(super) unexplained: std::sync::Mutex<Option<String>>,
+    /// The first refusal that coincided with no freeze, set once.
+    pub(super) unexplained: std::sync::OnceLock<String>,
 }
 
 /// The connector's rotation phase, sampled from its own status watch.
@@ -391,20 +393,17 @@ pub(super) struct FreezeWatch {
     frozen: std::sync::atomic::AtomicBool,
     seen_frozen: std::sync::atomic::AtomicBool,
     last_frozen_ms: AtomicU64,
-    started: std::sync::Mutex<Option<Instant>>,
-    phase: std::sync::Mutex<String>,
+    /// The origin of `last_frozen_ms`, set by the first sample.
+    started: std::sync::OnceLock<Instant>,
+    /// The last sampled phase.  The status sampler is the only writer.
+    phase: tokio::sync::watch::Sender<String>,
     rotations_completed: AtomicU64,
 }
 
 impl FreezeWatch {
     pub(super) fn record(&self, phase: &str, rotations_completed: u64) {
-        let mut started = self.started.lock().unwrap_or_else(|e| e.into_inner());
-        if started.is_none() {
-            *started = Some(Instant::now());
-        }
-        let origin = started.expect("set above");
-        drop(started);
-        *self.phase.lock().unwrap_or_else(|e| e.into_inner()) = phase.to_owned();
+        let origin = *self.started.get_or_init(Instant::now);
+        self.phase.send_replace(phase.to_owned());
         self.rotations_completed
             .store(rotations_completed, Ordering::SeqCst);
         let frozen = FROZEN_PHASES.contains(&phase);
@@ -425,11 +424,9 @@ impl FreezeWatch {
         if !self.seen_frozen.load(Ordering::SeqCst) {
             return false;
         }
-        let started = self.started.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(origin) = *started else {
+        let Some(origin) = self.started.get() else {
             return false;
         };
-        drop(started);
         let now = u64::try_from(origin.elapsed().as_millis()).unwrap_or(u64::MAX);
         now.saturating_sub(self.last_frozen_ms.load(Ordering::SeqCst))
             <= u64::try_from(FREEZE_COINCIDENCE.as_millis()).unwrap_or(u64::MAX)
@@ -438,7 +435,7 @@ impl FreezeWatch {
     /// The sentence a refusal outside a freeze is reported with.  It names the
     /// connector state, so the failure is diagnosable without a rerun.
     pub(super) fn unexplained(&self) -> String {
-        let phase = self.phase.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let phase = self.phase.borrow().clone();
         format!(
             "not_dispatched refusal outside a rotation freeze: connector phase={phase:?} rotations_completed={}",
             self.rotations_completed.load(Ordering::SeqCst)
@@ -538,7 +535,8 @@ pub(super) fn json_stream(value: &Value) -> StreamBody<ConsumerStream> {
 /// transport. A reader that took one message and let the response go would
 /// destroy the connection it was reading.
 pub(super) struct HeldStream {
-    payloads: Arc<std::sync::Mutex<Vec<Value>>>,
+    /// Every payload read so far.  The drain task is the only writer.
+    payloads: Arc<AppendLog<Value>>,
     errored: Arc<std::sync::atomic::AtomicBool>,
     ended: Arc<std::sync::atomic::AtomicBool>,
     task: tokio::task::JoinHandle<()>,
@@ -546,7 +544,7 @@ pub(super) struct HeldStream {
 
 impl HeldStream {
     pub(super) fn hold(response: http::Response<hyper::body::Incoming>) -> Self {
-        let payloads = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let payloads = Arc::new(AppendLog::default());
         let errored = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let ended = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let sink = Arc::clone(&payloads);
@@ -572,10 +570,9 @@ impl HeldStream {
                 }
                 let all = sse_payloads(&buffer);
                 if all.len() > taken {
-                    let mut guard = sink.lock().unwrap_or_else(|e| e.into_inner());
                     for payload in &all[taken..] {
                         if let Ok(value) = serde_json::from_slice::<Value>(payload) {
-                            guard.push(value);
+                            sink.push(value);
                         }
                     }
                     taken = all.len();
@@ -592,10 +589,7 @@ impl HeldStream {
     }
 
     pub(super) fn seen(&self) -> Vec<Value> {
-        self.payloads
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
+        self.payloads.snapshot()
     }
 
     /// Wait for a message this stream carried that `pick` accepts.
@@ -921,14 +915,9 @@ impl Gate<'_> {
         if coincides {
             self.ledger.retries.fetch_add(1, Ordering::SeqCst);
         } else {
-            let mut slot = self
-                .ledger
+            self.ledger
                 .unexplained
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            if slot.is_none() {
-                *slot = Some(self.freeze.unexplained());
-            }
+                .get_or_init(|| self.freeze.unexplained());
         }
         if coincides && *retries < NOT_DISPATCHED_RETRIES {
             *retries += 1;
@@ -1945,12 +1934,7 @@ async fn run(
     evidence.membership_resigns = gate.membership_resigns;
     evidence.not_dispatched_refusals = gate.ledger.refusals.load(Ordering::SeqCst);
     evidence.not_dispatched_retries = gate.ledger.retries.load(Ordering::SeqCst);
-    evidence.unexplained_refusal = gate
-        .ledger
-        .unexplained
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone();
+    evidence.unexplained_refusal = gate.ledger.unexplained.get().cloned();
     let export = gate.export();
     evidence.device_sessions = export.connections_opened;
     if let Some(client) = &gate.client {

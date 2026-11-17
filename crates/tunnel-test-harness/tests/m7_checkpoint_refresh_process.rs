@@ -18,7 +18,7 @@ use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex,
+        Arc,
         atomic::{AtomicU8, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
@@ -29,9 +29,9 @@ use serde::Deserialize;
 use tokio::{
     io::AsyncWriteExt,
     net::{TcpListener as TokioTcpListener, TcpStream},
-    sync::Mutex as AsyncMutex,
+    sync::{mpsc, oneshot, watch},
     task::JoinSet,
-    time::{sleep, timeout},
+    time::{sleep, timeout, timeout_at},
 };
 use tokio_rustls::TlsAcceptor;
 use tokio_util::sync::CancellationToken;
@@ -112,34 +112,90 @@ struct CheckpointObservation {
     response: Vec<u8>,
 }
 
+/// Work handed to the checkpoint authority's one request owner.
+enum CheckpointCommand {
+    /// Serve one accepted connection, start to finish.
+    Serve {
+        stream: TcpStream,
+        acceptor: TlsAcceptor,
+        context: Arc<MutableCheckpointContext>,
+        cancellation: CancellationToken,
+        /// The connection's own deadline, running since it was accepted.
+        deadline: tokio::time::Instant,
+        /// Dropped when the connection has been served; closed from the
+        /// other side when the connection task gave up or was aborted.
+        done: oneshot::Sender<()>,
+    },
+    /// Change the refresh mode once every request ahead of it has finished.
+    TransitionMode {
+        mode: RefreshMode,
+        applied: oneshot::Sender<()>,
+    },
+}
+
+/// Every accepted connection may queue one request, plus the scenario's own
+/// mode transition; a sender waits its turn rather than being dropped.
+const CHECKPOINT_COMMAND_QUEUE: usize = AUXILIARY_CONNECTION_LIMIT + 1;
+
+/// The scenario's handle on the fixture authority's state.
+///
+/// One request owner (`run_checkpoint_request_owner`) serves connections and
+/// applies mode transitions strictly one after another, so a mode never
+/// changes underneath a request and each request's observation is recorded
+/// before the next one starts. It is the only writer of `mode`,
+/// `next_version` and the observation record. The scenario is the only
+/// writer of the minimum versions, which the owner samples per request.
 struct MutableCheckpointState {
-    mode: AtomicU8,
+    mode: Arc<AtomicU8>,
     next_version: AtomicU64,
-    minimum_versions: Mutex<BTreeMap<String, u64>>,
-    observations: Mutex<Vec<CheckpointObservation>>,
-    request_gate: AsyncMutex<()>,
+    minimum_versions: watch::Sender<BTreeMap<String, u64>>,
+    observations: watch::Receiver<Vec<CheckpointObservation>>,
+    commands: mpsc::Sender<CheckpointCommand>,
+}
+
+/// The request owner's half of [`MutableCheckpointState`].
+struct CheckpointRequestQueue {
+    commands: mpsc::Receiver<CheckpointCommand>,
+    mode: Arc<AtomicU8>,
+    observations: watch::Sender<Vec<CheckpointObservation>>,
 }
 
 impl MutableCheckpointState {
-    fn new(minimum_versions: BTreeMap<String, u64>) -> Arc<Self> {
-        Arc::new(Self {
-            mode: AtomicU8::new(RefreshMode::Fresh as u8),
+    fn new(minimum_versions: BTreeMap<String, u64>) -> (Arc<Self>, CheckpointRequestQueue) {
+        let (commands, command_queue) = mpsc::channel(CHECKPOINT_COMMAND_QUEUE);
+        let (record, observations) = watch::channel(Vec::new());
+        let mode = Arc::new(AtomicU8::new(RefreshMode::Fresh as u8));
+        let state = Arc::new(Self {
+            mode: Arc::clone(&mode),
             next_version: AtomicU64::new(0),
-            minimum_versions: Mutex::new(minimum_versions),
-            observations: Mutex::new(Vec::new()),
-            request_gate: AsyncMutex::new(()),
-        })
+            minimum_versions: watch::Sender::new(minimum_versions),
+            observations,
+            commands,
+        });
+        let queue = CheckpointRequestQueue {
+            commands: command_queue,
+            mode,
+            observations: record,
+        };
+        (state, queue)
     }
 
     async fn transition_mode(&self, mode: RefreshMode, deadline: ScenarioDeadline) -> Result<()> {
         let remaining = deadline.remaining("checkpoint mode transition")?;
-        let _request_gate = timeout(remaining, self.request_gate.lock())
+        let (applied, done) = oneshot::channel();
+        let transition = async {
+            self.commands
+                .send(CheckpointCommand::TransitionMode { mode, applied })
+                .await
+                .ok()?;
+            done.await.ok()
+        };
+        timeout(remaining, transition)
             .await
             .map_err(|_| {
                 HarnessError::Timeout("checkpoint mode transition did not drain requests".into())
-            })?;
-        self.mode.store(mode as u8, Ordering::Release);
-        Ok(())
+            })?
+            .ok_or_else(|| HarnessError::Process("checkpoint request owner stopped".into()))
     }
 
     fn issue(&self) -> (RefreshMode, u64) {
@@ -153,22 +209,8 @@ impl MutableCheckpointState {
         (mode, version)
     }
 
-    fn record(&self, observation: CheckpointObservation) {
-        let mut observations = self
-            .observations
-            .lock()
-            .expect("checkpoint observations mutex");
-        if observations.len() == MAX_OBSERVATIONS {
-            observations.remove(0);
-        }
-        observations.push(observation);
-    }
-
     fn observations(&self) -> Vec<CheckpointObservation> {
-        self.observations
-            .lock()
-            .expect("checkpoint observations mutex")
-            .clone()
+        self.observations.borrow().clone()
     }
 
     fn latest_fresh(&self) -> Option<CheckpointObservation> {
@@ -184,28 +226,41 @@ impl MutableCheckpointState {
                 "checkpoint minimum membership version must be non-zero".into(),
             ));
         }
-        let mut minimum_versions = self
-            .minimum_versions
-            .lock()
-            .map_err(|_| HarnessError::Process("checkpoint minimum mutex poisoned".into()))?;
-        if minimum_versions
-            .get(node_id)
-            .is_some_and(|current| version < *current)
-        {
+        let mut rolled_back = false;
+        self.minimum_versions.send_if_modified(|minimum_versions| {
+            if minimum_versions
+                .get(node_id)
+                .is_some_and(|current| version < *current)
+            {
+                rolled_back = true;
+                return false;
+            }
+            minimum_versions.insert(node_id.to_owned(), version);
+            true
+        });
+        if rolled_back {
             return Err(HarnessError::Process(
                 "checkpoint minimum membership version would roll back".into(),
             ));
         }
-        minimum_versions.insert(node_id.to_owned(), version);
         Ok(())
     }
 
     fn minimum_versions(&self) -> BTreeMap<String, u64> {
-        self.minimum_versions
-            .lock()
-            .expect("checkpoint minimum mutex")
-            .clone()
+        self.minimum_versions.borrow().clone()
     }
+}
+
+fn record_observation(
+    observations: &watch::Sender<Vec<CheckpointObservation>>,
+    observation: CheckpointObservation,
+) {
+    observations.send_modify(|observations| {
+        if observations.len() == MAX_OBSERVATIONS {
+            observations.remove(0);
+        }
+        observations.push(observation);
+    });
 }
 
 #[derive(Deserialize)]
@@ -240,7 +295,7 @@ impl MutableCheckpointServer {
     ) -> Result<Self> {
         let listener = TokioTcpListener::bind("127.0.0.1:0").await?;
         let address = listener.local_addr()?;
-        let state = MutableCheckpointState::new(minimum_versions);
+        let (state, requests) = MutableCheckpointState::new(minimum_versions);
         let context = Arc::new(MutableCheckpointContext {
             authority,
             deployment_id,
@@ -252,6 +307,7 @@ impl MutableCheckpointServer {
             listener,
             TlsAcceptor::from(server_config),
             context,
+            requests,
             cancellation.clone(),
         ));
         sleep(Duration::from_millis(1)).await;
@@ -306,6 +362,72 @@ async fn run_mutable_checkpoint_server(
     listener: TokioTcpListener,
     acceptor: TlsAcceptor,
     context: Arc<MutableCheckpointContext>,
+    requests: CheckpointRequestQueue,
+    cancellation: CancellationToken,
+) -> Result<()> {
+    let owner = tokio::spawn(run_checkpoint_request_owner(requests, cancellation.clone()));
+    let result = accept_checkpoint_connections(listener, acceptor, context, cancellation).await;
+    owner.abort();
+    let _ = owner.await;
+    result
+}
+
+/// Serve connections and apply mode transitions one at a time, in the order
+/// they were queued.
+async fn run_checkpoint_request_owner(
+    mut requests: CheckpointRequestQueue,
+    cancellation: CancellationToken,
+) {
+    loop {
+        let command = tokio::select! {
+            _ = cancellation.cancelled() => return,
+            command = requests.commands.recv() => match command {
+                Some(command) => command,
+                None => return,
+            },
+        };
+        match command {
+            CheckpointCommand::Serve {
+                stream,
+                acceptor,
+                context,
+                cancellation,
+                deadline,
+                mut done,
+            } => {
+                // Stop as soon as the connection task is gone or its deadline
+                // passes, so one abandoned connection never holds up the rest.
+                tokio::select! {
+                    _ = done.closed() => {}
+                    _ = timeout_at(
+                        deadline,
+                        serve_checkpoint_request(
+                            stream,
+                            acceptor,
+                            &context,
+                            &cancellation,
+                            &requests.observations,
+                        ),
+                    ) => {}
+                }
+            }
+            CheckpointCommand::TransitionMode { mode, applied } => {
+                // A caller whose deadline passed while it waited must not see
+                // the mode change afterwards.
+                if applied.is_closed() {
+                    continue;
+                }
+                requests.mode.store(mode as u8, Ordering::Release);
+                let _ = applied.send(());
+            }
+        }
+    }
+}
+
+async fn accept_checkpoint_connections(
+    listener: TokioTcpListener,
+    acceptor: TlsAcceptor,
+    context: Arc<MutableCheckpointContext>,
     cancellation: CancellationToken,
 ) -> Result<()> {
     let mut connections = JoinSet::new();
@@ -354,8 +476,36 @@ async fn run_mutable_checkpoint_connection(
     context: Arc<MutableCheckpointContext>,
     cancellation: CancellationToken,
 ) {
-    let _ = timeout(AUXILIARY_CONNECTION_DEADLINE, async move {
-        let _request_gate = context.state.request_gate.lock().await;
+    let deadline = tokio::time::Instant::now() + AUXILIARY_CONNECTION_DEADLINE;
+    let (done, served) = oneshot::channel();
+    let commands = context.state.commands.clone();
+    let _ = timeout_at(deadline, async move {
+        let serve = CheckpointCommand::Serve {
+            stream,
+            acceptor,
+            context,
+            cancellation,
+            deadline,
+            done,
+        };
+        if commands.send(serve).await.is_ok() {
+            // Resolves when the owner drops `done`, served or not.
+            let _ = served.await;
+        }
+    })
+    .await;
+}
+
+/// Serve one checkpoint request. Only the request owner calls this, so
+/// requests never overlap each other or a mode transition.
+async fn serve_checkpoint_request(
+    stream: TcpStream,
+    acceptor: TlsAcceptor,
+    context: &MutableCheckpointContext,
+    cancellation: &CancellationToken,
+    observations: &watch::Sender<Vec<CheckpointObservation>>,
+) {
+    {
         let mut tls = tokio::select! {
             _ = cancellation.cancelled() => return,
             accepted = acceptor.accept(stream) => match accepted {
@@ -406,18 +556,20 @@ async fn run_mutable_checkpoint_connection(
         } {
             return;
         }
-        context.state.record(CheckpointObservation {
-            mode,
-            version,
-            nonce: request.nonce,
-            response: bytes,
-        });
+        record_observation(
+            observations,
+            CheckpointObservation {
+                mode,
+                version,
+                nonce: request.nonce,
+                response: bytes,
+            },
+        );
         tokio::select! {
             _ = cancellation.cancelled() => {}
             _ = tls.shutdown() => {}
         }
-    })
-    .await;
+    }
 }
 
 struct ProcessFixture {

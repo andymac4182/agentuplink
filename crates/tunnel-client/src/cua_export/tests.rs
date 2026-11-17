@@ -413,3 +413,66 @@ async fn a_click_on_a_superseded_capture_is_refused_at_the_export() {
     export.shutdown().await;
     backend.stop();
 }
+
+/// A lease the device state holds is always one the session's entry names,
+/// **wherever the exchange that asked for it is dropped**. An earlier
+/// revision took the lease and recorded it in two awaits of the requesting
+/// exchange; dropped between them, the lease stayed held with nothing
+/// recorded, so its own principal's release answered `lease_not_held` and
+/// every other principal was refused until it expired.
+///
+/// The acquire is dropped after each number of polls in turn (this runtime
+/// has one thread, so a poll count names one suspension point). Whatever
+/// happened, the principal's own release must then leave the target free.
+#[tokio::test]
+async fn a_dropped_acquire_never_strands_a_lease() {
+    let backend = FixtureBackend::start().await.expect("fixture");
+    let workspace = tempfile::tempdir().expect("workspace");
+    let export =
+        CuaExport::from_settings(&settings(workspace.path(), &backend, None)).expect("export");
+    // Both sessions exist, so every drop below lands in the lease path.
+    for binding in ["agent-a", "agent-b"] {
+        let described = call(&export, binding, "describe", json!({})).await;
+        assert_eq!(outcome(&described), "answered_locally", "{described}");
+    }
+
+    let mut completed = false;
+    for polls in 0..64 {
+        let mut acquire = Box::pin(call(&export, "agent-a", LEASE_ACQUIRE, json!({})));
+        for _ in 0..polls {
+            if std::future::poll_fn(|cx| std::task::Poll::Ready(acquire.as_mut().poll(cx)))
+                .await
+                .is_ready()
+            {
+                completed = true;
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        drop(acquire);
+
+        // Its own release either gives the lease back or finds none taken.
+        let released = call(&export, "agent-a", LEASE_RELEASE, json!({})).await;
+        if outcome(&released) != "answered_locally" {
+            assert_eq!(released["error"]["code"], "lease_not_held", "{released}");
+        }
+        // Either way nothing is left held: the other principal gets it.
+        let other = call(&export, "agent-b", LEASE_ACQUIRE, json!({})).await;
+        assert_eq!(
+            outcome(&other),
+            "answered_locally",
+            "after {polls} polls: {other}"
+        );
+        let other = call(&export, "agent-b", LEASE_RELEASE, json!({})).await;
+        assert_eq!(outcome(&other), "answered_locally", "{other}");
+        if completed {
+            break;
+        }
+    }
+    assert!(
+        completed,
+        "the acquire ran to completion within the poll budget"
+    );
+    export.shutdown().await;
+    backend.stop();
+}

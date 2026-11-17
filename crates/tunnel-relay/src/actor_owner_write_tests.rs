@@ -11,8 +11,8 @@
 use std::{
     collections::BTreeSet,
     sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc,
+        atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -49,6 +49,15 @@ enum OwnerReadMode {
     Absent,
 }
 
+impl OwnerReadMode {
+    fn from_discriminant(value: u8) -> Self {
+        [Self::Authoritative, Self::Fail, Self::Absent]
+            .into_iter()
+            .find(|mode| *mode as u8 == value)
+            .expect("a stored owner read mode")
+    }
+}
+
 /// A memory catalog whose owner renewal can lose its reply after committing
 /// and whose owner read can be steered, with every owner-affecting call
 /// counted so replay is observable.
@@ -57,7 +66,8 @@ struct LostReplyCatalog {
     lose_renew_reply: AtomicBool,
     renew_calls: AtomicUsize,
     current_owner_calls: AtomicUsize,
-    owner_read: Mutex<OwnerReadMode>,
+    /// An [`OwnerReadMode`] discriminant.
+    owner_read: AtomicU8,
 }
 
 impl LostReplyCatalog {
@@ -67,12 +77,12 @@ impl LostReplyCatalog {
             lose_renew_reply: AtomicBool::new(false),
             renew_calls: AtomicUsize::new(0),
             current_owner_calls: AtomicUsize::new(0),
-            owner_read: Mutex::new(OwnerReadMode::Authoritative),
+            owner_read: AtomicU8::new(OwnerReadMode::Authoritative as u8),
         }
     }
 
     fn set_owner_read(&self, mode: OwnerReadMode) {
-        *self.owner_read.lock().expect("owner read mode") = mode;
+        self.owner_read.store(mode as u8, Ordering::Release);
     }
 }
 
@@ -195,7 +205,7 @@ impl Catalog for LostReplyCatalog {
         at: DateTime<Utc>,
     ) -> Result<Option<OwnerClaim>, CatalogError> {
         self.current_owner_calls.fetch_add(1, Ordering::AcqRel);
-        let mode = *self.owner_read.lock().expect("owner read mode");
+        let mode = OwnerReadMode::from_discriminant(self.owner_read.load(Ordering::Acquire));
         match mode {
             OwnerReadMode::Authoritative => {
                 self.inner.current_owner(tenant_id, device_id, at).await
@@ -285,7 +295,7 @@ async fn owned_session_fixture(session_id: &str) -> Fixture {
             session.owner, claim.token,
             "the session owns its claimed token"
         );
-        session.data_tx = Some(data_tx);
+        session.attach_data_for_test(data_tx);
         // Renewal is due: the lease is a third consumed plus a margin.
         session.last_lease_renewal = Instant::now()
             .checked_sub(owner_lease / 3 + Duration::from_secs(1))
@@ -406,7 +416,8 @@ async fn lost_renewal_reply_keeps_the_session_unready_without_replay_until_the_o
         .expect("a lost reply is not a failed authority: the session stays");
     assert!(!session.closed);
     let unknown = session
-        .owner_write_unknown
+        .lease_maintenance
+        .unknown()
         .expect("the session records the unknown owner write");
     assert_eq!(unknown.cause, Some(UnknownWriteCause::ConnectionLost));
     assert_eq!(fixture.catalog.renew_calls.load(Ordering::Acquire), 1);
@@ -454,7 +465,7 @@ async fn lost_renewal_reply_keeps_the_session_unready_without_replay_until_the_o
         .get(&key.scope())
         .expect("the reconciled session stays live");
     assert!(
-        session.owner_write_unknown.is_none(),
+        session.lease_maintenance.unknown().is_none(),
         "the authoritative read confirmed the exact token and cleared the unknown state"
     );
     assert_eq!(
@@ -506,7 +517,8 @@ async fn failed_owner_read_keeps_the_session_unready_until_the_confirmed_lease_r
     maintenance_round(&mut fixture.actor).await;
     assert!(
         fixture.actor.sessions[&key.scope()]
-            .owner_write_unknown
+            .lease_maintenance
+            .unknown()
             .is_some()
     );
 
@@ -518,7 +530,7 @@ async fn failed_owner_read_keeps_the_session_unready_until_the_confirmed_lease_r
         .get(&key.scope())
         .expect("an unreadable authority keeps the session while the confirmed lease lasts");
     assert!(
-        session.owner_write_unknown.is_some(),
+        session.lease_maintenance.unknown().is_some(),
         "the session stays unready until a read succeeds"
     );
     assert_eq!(fixture.catalog.renew_calls.load(Ordering::Acquire), 1);
@@ -576,7 +588,8 @@ async fn owner_read_without_the_exact_token_fences_the_session() {
     maintenance_round(&mut fixture.actor).await;
     assert!(
         fixture.actor.sessions[&key.scope()]
-            .owner_write_unknown
+            .lease_maintenance
+            .unknown()
             .is_some()
     );
 

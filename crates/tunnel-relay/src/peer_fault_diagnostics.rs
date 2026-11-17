@@ -11,10 +11,10 @@
 //! own state removal.
 
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::BTreeMap,
     sync::{
-        Arc, Mutex, OnceLock,
-        atomic::{AtomicBool, Ordering},
+        Arc, OnceLock,
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Instant,
 };
@@ -24,7 +24,12 @@ use tunnel_catalog::OwnerToken;
 use tunnel_transport::PeerTransportError;
 use uuid::Uuid;
 
-use crate::peer_runtime::{PeerOpenDiagnostic, PeerOpenDiagnosticStage, PeerRuntimeError};
+use crate::{
+    peer_runtime::{PeerOpenDiagnostic, PeerOpenDiagnosticStage, PeerRuntimeError},
+    peer_transport_diagnostics::cells::{
+        Arena, Entry, Ledger, Order, Place, WordReader, WordWriter, bump, code_of, variant,
+    },
+};
 
 /// Maximum number of recent tuples retained in the ring.
 pub const MAX_RECENT_PEER_FAULTS: usize = 32;
@@ -50,6 +55,9 @@ pub enum TaskClosureStage {
 }
 
 impl TaskClosureStage {
+    /// Every stage, for the closure counters and for decoding a tuple.
+    pub const ALL: [Self; 3] = [Self::Control, Self::Data, Self::ConsumerStream];
+
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -92,6 +100,20 @@ pub enum TaskClosureCause {
 }
 
 impl TaskClosureCause {
+    /// Every cause, for the closure counters and for decoding a tuple.
+    pub const ALL: [Self; 10] = [
+        Self::PeerClosed,
+        Self::WriteFailed,
+        Self::ProtocolError,
+        Self::RecordTooLarge,
+        Self::UnexpectedMessage,
+        Self::ServerClose,
+        Self::StreamClosed,
+        Self::Expired,
+        Self::StreamFailed,
+        Self::LivenessTimeout,
+    ];
+
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -154,6 +176,9 @@ pub enum PeerFaultRole {
 }
 
 impl PeerFaultRole {
+    /// In the order of the fault cells.
+    const ALL: [Self; 2] = [Self::Ingress, Self::Owner];
+
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -481,31 +506,137 @@ pub struct PeerFaultDiagnosticSnapshot {
     /// kept in their own ring so a routine close never appears in
     /// `fault_count`, `cause_counts`, `last_by_stage` or `recent`.
     pub closures: Vec<TaskClosureEventSnapshot>,
+    /// True only when this snapshot could not be taken because too many
+    /// reads of these diagnostics were in progress at once.  Every other
+    /// field is then a placeholder and not an observation: the counts are
+    /// unknown, not zero.  Absent from the serialized snapshot otherwise.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub unavailable: bool,
 }
 
-#[derive(Default)]
+/// The cap on this diagnostic's storage: 2^17 blocks of 88 bytes, 11.5 MB.
+/// About five hundred blocks are retained; the rest is head-room for
+/// recorders in flight and for blocks parked behind a reader.  At the cap a
+/// fault or closure is refused and counted, never half-recorded.
+const BLOCKS: usize = 1 << 17;
+
+const ROLES: usize = PeerFaultRole::ALL.len();
+const STAGES: usize = PeerOpenDiagnosticStage::ALL.len();
+const CAUSES: usize = PeerFaultCause::ALL.len();
+const CLOSURE_STAGES: usize = TaskClosureStage::ALL.len();
+const CLOSURE_CAUSES: usize = TaskClosureCause::ALL.len();
+
+/// The ledger group holding the recent ring, and the group holding each
+/// stage's latest tuple at the stage's position.
+const RECENT: usize = 0;
+const LATEST: usize = 1;
+
+/// The shared diagnostic clock and the two ledgers.
+///
+/// A fault is counted once, in the `(role, stage, cause)` cell of the fault
+/// ledger; a closure once, in the `(stage, cause)` cell of the closure
+/// ledger.  Every total and breakdown a snapshot reports is a sum over one
+/// read of those cells, so the breakdowns agree with the total and with
+/// each other in every snapshot, and the retained tuples come from the same
+/// state as the cells that count them.
 struct PeerFaultDiagnosticState {
-    sequence: u64,
-    fault_count: u64,
-    ingress_count: u64,
-    owner_count: u64,
-    stage_counts: BTreeMap<&'static str, u64>,
-    cause_counts: BTreeMap<&'static str, u64>,
-    last_by_stage: BTreeMap<&'static str, PeerFaultEventSnapshot>,
-    recent: VecDeque<PeerFaultEventSnapshot>,
-    closure_stage_counts: BTreeMap<&'static str, u64>,
-    closure_cause_counts: BTreeMap<&'static str, u64>,
-    closures: VecDeque<TaskClosureEventSnapshot>,
+    arena: Arena,
+    sequence: AtomicU64,
+    faults: Ledger,
+    closures: Ledger,
+}
+
+impl Default for PeerFaultDiagnosticState {
+    fn default() -> Self {
+        Self::with_blocks(BLOCKS)
+    }
+}
+
+impl PeerFaultDiagnosticState {
+    fn with_blocks(blocks: usize) -> Self {
+        Self {
+            arena: Arena::new(blocks),
+            sequence: AtomicU64::new(0),
+            faults: Ledger::new(ROLES * STAGES * CAUSES, &[MAX_RECENT_PEER_FAULTS, STAGES]),
+            closures: Ledger::new(CLOSURE_STAGES * CLOSURE_CAUSES, &[MAX_TASK_CLOSURES]),
+        }
+    }
+}
+
+fn index(code: u64) -> usize {
+    usize::try_from(code).unwrap_or(usize::MAX)
+}
+
+fn encode_fault(event: &PeerFaultEventSnapshot) -> WordWriter {
+    let mut record = WordWriter::new();
+    record.u64(event.observed_at_ms);
+    record.u64(code_of(&PeerFaultRole::ALL, &event.role));
+    record.u64(code_of(&PeerOpenDiagnosticStage::ALL, &event.stage));
+    record.u64(code_of(&PeerFaultCause::ALL, &event.cause));
+    record.uuid(event.tenant_id);
+    record.uuid(event.device_id);
+    record.opt_text(event.session_id.as_deref());
+    record.opt_u64(event.owner_epoch);
+    record.opt_text(event.owner_node_id.as_deref());
+    record.opt_uuid(event.service_id);
+    record.opt_text(event.request_id.as_deref());
+    record
+}
+
+fn decode_fault(sequence: u64, mut record: WordReader) -> Option<PeerFaultEventSnapshot> {
+    Some(PeerFaultEventSnapshot {
+        sequence,
+        observed_at_ms: record.u64()?,
+        role: variant(&PeerFaultRole::ALL, record.u64()?)?,
+        stage: variant(&PeerOpenDiagnosticStage::ALL, record.u64()?)?,
+        cause: variant(&PeerFaultCause::ALL, record.u64()?)?,
+        tenant_id: record.uuid()?,
+        device_id: record.uuid()?,
+        session_id: record.opt_text()?,
+        owner_epoch: record.opt_u64()?,
+        owner_node_id: record.opt_text()?,
+        service_id: record.opt_uuid()?,
+        request_id: record.opt_text()?,
+    })
+}
+
+fn decode_closure(sequence: u64, mut record: WordReader) -> Option<TaskClosureEventSnapshot> {
+    Some(TaskClosureEventSnapshot {
+        sequence,
+        observed_at_ms: record.u64()?,
+        stage: variant(&TaskClosureStage::ALL, record.u64()?)?,
+        cause: variant(&TaskClosureCause::ALL, record.u64()?)?,
+        tenant_id: record.uuid()?,
+        device_id: record.uuid()?,
+        session_id: record.text()?,
+        epoch: record.u64()?,
+        stream_id: record.opt_u64()?,
+    })
+}
+
+fn add(counts: &mut BTreeMap<&'static str, u64>, label: &'static str, count: u64) {
+    let total = counts.entry(label).or_insert(0);
+    *total = total.saturating_add(count);
 }
 
 /// Cloneable bounded state for peer fault tuples.
 #[derive(Clone, Default)]
 pub(crate) struct PeerFaultDiagnostics {
-    state: Arc<Mutex<PeerFaultDiagnosticState>>,
+    state: Arc<PeerFaultDiagnosticState>,
 }
 
 impl PeerFaultDiagnostics {
     /// Record one tuple without retaining any error text.
+    ///
+    /// The tuple's cell, the stage's latest tuple and the recent ring change
+    /// in one atomic step, and that step draws the tuple's sequence (again,
+    /// if it loses the race to install), so tuples are installed in sequence
+    /// order: the stage keeps the tuple with the highest sequence, the ring
+    /// keeps the highest sequences, and the tuple is in both when this
+    /// returns.  The step costs the tree nodes on the paths to the four
+    /// words it changes (8 to 10 blocks) plus the tuple encoded twice, for
+    /// the ring and for the stage (4 or 5 blocks each), whatever the size
+    /// of the cell matrix.
     pub(crate) fn record(
         &self,
         context: &PeerFaultContext,
@@ -513,13 +644,10 @@ impl PeerFaultDiagnostics {
         stage: PeerOpenDiagnosticStage,
         cause: PeerFaultCause,
     ) {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.sequence = state.sequence.saturating_add(1);
+        let state = &*self.state;
         let event = PeerFaultEventSnapshot {
-            sequence: state.sequence,
+            // Assigned by the commit that installs the tuple.
+            sequence: 0,
             observed_at_ms: diagnostic_now_ms(),
             role,
             stage,
@@ -532,126 +660,221 @@ impl PeerFaultDiagnostics {
             service_id: context.service_id,
             request_id: context.request_id.clone(),
         };
-        state.fault_count = state.fault_count.saturating_add(1);
-        match role {
-            PeerFaultRole::Ingress => state.ingress_count = state.ingress_count.saturating_add(1),
-            PeerFaultRole::Owner => state.owner_count = state.owner_count.saturating_add(1),
-        }
-        let stage_count = state.stage_counts.entry(stage.as_str()).or_default();
-        *stage_count = stage_count.saturating_add(1);
-        let cause_count = state.cause_counts.entry(cause.as_str()).or_default();
-        *cause_count = cause_count.saturating_add(1);
-        state.last_by_stage.insert(stage.as_str(), event.clone());
-        if state.recent.len() >= MAX_RECENT_PEER_FAULTS {
-            state.recent.pop_front();
-        }
-        state.recent.push_back(event);
+        let role = index(code_of(&PeerFaultRole::ALL, &role));
+        let stage = code_of(&PeerOpenDiagnosticStage::ALL, &stage);
+        let cause = index(code_of(&PeerFaultCause::ALL, &cause));
+        let cell = role
+            .saturating_mul(STAGES)
+            .saturating_add(index(stage))
+            .saturating_mul(CAUSES)
+            .saturating_add(cause);
+        state.faults.commit(
+            &state.arena,
+            Some(&state.sequence),
+            &[cell],
+            vec![
+                Entry {
+                    place: Place::Push(RECENT),
+                    order: Order::Sequence,
+                    record: encode_fault(&event),
+                },
+                Entry {
+                    place: Place::Key(LATEST, index(stage)),
+                    order: Order::Sequence,
+                    record: encode_fault(&event),
+                },
+            ],
+        );
     }
 
     /// Record one bounded task closure tuple and return its position on the
     /// shared diagnostic clock.
     ///
     /// EC-061 requires every closure to report a bounded lifecycle stage and
-    /// cause *before* the owner state it refers to is unregistered.  The
-    /// sequence here is drawn from the same mutex-protected counter that
+    /// cause *before* the owner state it refers to is unregistered.  A task
+    /// meets that by calling this, and letting it return, before it stamps
+    /// and unregisters.
+    ///
+    /// The sequence is drawn by the atomic step that installs the tuple
+    /// (and drawn again if that step loses the race to install), so
+    /// closures enter the ring in sequence order and the ring holds the
+    /// [`MAX_TASK_CLOSURES`] highest sequences.  The tuple is therefore in
+    /// the ring when this returns, and stays until that many later closures
+    /// have displaced it.  The one exception is diagnostic storage at its
+    /// cap, in which case neither the tuple nor its count is recorded,
+    /// the drop is counted (`diagnostic_records_dropped` in the HTTP
+    /// forward snapshot), and the stamp returned is still a fresh position
+    /// on the clock.
+    ///
+    /// The sequence comes from the same atomic counter that
     /// [`Self::record`] and [`Self::stamp`] use, so a closure tuple and an
     /// owner unregister tombstone are totally ordered against each other by
-    /// the identical predicate: `closure.sequence < unregister.sequence`
-    /// proves this call released the shared mutex before the unregister's
-    /// stamp acquired it, and therefore before the removal that follows that
-    /// stamp in program order.
+    /// the identical predicate.  `closure.sequence < unregister.sequence`
+    /// proves exactly that the tuple's installing step drew its position
+    /// before the unregister's stamp drew its own.  When both are drawn by
+    /// one task in program order, as the closing task does, the tuple is in
+    /// the ring before the stamp is drawn; between two tasks racing each
+    /// other it orders the two draws and nothing later.
     ///
     /// A closure is not a fault.  It touches only the closure ring and the
     /// closure counters; `fault_count`, `cause_counts`, `last_by_stage` and
     /// `recent` keep their existing shape and meaning, so an ordinary
-    /// lifecycle end can never be misread as a peer fault.  The call takes no
-    /// session lock and performs no I/O, so it cannot change when the close
-    /// it attributes actually lands.
+    /// lifecycle end can never be misread as a peer fault.  The call takes
+    /// no session state and performs no I/O, so it cannot change when the
+    /// close it attributes actually lands.
     pub(crate) fn record_closure(
         &self,
         scope: &TaskClosureScope,
         stage: TaskClosureStage,
         cause: TaskClosureCause,
     ) -> DiagnosticStamp {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.sequence = state.sequence.saturating_add(1);
-        let stamp = DiagnosticStamp {
-            sequence: state.sequence,
-            at_ms: diagnostic_now_ms(),
-        };
-        let event = TaskClosureEventSnapshot {
-            sequence: stamp.sequence,
-            observed_at_ms: stamp.at_ms,
-            stage,
-            cause,
-            tenant_id: scope.tenant_id,
-            device_id: scope.device_id,
-            session_id: scope.session_id.clone(),
-            epoch: scope.epoch,
-            stream_id: scope.stream_id,
-        };
-        let stage_count = state
-            .closure_stage_counts
-            .entry(stage.as_str())
-            .or_default();
-        *stage_count = stage_count.saturating_add(1);
-        let cause_count = state
-            .closure_cause_counts
-            .entry(cause.as_str())
-            .or_default();
-        *cause_count = cause_count.saturating_add(1);
-        if state.closures.len() >= MAX_TASK_CLOSURES {
-            state.closures.pop_front();
+        let state = &*self.state;
+        let at_ms = diagnostic_now_ms();
+        let stage = code_of(&TaskClosureStage::ALL, &stage);
+        let cause = code_of(&TaskClosureCause::ALL, &cause);
+        let mut record = WordWriter::new();
+        record.u64(at_ms);
+        record.u64(stage);
+        record.u64(cause);
+        record.uuid(scope.tenant_id);
+        record.uuid(scope.device_id);
+        record.text(&scope.session_id);
+        record.u64(scope.epoch);
+        record.opt_u64(scope.stream_id);
+        let cell = index(stage)
+            .saturating_mul(CLOSURE_CAUSES)
+            .saturating_add(index(cause));
+        let committed = state.closures.commit(
+            &state.arena,
+            Some(&state.sequence),
+            &[cell],
+            vec![Entry {
+                place: Place::Push(RECENT),
+                order: Order::Sequence,
+                record,
+            }],
+        );
+        DiagnosticStamp {
+            sequence: committed.map_or_else(|| bump(&state.sequence), |done| done.sequence),
+            at_ms,
         }
-        state.closures.push_back(event);
-        stamp
     }
 
     /// Draw the next position on this relay's diagnostic clock without
     /// recording a fault.
     ///
-    /// The sequence comes from the same mutex-protected counter as
-    /// [`Self::record`], so acquiring a stamp establishes a real happens-after
-    /// relationship with every tuple that already holds a lower sequence.  The
-    /// caller stamps the moment *before* it unregisters owner state, so a
-    /// tuple with a lower sequence is provably recorded first.  It retains
-    /// nothing and is not itself a fault: no counter, ring or per-stage latch
-    /// is touched.
+    /// The sequence comes from the same atomic counter as [`Self::record`],
+    /// so a stamp is drawn after every tuple that holds a lower sequence
+    /// drew its own.  The caller stamps the moment *before* it unregisters
+    /// owner state, having already recorded what it had to record, so a
+    /// tuple of its own with a lower sequence was recorded first.  A stamp
+    /// retains nothing and is not itself a fault: no counter, ring or
+    /// per-stage latch is touched.
     #[must_use]
     pub(crate) fn stamp(&self) -> DiagnosticStamp {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.sequence = state.sequence.saturating_add(1);
         DiagnosticStamp {
-            sequence: state.sequence,
+            sequence: bump(&self.state.sequence),
             at_ms: diagnostic_now_ms(),
         }
     }
 
+    /// Call `hook` at each step of every later record, to park a recorder
+    /// between its steps.
+    #[cfg(test)]
+    fn park_recorders(&self, hook: Arc<dyn Fn(&'static str) + Send + Sync>) {
+        let faults = Arc::clone(&hook);
+        self.state
+            .faults
+            .park_commits(Box::new(move |step| faults(step)));
+        self.state
+            .closures
+            .park_commits(Box::new(move |step| hook(step)));
+    }
+
+    /// Diagnostics with a storage cap other than the relay's.
+    #[cfg(test)]
+    fn with_blocks(blocks: usize) -> Self {
+        Self {
+            state: Arc::new(PeerFaultDiagnosticState::with_blocks(blocks)),
+        }
+    }
+
+    /// Passes snapshots have made over the fault and closure states.
+    #[cfg(test)]
+    fn read_passes(&self) -> u64 {
+        self.state.faults.read_passes() + self.state.closures.read_passes()
+    }
+
     /// Return the bounded typed view used by the relay snapshot.
+    ///
+    /// Faults and closures are two states read one after the other; nothing
+    /// a snapshot reports relates one to the other.  Each is read in one
+    /// pass that no recorder can force to repeat, so a snapshot's work is
+    /// bounded by the size of the two states, plus two bounded batches of
+    /// reclamation, however many faults are being recorded meanwhile.  If
+    /// too many reads are already in progress the snapshot says it is
+    /// unavailable instead of reporting counts it did not read.
     #[must_use]
     pub(crate) fn snapshot(&self) -> PeerFaultDiagnosticSnapshot {
-        let state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        PeerFaultDiagnosticSnapshot {
-            fault_count: state.fault_count,
-            ingress_count: state.ingress_count,
-            owner_count: state.owner_count,
-            stage_counts: state.stage_counts.clone(),
-            cause_counts: state.cause_counts.clone(),
-            last_by_stage: state.last_by_stage.clone(),
-            recent: state.recent.iter().cloned().collect(),
-            closure_stage_counts: state.closure_stage_counts.clone(),
-            closure_cause_counts: state.closure_cause_counts.clone(),
-            closures: state.closures.iter().cloned().collect(),
+        let state = &*self.state;
+        let (Some(faults), Some(closures)) = (
+            state.faults.read(&state.arena),
+            state.closures.read(&state.arena),
+        ) else {
+            return PeerFaultDiagnosticSnapshot {
+                unavailable: true,
+                ..PeerFaultDiagnosticSnapshot::default()
+            };
+        };
+        let mut snapshot = PeerFaultDiagnosticSnapshot::default();
+        let cells = PeerFaultRole::ALL.iter().flat_map(|role| {
+            PeerOpenDiagnosticStage::ALL.iter().flat_map(move |stage| {
+                PeerFaultCause::ALL
+                    .iter()
+                    .map(move |cause| (*role, *stage, *cause))
+            })
+        });
+        for ((role, stage, cause), count) in cells.zip(&faults.counts) {
+            if *count == 0 {
+                continue;
+            }
+            snapshot.fault_count = snapshot.fault_count.saturating_add(*count);
+            let by_role = match role {
+                PeerFaultRole::Ingress => &mut snapshot.ingress_count,
+                PeerFaultRole::Owner => &mut snapshot.owner_count,
+            };
+            *by_role = by_role.saturating_add(*count);
+            add(&mut snapshot.stage_counts, stage.as_str(), *count);
+            add(&mut snapshot.cause_counts, cause.as_str(), *count);
         }
+        for retained in faults.retained {
+            let Some(event) = decode_fault(retained.order, retained.record) else {
+                continue;
+            };
+            if retained.group == RECENT {
+                snapshot.recent.push(event);
+            } else {
+                snapshot.last_by_stage.insert(event.stage.as_str(), event);
+            }
+        }
+        let cells = TaskClosureStage::ALL.iter().flat_map(|stage| {
+            TaskClosureCause::ALL
+                .iter()
+                .map(move |cause| (*stage, *cause))
+        });
+        for ((stage, cause), count) in cells.zip(&closures.counts) {
+            if *count == 0 {
+                continue;
+            }
+            add(&mut snapshot.closure_stage_counts, stage.as_str(), *count);
+            add(&mut snapshot.closure_cause_counts, cause.as_str(), *count);
+        }
+        snapshot.closures = closures
+            .retained
+            .into_iter()
+            .filter_map(|retained| decode_closure(retained.order, retained.record))
+            .collect();
+        snapshot
     }
 }
 
@@ -1075,6 +1298,375 @@ mod tests {
         // A stamp is not a fault: only the two records are counted.
         assert_eq!(snapshot.fault_count, 2);
         assert_eq!(snapshot.recent.len(), 2);
+    }
+
+    /// A recorded closure names its stage and cause by table position, so a
+    /// variant missing from a table would neither count nor decode.
+    #[test]
+    fn every_closure_stage_and_cause_is_enumerated() {
+        for stage in TaskClosureStage::ALL {
+            match stage {
+                TaskClosureStage::Control
+                | TaskClosureStage::Data
+                | TaskClosureStage::ConsumerStream => {}
+            }
+        }
+        for cause in TaskClosureCause::ALL {
+            match cause {
+                TaskClosureCause::PeerClosed
+                | TaskClosureCause::WriteFailed
+                | TaskClosureCause::ProtocolError
+                | TaskClosureCause::RecordTooLarge
+                | TaskClosureCause::UnexpectedMessage
+                | TaskClosureCause::ServerClose
+                | TaskClosureCause::StreamClosed
+                | TaskClosureCause::Expired
+                | TaskClosureCause::StreamFailed
+                | TaskClosureCause::LivenessTimeout => {}
+            }
+        }
+        let mut labels: Vec<&str> = TaskClosureCause::ALL.iter().map(|c| c.as_str()).collect();
+        labels.sort_unstable();
+        labels.dedup();
+        assert_eq!(labels.len(), TaskClosureCause::ALL.len());
+    }
+
+    #[test]
+    fn closures_keep_their_own_ring_counters_and_clock_position() {
+        let diagnostics = PeerFaultDiagnostics::default();
+        let scope = TaskClosureScope {
+            tenant_id: Uuid::from_u128(1),
+            device_id: Uuid::from_u128(2),
+            session_id: "session-7".to_owned(),
+            epoch: 9,
+            stream_id: Some(41),
+        };
+        let total = MAX_TASK_CLOSURES + 3;
+        let mut last = None;
+        for _ in 0..total {
+            last = Some(diagnostics.record_closure(
+                &scope,
+                TaskClosureStage::ConsumerStream,
+                TaskClosureCause::Expired,
+            ));
+        }
+        let after = diagnostics.stamp();
+        let snapshot = diagnostics.snapshot();
+        assert_eq!(snapshot.fault_count, 0);
+        assert!(snapshot.recent.is_empty());
+        assert!(snapshot.last_by_stage.is_empty());
+        assert_eq!(snapshot.closures.len(), MAX_TASK_CLOSURES);
+        assert_eq!(
+            snapshot.closure_stage_counts.get("consumer_stream"),
+            Some(&(total as u64))
+        );
+        assert_eq!(
+            snapshot.closure_cause_counts.get("expired"),
+            Some(&(total as u64))
+        );
+        assert_eq!(snapshot.closure_stage_counts.len(), 1);
+        let sequences: Vec<u64> = snapshot.closures.iter().map(|c| c.sequence).collect();
+        assert_eq!(sequences, (4..=total as u64).collect::<Vec<u64>>());
+        let newest = snapshot.closures.last().expect("closure retained");
+        assert_eq!(Some(newest.sequence), last.map(|stamp| stamp.sequence));
+        assert!(newest.sequence < after.sequence);
+        assert_eq!(newest.stage, TaskClosureStage::ConsumerStream);
+        assert_eq!(newest.cause, TaskClosureCause::Expired);
+        assert_eq!(newest.tenant_id, scope.tenant_id);
+        assert_eq!(newest.device_id, scope.device_id);
+        assert_eq!(newest.session_id, scope.session_id);
+        assert_eq!(newest.epoch, scope.epoch);
+        assert_eq!(newest.stream_id, scope.stream_id);
+    }
+
+    /// What the C11 capture scanner requires of every snapshot it reads
+    /// (`validate_peer_fault_table` in `tunnel-test-harness`).
+    fn assert_scanner_invariants(snapshot: &PeerFaultDiagnosticSnapshot) {
+        let faults = snapshot.fault_count;
+        assert_eq!(snapshot.ingress_count + snapshot.owner_count, faults);
+        assert_eq!(snapshot.stage_counts.values().sum::<u64>(), faults);
+        assert_eq!(snapshot.cause_counts.values().sum::<u64>(), faults);
+        // A count of n means the n-th tuple is visible: the ring is exactly
+        // as full as the count allows, never shorter and never longer.
+        assert_eq!(
+            snapshot.recent.len() as u64,
+            faults.min(MAX_RECENT_PEER_FAULTS as u64)
+        );
+        assert!(
+            snapshot
+                .recent
+                .windows(2)
+                .all(|w| w[0].sequence < w[1].sequence)
+        );
+        for (stage, event) in &snapshot.last_by_stage {
+            assert_eq!(event.stage.as_str(), *stage);
+            assert!(snapshot.stage_counts.get(stage).is_some_and(|c| *c > 0));
+            // The stage's latest tuple is at least as new as any of that
+            // stage in the ring.
+            assert!(
+                snapshot
+                    .recent
+                    .iter()
+                    .filter(|recent| recent.stage == event.stage)
+                    .all(|recent| recent.sequence <= event.sequence)
+            );
+        }
+        assert_eq!(
+            snapshot.last_by_stage.len(),
+            snapshot.stage_counts.len(),
+            "every counted stage has its latest tuple"
+        );
+        let closures: u64 = snapshot.closure_stage_counts.values().sum();
+        assert_eq!(
+            snapshot.closure_cause_counts.values().sum::<u64>(),
+            closures
+        );
+        assert_eq!(
+            snapshot.closures.len() as u64,
+            closures.min(MAX_TASK_CLOSURES as u64)
+        );
+        assert!(
+            snapshot
+                .closures
+                .windows(2)
+                .all(|w| w[0].sequence < w[1].sequence)
+        );
+    }
+
+    /// Recorders on several threads are parked between the steps of their
+    /// records -- sometimes for far longer than a snapshot takes -- while a
+    /// reader snapshots continuously.  Every snapshot must satisfy the
+    /// scanner's invariants; none may show a count without its tuple.
+    #[test]
+    fn parked_recorders_never_break_a_snapshot_invariant() {
+        const WRITERS: usize = 4;
+        const PER_WRITER: usize = 400;
+        let diagnostics = PeerFaultDiagnostics::default();
+        let steps = Arc::new(AtomicU64::new(0));
+        {
+            let steps = Arc::clone(&steps);
+            diagnostics.park_recorders(Arc::new(move |_step| {
+                if steps.fetch_add(1, Ordering::SeqCst).is_multiple_of(53) {
+                    std::thread::sleep(std::time::Duration::from_micros(400));
+                } else {
+                    std::thread::yield_now();
+                }
+            }));
+        }
+        let writers: Vec<_> = (0..WRITERS)
+            .map(|writer| {
+                let diagnostics = diagnostics.clone();
+                std::thread::spawn(move || {
+                    let context = PeerFaultContext::for_owner(
+                        &owner(),
+                        Some(Uuid::from_u128(3)),
+                        Some(format!("request-{writer}")),
+                    );
+                    let scope = TaskClosureScope {
+                        tenant_id: Uuid::from_u128(1),
+                        device_id: Uuid::from_u128(2),
+                        session_id: "session-7".to_owned(),
+                        epoch: 9,
+                        stream_id: Some(writer as u64),
+                    };
+                    for round in 0..PER_WRITER {
+                        let pick = writer + round;
+                        diagnostics.record(
+                            &context,
+                            PeerFaultRole::ALL[pick % 2],
+                            PeerOpenDiagnosticStage::ALL[pick % PeerOpenDiagnosticStage::ALL.len()],
+                            PeerFaultCause::ALL[pick % PeerFaultCause::ALL.len()],
+                        );
+                        let closure = diagnostics.record_closure(
+                            &scope,
+                            TaskClosureStage::ALL[pick % TaskClosureStage::ALL.len()],
+                            TaskClosureCause::ALL[pick % TaskClosureCause::ALL.len()],
+                        );
+                        // The closure is in the ring when the call returns.
+                        if round % 16 == 0 {
+                            let stamp = diagnostics.stamp();
+                            assert!(closure.sequence < stamp.sequence);
+                        }
+                    }
+                })
+            })
+            .collect();
+        let mut samples = 0_u64;
+        let mut last = 0;
+        while writers.iter().any(|writer| !writer.is_finished()) {
+            let snapshot = diagnostics.snapshot();
+            assert_scanner_invariants(&snapshot);
+            assert!(snapshot.fault_count >= last);
+            last = snapshot.fault_count;
+            samples += 1;
+        }
+        for writer in writers {
+            writer.join().expect("recorder finishes");
+        }
+        assert!(samples > 0);
+        let snapshot = diagnostics.snapshot();
+        assert_scanner_invariants(&snapshot);
+        let total = (WRITERS * PER_WRITER) as u64;
+        assert_eq!(snapshot.fault_count, total);
+        assert_eq!(snapshot.closure_stage_counts.values().sum::<u64>(), total);
+        // Faults, closures and stamps share one clock: the ring holds the
+        // highest fault sequences drawn, all of them late on that clock.
+        let lowest_kept = snapshot.recent.first().map(|event| event.sequence);
+        assert!(lowest_kept.is_some_and(|sequence| sequence > total));
+    }
+
+    /// Faults and closures are recorded without pause for as long as a
+    /// reader is snapshotting.  Every snapshot completes in exactly one pass
+    /// over each of the two states -- continuous recording cannot make the
+    /// reader try again -- and satisfies the scanner's invariants, and a
+    /// lone recorder's closure is in the ring when its call returns.
+    #[test]
+    fn a_reader_under_continuous_faults_finishes_each_snapshot_in_one_pass() {
+        const SNAPSHOTS: u64 = 4_000;
+        // Recording here is unbounded in rate, so the storage cap is lifted:
+        // a reader descheduled by a busy machine would otherwise turn this
+        // into a test of the cap, which has its own tests.
+        let diagnostics = PeerFaultDiagnostics::with_blocks(1 << 22);
+        let stop = Arc::new(AtomicBool::new(false));
+        let writers: Vec<_> = (0..4_usize)
+            .map(|writer| {
+                let diagnostics = diagnostics.clone();
+                let stop = Arc::clone(&stop);
+                std::thread::spawn(move || {
+                    let context = PeerFaultContext::for_owner(
+                        &owner(),
+                        Some(Uuid::from_u128(3)),
+                        Some(format!("request-{writer}")),
+                    );
+                    let scope = TaskClosureScope {
+                        tenant_id: Uuid::from_u128(1),
+                        device_id: Uuid::from_u128(2),
+                        session_id: "session-7".to_owned(),
+                        epoch: 9,
+                        stream_id: Some(writer as u64),
+                    };
+                    let mut pick = writer;
+                    let mut records = 0_u64;
+                    while !stop.load(Ordering::SeqCst) {
+                        pick += 5;
+                        diagnostics.record(
+                            &context,
+                            PeerFaultRole::ALL[pick % 2],
+                            PeerOpenDiagnosticStage::ALL[pick % PeerOpenDiagnosticStage::ALL.len()],
+                            PeerFaultCause::ALL[pick % PeerFaultCause::ALL.len()],
+                        );
+                        diagnostics.record_closure(
+                            &scope,
+                            TaskClosureStage::ALL[pick % TaskClosureStage::ALL.len()],
+                            TaskClosureCause::ALL[pick % TaskClosureCause::ALL.len()],
+                        );
+                        records += 1;
+                    }
+                    records
+                })
+            })
+            .collect();
+        let mut last = 0;
+        for _ in 0..SNAPSHOTS {
+            let snapshot = diagnostics.snapshot();
+            assert_scanner_invariants(&snapshot);
+            assert!(snapshot.fault_count >= last);
+            last = snapshot.fault_count;
+        }
+        // The recorders were still recording when the last snapshot ended.
+        assert!(writers.iter().all(|writer| !writer.is_finished()));
+        assert_eq!(diagnostics.read_passes(), 2 * SNAPSHOTS);
+        stop.store(true, Ordering::SeqCst);
+        let records: u64 = writers
+            .into_iter()
+            .map(|writer| writer.join().expect("recorder finishes"))
+            .sum();
+        let snapshot = diagnostics.snapshot();
+        assert_scanner_invariants(&snapshot);
+        assert_eq!(snapshot.fault_count, records);
+        assert_eq!(snapshot.closure_stage_counts.values().sum::<u64>(), records);
+
+        // With the others stopped, a closure is retained by the time its
+        // call returns, and is the newest in the ring.
+        let scope = TaskClosureScope {
+            tenant_id: Uuid::from_u128(1),
+            device_id: Uuid::from_u128(2),
+            session_id: "session-8".to_owned(),
+            epoch: 10,
+            stream_id: None,
+        };
+        let stamp =
+            diagnostics.record_closure(&scope, TaskClosureStage::ALL[0], TaskClosureCause::ALL[0]);
+        let newest = diagnostics.snapshot().closures.pop();
+        assert_eq!(newest.map(|closure| closure.sequence), Some(stamp.sequence));
+    }
+
+    /// With every reader cell taken a snapshot says it is unavailable --
+    /// in the typed value and in its JSON -- rather than reporting zero
+    /// faults; with a cell free it reports the faults and the marker is
+    /// absent, so the serialized shape is unchanged.
+    #[test]
+    fn a_refused_snapshot_is_unavailable_not_empty() {
+        let diagnostics = PeerFaultDiagnostics::default();
+        let context = PeerFaultContext::for_owner(&owner(), Some(Uuid::from_u128(3)), None);
+        diagnostics.record(
+            &context,
+            PeerFaultRole::Owner,
+            PeerOpenDiagnosticStage::ALL[0],
+            PeerFaultCause::ALL[0],
+        );
+        let held = diagnostics.state.arena.occupy_readers();
+        let refused = diagnostics.snapshot();
+        assert!(refused.unavailable);
+        let json = serde_json::to_string(&refused).expect("snapshot serializes");
+        assert!(json.contains("\"unavailable\":true"), "{json}");
+        drop(held);
+        let snapshot = diagnostics.snapshot();
+        assert!(!snapshot.unavailable);
+        assert_eq!(snapshot.fault_count, 1);
+        assert_scanner_invariants(&snapshot);
+        let json = serde_json::to_string(&snapshot).expect("snapshot serializes");
+        assert!(!json.contains("unavailable"), "{json}");
+    }
+
+    /// At its storage cap the recorder refuses whole records: every
+    /// snapshot still satisfies the scanner's invariants, and recording
+    /// resumes when the stalled reader is gone.
+    #[test]
+    fn faults_at_the_storage_cap_are_refused_whole() {
+        let diagnostics = PeerFaultDiagnostics::with_blocks(512);
+        let context = PeerFaultContext::for_owner(&owner(), Some(Uuid::from_u128(3)), None);
+        let record = |pick: usize| {
+            diagnostics.record(
+                &context,
+                PeerFaultRole::ALL[pick % 2],
+                PeerOpenDiagnosticStage::ALL[pick % PeerOpenDiagnosticStage::ALL.len()],
+                PeerFaultCause::ALL[pick % PeerFaultCause::ALL.len()],
+            );
+        };
+        let mut stalled = diagnostics.state.arena.occupy_readers();
+        for pick in 0..400 {
+            record(pick);
+        }
+        assert!(diagnostics.state.arena.dropped() > 0);
+        assert!(diagnostics.state.arena.allocated() <= 512);
+        stalled.pop();
+        let capped = diagnostics.snapshot();
+        assert_scanner_invariants(&capped);
+        assert!(capped.fault_count > 0 && capped.fault_count < 400);
+        drop(stalled);
+        // Each snapshot reclaims a bounded batch of the parked blocks.
+        for _ in 0..64 {
+            assert_scanner_invariants(&diagnostics.snapshot());
+        }
+        let dropped = diagnostics.state.arena.dropped();
+        for pick in 0..100 {
+            record(pick);
+        }
+        assert_eq!(diagnostics.state.arena.dropped(), dropped);
+        let snapshot = diagnostics.snapshot();
+        assert_scanner_invariants(&snapshot);
+        assert_eq!(snapshot.fault_count, capped.fault_count + 100);
     }
 
     #[test]

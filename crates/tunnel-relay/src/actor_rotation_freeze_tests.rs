@@ -131,9 +131,6 @@ fn fixture_stream(
     let sequence = StreamState::new(stream_id, wire::M2_INITIAL_WINDOW_BYTES as u64)
         .expect("fixture stream sequence");
     M2Stream {
-        // These fixtures build admitted streams; a deferred
-        // pre-admission terminal cause never applies to them.
-        deferred_terminal_cause: None,
         credit_held: false,
         open_message_id: open_message_id.to_owned(),
         operation_id: operation_id.to_owned(),
@@ -162,8 +159,13 @@ fn fixture_stream(
         terminal: false,
         pending_terminal: None,
         terminal_fin_failure: false,
-        open_pending,
-        registration_dropped: false,
+        // No fixture drops a registration, so no deferred pre-admission
+        // terminal cause applies.
+        admission: if open_pending {
+            crate::actor::StreamAdmission::OpenPending
+        } else {
+            crate::actor::StreamAdmission::Admitted
+        },
         closed: CancellationToken::new(),
         admission_lease: CancellationToken::new(),
         admission_deadline: Instant::now() + StdDuration::from_secs(60),
@@ -293,7 +295,6 @@ impl FreezeFixture {
         session.profile = runtime::RuntimeProfile::M2;
         session.generation = attempt.old_generation;
         session.connection_id = attempt.old_connection_id.clone();
-        session.data_tx = Some(old_tx.clone());
         session.active_carrier = Some(DataCarrier {
             context: old_carrier.context(),
             tx: old_tx,
@@ -515,7 +516,7 @@ impl FreezeFixture {
             .session()
             .rotation
             .as_ref()
-            .and_then(|rotation| rotation.own_fence.clone());
+            .and_then(|rotation| rotation.fences.own().cloned());
         sequenced(&before)
     }
 
@@ -704,7 +705,13 @@ impl FreezeFixture {
                 .get_mut(&self.key.scope())
                 .and_then(|session| session.pending.get_mut(&stream_id))
                 .expect("finite echo is pending");
-            pending.authorization_in_flight = true;
+            // Rebuilt through the transition (was a direct flag write).
+            assert!(
+                pending
+                    .exchange
+                    .apply(crate::actor::UnaryEvent::ChallengeAccepted)
+                    .is_ok()
+            );
             pending.challenge_id = Some(challenge_id.clone());
         }
         let identity = self.session().identity.clone();
@@ -985,7 +992,7 @@ async fn frozen_relay_writer_defers_consumer_fin_until_committed() {
         !fixture.stream().terminal_fin_failure,
         "a deferred FIN is bounded backpressure, not a publication failure"
     );
-    assert!(fixture.session().terminal_fin_failure_deadline.is_none());
+    assert!(fixture.session().terminal_fin_failure_deadline.is_idle());
 
     fixture.connector_drained().await;
     fixture.connector_committed().await;
@@ -1003,7 +1010,7 @@ async fn frozen_relay_writer_defers_consumer_fin_until_committed() {
         Some(Terminal::Fin)
     );
     assert!(!fixture.stream().terminal_fin_failure);
-    assert!(fixture.session().terminal_fin_failure_deadline.is_none());
+    assert!(fixture.session().terminal_fin_failure_deadline.is_idle());
 }
 
 #[tokio::test]
@@ -1042,7 +1049,7 @@ async fn frozen_relay_writer_defers_peer_terminal_reply_until_committed() {
     assert_eq!(fixture.relay_last_emitted(), 1);
     assert!(fixture.stream().terminal);
     assert!(!fixture.stream().terminal_fin_failure);
-    assert!(fixture.session().terminal_fin_failure_deadline.is_none());
+    assert!(fixture.session().terminal_fin_failure_deadline.is_idle());
     assert!(
         fixture
             .drain_control()
@@ -1309,7 +1316,7 @@ async fn recovering_session_defers_consumer_fin_without_failure_deadline() {
         .disconnect_data(fixture.old_carrier.clone())
         .await;
     assert_eq!(fixture.phase(), RotationPhase::Recovering);
-    assert!(fixture.session().data_tx.is_none());
+    assert!(fixture.session().data_tx().is_none());
     assert!(
         fixture
             .drain_control()
@@ -1329,7 +1336,7 @@ async fn recovering_session_defers_consumer_fin_without_failure_deadline() {
         !fixture.stream().terminal_fin_failure,
         "a FIN deferred by recovery is not a publication failure"
     );
-    assert!(fixture.session().terminal_fin_failure_deadline.is_none());
+    assert!(fixture.session().terminal_fin_failure_deadline.is_idle());
     assert_eq!(fixture.relay_last_emitted(), 1);
 }
 
@@ -1372,7 +1379,7 @@ async fn old_carrier_loss_while_draining_enters_retained_recovery() {
         "losing the old carrier while draining must not close the session"
     );
     assert_eq!(fixture.phase(), RotationPhase::Recovering);
-    assert!(fixture.session().data_tx.is_none());
+    assert!(fixture.session().data_tx().is_none());
     assert!(fixture.session().active_carrier.is_none());
     let rotation = fixture
         .session()
@@ -1506,7 +1513,7 @@ async fn old_carrier_loss_while_committing_enters_recovery_without_promoting_eit
     );
     assert_eq!(fixture.session().generation, fixture.attempt.old_generation);
     assert!(
-        fixture.session().data_tx.is_none(),
+        fixture.session().data_tx().is_none(),
         "neither abandoned carrier remains writable"
     );
     let recovery_attempt = status.attempt.clone().expect("recovery attempt identity");
@@ -1689,7 +1696,7 @@ async fn old_carrier_loss_while_aborting_enters_retained_recovery_and_fences_the
     );
     assert!(status.socket_count <= 3);
     assert_eq!(fixture.retained_cursors(), retained_before);
-    assert!(fixture.session().data_tx.is_none());
+    assert!(fixture.session().data_tx().is_none());
     assert!(fixture.session().active_carrier.is_none());
     {
         let rotation = fixture
@@ -1700,10 +1707,10 @@ async fn old_carrier_loss_while_aborting_enters_retained_recovery_and_fences_the
         assert!(rotation.recovery.is_some(), "a recovery episode is owned");
         assert!(rotation.candidate.is_none());
         assert!(
-            rotation.abort_message_id.is_none(),
+            !rotation.abort.is_sent(),
             "the in-flight abort is fenced by the episode"
         );
-        assert!(rotation.pending_abort_ack.is_none());
+        assert!(rotation.abort.pending_ack().is_none());
     }
     assert!(
         super::monotonic_millis() < overlap_deadline_ms,
@@ -1850,7 +1857,7 @@ async fn old_carrier_loss_after_connector_aborted_but_before_owner_closure_enter
             .session()
             .rotation
             .as_ref()
-            .is_some_and(|rotation| rotation.pending_abort_ack.is_some()),
+            .is_some_and(|rotation| rotation.abort.pending_ack().is_some()),
         "the connector acknowledgement is pending the owner closure"
     );
     let retained_before = fixture.retained_cursors();
@@ -1878,8 +1885,8 @@ async fn old_carrier_loss_after_connector_aborted_but_before_owner_closure_enter
             .expect("rotation state retained");
         assert!(rotation.recovery.is_some());
         assert!(rotation.candidate.is_none());
-        assert!(rotation.pending_abort_ack.is_none());
-        assert!(rotation.abort_message_id.is_none());
+        assert!(rotation.abort.pending_ack().is_none());
+        assert!(!rotation.abort.is_sent());
     }
     let control = fixture.drain_control();
     assert!(
@@ -2621,8 +2628,8 @@ async fn refused_http_reset_is_retried_in_order_and_cancels_out_of_band() {
     let _watchers = attach_http(&mut fixture);
     let data_tx = fixture
         .session()
-        .data_tx
-        .clone()
+        .data_tx()
+        .cloned()
         .expect("fixture data writer");
     while data_tx.try_send(super::DataOutbound::Close).is_ok() {}
     let outcome = fixture.actor.reset_http_stream(
@@ -2638,7 +2645,7 @@ async fn refused_http_reset_is_retried_in_order_and_cancels_out_of_band() {
         "the refused RESET stays pending"
     );
     assert!(fixture.stream().terminal_fin_failure);
-    assert!(fixture.session().terminal_fin_failure_deadline.is_some());
+    assert!(fixture.session().terminal_fin_failure_deadline.is_armed());
     assert!(
         fixture
             .drain_control()
@@ -2656,7 +2663,7 @@ async fn refused_http_reset_is_retried_in_order_and_cancels_out_of_band() {
     );
     assert!(fixture.stream().pending_terminal.is_none());
     assert!(!fixture.stream().terminal_fin_failure);
-    assert!(fixture.session().terminal_fin_failure_deadline.is_none());
+    assert!(fixture.session().terminal_fin_failure_deadline.is_idle());
 }
 
 /// M6-C151: a FIN that a momentarily full writer queue refuses is kept for
@@ -2676,8 +2683,8 @@ async fn m6c151_refused_http_fin_is_retried_and_the_session_survives() {
     let generation = fixture.attempt.old_generation;
     let data_tx = fixture
         .session()
-        .data_tx
-        .clone()
+        .data_tx()
+        .cloned()
         .expect("fixture data writer");
     while data_tx.try_send(super::DataOutbound::Close).is_ok() {}
     assert!(
@@ -2692,7 +2699,7 @@ async fn m6c151_refused_http_fin_is_retried_and_the_session_survives() {
         "the refused FIN stays pending for the ordered retry"
     );
     assert!(fixture.stream().terminal_fin_failure);
-    assert!(fixture.session().terminal_fin_failure_deadline.is_some());
+    assert!(fixture.session().terminal_fin_failure_deadline.is_armed());
 
     // The writer drains; the tick's retry publishes the FIN in order.
     // (The retry is the tick's `retry_failed_terminals` step, called on its
@@ -2707,7 +2714,7 @@ async fn m6c151_refused_http_fin_is_retried_and_the_session_survives() {
     );
     assert!(fixture.stream().pending_terminal.is_none());
     assert!(!fixture.stream().terminal_fin_failure);
-    assert!(fixture.session().terminal_fin_failure_deadline.is_none());
+    assert!(fixture.session().terminal_fin_failure_deadline.is_idle());
 
     // The next deadline check therefore has nothing to fail closed on.
     fixture.actor.tick().await;
@@ -2734,8 +2741,8 @@ async fn m6c190_http_data_refused_by_a_full_writer_parks_and_is_sequenced_in_ord
     let generation = fixture.attempt.old_generation;
     let data_tx = fixture
         .session()
-        .data_tx
-        .clone()
+        .data_tx()
+        .cloned()
         .expect("fixture data writer");
     while data_tx.try_send(super::DataOutbound::Close).is_ok() {}
 
@@ -2849,8 +2856,8 @@ async fn m6c190_an_owed_ack_is_sent_before_a_parked_chunk_on_a_slow_writer() {
     let generation = fixture.attempt.old_generation;
     let data_tx = fixture
         .session()
-        .data_tx
-        .clone()
+        .data_tx()
+        .cloned()
         .expect("fixture data writer");
     while data_tx.try_send(super::DataOutbound::Close).is_ok() {}
     let (head_tx, mut head) = oneshot::channel();
@@ -2875,8 +2882,9 @@ async fn m6c190_an_owed_ack_is_sent_before_a_parked_chunk_on_a_slow_writer() {
                 sequence: 1,
             },
         );
-        session.flow_control_owed_deadline =
-            Some(Instant::now() + super::OWNER_FORGET_FAILURE_TIMEOUT);
+        session
+            .flow_control_owed_deadline
+            .set(Some(Instant::now() + super::OWNER_FORGET_FAILURE_TIMEOUT));
     }
 
     // One slot frees: the owed ACK takes it and the fence is disarmed.
@@ -2886,7 +2894,7 @@ async fn m6c190_an_owed_ack_is_sent_before_a_parked_chunk_on_a_slow_writer() {
         fixture.session().owed_acks.is_empty(),
         "the owed ACK is sent first"
     );
-    assert!(fixture.session().flow_control_owed_deadline.is_none());
+    assert!(fixture.session().flow_control_owed_deadline.is_idle());
     assert!(
         matches!(head.try_recv(), Err(oneshot::error::TryRecvError::Empty)),
         "the parked chunk waits for the next free slot"
@@ -2975,8 +2983,8 @@ async fn m6c151_a_fin_refused_for_the_whole_window_still_fails_closed() {
     let key = fixture.key.clone();
     let data_tx = fixture
         .session()
-        .data_tx
-        .clone()
+        .data_tx()
+        .cloned()
         .expect("fixture data writer");
     while data_tx.try_send(super::DataOutbound::Close).is_ok() {}
     assert!(
@@ -2988,7 +2996,9 @@ async fn m6c151_a_fin_refused_for_the_whole_window_still_fails_closed() {
     assert!(fixture.session_alive(), "inside the window the FIN waits");
     assert_eq!(fixture.stream().pending_terminal, Some(Terminal::Fin));
     if let Some(session) = fixture.actor.sessions.get_mut(&key.scope()) {
-        session.terminal_fin_failure_deadline = Some(Instant::now());
+        session
+            .terminal_fin_failure_deadline
+            .set(Some(Instant::now()));
     }
     fixture.actor.tick().await;
     assert!(!fixture.session_alive());
@@ -3011,8 +3021,8 @@ async fn m6c151_refused_peer_terminal_reply_is_retried_by_the_tick() {
     let generation = fixture.attempt.old_generation;
     let data_tx = fixture
         .session()
-        .data_tx
-        .clone()
+        .data_tx()
+        .cloned()
         .expect("fixture data writer");
     while data_tx.try_send(super::DataOutbound::Close).is_ok() {}
     assert!(
@@ -3021,14 +3031,14 @@ async fn m6c151_refused_peer_terminal_reply_is_retried_by_the_tick() {
             .queue_peer_terminal_reply(&key, STREAM_ID, Terminal::Fin)
     );
     assert_eq!(fixture.stream().pending_terminal, Some(Terminal::Fin));
-    assert!(fixture.session().terminal_fin_failure_deadline.is_some());
+    assert!(fixture.session().terminal_fin_failure_deadline.is_armed());
     let _ = drain_data(&mut fixture.old_rx);
     fixture.actor.retry_failed_terminals(&key);
     assert_eq!(
         sequenced(&drain_data(&mut fixture.old_rx)),
         vec![(FrameKind::Fin, 1, generation)]
     );
-    assert!(fixture.session().terminal_fin_failure_deadline.is_none());
+    assert!(fixture.session().terminal_fin_failure_deadline.is_idle());
     fixture.actor.tick().await;
     assert!(fixture.session_alive());
 }
@@ -3457,7 +3467,7 @@ async fn unary_echo_authorized_during_freeze_dispatches_after_commit() {
             .session()
             .pending
             .get(&stream_id)
-            .is_some_and(|pending| pending.dispatched)
+            .is_some_and(|pending| pending.exchange.dispatched())
     );
 }
 
@@ -3794,7 +3804,7 @@ async fn a_unary_echo_whose_consumer_left_is_still_forgotten_and_keeps_the_sessi
     fixture.actor.expire_pending_echoes(&key);
     assert!(fixture.session_alive());
     assert!(
-        fixture.session().pending[&stream_id].abandon.abandoned,
+        fixture.session().pending[&stream_id].exchange.abandoned(),
         "the consumer is answered and the exchange abandoned, not dropped"
     );
 
@@ -3911,7 +3921,13 @@ async fn a_unary_echo_invalidated_before_dispatch_is_reset_and_forgotten() {
         .get_mut(&fixture.key.scope())
         .and_then(|session| session.pending.get_mut(&stream_id))
     {
-        pending.authorization_in_flight = true;
+        // Rebuilt through the transition (was a direct flag write).
+        assert!(
+            pending
+                .exchange
+                .apply(crate::actor::UnaryEvent::ChallengeAccepted)
+                .is_ok()
+        );
         pending.challenge_id = Some(challenge.challenge_id.clone());
     }
     // The grant is gone at the catalog.
@@ -4160,10 +4176,14 @@ async fn an_abandoned_unary_echo_that_never_ends_closes_the_session_after_its_bo
             .get_mut(&key.scope())
             .and_then(|session| session.pending.get_mut(&stream_id))
         {
-            pending.abandon.abandoned_at = Some(
-                Instant::now()
-                    .checked_sub(ago)
-                    .expect("the monotonic clock has run longer than the back-dated interval"),
+            // The exchange was abandoned by the expiry above; only its
+            // abandonment instant is re-dated.
+            assert!(
+                pending.exchange.backdate_abandonment(
+                    Instant::now()
+                        .checked_sub(ago)
+                        .expect("the monotonic clock has run longer than the back-dated interval"),
+                )
             );
         }
     };
@@ -4297,7 +4317,9 @@ fn m6c160_backdate_fin_failure(fixture: &mut FreezeFixture, stream_id: u64) -> I
         .get_mut(&fixture.key.scope())
         .expect("fixture session");
     session.terminal_fin_failed_at.insert(stream_id, first);
-    session.terminal_fin_failure_deadline = Some(first + StdDuration::from_secs(5));
+    session
+        .terminal_fin_failure_deadline
+        .set(Some(first + StdDuration::from_secs(5)));
     first + StdDuration::from_secs(5)
 }
 
@@ -4321,7 +4343,7 @@ async fn m6c160_another_streams_progress_does_not_extend_a_fin_window() {
         "the other stream's FIN reached the wire"
     );
     assert_eq!(
-        fixture.session().terminal_fin_failure_deadline,
+        fixture.session().terminal_fin_failure_deadline.deadline(),
         Some(expired),
         "the still-refused stream keeps its own, expired window"
     );
@@ -4346,6 +4368,7 @@ async fn m6c160_a_streams_own_progress_restarts_the_fin_window() {
         fixture
             .session()
             .terminal_fin_failure_deadline
+            .deadline()
             .is_some_and(|deadline| deadline > Instant::now()),
         "the window now runs from the other stream's own refusal"
     );
@@ -4365,8 +4388,8 @@ async fn m6c160_an_ack_owed_on_the_retired_carrier_is_resent_on_the_new_one_at_c
     let _ = drain_data(&mut fixture.old_rx);
     let data_tx = fixture
         .session()
-        .data_tx
-        .clone()
+        .data_tx()
+        .cloned()
         .expect("fixture data writer");
     while data_tx.try_send(super::DataOutbound::Close).is_ok() {}
     let mut payload = (b"owed".len() as u32).to_be_bytes().to_vec();
@@ -4410,7 +4433,10 @@ async fn m6c160_an_ack_owed_on_the_retired_carrier_is_resent_on_the_new_one_at_c
         fixture.session().owed_acks.is_empty(),
         "nothing is owed once it went out"
     );
-    assert_eq!(fixture.session().flow_control_owed_deadline, None);
+    assert_eq!(
+        fixture.session().flow_control_owed_deadline.deadline(),
+        None
+    );
 }
 
 /// A connector `data_loss` report naming `generation`/`connection_id`.
@@ -4647,7 +4673,13 @@ impl FreezeFixture {
                 .get_mut(&self.key.scope())
                 .and_then(|session| session.pending.get_mut(&stream_id))
                 .expect("finite echo is pending");
-            pending.authorization_in_flight = true;
+            // Rebuilt through the transition (was a direct flag write).
+            assert!(
+                pending
+                    .exchange
+                    .apply(crate::actor::UnaryEvent::ChallengeAccepted)
+                    .is_ok()
+            );
             pending.challenge_id = Some(challenge_id.clone());
         }
         DeviceChallenge {
@@ -4930,7 +4962,7 @@ async fn m6c207_a_result_held_past_its_bounds_is_read_again_not_revoked() {
             .session()
             .pending
             .get(&stream_id)
-            .is_some_and(|pending| pending.dispatched)
+            .is_some_and(|pending| pending.exchange.dispatched())
     );
 }
 
@@ -5868,8 +5900,8 @@ async fn m4_47_a_unary_request_refused_by_backpressure_is_not_dispatched_and_kee
         .get_mut(&fixture.key.scope())
         .and_then(|session| session.pending.get_mut(&stream_id))
         .expect("finite echo is pending")
-        .abandon
-        .admitted = true;
+        .connector
+        .apply(crate::actor::UnaryConnectorEvent::Admitted);
     let room = m4_47_saturate_data_lane(&fixture);
 
     fixture.authorize_unary_echo(stream_id);
@@ -6005,12 +6037,12 @@ async fn m4_47_a_unary_request_refused_by_a_full_writer_is_not_dispatched() {
         .get_mut(&fixture.key.scope())
         .and_then(|session| session.pending.get_mut(&stream_id))
         .expect("finite echo is pending")
-        .abandon
-        .admitted = true;
+        .connector
+        .apply(crate::actor::UnaryConnectorEvent::Admitted);
     let data_tx = fixture
         .session()
-        .data_tx
-        .clone()
+        .data_tx()
+        .cloned()
         .expect("the old carrier is the writer");
     let mut fillers = 0_usize;
     // Leave exactly one slot: room for the DATA but not its FIN, the case

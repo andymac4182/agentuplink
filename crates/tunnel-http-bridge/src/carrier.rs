@@ -247,6 +247,124 @@ enum Delivery {
     Signal(SignaledReset),
 }
 
+/// Where an inbound pump is in one carrier direction.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Inbound {
+    /// Neither the carrier's FIN nor an after-FIN RESET signal was seen.
+    Streaming,
+    /// The carrier's FIN was read (in order, or one event ahead).
+    FinSeen,
+    /// The carrier signalled a RESET that follows the peer's FIN, before
+    /// the pump read that FIN.  The bridge's signal is raised; the signal is
+    /// no longer watched.
+    ResetSignalled,
+    /// Both: the FIN was read and the RESET that follows it was signalled.
+    FinSeenResetSignalled,
+    /// The pump is over.
+    Ended(InboundEnd),
+}
+
+/// Everything that can change an [`Inbound`] phase.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InboundEvent {
+    /// The carrier's out-of-band RESET signal fired.
+    Signal(SignaledReset),
+    /// The carrier's FIN was read, in order or ahead.
+    Fin,
+    /// The carrier's RESET was read ahead of a DATA chunk still waiting for
+    /// handoff credit.
+    ResetAhead(ResetDetail),
+    /// The carrier's RESET was reached in order.
+    Reset(ResetDetail),
+    /// The carrier ended without (further) FIN or RESET.
+    Closed,
+    /// The bridge stopped reading.
+    BridgeClosed,
+}
+
+/// What a transition asks the pump to do.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InboundEffect {
+    /// Carry on with ordered delivery.
+    Continue,
+    /// Raise the bridge's RESET signal without queuing anything: the RESET
+    /// follows the peer's FIN, and the ordered frames still arrive in
+    /// sequence.
+    RaiseSignal(SignaledReset),
+    /// Keep the RESET read ahead and deliver it in order: the direction it
+    /// follows is complete and must not be truncated.
+    Hold,
+    /// Queue RESET to the bridge now; the pump ended with it.
+    Reset(ResetDetail),
+    /// The pump ended.
+    End(InboundEnd),
+    /// The event is not legal in this phase; nothing changed.
+    Refused,
+}
+
+impl Inbound {
+    const fn fin_seen(self) -> bool {
+        matches!(self, Self::FinSeen | Self::FinSeenResetSignalled)
+    }
+
+    /// Whether the carrier's RESET signal is still to be watched.
+    const fn watches_signal(self) -> bool {
+        matches!(self, Self::Streaming | Self::FinSeen)
+    }
+
+    /// The only place an inbound phase changes.
+    fn transition(&mut self, event: InboundEvent) -> InboundEffect {
+        let (next, effect) = match (*self, event) {
+            (Self::Ended(_), _)
+            | (Self::ResetSignalled | Self::FinSeenResetSignalled, InboundEvent::Signal(_)) => {
+                (*self, InboundEffect::Refused)
+            }
+            (Self::Streaming, InboundEvent::Signal(reset)) if reset.after_fin => {
+                (Self::ResetSignalled, InboundEffect::RaiseSignal(reset))
+            }
+            (Self::FinSeen, InboundEvent::Signal(reset)) if reset.after_fin => (
+                Self::FinSeenResetSignalled,
+                InboundEffect::RaiseSignal(reset),
+            ),
+            // A RESET before the peer's FIN is terminal at once.
+            (Self::Streaming | Self::FinSeen, InboundEvent::Signal(reset)) => (
+                Self::Ended(InboundEnd::Reset(reset.detail)),
+                InboundEffect::Reset(reset.detail),
+            ),
+            (Self::Streaming | Self::FinSeen, InboundEvent::Fin) => {
+                (Self::FinSeen, InboundEffect::Continue)
+            }
+            (Self::ResetSignalled | Self::FinSeenResetSignalled, InboundEvent::Fin) => {
+                (Self::FinSeenResetSignalled, InboundEffect::Continue)
+            }
+            (Self::FinSeen | Self::FinSeenResetSignalled, InboundEvent::ResetAhead(_)) => {
+                (*self, InboundEffect::Hold)
+            }
+            (Self::Streaming | Self::ResetSignalled, InboundEvent::ResetAhead(detail))
+            | (_, InboundEvent::Reset(detail)) => (
+                Self::Ended(InboundEnd::Reset(detail)),
+                InboundEffect::Reset(detail),
+            ),
+            (phase, InboundEvent::Closed) => {
+                // Dropping the only sender without FIN or RESET is a carrier
+                // failure to the bridge.
+                let end = if phase.fin_seen() {
+                    InboundEnd::Finished
+                } else {
+                    InboundEnd::CarrierClosed
+                };
+                (Self::Ended(end), InboundEffect::End(end))
+            }
+            (_, InboundEvent::BridgeClosed) => (
+                Self::Ended(InboundEnd::BridgeClosed),
+                InboundEffect::End(InboundEnd::BridgeClosed),
+            ),
+        };
+        *self = next;
+        effect
+    }
+}
+
 /// Move a carrier's ordered events into the bridge.  While one DATA chunk
 /// waits for handoff credit, the pump reads at most one further event
 /// ahead, and it also watches the carrier's out-of-band RESET signal, so a
@@ -255,91 +373,256 @@ enum Delivery {
 /// RESET are still delivered in sequence.
 pub async fn pump_inbound<R: CarrierReader>(mut reader: R, to_bridge: FrameSender) -> InboundEnd {
     let mut signal = reader.reset_signal();
-    let mut signalled = false;
-    let mut fin_seen = false;
+    let mut phase = Inbound::Streaming;
+    // The one event read ahead of a DATA chunk waiting for handoff credit.
     let mut ahead: Option<CarrierEvent> = None;
     loop {
         let event = if let Some(event) = ahead.take() {
             event
-        } else if signalled {
-            tokio::select! {
-                biased;
-                () = to_bridge.closed() => return InboundEnd::BridgeClosed,
-                event = reader.next() => event,
-            }
         } else {
-            tokio::select! {
+            let step = tokio::select! {
                 biased;
-                () = to_bridge.closed() => return InboundEnd::BridgeClosed,
-                reset = signal.wait() => {
-                    signalled = true;
-                    if reset.after_fin {
-                        to_bridge.signal_reset(reset);
-                        continue;
-                    }
-                    to_bridge.reset(reset.detail);
-                    return InboundEnd::Reset(reset.detail);
+                () = to_bridge.closed() => Wake::Event(InboundEvent::BridgeClosed),
+                reset = signal.wait(), if phase.watches_signal() => {
+                    Wake::Event(InboundEvent::Signal(reset))
                 }
-                event = reader.next() => event,
+                event = reader.next() => Wake::Read(event),
+            };
+            match step {
+                Wake::Read(event) => event,
+                Wake::Event(event) => {
+                    if let Some(end) = act(&mut phase, event, &to_bridge) {
+                        return end;
+                    }
+                    continue;
+                }
             }
         };
-        match event {
+        let ordered = match event {
             CarrierEvent::Data(data) => {
-                let mut delivered = false;
-                {
-                    let send = to_bridge.send_data(data);
-                    tokio::pin!(send);
-                    while !delivered {
-                        let outcome = tokio::select! {
-                            biased;
-                            result = &mut send => Delivery::Sent(result.is_ok()),
-                            reset = signal.wait(), if !signalled => Delivery::Signal(reset),
-                            event = reader.next(), if ahead.is_none() => Delivery::Ahead(event),
-                        };
-                        match outcome {
-                            Delivery::Sent(true) => delivered = true,
-                            Delivery::Sent(false) => return InboundEnd::BridgeClosed,
-                            Delivery::Signal(reset) => {
-                                signalled = true;
-                                if !reset.after_fin {
-                                    to_bridge.reset(reset.detail);
-                                    return InboundEnd::Reset(reset.detail);
+                let send = to_bridge.send_data(data);
+                tokio::pin!(send);
+                loop {
+                    let outcome = tokio::select! {
+                        biased;
+                        result = &mut send => Delivery::Sent(result.is_ok()),
+                        reset = signal.wait(), if phase.watches_signal() => {
+                            Delivery::Signal(reset)
+                        }
+                        event = reader.next(), if ahead.is_none() => Delivery::Ahead(event),
+                    };
+                    let event = match outcome {
+                        Delivery::Sent(true) => break,
+                        Delivery::Sent(false) => InboundEvent::BridgeClosed,
+                        Delivery::Signal(reset) => InboundEvent::Signal(reset),
+                        Delivery::Ahead(CarrierEvent::Reset(detail)) => {
+                            match phase.transition(InboundEvent::ResetAhead(detail)) {
+                                InboundEffect::Hold => {
+                                    ahead = Some(CarrierEvent::Reset(detail));
+                                    continue;
                                 }
-                                to_bridge.signal_reset(reset);
-                            }
-                            Delivery::Ahead(CarrierEvent::Reset(detail)) if !fin_seen => {
-                                to_bridge.reset(detail);
-                                return InboundEnd::Reset(detail);
-                            }
-                            Delivery::Ahead(event) => {
-                                if event == CarrierEvent::Fin {
-                                    fin_seen = true;
+                                effect => {
+                                    if let Some(end) = perform(effect, &to_bridge) {
+                                        return end;
+                                    }
+                                    continue;
                                 }
-                                ahead = Some(event);
                             }
                         }
+                        Delivery::Ahead(event) => {
+                            if event == CarrierEvent::Fin {
+                                phase.transition(InboundEvent::Fin);
+                            }
+                            ahead = Some(event);
+                            continue;
+                        }
+                    };
+                    if let Some(end) = act(&mut phase, event, &to_bridge) {
+                        return end;
                     }
                 }
+                continue;
             }
             CarrierEvent::Fin => {
-                fin_seen = true;
+                phase.transition(InboundEvent::Fin);
                 if to_bridge.finish().is_err() {
-                    return InboundEnd::BridgeClosed;
+                    InboundEvent::BridgeClosed
+                } else {
+                    continue;
                 }
             }
-            CarrierEvent::Reset(detail) => {
-                to_bridge.reset(detail);
-                return InboundEnd::Reset(detail);
+            CarrierEvent::Reset(detail) => InboundEvent::Reset(detail),
+            CarrierEvent::Closed => InboundEvent::Closed,
+        };
+        if let Some(end) = act(&mut phase, ordered, &to_bridge) {
+            return end;
+        }
+    }
+}
+
+/// One wake-up of the idle pump: a carrier event to deliver in order, or an
+/// event that only changes the phase.
+enum Wake {
+    Read(CarrierEvent),
+    Event(InboundEvent),
+}
+
+/// Apply `event` and carry out its effect; the pump's end, if it ended.
+fn act(phase: &mut Inbound, event: InboundEvent, to_bridge: &FrameSender) -> Option<InboundEnd> {
+    perform(phase.transition(event), to_bridge)
+}
+
+fn perform(effect: InboundEffect, to_bridge: &FrameSender) -> Option<InboundEnd> {
+    match effect {
+        InboundEffect::Continue | InboundEffect::Hold | InboundEffect::Refused => None,
+        InboundEffect::RaiseSignal(reset) => {
+            to_bridge.signal_reset(reset);
+            None
+        }
+        InboundEffect::Reset(detail) => {
+            to_bridge.reset(detail);
+            Some(InboundEnd::Reset(detail))
+        }
+        InboundEffect::End(end) => Some(end),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const DETAIL: ResetDetail = ResetDetail {
+        code: HttpErrorCode::Cancelled,
+        execution: Execution::Unknown,
+    };
+    const BEFORE_FIN: SignaledReset = SignaledReset {
+        detail: DETAIL,
+        after_fin: false,
+    };
+    const AFTER_FIN: SignaledReset = SignaledReset {
+        detail: DETAIL,
+        after_fin: true,
+    };
+    const LIVE: [Inbound; 4] = [
+        Inbound::Streaming,
+        Inbound::FinSeen,
+        Inbound::ResetSignalled,
+        Inbound::FinSeenResetSignalled,
+    ];
+    const RESET: (Inbound, InboundEffect) = (
+        Inbound::Ended(InboundEnd::Reset(DETAIL)),
+        InboundEffect::Reset(DETAIL),
+    );
+
+    fn step(mut phase: Inbound, event: InboundEvent) -> (Inbound, InboundEffect) {
+        let effect = phase.transition(event);
+        (phase, effect)
+    }
+
+    #[test]
+    fn a_signal_before_fin_is_terminal_and_one_after_fin_is_only_raised() {
+        for phase in [Inbound::Streaming, Inbound::FinSeen] {
+            assert!(phase.watches_signal());
+            assert_eq!(step(phase, InboundEvent::Signal(BEFORE_FIN)), RESET);
+        }
+        assert_eq!(
+            step(Inbound::Streaming, InboundEvent::Signal(AFTER_FIN)),
+            (
+                Inbound::ResetSignalled,
+                InboundEffect::RaiseSignal(AFTER_FIN)
+            )
+        );
+        assert_eq!(
+            step(Inbound::FinSeen, InboundEvent::Signal(AFTER_FIN)),
+            (
+                Inbound::FinSeenResetSignalled,
+                InboundEffect::RaiseSignal(AFTER_FIN)
+            )
+        );
+        // Once signalled, the signal is no longer watched and a second one
+        // is refused.
+        for phase in [Inbound::ResetSignalled, Inbound::FinSeenResetSignalled] {
+            assert!(!phase.watches_signal());
+            for reset in [BEFORE_FIN, AFTER_FIN] {
+                assert_eq!(
+                    step(phase, InboundEvent::Signal(reset)),
+                    (phase, InboundEffect::Refused)
+                );
             }
-            CarrierEvent::Closed => {
-                // Dropping the only sender without FIN or RESET is a carrier
-                // failure to the bridge.
-                return if fin_seen {
-                    InboundEnd::Finished
-                } else {
-                    InboundEnd::CarrierClosed
-                };
-            }
+        }
+    }
+
+    #[test]
+    fn fin_is_remembered_in_every_live_phase() {
+        for (phase, next) in [
+            (Inbound::Streaming, Inbound::FinSeen),
+            (Inbound::FinSeen, Inbound::FinSeen),
+            (Inbound::ResetSignalled, Inbound::FinSeenResetSignalled),
+            (
+                Inbound::FinSeenResetSignalled,
+                Inbound::FinSeenResetSignalled,
+            ),
+        ] {
+            assert_eq!(
+                step(phase, InboundEvent::Fin),
+                (next, InboundEffect::Continue)
+            );
+            assert!(next.fin_seen());
+        }
+    }
+
+    #[test]
+    fn a_reset_read_ahead_truncates_only_an_unfinished_direction() {
+        for phase in [Inbound::Streaming, Inbound::ResetSignalled] {
+            assert_eq!(step(phase, InboundEvent::ResetAhead(DETAIL)), RESET);
+        }
+        for phase in [Inbound::FinSeen, Inbound::FinSeenResetSignalled] {
+            assert_eq!(
+                step(phase, InboundEvent::ResetAhead(DETAIL)),
+                (phase, InboundEffect::Hold)
+            );
+        }
+        // Reached in order it always ends the pump.
+        for phase in LIVE {
+            assert_eq!(step(phase, InboundEvent::Reset(DETAIL)), RESET);
+        }
+    }
+
+    #[test]
+    fn the_carrier_closing_is_a_finish_only_after_fin() {
+        for phase in LIVE {
+            let end = if phase.fin_seen() {
+                InboundEnd::Finished
+            } else {
+                InboundEnd::CarrierClosed
+            };
+            assert_eq!(
+                step(phase, InboundEvent::Closed),
+                (Inbound::Ended(end), InboundEffect::End(end))
+            );
+            assert_eq!(
+                step(phase, InboundEvent::BridgeClosed),
+                (
+                    Inbound::Ended(InboundEnd::BridgeClosed),
+                    InboundEffect::End(InboundEnd::BridgeClosed)
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn an_ended_pump_refuses_every_event() {
+        let ended = Inbound::Ended(InboundEnd::Finished);
+        for event in [
+            InboundEvent::Signal(BEFORE_FIN),
+            InboundEvent::Signal(AFTER_FIN),
+            InboundEvent::Fin,
+            InboundEvent::ResetAhead(DETAIL),
+            InboundEvent::Reset(DETAIL),
+            InboundEvent::Closed,
+            InboundEvent::BridgeClosed,
+        ] {
+            assert_eq!(step(ended, event), (ended, InboundEffect::Refused));
         }
     }
 }

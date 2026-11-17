@@ -23,7 +23,7 @@ use tunnel_cua_fixture::{FixtureBackend, SCREEN_HEIGHT, SCREEN_WIDTH};
 
 const LIMIT: u64 = tunnel_cua::DEFAULT_REQUEST_BODY_LIMIT;
 
-fn agent(backend: &FixtureBackend) -> (Arc<DeviceState>, SessionFacade) {
+async fn agent(backend: &FixtureBackend) -> (Arc<DeviceState>, SessionFacade) {
     let state = DeviceState::new();
     let endpoint = BackendEndpoint::new(backend.address()).expect("the fixture binds loopback");
     let facade = SessionFacade::new(
@@ -32,7 +32,7 @@ fn agent(backend: &FixtureBackend) -> (Arc<DeviceState>, SessionFacade) {
         SessionId::new(1),
         TargetSession::new("console:1"),
     );
-    facade.acquire_input_lease().expect("an idle target");
+    facade.acquire_input_lease().await.expect("an idle target");
     (state, facade)
 }
 
@@ -65,7 +65,7 @@ fn screen() -> PointSpace {
 #[tokio::test]
 async fn a_declared_point_space_derives_the_scale_of_every_capture() {
     let backend = FixtureBackend::start().await.unwrap();
-    let (state, agent) = agent(&backend);
+    let (state, agent) = agent(&backend).await;
     state.declare_point_space(Some(screen()));
 
     backend.capture_scale().set(200);
@@ -97,7 +97,7 @@ async fn a_declared_point_space_derives_the_scale_of_every_capture() {
 async fn a_contradicted_or_missing_point_space_refuses_every_coordinate() {
     let backend = FixtureBackend::start().await.unwrap();
     backend.capture_scale().set(200);
-    let (state, agent) = agent(&backend);
+    let (state, agent) = agent(&backend).await;
     let refused = Dispatch::NotDispatched(NotDispatched::InputAuthority(InputRefusal::Capture(
         CaptureRefusal::ScaleUndeclared,
     )));
@@ -148,7 +148,7 @@ async fn a_contradicted_or_missing_point_space_refuses_every_coordinate() {
 async fn a_point_space_outranks_a_declared_percentage() {
     let backend = FixtureBackend::start().await.unwrap();
     backend.capture_scale().set(200);
-    let (state, agent) = agent(&backend);
+    let (state, agent) = agent(&backend).await;
     state.declare_scale_percent(Some(100));
     state.declare_point_space(Some(screen()));
     let identity = capture(&agent).await;

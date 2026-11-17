@@ -16,7 +16,7 @@ use std::{
 use chrono::{DateTime, Utc};
 use http::StatusCode;
 use tokio::{
-    sync::Mutex,
+    sync::{mpsc, oneshot},
     task::JoinHandle,
     time::{sleep, timeout},
 };
@@ -389,6 +389,100 @@ struct RouteObservation {
     owner_node: String,
 }
 
+/// One inbound peer request offered to the observation owner.
+struct Admission {
+    request_id: String,
+    data_sequence: Option<(Uuid, u64)>,
+    route: RouteObservation,
+}
+
+enum ObservationCommand {
+    Admit(
+        Admission,
+        oneshot::Sender<std::result::Result<(), &'static str>>,
+    ),
+    Routes(oneshot::Sender<Vec<RouteObservation>>),
+}
+
+/// Bound on admissions queued behind the observation owner. A full queue
+/// makes the peer handler wait, which is the backpressure the scenario wants:
+/// an admission is never dropped or reordered.
+const OBSERVATION_QUEUE: usize = 64;
+
+/// Handle to the task that owns the acceptance run's [`Observation`].
+///
+/// Replay rejection, the per-device data fence and the route record must be
+/// decided together for each request, so one task owns all three and admits
+/// requests in arrival order.
+#[derive(Clone)]
+struct ObservationLog {
+    commands: mpsc::Sender<ObservationCommand>,
+}
+
+impl ObservationLog {
+    fn spawn() -> Self {
+        let (commands, mut inbox) = mpsc::channel(OBSERVATION_QUEUE);
+        tokio::spawn(async move {
+            let mut state = Observation::default();
+            while let Some(command) = inbox.recv().await {
+                match command {
+                    ObservationCommand::Admit(admission, reply) => {
+                        let _ = reply.send(state.admit(admission));
+                    }
+                    ObservationCommand::Routes(reply) => {
+                        let _ = reply.send(state.routes.clone());
+                    }
+                }
+            }
+        });
+        Self { commands }
+    }
+
+    async fn admit(&self, admission: Admission) -> std::result::Result<(), PeerRuntimeError> {
+        let (reply, outcome) = oneshot::channel();
+        self.commands
+            .send(ObservationCommand::Admit(admission, reply))
+            .await
+            .map_err(|_| observation_owner_stopped())?;
+        outcome
+            .await
+            .map_err(|_| observation_owner_stopped())?
+            .map_err(|reason| PeerRuntimeError::Membership(reason.into()))
+    }
+
+    async fn routes(&self) -> Result<Vec<RouteObservation>> {
+        let (reply, routes) = oneshot::channel();
+        self.commands
+            .send(ObservationCommand::Routes(reply))
+            .await
+            .map_err(|_| HarnessError::InvalidInput("M7 observation owner stopped".into()))?;
+        routes
+            .await
+            .map_err(|_| HarnessError::InvalidInput("M7 observation owner stopped".into()))
+    }
+}
+
+fn observation_owner_stopped() -> PeerRuntimeError {
+    PeerRuntimeError::Membership("observation owner stopped".into())
+}
+
+impl Observation {
+    fn admit(&mut self, admission: Admission) -> std::result::Result<(), &'static str> {
+        if !self.request_ids.insert(admission.request_id) {
+            return Err("replayed request ID");
+        }
+        if let Some((device_id, sequence)) = admission.data_sequence {
+            let entries = self.data_sequences.entry(device_id).or_default();
+            if entries.last().is_some_and(|last| sequence <= *last) {
+                return Err("stale data fence");
+            }
+            entries.push(sequence);
+        }
+        self.routes.push(admission.route);
+        Ok(())
+    }
+}
+
 struct RunningPeer {
     node_id: String,
     runtime: Arc<PeerRuntime>,
@@ -460,7 +554,7 @@ async fn verify_with_redis(redis: &RedisLease) -> Result<ClusterAcceptanceEviden
 
     let shared_catalog: SharedCatalog = Arc::new(catalog.clone());
     let bindings = Arc::new(verified_bindings(&cluster)?);
-    let observations = Arc::new(Mutex::new(Observation::default()));
+    let observations = ObservationLog::spawn();
     let device_by_id = Arc::new(
         topology
             .all_devices()
@@ -530,15 +624,13 @@ async fn verify_with_redis(redis: &RedisLease) -> Result<ClusterAcceptanceEviden
         peer.shutdown().await?;
     }
 
-    let observation = observations.lock().await;
-    let owner_count = observation
-        .routes
+    let routes = observations.routes().await?;
+    let owner_count = routes
         .iter()
         .map(|route| route.owner_node.as_str())
         .collect::<BTreeSet<_>>()
         .len();
-    let direct_hops_only = observation
-        .routes
+    let direct_hops_only = routes
         .iter()
         .all(|route| route.route != InternalRoute::Health && route.source_node != route.owner_node);
     let owner_topology_evidence = ClusterOwnerTopologyEvidence {
@@ -574,7 +666,7 @@ fn owner_callback(
     owners: Arc<HashMap<Uuid, OwnerClaim>>,
     devices: Arc<HashMap<Uuid, crate::DeviceFixture>>,
     consumer: Arc<ConsumerAuth>,
-    observations: Arc<Mutex<Observation>>,
+    observations: ObservationLog,
 ) -> impl tunnel_relay::PeerIngressHandler + Clone {
     move |request: InboundPeerRequest| {
         let catalog = catalog.clone();
@@ -594,7 +686,7 @@ async fn handle_peer_request(
     owners: Arc<HashMap<Uuid, OwnerClaim>>,
     devices: Arc<HashMap<Uuid, crate::DeviceFixture>>,
     consumer: Arc<ConsumerAuth>,
-    observations: Arc<Mutex<Observation>>,
+    observations: ObservationLog,
 ) -> std::result::Result<(), PeerRuntimeError> {
     let envelope = request.envelope().clone();
     let now = Utc::now();
@@ -695,27 +787,17 @@ async fn handle_peer_request(
         InternalRequest::DeviceData(request) => Some(request.sequence),
         _ => None,
     };
-    {
-        let mut state = observations.lock().await;
-        if !state.request_ids.insert(envelope.request_id.clone()) {
-            return Err(PeerRuntimeError::Membership("replayed request ID".into()));
-        }
-        if let Some(sequence) = sequence {
-            let entries = state
-                .data_sequences
-                .entry(envelope.destination.device_id)
-                .or_default();
-            if entries.last().is_some_and(|last| sequence <= *last) {
-                return Err(PeerRuntimeError::Membership("stale data fence".into()));
-            }
-            entries.push(sequence);
-        }
-        state.routes.push(RouteObservation {
-            route,
-            source_node: envelope.source.node_id.clone(),
-            owner_node: destination_owner.token.node_id.clone(),
-        });
-    }
+    observations
+        .admit(Admission {
+            request_id: envelope.request_id.clone(),
+            data_sequence: sequence.map(|sequence| (envelope.destination.device_id, sequence)),
+            route: RouteObservation {
+                route,
+                source_node: envelope.source.node_id.clone(),
+                owner_node: destination_owner.token.node_id.clone(),
+            },
+        })
+        .await?;
     send.respond(StatusCode::OK).await?;
     while let Some(record) = recv.recv_message().await? {
         send.send_message(record.kind(), record.body()).await?;

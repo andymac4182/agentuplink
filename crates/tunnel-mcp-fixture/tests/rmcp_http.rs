@@ -23,7 +23,7 @@ async fn http_export_round_trip(profile: &str, legacy: bool) {
     let (url, shutdown) = rmcp_http_backend(legacy, dir.path()).await;
     let export = http_export(profile, &url, None);
     let gateway = gateway(export.clone(), dir.path());
-    let (client, handler) = connect(&gateway, legacy).await;
+    let (client, mut handler) = connect(&gateway, legacy).await;
 
     let tools = within(client.list_all_tools()).await.expect("tools/list");
     assert!(tools.iter().any(|tool| tool.name == "progress"));
@@ -63,10 +63,7 @@ async fn http_export_round_trip(profile: &str, legacy: bool) {
     within(handle.await_response())
         .await
         .expect("progress result");
-    assert_eq!(
-        handler.progress.lock().expect("lock").clone(),
-        vec![1.0, 2.0, 3.0]
-    );
+    assert_eq!(handler.drain(), vec![1.0, 2.0, 3.0]);
 
     // Cancellation: 2026 closes the request's response stream (the export
     // drops the backend connection); 2025 POSTs notifications/cancelled.

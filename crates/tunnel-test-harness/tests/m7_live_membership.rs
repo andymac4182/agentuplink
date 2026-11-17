@@ -24,7 +24,7 @@ use std::{
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use http::StatusCode;
 use tokio::{
-    sync::RwLock,
+    sync::watch,
     task::JoinHandle,
     time::{timeout, timeout_at},
 };
@@ -76,9 +76,11 @@ struct DirectoryState {
     minimum_versions: BTreeMap<String, u64>,
 }
 
+/// The scenario is the directory's only writer: it publishes each complete
+/// replacement, and the membership runtime samples whichever is current.
 #[derive(Clone)]
 struct SignedDirectory {
-    state: Arc<RwLock<DirectoryState>>,
+    state: Arc<watch::Sender<DirectoryState>>,
     reads: Arc<AtomicUsize>,
 }
 
@@ -89,7 +91,7 @@ impl SignedDirectory {
             .map(|record| (record.version_node_id(), record.version))
             .collect();
         Self {
-            state: Arc::new(RwLock::new(DirectoryState {
+            state: Arc::new(watch::Sender::new(DirectoryState {
                 records,
                 minimum_versions,
             })),
@@ -102,14 +104,14 @@ impl SignedDirectory {
             .iter()
             .map(|record| (record.version_node_id(), record.version))
             .collect();
-        *self.state.write().await = DirectoryState {
+        self.state.send_replace(DirectoryState {
             records,
             minimum_versions,
-        };
+        });
     }
 
     async fn snapshot(&self) -> DirectoryState {
-        self.state.read().await.clone()
+        self.state.borrow().clone()
     }
 
     fn reads(&self) -> usize {
@@ -144,7 +146,7 @@ impl MembershipRecordSource for SignedDirectory {
     > {
         Box::pin(async move {
             self.reads.fetch_add(1, Ordering::AcqRel);
-            Ok(self.state.read().await.records.clone())
+            Ok(self.state.borrow().records.clone())
         })
     }
 }
@@ -586,6 +588,7 @@ async fn exercise_rotation(fixture: &LiveFixture) -> Result<(), String> {
             OLD_BOOT_ID,
             fixture.old_pin.to_hex(),
         ))
+        .await
         .map_err(|error| format!("old overlap admission failed: {error}"))?;
 
     let reads_before_rotation = fixture.directory.reads();
@@ -685,6 +688,7 @@ async fn exercise_rotation(fixture: &LiveFixture) -> Result<(), String> {
             NEW_BOOT_ID,
             fixture.new_pin.to_hex(),
         ))
+        .await
         .map_err(|error| format!("new replacement admission failed: {error}"))?;
 
     // Publish an already-expired, signed revision without a wake hint.  The

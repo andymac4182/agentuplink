@@ -33,7 +33,7 @@
 use std::{
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicU64, Ordering},
+        atomic::{AtomicI64, AtomicU8, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -88,20 +88,112 @@ impl OffsetVerdict {
         }
     }
 
-    fn as_u8(self) -> u8 {
+    /// Whether this verdict is on the not-ready side of the readiness line.
+    fn is_beyond(self) -> bool {
+        self == Self::Beyond
+    }
+}
+
+/// The streak counter shares the phase byte with the verdict.
+const PHASE_STREAK_SLOTS: u8 = 16;
+const _: () = assert!(CONSECUTIVE_SAMPLES_TO_FLIP <= PHASE_STREAK_SLOTS);
+
+/// The clock-offset state machine: nothing measured yet, or a published
+/// verdict with the hysteresis streak towards crossing the readiness line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ClockOffsetPhase {
+    /// No successful sample yet; the relay is within the bound.
+    Unmeasured,
+    /// At least one successful sample was recorded.
+    Measured {
+        /// The published verdict.
+        verdict: OffsetVerdict,
+        /// Consecutive samples on the other side of the readiness line;
+        /// always below [`CONSECUTIVE_SAMPLES_TO_FLIP`].
+        streak: u8,
+    },
+}
+
+impl ClockOffsetPhase {
+    /// The published verdict; within the bound before the first sample.
+    pub(crate) fn verdict(self) -> OffsetVerdict {
         match self {
-            Self::Within => 0,
-            Self::Warn => 1,
-            Self::Beyond => 2,
+            Self::Unmeasured => OffsetVerdict::Within,
+            Self::Measured { verdict, .. } => verdict,
         }
     }
 
-    fn from_u8(value: u8) -> Self {
-        match value {
-            0 => Self::Within,
-            1 => Self::Warn,
-            _ => Self::Beyond,
+    fn streak(self) -> u8 {
+        match self {
+            Self::Unmeasured => 0,
+            Self::Measured { streak, .. } => streak,
         }
+    }
+
+    /// The only transition: apply one successful sample and return the next
+    /// phase with the verdict change, if any.
+    ///
+    /// Crossing the readiness line (into or out of `Beyond`) takes
+    /// [`CONSECUTIVE_SAMPLES_TO_FLIP`] samples in a row; moving between
+    /// `Within` and `Warn` is immediate. A failed sample is not an event of
+    /// this machine, so it neither counts nor resets the streak.
+    pub(crate) fn on_sample(
+        self,
+        sample: OffsetVerdict,
+    ) -> (Self, Option<(OffsetVerdict, OffsetVerdict)>) {
+        let previous = self.verdict();
+        let crosses = sample.is_beyond() != previous.is_beyond();
+        let next = if crosses {
+            let streak = self.streak().saturating_add(1);
+            if streak >= CONSECUTIVE_SAMPLES_TO_FLIP {
+                Self::Measured {
+                    verdict: sample,
+                    streak: 0,
+                }
+            } else {
+                Self::Measured {
+                    verdict: previous,
+                    streak,
+                }
+            }
+        } else {
+            Self::Measured {
+                verdict: sample,
+                streak: 0,
+            }
+        };
+        let verdict = next.verdict();
+        (next, (previous != verdict).then_some((previous, verdict)))
+    }
+
+    /// The one encoding of a phase into its atomic byte.
+    fn encode(self) -> u8 {
+        match self {
+            Self::Unmeasured => 0,
+            Self::Measured { verdict, streak } => {
+                let verdict = match verdict {
+                    OffsetVerdict::Within => 0,
+                    OffsetVerdict::Warn => 1,
+                    OffsetVerdict::Beyond => 2,
+                };
+                1 + verdict * PHASE_STREAK_SLOTS + streak.min(PHASE_STREAK_SLOTS - 1)
+            }
+        }
+    }
+
+    /// The inverse of [`Self::encode`]. A byte no phase encodes to cannot be
+    /// stored; it decodes to not ready rather than to a ready state.
+    fn decode(value: u8) -> Self {
+        let Some(measured) = value.checked_sub(1) else {
+            return Self::Unmeasured;
+        };
+        let streak = measured % PHASE_STREAK_SLOTS;
+        let verdict = match measured / PHASE_STREAK_SLOTS {
+            0 => OffsetVerdict::Within,
+            1 => OffsetVerdict::Warn,
+            _ => OffsetVerdict::Beyond,
+        };
+        Self::Measured { verdict, streak }
     }
 }
 
@@ -175,11 +267,12 @@ pub(crate) async fn measure<A: AuthorityClock, L: LocalClock + ?Sized>(
 /// The published clock-offset state. Payload-free: a signed offset in
 /// milliseconds, a verdict and counters.
 pub(crate) struct ClockOffsetHealth {
+    /// The last measured offset; meaningful once `phase` is measured. It
+    /// is stored before the phase that makes it visible.
     offset_ms: AtomicI64,
-    measured: AtomicBool,
-    verdict: AtomicU8,
-    /// Consecutive samples on the other side of the readiness line.
-    streak: AtomicU8,
+    /// The encoded [`ClockOffsetPhase`]. The measurement loop is its only
+    /// writer; readers sample it.
+    phase: AtomicU8,
     measurements: AtomicU64,
     failures: AtomicU64,
 }
@@ -188,9 +281,7 @@ impl ClockOffsetHealth {
     pub(crate) fn new() -> Self {
         Self {
             offset_ms: AtomicI64::new(0),
-            measured: AtomicBool::new(false),
-            verdict: AtomicU8::new(OffsetVerdict::Within.as_u8()),
-            streak: AtomicU8::new(0),
+            phase: AtomicU8::new(ClockOffsetPhase::Unmeasured.encode()),
             measurements: AtomicU64::new(0),
             failures: AtomicU64::new(0),
         }
@@ -203,15 +294,20 @@ impl ClockOffsetHealth {
     }
 
     pub(crate) fn verdict(&self) -> OffsetVerdict {
-        OffsetVerdict::from_u8(self.verdict.load(Ordering::Acquire))
+        self.phase().verdict()
+    }
+
+    pub(crate) fn phase(&self) -> ClockOffsetPhase {
+        ClockOffsetPhase::decode(self.phase.load(Ordering::Acquire))
     }
 
     /// The last measured offset in milliseconds, local minus authority;
     /// `None` before the first measurement.
     pub(crate) fn offset_ms(&self) -> Option<i64> {
-        self.measured
-            .load(Ordering::Acquire)
-            .then(|| self.offset_ms.load(Ordering::Acquire))
+        match self.phase() {
+            ClockOffsetPhase::Unmeasured => None,
+            ClockOffsetPhase::Measured { .. } => Some(self.offset_ms.load(Ordering::Acquire)),
+        }
     }
 
     pub(crate) fn measurements(&self) -> u64 {
@@ -233,29 +329,9 @@ impl ClockOffsetHealth {
                 self.measurements.fetch_add(1, Ordering::Relaxed);
                 self.offset_ms
                     .store(offset.num_milliseconds(), Ordering::Release);
-                self.measured.store(true, Ordering::Release);
-                let sample = OffsetVerdict::of(*offset);
-                let previous = self.verdict();
-                // Crossing the readiness line (into or out of `Beyond`) takes
-                // `CONSECUTIVE_SAMPLES_TO_FLIP` samples in a row; moving
-                // between `Within` and `Warn` is immediate. A failed sample
-                // neither counts nor resets the streak.
-                let crosses =
-                    (sample == OffsetVerdict::Beyond) != (previous == OffsetVerdict::Beyond);
-                let next = if crosses {
-                    let streak = self.streak.fetch_add(1, Ordering::AcqRel).saturating_add(1);
-                    if streak >= CONSECUTIVE_SAMPLES_TO_FLIP {
-                        self.streak.store(0, Ordering::Release);
-                        sample
-                    } else {
-                        previous
-                    }
-                } else {
-                    self.streak.store(0, Ordering::Release);
-                    sample
-                };
-                self.verdict.store(next.as_u8(), Ordering::Release);
-                (previous != next).then_some((previous, next))
+                let (next, change) = self.phase().on_sample(OffsetVerdict::of(*offset));
+                self.phase.store(next.encode(), Ordering::Release);
+                change
             }
             Measurement::Failed => {
                 self.failures.fetch_add(1, Ordering::Relaxed);

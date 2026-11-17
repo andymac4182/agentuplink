@@ -7,14 +7,17 @@
 //! Only saturating counters and the latest closed-category event are retained.
 
 use std::{
-    sync::{Arc, Mutex, OnceLock},
+    sync::{Arc, OnceLock, atomic::AtomicU64},
     time::Instant,
 };
 
 use serde::Serialize;
 use uuid::Uuid;
 
-use crate::peer_transport_diagnostics::PeerTransportDiagnosticOutcome;
+use crate::peer_transport_diagnostics::{
+    PeerTransportDiagnosticOutcome,
+    cells::{Arena, Entry, Ledger, Order, Place, WordReader, WordWriter, code_of, variant},
+};
 
 /// The side of the forwarded consumer peer exchange that observed a terminal
 /// event.  The names describe the relay-local direction, not a user payload.
@@ -47,6 +50,13 @@ pub enum PeerConsumerDiagnosticH3Code {
 }
 
 impl PeerConsumerDiagnosticH3Code {
+    const ALL: [Self; 4] = [
+        Self::FrameUnexpected,
+        Self::RequestCancelled,
+        Self::NoError,
+        Self::Other,
+    ];
+
     /// Return the stable redacted diagnostic label.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
@@ -71,6 +81,14 @@ pub(crate) struct PeerConsumerDiagnosticContext {
 }
 
 impl PeerConsumerDiagnosticRole {
+    /// In the order of the counters and latest-event slots.
+    const ALL: [Self; 4] = [
+        Self::IngressSend,
+        Self::IngressReceive,
+        Self::OwnerSend,
+        Self::OwnerReceive,
+    ];
+
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -112,29 +130,73 @@ pub struct PeerConsumerDiagnosticSnapshot {
     pub last_ingress_receive: Option<PeerConsumerDiagnosticEventSnapshot>,
     pub last_owner_send: Option<PeerConsumerDiagnosticEventSnapshot>,
     pub last_owner_receive: Option<PeerConsumerDiagnosticEventSnapshot>,
+    /// True only when this snapshot could not be taken because too many
+    /// reads of these diagnostics were in progress at once.  Every other
+    /// field is then a placeholder and not an observation: the counts are
+    /// unknown, not zero.  Absent from the serialized snapshot otherwise.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub unavailable: bool,
 }
 
-#[derive(Default)]
+/// The cap on this diagnostic's storage: 2^14 blocks of 88 bytes, 1.4 MB.
+/// A handful of events is retained; the rest is head-room.
+const BLOCKS: usize = 1 << 14;
+
+/// The clock events are numbered from, and the ledger holding one counter
+/// and the latest event per role.
 struct PeerConsumerDiagnosticState {
+    arena: Arena,
+    sequence: AtomicU64,
+    ledger: Ledger,
+}
+
+impl Default for PeerConsumerDiagnosticState {
+    fn default() -> Self {
+        Self {
+            arena: Arena::new(BLOCKS),
+            sequence: AtomicU64::new(0),
+            ledger: Ledger::new(
+                PeerConsumerDiagnosticRole::ALL.len(),
+                &[PeerConsumerDiagnosticRole::ALL.len()],
+            ),
+        }
+    }
+}
+
+fn decode_event(
     sequence: u64,
-    ingress_send_count: u64,
-    ingress_receive_count: u64,
-    owner_send_count: u64,
-    owner_receive_count: u64,
-    last_ingress_send: Option<PeerConsumerDiagnosticEventSnapshot>,
-    last_ingress_receive: Option<PeerConsumerDiagnosticEventSnapshot>,
-    last_owner_send: Option<PeerConsumerDiagnosticEventSnapshot>,
-    last_owner_receive: Option<PeerConsumerDiagnosticEventSnapshot>,
+    mut record: WordReader,
+) -> Option<PeerConsumerDiagnosticEventSnapshot> {
+    Some(PeerConsumerDiagnosticEventSnapshot {
+        sequence,
+        observed_at_ms: record.u64()?,
+        tenant_id: record.uuid()?,
+        device_id: record.uuid()?,
+        session_id: record.text()?,
+        epoch: record.u64()?,
+        service_id: record.uuid()?,
+        request_id: record.text()?,
+        role: variant(&PeerConsumerDiagnosticRole::ALL, record.u64()?)?,
+        outcome: variant(&PeerTransportDiagnosticOutcome::ALL, record.u64()?)?,
+        h3_code: match record.opt_u64()? {
+            Some(code) => Some(variant(&PeerConsumerDiagnosticH3Code::ALL, code)?),
+            None => None,
+        },
+    })
 }
 
 /// Cloneable bounded state for the consumer peer route.
 #[derive(Clone, Default)]
 pub(crate) struct PeerConsumerDiagnostics {
-    state: Arc<Mutex<PeerConsumerDiagnosticState>>,
+    state: Arc<PeerConsumerDiagnosticState>,
 }
 
 impl PeerConsumerDiagnostics {
     /// Record one typed terminal outcome without retaining transport text.
+    ///
+    /// The role's count and its latest event change in one atomic step, and
+    /// the sequence is drawn by the step that installs them, so the latest
+    /// event is the one with the highest sequence.
     pub(crate) fn record(
         &self,
         context: &PeerConsumerDiagnosticContext,
@@ -142,61 +204,61 @@ impl PeerConsumerDiagnostics {
         outcome: PeerTransportDiagnosticOutcome,
         h3_code: Option<PeerConsumerDiagnosticH3Code>,
     ) {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.sequence = state.sequence.saturating_add(1);
-        let event = PeerConsumerDiagnosticEventSnapshot {
-            sequence: state.sequence,
-            observed_at_ms: diagnostic_now_ms(),
-            tenant_id: context.tenant_id,
-            device_id: context.device_id,
-            session_id: context.session_id.clone(),
-            epoch: context.epoch,
-            service_id: context.service_id,
-            request_id: context.request_id.clone(),
-            role,
-            outcome,
-            h3_code,
-        };
-        match role {
-            PeerConsumerDiagnosticRole::IngressSend => {
-                state.ingress_send_count = state.ingress_send_count.saturating_add(1);
-                state.last_ingress_send = Some(event);
-            }
-            PeerConsumerDiagnosticRole::IngressReceive => {
-                state.ingress_receive_count = state.ingress_receive_count.saturating_add(1);
-                state.last_ingress_receive = Some(event);
-            }
-            PeerConsumerDiagnosticRole::OwnerSend => {
-                state.owner_send_count = state.owner_send_count.saturating_add(1);
-                state.last_owner_send = Some(event);
-            }
-            PeerConsumerDiagnosticRole::OwnerReceive => {
-                state.owner_receive_count = state.owner_receive_count.saturating_add(1);
-                state.last_owner_receive = Some(event);
-            }
-        }
+        let state = &*self.state;
+        let mut event = WordWriter::new();
+        event.u64(diagnostic_now_ms());
+        event.uuid(context.tenant_id);
+        event.uuid(context.device_id);
+        event.text(&context.session_id);
+        event.u64(context.epoch);
+        event.uuid(context.service_id);
+        event.text(&context.request_id);
+        let index = code_of(&PeerConsumerDiagnosticRole::ALL, &role);
+        event.u64(index);
+        event.u64(code_of(&PeerTransportDiagnosticOutcome::ALL, &outcome));
+        event.opt_u64(h3_code.map(|code| code_of(&PeerConsumerDiagnosticH3Code::ALL, &code)));
+        let index = usize::try_from(index).unwrap_or(usize::MAX);
+        state.ledger.commit(
+            &state.arena,
+            Some(&state.sequence),
+            &[index],
+            vec![Entry {
+                place: Place::Key(0, index),
+                order: Order::Sequence,
+                record: event,
+            }],
+        );
     }
 
     /// Return the bounded typed view used by the relay snapshot.
     #[must_use]
     pub(crate) fn snapshot(&self) -> PeerConsumerDiagnosticSnapshot {
-        let state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        PeerConsumerDiagnosticSnapshot {
-            ingress_send_count: state.ingress_send_count,
-            ingress_receive_count: state.ingress_receive_count,
-            owner_send_count: state.owner_send_count,
-            owner_receive_count: state.owner_receive_count,
-            last_ingress_send: state.last_ingress_send.clone(),
-            last_ingress_receive: state.last_ingress_receive.clone(),
-            last_owner_send: state.last_owner_send.clone(),
-            last_owner_receive: state.last_owner_receive.clone(),
+        let Some(view) = self.state.ledger.read(&self.state.arena) else {
+            return PeerConsumerDiagnosticSnapshot {
+                unavailable: true,
+                ..PeerConsumerDiagnosticSnapshot::default()
+            };
+        };
+        let mut snapshot = PeerConsumerDiagnosticSnapshot {
+            ingress_send_count: view.count(0),
+            ingress_receive_count: view.count(1),
+            owner_send_count: view.count(2),
+            owner_receive_count: view.count(3),
+            ..PeerConsumerDiagnosticSnapshot::default()
+        };
+        for retained in view.retained {
+            let Some(event) = decode_event(retained.order, retained.record) else {
+                continue;
+            };
+            let last = match event.role {
+                PeerConsumerDiagnosticRole::IngressSend => &mut snapshot.last_ingress_send,
+                PeerConsumerDiagnosticRole::IngressReceive => &mut snapshot.last_ingress_receive,
+                PeerConsumerDiagnosticRole::OwnerSend => &mut snapshot.last_owner_send,
+                PeerConsumerDiagnosticRole::OwnerReceive => &mut snapshot.last_owner_receive,
+            };
+            *last = Some(event);
         }
+        snapshot
     }
 }
 

@@ -15,7 +15,7 @@ use std::{
 };
 
 use chrono::Utc;
-use tokio::sync::RwLock;
+use tokio::sync::watch;
 use tunnel_catalog::SignedMembershipRecord;
 use tunnel_cluster::membership::{
     MEMBERSHIP_SCHEMA_VERSION, MembershipCheckpoint, MembershipError, MembershipIssuer,
@@ -81,12 +81,15 @@ impl CheckpointAuthority for TestCheckpointAuthority {
     }
 }
 
-/// A pending re-sign the source performs during its next read.
-type PendingResign = Arc<std::sync::Mutex<Option<(Arc<MembershipIssuer>, u64)>>>;
+/// A pending re-sign the source performs during its next read: the test
+/// publishes it and the read that takes it publishes `None` in its place.
+type PendingResign = Arc<watch::Sender<Option<(Arc<MembershipIssuer>, u64)>>>;
 
 #[derive(Clone)]
 struct TestMembershipSource {
-    records: Arc<RwLock<Vec<SignedMembershipRecord>>>,
+    /// The catalog's current records: whoever is publishing replaces the
+    /// whole list, and every read samples the latest one.
+    records: Arc<watch::Sender<Vec<SignedMembershipRecord>>>,
     fail_reads: Arc<AtomicBool>,
     /// When set, the next read re-signs both nodes' records at this version
     /// *during the read*, with an un-backdated `not_before`: the shape of a
@@ -103,16 +106,12 @@ impl MembershipRecordSource for TestMembershipSource {
             if self.fail_reads.load(Ordering::Acquire) {
                 return Err(MembershipSourceError::Catalog);
             }
-            let resign = self
-                .resign_during_read
-                .lock()
-                .expect("resign-during-read mutex")
-                .take();
+            let resign = self.resign_during_read.send_replace(None);
             if let Some((issuer, version)) = resign {
                 // The publish lands strictly after the relay received its
                 // checkpoint, so its signing instant is later than that.
                 tokio::time::sleep(Duration::from_millis(5)).await;
-                *self.records.write().await = vec![
+                self.records.send_replace(vec![
                     sign_record_signed_now(&issuer, NODE_ID, version, "key-1", SPKI_SHA256),
                     sign_record_signed_now(
                         &issuer,
@@ -121,9 +120,9 @@ impl MembershipRecordSource for TestMembershipSource {
                         "peer-key-1",
                         PEER_SPKI_SHA256,
                     ),
-                ];
+                ]);
             }
-            Ok(self.records.read().await.clone())
+            Ok(self.records.borrow().clone())
         })
     }
 }
@@ -134,7 +133,7 @@ struct Fixture {
     source: TestMembershipSource,
     runtime: Arc<MembershipRuntime>,
     /// The peer relay's current record, republished with every local one.
-    peer_record: RwLock<SignedMembershipRecord>,
+    peer_record: watch::Sender<SignedMembershipRecord>,
 }
 
 impl Fixture {
@@ -164,9 +163,9 @@ impl Fixture {
             lifetime_s: AtomicI64::new(30),
         });
         let source = TestMembershipSource {
-            records: Arc::new(RwLock::new(Vec::new())),
+            records: Arc::new(watch::Sender::new(Vec::new())),
             fail_reads: Arc::new(AtomicBool::new(false)),
-            resign_during_read: Arc::new(std::sync::Mutex::new(None)),
+            resign_during_read: Arc::new(watch::Sender::new(None)),
         };
         let config = MembershipRuntimeConfig::new(
             DEPLOYMENT_ID,
@@ -210,7 +209,7 @@ impl Fixture {
             authority,
             source,
             runtime,
-            peer_record: RwLock::new(peer_record),
+            peer_record: watch::Sender::new(peer_record),
         };
         fixture
             .publish(fixture.record(1, "key-1", SPKI_SHA256, 30))
@@ -245,13 +244,13 @@ impl Fixture {
 
     /// Publish this node's record alongside the peer's current one.
     async fn publish(&self, record: SignedMembershipRecord) {
-        let peer = self.peer_record.read().await.clone();
-        *self.source.records.write().await = vec![record, peer];
+        let peer = self.peer_record.borrow().clone();
+        self.source.records.send_replace(vec![record, peer]);
     }
 
     /// Replace the peer's record; it is published with the next local one.
     async fn set_peer_record(&self, record: SignedMembershipRecord) {
-        *self.peer_record.write().await = record;
+        self.peer_record.send_replace(record);
     }
 
     /// Publish a re-signed record at `version` for the same node and key.
@@ -272,7 +271,7 @@ impl Fixture {
     /// exact key expires. No supervisor or snapshot runs an expiry sweep.
     async fn admit_short_lived_peer(&self) -> tunnel_relay::PeerAdmission {
         let signed: tunnel_cluster::membership::SignedMembershipRecord =
-            serde_json::from_slice(&self.peer_record.read().await.bytes).unwrap();
+            serde_json::from_slice(&self.peer_record.borrow().bytes).unwrap();
         let mut record = signed.record();
         record.record_version = 2;
         let mut replacement = record.keys[0].clone();
@@ -292,6 +291,7 @@ impl Fixture {
                 "boot-peer",
                 PEER_SPKI_SHA256,
             ))
+            .await
             .expect("admit the peer before its short key window ends")
     }
 }
@@ -458,11 +458,13 @@ async fn a_same_key_resign_keeps_the_active_admission() {
             .runtime
             .set_invalidation_callback(Some(Arc::new(move |_identity, _reason| {
                 invalidations.fetch_add(1, Ordering::AcqRel);
-            })));
+            })))
+            .await;
     }
     let admission = fixture
         .runtime
         .admit_peer(Fixture::identity())
+        .await
         .expect("an active admission");
     let stream = admission.cancellation();
     let first_deadline = stream.expires_at().expect("a monotonic deadline");
@@ -487,6 +489,7 @@ async fn a_same_key_resign_keeps_the_active_admission() {
     let again = fixture
         .runtime
         .admit_peer(Fixture::identity())
+        .await
         .expect("admission after the re-sign");
     assert!(
         !admission.is_invalidated() && !again.is_invalidated(),
@@ -503,6 +506,7 @@ async fn a_resign_that_changes_the_key_still_invalidates_the_admission() {
     let admission = fixture
         .runtime
         .admit_peer(Fixture::identity())
+        .await
         .expect("an active admission");
     let stream = admission.cancellation();
     // Same SPKI, different key identifier: the binding changed.
@@ -533,6 +537,7 @@ async fn admission_after(
     let admission = fixture
         .runtime
         .admit_peer(Fixture::identity())
+        .await
         .expect("an active admission");
     let stream = admission.cancellation();
     fixture.publish(record).await;
@@ -617,6 +622,7 @@ async fn a_higher_version_that_revokes_the_key_invalidates() {
             "boot-peer",
             PEER_SPKI_SHA256,
         ))
+        .await
         .expect("an admission of the peer");
     let stream = admission.cancellation();
     fixture
@@ -656,6 +662,7 @@ async fn an_admission_past_its_deadline_is_not_re_bound_by_a_renewal() {
     let admission = fixture
         .runtime
         .admit_peer(Fixture::identity())
+        .await
         .expect("an admission under the short record");
     let stream = admission.cancellation();
     tokio::time::sleep(Duration::from_millis(2_300)).await;
@@ -755,6 +762,7 @@ async fn an_equal_version_same_key_record_invalidates_the_admission() {
     let admission = fixture
         .runtime
         .admit_peer(Fixture::identity())
+        .await
         .expect("an active admission");
     let stream = admission.cancellation();
     fixture
@@ -777,6 +785,7 @@ async fn a_lower_version_same_key_record_invalidates_the_admission() {
     let admission = fixture
         .runtime
         .admit_peer(Fixture::identity())
+        .await
         .expect("an active admission");
     let stream = admission.cancellation();
     fixture
@@ -797,6 +806,7 @@ async fn a_higher_version_with_an_earlier_boundary_invalidates_the_admission() {
     let admission = fixture
         .runtime
         .admit_peer(Fixture::identity())
+        .await
         .expect("an active admission");
     let stream = admission.cancellation();
     fixture
@@ -826,6 +836,7 @@ async fn a_shrunk_checkpoint_window_invalidates_the_admission() {
     let admission = fixture
         .runtime
         .admit_peer(Fixture::identity())
+        .await
         .expect("an active admission");
     let stream = admission.cancellation();
     fixture.authority.lifetime_s.store(5, Ordering::Release);
@@ -901,6 +912,7 @@ async fn back_to_back_resigns_end_ready_and_keep_a_live_admission() {
     let admission = fixture
         .runtime
         .admit_peer(Fixture::identity())
+        .await
         .expect("admission after recovery");
     let stream = admission.cancellation();
     for _ in 0..3 {
@@ -929,6 +941,7 @@ async fn a_resign_published_between_checkpoint_and_records_keeps_ready_and_admis
     let local = fixture
         .runtime
         .admit_peer(Fixture::identity())
+        .await
         .expect("a local-identity admission");
     let peer = fixture
         .runtime
@@ -937,16 +950,16 @@ async fn a_resign_published_between_checkpoint_and_records_keeps_ready_and_admis
             "boot-peer",
             PEER_SPKI_SHA256,
         ))
+        .await
         .expect("a peer admission");
     let local_stream = local.cancellation();
     let peer_stream = peer.cancellation();
     tokio::time::sleep(Duration::from_millis(1_100)).await;
     for version in 2..=4 {
-        *fixture
+        fixture
             .source
             .resign_during_read
-            .lock()
-            .expect("resign-during-read mutex") = Some((Arc::clone(&fixture.issuer), version));
+            .send_replace(Some((Arc::clone(&fixture.issuer), version)));
         let result = fixture.runtime.reconcile_once().await;
         assert!(
             result.is_ok(),
@@ -993,7 +1006,7 @@ async fn racing_same_key_resigns_never_reject_the_local_key() {
                         PEER_SPKI_SHA256,
                     ),
                 ];
-                *records.write().await = signed;
+                records.send_replace(signed);
                 version += 1;
                 tokio::task::yield_now().await;
             }
@@ -1037,6 +1050,7 @@ async fn a_resign_from_a_signer_ahead_is_accepted_inside_the_skew_and_rejected_b
     let local = fixture
         .runtime
         .admit_peer(Fixture::identity())
+        .await
         .expect("an active local admission");
     let peer = fixture
         .runtime
@@ -1045,6 +1059,7 @@ async fn a_resign_from_a_signer_ahead_is_accepted_inside_the_skew_and_rejected_b
             "boot-peer",
             PEER_SPKI_SHA256,
         ))
+        .await
         .expect("an active peer admission");
     let local_stream = local.cancellation();
     let peer_stream = peer.cancellation();
@@ -1090,6 +1105,7 @@ async fn a_resign_from_a_signer_ahead_is_accepted_inside_the_skew_and_rejected_b
             "boot-peer",
             PEER_SPKI_SHA256,
         ))
+        .await
         .expect("a new peer admission binds the record signed ahead inside the skew");
     // The peer route and its pin set agree with the binding (Opus review of
     // #225, B1): a record and key signed ahead inside the skew are routable,
@@ -1199,6 +1215,7 @@ async fn the_served_key_is_active_inside_the_skew_and_not_beyond_it() {
     let admission = fixture
         .runtime
         .admit_peer(Fixture::identity())
+        .await
         .expect("an active admission");
     let stream = admission.cancellation();
 
@@ -1243,4 +1260,136 @@ async fn the_served_key_is_active_inside_the_skew_and_not_beyond_it() {
         stream.reason(),
         Some(PeerInvalidationReason::MembershipRevoked)
     );
+}
+
+/// Block this test's single-threaded runtime until `deadline` has passed.
+/// Nothing else can be polled meanwhile, so the membership owner task cannot
+/// have applied the expiry when the reads that follow are made.
+fn block_until_past(deadline: std::time::Instant) {
+    let past = deadline + Duration::from_millis(50);
+    while std::time::Instant::now() < past {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Trust expiry is computed by the reader, at the instant of the read, from
+/// the published deadlines. A runtime past its signed trust boundary reads
+/// unready, binds nothing and routes nowhere even though the task that owns
+/// the membership state has not run since the boundary passed. That read
+/// then makes the owner apply the expiry and dispatch the invalidation,
+/// with no reconcile in between.
+#[tokio::test]
+async fn a_read_past_the_trust_deadline_is_unready_before_the_owner_task_has_run() {
+    let fixture = Fixture::ready().await;
+    fixture
+        .publish(fixture.record(2, "key-1", SPKI_SHA256, 2))
+        .await;
+    fixture
+        .runtime
+        .reconcile_once()
+        .await
+        .expect("the short record is shorter but still Ready");
+    let dispatched = Arc::new(AtomicU64::new(0));
+    let counter = Arc::clone(&dispatched);
+    fixture
+        .runtime
+        .set_invalidation_callback(Some(Arc::new(move |_identity, reason| {
+            assert_eq!(reason, PeerInvalidationReason::TrustExpired);
+            counter.fetch_add(1, Ordering::AcqRel);
+        })))
+        .await;
+    let admission = fixture
+        .runtime
+        .admit_peer(Fixture::identity())
+        .await
+        .expect("an admission under the short record");
+    let stream = admission.cancellation();
+    assert_eq!(fixture.runtime.readiness(), MembershipReadiness::Ready);
+    assert_eq!(fixture.runtime.snapshot().active_peer_count, 1);
+    assert!(
+        fixture
+            .runtime
+            .verified_peer_binding(&Fixture::identity())
+            .is_ok()
+    );
+
+    block_until_past(admission.deadline().expires_at());
+
+    assert_eq!(
+        fixture.runtime.readiness(),
+        MembershipReadiness::Unready(MembershipUnreadyReason::CheckpointExpired),
+        "a reader past the signed trust boundary still read Ready"
+    );
+    let snapshot = fixture.runtime.snapshot();
+    assert_eq!(
+        snapshot.readiness,
+        MembershipReadiness::Unready(MembershipUnreadyReason::CheckpointExpired)
+    );
+    assert_eq!(snapshot.active_peer_count, 0);
+    assert!(matches!(
+        fixture.runtime.verified_peer_binding(&Fixture::identity()),
+        Err(tunnel_relay::MembershipRuntimeError::NotReady)
+    ));
+    assert!(fixture.runtime.verified_peer_route_targets().is_empty());
+    assert!(
+        !stream.is_cancelled() && dispatched.load(Ordering::Acquire) == 0,
+        "the owner task ran before the reads, so they proved nothing about read-time expiry"
+    );
+
+    // The owner task now makes the same transition in its own state and
+    // dispatches it: no reconcile is needed.
+    tokio::time::timeout(Duration::from_secs(5), stream.cancelled())
+        .await
+        .expect("the owner task dispatches the expiry a reader observed");
+    assert_eq!(stream.reason(), Some(PeerInvalidationReason::TrustExpired));
+    assert!(stream.trust_expired());
+    assert!(matches!(
+        fixture.runtime.admit_peer(Fixture::identity()).await,
+        Err(tunnel_relay::MembershipRuntimeError::NotReady)
+    ));
+    assert_eq!(dispatched.load(Ordering::Acquire), 1);
+    assert_eq!(
+        fixture.runtime.readiness(),
+        MembershipReadiness::Unready(MembershipUnreadyReason::CheckpointExpired)
+    );
+}
+
+/// The same for one admission's own deadline while the runtime stays Ready:
+/// a peer key past its window is not counted as an active admission by a
+/// reader, and cannot be bound, before the owner task has swept it.
+#[tokio::test]
+async fn a_read_past_an_admission_deadline_does_not_count_it_before_the_owner_task_has_run() {
+    let fixture = Fixture::ready().await;
+    let admission = fixture.admit_short_lived_peer().await;
+    let stream = admission.cancellation();
+    let peer = MembershipPeerIdentity::new(PEER_NODE_ID, "boot-peer", PEER_SPKI_SHA256);
+    assert_eq!(fixture.runtime.snapshot().active_peer_count, 1);
+    assert!(fixture.runtime.verified_peer_binding(&peer).is_ok());
+
+    block_until_past(admission.deadline().expires_at());
+
+    let snapshot = fixture.runtime.snapshot();
+    assert_eq!(snapshot.readiness, MembershipReadiness::Ready);
+    assert_eq!(
+        snapshot.active_peer_count, 0,
+        "an admission past its deadline was still counted"
+    );
+    assert!(matches!(
+        fixture.runtime.verified_peer_binding(&peer),
+        Err(tunnel_relay::MembershipRuntimeError::PeerRejected)
+    ));
+    assert!(
+        !stream.is_cancelled(),
+        "the owner task ran before the reads"
+    );
+
+    tokio::time::timeout(Duration::from_secs(5), stream.cancelled())
+        .await
+        .expect("the owner task sweeps the admission a reader saw expired");
+    assert_eq!(stream.reason(), Some(PeerInvalidationReason::TrustExpired));
+    assert!(matches!(
+        fixture.runtime.admit_peer(peer).await,
+        Err(tunnel_relay::MembershipRuntimeError::PeerRejected)
+    ));
+    assert_eq!(fixture.runtime.readiness(), MembershipReadiness::Ready);
 }

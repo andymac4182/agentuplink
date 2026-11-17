@@ -1,0 +1,11 @@
+# Locks were removed from every workspace crate on 2026-11-18 (docs/tasks.md
+# M6-C270). Shared mutable state is owned by one task (bounded command queue,
+# oneshot replies), published through a single-writer `watch`, or kept in
+# independent atomics. These entries keep it that way: `clippy::disallowed_types`
+# is part of `clippy::all`, which the workspace denies in CI.
+disallowed-types = [
+    { path = "std::sync::Mutex", reason = "no locks: give the state one owning task, or use atomics / OnceLock / watch" },
+    { path = "std::sync::RwLock", reason = "no locks: give the state one owning task, or publish immutable snapshots through watch" },
+    { path = "tokio::sync::Mutex", reason = "no locks: give the state one owning task with a bounded command queue" },
+    { path = "tokio::sync::RwLock", reason = "no locks: give the state one owning task, or publish immutable snapshots through watch" },
+]

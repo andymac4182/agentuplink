@@ -7,16 +7,16 @@
 //! device sockets terminate at the selected owner relay, so the test covers
 //! the real three-relay/H3 route.
 
+use super::append_log::AppendLog;
 use super::{EXCHANGE_TIMEOUT, ProductionCluster, SCENARIO_TIMEOUT, open_consumer_stream};
 use crate::{HarnessError, OidcTokenOptions, Result, RunningHarness};
 use futures_util::{FutureExt, SinkExt, StreamExt};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeMap,
     net::SocketAddr,
     panic::AssertUnwindSafe,
     sync::{
-        Arc, Mutex,
+        Arc, OnceLock,
         atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
     },
     time::Duration,
@@ -3210,9 +3210,11 @@ pub(crate) struct EffectState {
     expected_payload: Vec<u8>,
     append_backend: bool,
     record_framed: bool,
-    fence_owner_id: Mutex<Option<String>>,
+    /// Every owner ID the device was fenced with; the last one is current.
+    fence_owner_ids: AppendLog<String>,
     device_phase: AtomicU8,
-    device_task_outcome: Mutex<Option<String>>,
+    /// Set once, by the device task as it ends.
+    device_task_outcome: OnceLock<String>,
     control_admitted: AtomicBool,
     owner_fenced: AtomicBool,
     data_admitted: AtomicBool,
@@ -3231,15 +3233,29 @@ pub(crate) struct EffectState {
     conflicting_observations: AtomicU64,
     invalid_observations: AtomicU64,
     fin_observations: AtomicU64,
-    raw: Mutex<Vec<RawFrameObservation>>,
-    append_entries: Mutex<Vec<Vec<u8>>>,
-    seen: Mutex<BTreeMap<IngressKey, (Vec<u8>, bool)>>,
+    // The three ledgers below are written by the one device task that
+    // `DeviceFixture::start` spawns and read by the scenario.  A frame is
+    // looked up and then recorded by that single writer, so the lookup and
+    // the record cannot interleave with another frame's.
+    raw: AppendLog<RawFrameObservation>,
+    append_entries: AppendLog<Vec<u8>>,
+    /// One entry per distinct ingress key, never more than the raw bound.
+    seen: AppendLog<SeenFrame>,
     effect_observed: tokio::sync::Notify,
     release_response: tokio::sync::Notify,
     late_response_requested: tokio::sync::Notify,
     late_response_requested_flag: AtomicBool,
     late_response_completed: tokio::sync::Notify,
-    late_response_result: Mutex<Option<LateResponseSendResult>>,
+    /// Every late-response result; the last one is current.
+    late_response_results: AppendLog<LateResponseSendResult>,
+}
+
+/// The first payload seen for one ingress key, and whether its effect was
+/// dispatched.
+struct SeenFrame {
+    key: IngressKey,
+    payload: Vec<u8>,
+    dispatched: AtomicBool,
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -3265,9 +3281,9 @@ impl EffectState {
             expected_payload,
             append_backend,
             record_framed,
-            fence_owner_id: Mutex::new(None),
+            fence_owner_ids: AppendLog::default(),
             device_phase: AtomicU8::new(DevicePhase::Starting as u8),
-            device_task_outcome: Mutex::new(None),
+            device_task_outcome: OnceLock::new(),
             control_admitted: AtomicBool::new(false),
             owner_fenced: AtomicBool::new(false),
             data_admitted: AtomicBool::new(false),
@@ -3286,15 +3302,15 @@ impl EffectState {
             conflicting_observations: AtomicU64::new(0),
             invalid_observations: AtomicU64::new(0),
             fin_observations: AtomicU64::new(0),
-            raw: Mutex::new(Vec::new()),
-            append_entries: Mutex::new(Vec::new()),
-            seen: Mutex::new(BTreeMap::new()),
+            raw: AppendLog::default(),
+            append_entries: AppendLog::default(),
+            seen: AppendLog::default(),
             effect_observed: tokio::sync::Notify::new(),
             release_response: tokio::sync::Notify::new(),
             late_response_requested: tokio::sync::Notify::new(),
             late_response_requested_flag: AtomicBool::new(false),
             late_response_completed: tokio::sync::Notify::new(),
-            late_response_result: Mutex::new(None),
+            late_response_results: AppendLog::default(),
         }
     }
 
@@ -3328,9 +3344,7 @@ impl EffectState {
     }
 
     fn record_device_task_outcome(&self, outcome: String) {
-        if let Ok(mut observed) = self.device_task_outcome.lock() {
-            *observed = Some(outcome);
-        }
+        let _ = self.device_task_outcome.set(outcome);
     }
 
     fn device_diagnostic(&self, task_state: &str) -> String {
@@ -3355,9 +3369,8 @@ impl EffectState {
         };
         let outcome = self
             .device_task_outcome
-            .lock()
-            .ok()
-            .and_then(|observed| observed.clone())
+            .get()
+            .cloned()
             .unwrap_or_else(|| "pending".to_owned());
         format!(
             "device task={task_state}, phase={}, outcome={outcome}",
@@ -3366,23 +3379,12 @@ impl EffectState {
     }
 
     fn record_fence_owner_id(&self, owner_id: &str) -> Result<()> {
-        self.fence_owner_id
-            .lock()
-            .map_err(|_| {
-                HarnessError::Process("synthetic side-effect owner ID lock poisoned".into())
-            })
-            .map(|mut observed| {
-                *observed = Some(owner_id.to_owned());
-            })
+        self.fence_owner_ids.push(owner_id.to_owned());
+        Ok(())
     }
 
     fn fence_owner_id(&self) -> Result<Option<String>> {
-        self.fence_owner_id
-            .lock()
-            .map(|observed| observed.clone())
-            .map_err(|_| {
-                HarnessError::Process("synthetic side-effect owner ID lock poisoned".into())
-            })
+        Ok(self.fence_owner_ids.last().cloned())
     }
 
     fn observe_application_frame(&self, frame: &Frame) -> Result<()> {
@@ -3417,37 +3419,35 @@ impl EffectState {
             kind: key.kind.clone(),
             payload_len: frame.payload.len(),
         };
-        let mut raw = self.raw.lock().map_err(|_| {
-            HarnessError::Process("synthetic side-effect raw observation lock poisoned".into())
-        })?;
-        if raw.len() >= MAX_RAW_OBSERVATIONS {
-            return Err(HarnessError::Process(
-                "synthetic side-effect raw observation bound exceeded".into(),
-            ));
-        }
-        raw.push(observation);
-        drop(raw);
+        self.raw
+            .push_bounded(MAX_RAW_OBSERVATIONS, observation)
+            .map_err(|_| {
+                HarnessError::Process("synthetic side-effect raw observation bound exceeded".into())
+            })?;
 
         if frame.payload != self.expected_payload {
             self.invalid_observations.fetch_add(1, Ordering::AcqRel);
         }
 
-        let mut seen = self.seen.lock().map_err(|_| {
-            HarnessError::Process("synthetic side-effect sequence lock poisoned".into())
-        })?;
-        if let Some((previous, dispatched)) = seen.get_mut(&key) {
+        if let Some(previous) = self.seen.iter().find(|seen| seen.key == key) {
             self.duplicate_observations.fetch_add(1, Ordering::AcqRel);
-            if previous.as_slice() != frame.payload.as_slice() {
+            if previous.payload.as_slice() != frame.payload.as_slice() {
                 self.conflicting_observations.fetch_add(1, Ordering::AcqRel);
             }
-            if dispatch && !*dispatched && previous.as_slice() == self.expected_payload.as_slice() {
-                *dispatched = true;
+            // Claim the dispatch only where the effect would be committed.
+            if dispatch
+                && previous.payload.as_slice() == self.expected_payload.as_slice()
+                && !previous.dispatched.swap(true, Ordering::AcqRel)
+            {
                 self.commit_effect(&frame.payload)?;
             }
             return Ok(());
         }
-        seen.insert(key, (frame.payload.clone(), dispatch));
-        drop(seen);
+        self.seen.push(SeenFrame {
+            key,
+            payload: frame.payload.clone(),
+            dispatched: AtomicBool::new(dispatch),
+        });
         if dispatch && frame.payload == self.expected_payload {
             self.commit_effect(&frame.payload)?;
         }
@@ -3462,19 +3462,15 @@ impl EffectState {
             sequence: frame.sequence,
             kind: format!("{:?}", frame.kind),
         };
-        let mut seen = self.seen.lock().map_err(|_| {
-            HarnessError::Process("synthetic side-effect sequence lock poisoned".into())
-        })?;
-        let Some((payload, dispatched)) = seen.get_mut(&key) else {
+        let Some(seen) = self.seen.iter().find(|seen| seen.key == key) else {
             return Err(HarnessError::Process(
                 "synthetic buffered DATA was absent from raw observations".into(),
             ));
         };
-        if !*dispatched {
-            *dispatched = true;
-            if payload.as_slice() == self.expected_payload.as_slice() {
-                self.commit_effect(payload)?;
-            }
+        if !seen.dispatched.swap(true, Ordering::AcqRel)
+            && seen.payload.as_slice() == self.expected_payload.as_slice()
+        {
+            self.commit_effect(&seen.payload)?;
         }
         Ok(())
     }
@@ -3495,46 +3491,30 @@ impl EffectState {
             kind: key.kind.clone(),
             payload_len: frame.payload.len(),
         };
-        let mut raw = self.raw.lock().map_err(|_| {
-            HarnessError::Process("synthetic side-effect raw observation lock poisoned".into())
-        })?;
-        if raw.len() >= MAX_RAW_OBSERVATIONS {
-            return Err(HarnessError::Process(
-                "synthetic side-effect raw observation bound exceeded".into(),
-            ));
-        }
-        raw.push(observation);
-        drop(raw);
+        self.raw
+            .push_bounded(MAX_RAW_OBSERVATIONS, observation)
+            .map_err(|_| {
+                HarnessError::Process("synthetic side-effect raw observation bound exceeded".into())
+            })?;
         self.fin_observations.fetch_add(1, Ordering::AcqRel);
         Ok(())
     }
 
     fn raw_snapshot(&self) -> Result<Vec<RawFrameObservation>> {
-        self.raw.lock().map(|raw| raw.clone()).map_err(|_| {
-            HarnessError::Process("synthetic side-effect raw observation lock poisoned".into())
-        })
+        Ok(self.raw.snapshot())
     }
 
     fn data_observations(&self) -> Result<usize> {
-        self.raw
-            .lock()
-            .map(|raw| raw.iter().filter(|item| item.kind == "Data").count())
-            .map_err(|_| {
-                HarnessError::Process("synthetic side-effect raw observation lock poisoned".into())
-            })
+        Ok(self.raw.iter().filter(|item| item.kind == "Data").count())
     }
 
     fn unique_sequences(&self) -> Result<usize> {
-        self.seen
-            .lock()
-            .map(|seen| {
-                seen.keys()
-                    .filter(|key| key.kind == format!("{:?}", FrameKind::Data))
-                    .count()
-            })
-            .map_err(|_| {
-                HarnessError::Process("synthetic side-effect sequence lock poisoned".into())
-            })
+        let data = format!("{:?}", FrameKind::Data);
+        Ok(self
+            .seen
+            .iter()
+            .filter(|seen| seen.key.kind == data)
+            .count())
     }
 
     fn commit_effect(&self, payload: &[u8]) -> Result<()> {
@@ -3548,15 +3528,11 @@ impl EffectState {
             } else {
                 payload
             };
-            let mut entries = self.append_entries.lock().map_err(|_| {
-                HarnessError::Process("synthetic append backend lock poisoned".into())
-            })?;
-            if entries.len() >= 64 {
-                return Err(HarnessError::Process(
-                    "synthetic append backend bound exceeded".into(),
-                ));
-            }
-            entries.push(body.to_vec());
+            self.append_entries
+                .push_bounded(64, body.to_vec())
+                .map_err(|_| {
+                    HarnessError::Process("synthetic append backend bound exceeded".into())
+                })?;
         }
         self.effect_invocations.fetch_add(1, Ordering::AcqRel);
         self.effect_observed.notify_waiters();
@@ -3564,10 +3540,7 @@ impl EffectState {
     }
 
     pub(crate) fn append_entries(&self) -> Result<Vec<Vec<u8>>> {
-        self.append_entries
-            .lock()
-            .map(|entries| entries.clone())
-            .map_err(|_| HarnessError::Process("synthetic append backend lock poisoned".into()))
+        Ok(self.append_entries.snapshot())
     }
 
     pub(crate) fn effect_count(&self) -> u64 {
@@ -3621,35 +3594,23 @@ impl EffectState {
     }
 
     pub(crate) fn raw_count(&self) -> Result<usize> {
-        self.raw.lock().map(|raw| raw.len()).map_err(|_| {
-            HarnessError::Process("synthetic side-effect raw observation lock poisoned".into())
-        })
+        Ok(self.raw.iter().count())
     }
 
     pub(crate) fn data_count(&self) -> Result<usize> {
-        self.raw
-            .lock()
-            .map(|raw| {
-                raw.iter()
-                    .filter(|observation| observation.kind == "Data")
-                    .count()
-            })
-            .map_err(|_| {
-                HarnessError::Process("synthetic side-effect raw observation lock poisoned".into())
-            })
+        Ok(self
+            .raw
+            .iter()
+            .filter(|observation| observation.kind == "Data")
+            .count())
     }
 
     pub(crate) fn fin_count(&self) -> Result<usize> {
-        self.raw
-            .lock()
-            .map(|raw| {
-                raw.iter()
-                    .filter(|observation| observation.kind == "Fin")
-                    .count()
-            })
-            .map_err(|_| {
-                HarnessError::Process("synthetic side-effect raw observation lock poisoned".into())
-            })
+        Ok(self
+            .raw
+            .iter()
+            .filter(|observation| observation.kind == "Fin")
+            .count())
     }
 
     pub(crate) fn notify_response(&self) {
@@ -3663,9 +3624,7 @@ impl EffectState {
     }
 
     fn complete_late_response(&self, result: LateResponseSendResult) {
-        if let Ok(mut observed) = self.late_response_result.lock() {
-            *observed = Some(result);
-        }
+        self.late_response_results.push(result);
         self.late_response_completed.notify_waiters();
     }
 
@@ -3673,44 +3632,28 @@ impl EffectState {
         if !self.late_response_requested_flag.load(Ordering::Acquire) {
             return;
         }
-        let should_notify = self
-            .late_response_result
-            .lock()
-            .map(|mut observed| {
-                if observed.is_none() {
-                    *observed = Some(LateResponseSendResult {
-                        data_attempts: 0,
-                        data_write_accepted: 0,
-                        data_write_rejected: 0,
-                        fin_attempts: 0,
-                        fin_write_accepted: 0,
-                        fin_write_rejected: 0,
-                        data_before_fin: false,
-                        write_completed: false,
-                        carrier_closed: true,
-                    });
-                    true
-                } else {
-                    false
-                }
-            })
-            .unwrap_or(false);
-        if should_notify {
+        // Only the device task records a late-response result, and this is
+        // that task's last step, so no result can arrive between the check
+        // and the record.
+        if self.late_response_results.len() == 0 {
+            self.late_response_results.push(LateResponseSendResult {
+                data_attempts: 0,
+                data_write_accepted: 0,
+                data_write_rejected: 0,
+                fin_attempts: 0,
+                fin_write_accepted: 0,
+                fin_write_rejected: 0,
+                data_before_fin: false,
+                write_completed: false,
+                carrier_closed: true,
+            });
             self.late_response_completed.notify_waiters();
         }
     }
 
     async fn wait_for_late_response(&self, deadline: Instant) -> Result<LateResponseSendResult> {
         loop {
-            if let Some(result) = self
-                .late_response_result
-                .lock()
-                .map_err(|_| {
-                    HarnessError::Process("synthetic late-frame result lock poisoned".into())
-                })?
-                .as_ref()
-                .copied()
-            {
+            if let Some(result) = self.late_response_results.last().copied() {
                 return Ok(result);
             }
             timeout_at(deadline, self.late_response_completed.notified())

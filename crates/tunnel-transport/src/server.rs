@@ -829,20 +829,24 @@ async fn refuse_connection(
             .max_header_list_size(DEFAULT_MAX_HTTP2_HEADER_LIST_BYTES);
         let connection = builder.serve_connection(TokioIo::new(tls_stream), service);
         tokio::pin!(connection);
-        let mut closing = false;
+        let mut phase = RefusalPhase::Answering;
         loop {
             tokio::select! {
                 biased;
-                _ = cancel.cancelled(), if !closing => {
-                    connection.as_mut().graceful_shutdown();
-                    closing = true;
+                _ = cancel.cancelled(), if phase == RefusalPhase::Answering => {
+                    if let Ok(next) = phase.on_event(RefusalEvent::ListenerCancelled) {
+                        phase = next;
+                        connection.as_mut().graceful_shutdown();
+                    }
                 }
                 _ = &mut connection => return,
-                _ = first_request.cancelled(), if !closing => {
+                _ = first_request.cancelled(), if phase == RefusalPhase::Answering => {
                     // One answer per connection: stop accepting further
                     // requests and close once the refusal is written.
-                    connection.as_mut().graceful_shutdown();
-                    closing = true;
+                    if let Ok(next) = phase.on_event(RefusalEvent::FirstRequest) {
+                        phase = next;
+                        connection.as_mut().graceful_shutdown();
+                    }
                 }
             }
         }
@@ -1078,8 +1082,7 @@ async fn serve_connection(
     // socket and releases this task's listener permit.
     let pre_request_deadline = tokio::time::sleep(timeouts.pre_request_timeout);
     tokio::pin!(pre_request_deadline);
-    let mut pre_request_phase = true;
-    let mut going_away = false;
+    let mut phase = ServedConnectionPhase::PreRequest;
 
     loop {
         tokio::select! {
@@ -1091,22 +1094,115 @@ async fn serve_connection(
             result = &mut connection => {
                 return result.map_err(|error| TransportError::Http(error.to_string()));
             }
-            _ = goaway.cancelled(), if !going_away => {
+            _ = goaway.cancelled(), if phase.awaits_goaway() => {
                 // HTTP/2 turnover (M6-C193): GOAWAY, then every stream
                 // already accepted runs to its end before the connection
                 // future completes and releases the permit.
-                going_away = true;
-                connection.as_mut().graceful_shutdown();
+                if let Ok(next) = phase.on_event(ServedConnectionEvent::Turnover) {
+                    phase = next;
+                    connection.as_mut().graceful_shutdown();
+                }
             }
-            _ = first_request.cancelled(), if pre_request_phase => {
-                pre_request_phase = false;
+            _ = first_request.cancelled(), if phase == ServedConnectionPhase::PreRequest => {
+                if let Ok(next) = phase.on_event(ServedConnectionEvent::FirstRequest) {
+                    phase = next;
+                }
             }
-            _ = &mut pre_request_deadline, if pre_request_phase => {
+            _ = &mut pre_request_deadline, if phase == ServedConnectionPhase::PreRequest => {
                 tracing::debug!(
                     pre_request_timeout_ms = timeouts.pre_request_timeout.as_millis(),
                     "closing connection that dispatched no request before the pre-request deadline"
                 );
                 return Ok(());
+            }
+        }
+    }
+}
+
+/// An event its connection phase has no transition for.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct IllegalPhaseEvent;
+
+/// Where an over-capacity connection is in its one `503` answer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RefusalPhase {
+    /// TLS is up; the refusal has not been asked to close yet.
+    Answering,
+    /// A graceful close was requested: the connection future runs to its end.
+    Closing,
+}
+
+/// What can move a [`RefusalPhase`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RefusalEvent {
+    /// The listener is shutting down.
+    ListenerCancelled,
+    /// The one request this connection is answered for was dispatched.
+    FirstRequest,
+}
+
+impl RefusalPhase {
+    /// The only place a refusal changes phase.  Either event closes it, once:
+    /// a connection already closing refuses both, and the loop above stops
+    /// listening for them.
+    fn on_event(self, event: RefusalEvent) -> Result<Self, IllegalPhaseEvent> {
+        match (self, event) {
+            (Self::Answering, RefusalEvent::ListenerCancelled | RefusalEvent::FirstRequest) => {
+                Ok(Self::Closing)
+            }
+            (Self::Closing, _) => Err(IllegalPhaseEvent),
+        }
+    }
+}
+
+/// Where a served connection is between its TLS handshake and its end.
+///
+/// `PreRequest -> Serving -> GoingAway`, and the connection ends from any of
+/// them when its future completes, the listener is cancelled, or -- in
+/// `PreRequest` only -- the pre-request deadline fires.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ServedConnectionPhase {
+    /// No request dispatched yet: the pre-request deadline is armed.
+    PreRequest,
+    /// At least one request was dispatched: the deadline is disarmed for good.
+    Serving,
+    /// Turnover asked for a graceful close (HTTP/2 GOAWAY); accepted streams
+    /// run to their end.
+    GoingAway,
+}
+
+/// What can move a [`ServedConnectionPhase`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ServedConnectionEvent {
+    /// Hyper dispatched the connection's first request.
+    FirstRequest,
+    /// A response chose this connection for turnover.
+    Turnover,
+}
+
+impl ServedConnectionPhase {
+    /// Whether the turnover signal is still to be acted on.
+    fn awaits_goaway(self) -> bool {
+        self != Self::GoingAway
+    }
+
+    /// The only place a served connection changes phase.
+    ///
+    /// Turnover is raised by a response, so a request was dispatched before
+    /// it: `PreRequest + Turnover` therefore also disarms the pre-request
+    /// deadline and goes straight to `GoingAway`.  (Before the phases were an
+    /// enum this was a `going_away && pre_request_phase` pair that the next
+    /// loop turn resolved the same way: the first-request signal, already
+    /// raised, is polled before the deadline.)  An event a phase has no
+    /// transition for is refused; the loop does not listen for it.
+    fn on_event(self, event: ServedConnectionEvent) -> Result<Self, IllegalPhaseEvent> {
+        match (self, event) {
+            (Self::PreRequest, ServedConnectionEvent::FirstRequest) => Ok(Self::Serving),
+            (Self::PreRequest | Self::Serving, ServedConnectionEvent::Turnover) => {
+                Ok(Self::GoingAway)
+            }
+            (Self::Serving, ServedConnectionEvent::FirstRequest) | (Self::GoingAway, _) => {
+                Err(IllegalPhaseEvent)
             }
         }
     }
@@ -1301,6 +1397,34 @@ mod tests {
     use super::*;
 
     const TEST_SEND_BUFFER_BYTES: u32 = 16 * 1024;
+
+    /// The served-connection phases: every legal transition, and every
+    /// event a phase has no transition for is refused.
+    #[test]
+    fn served_connection_phase_transition_table() {
+        use ServedConnectionEvent::{FirstRequest, Turnover};
+        use ServedConnectionPhase::{GoingAway, PreRequest, Serving};
+        assert_eq!(PreRequest.on_event(FirstRequest), Ok(Serving));
+        // Turnover is raised by a response, so it implies the first request.
+        assert_eq!(PreRequest.on_event(Turnover), Ok(GoingAway));
+        assert_eq!(Serving.on_event(Turnover), Ok(GoingAway));
+        assert_eq!(Serving.on_event(FirstRequest), Err(IllegalPhaseEvent));
+        assert_eq!(GoingAway.on_event(FirstRequest), Err(IllegalPhaseEvent));
+        assert_eq!(GoingAway.on_event(Turnover), Err(IllegalPhaseEvent));
+        assert!(PreRequest.awaits_goaway() && Serving.awaits_goaway());
+        assert!(!GoingAway.awaits_goaway());
+    }
+
+    /// The over-capacity refusal closes once, on either event.
+    #[test]
+    fn refusal_phase_transition_table() {
+        use RefusalEvent::{FirstRequest, ListenerCancelled};
+        use RefusalPhase::{Answering, Closing};
+        assert_eq!(Answering.on_event(ListenerCancelled), Ok(Closing));
+        assert_eq!(Answering.on_event(FirstRequest), Ok(Closing));
+        assert_eq!(Closing.on_event(ListenerCancelled), Err(IllegalPhaseEvent));
+        assert_eq!(Closing.on_event(FirstRequest), Err(IllegalPhaseEvent));
+    }
 
     fn test_server_config() -> Arc<rustls::ServerConfig> {
         let builder = rustls::ServerConfig::builder_with_provider(

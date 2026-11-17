@@ -292,3 +292,19 @@ async fn m6c67_readyz_follows_a_lost_and_a_stalled_authority_and_recovers() {
     let (after, _) = until_readyz(&app, 503, READY_FOR + Duration::from_secs(2)).await;
     assert!(after <= READY_FOR + Duration::from_secs(1), "{after:?}");
 }
+
+#[test]
+fn every_failure_class_has_its_own_counter_slot() {
+    for (slot, class) in FAILURE_CLASSES.iter().enumerate() {
+        assert_eq!(failure_slot(*class), slot, "{}", class.as_str());
+    }
+    let readiness = AuthorityReadiness::new();
+    assert!(readiness.failures().is_empty());
+    readiness.count_failure(CatalogConnectionFailure::RunChanged);
+    readiness.count_failure(CatalogConnectionFailure::RunChanged);
+    readiness.count_failure(CatalogConnectionFailure::Timeout);
+    assert_eq!(
+        readiness.failures(),
+        BTreeMap::from([("run_changed", 2), ("timeout", 1)])
+    );
+}

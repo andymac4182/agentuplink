@@ -3,7 +3,7 @@ use std::{
     future::Future,
     panic::AssertUnwindSafe,
     sync::{
-        Arc, Mutex,
+        Arc,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
@@ -14,8 +14,8 @@ use chrono::{Duration as ChronoDuration, Utc};
 use futures_util::FutureExt;
 use tokio::{
     net::TcpListener,
-    sync::{Notify, mpsc, oneshot},
-    task::{JoinHandle, JoinSet},
+    sync::{Notify, mpsc, oneshot, watch},
+    task::{AbortHandle, JoinHandle, JoinSet},
 };
 use tokio_util::sync::CancellationToken;
 use tunnel_catalog::{
@@ -80,6 +80,26 @@ pub(crate) use freeze_hold::{ROTATION_FREEZE_ECHO_CODE, ROTATION_FREEZE_RETRY_AF
 
 #[path = "actor_connector_rejected.rs"]
 mod connector_rejected;
+
+#[path = "actor_unary_exchange_state.rs"]
+mod unary_exchange;
+use unary_exchange::{UnaryConnector, UnaryConnectorEvent, UnaryEvent, UnaryExchange};
+
+#[path = "actor_stream_admission_state.rs"]
+mod stream_admission;
+use stream_admission::{AdmissionEvent, StreamAdmission};
+
+#[path = "actor_session_state.rs"]
+mod session_state;
+use session_state::{FailClosedDeadline, LeaseEvent, LeaseMaintenance};
+
+#[path = "actor_recovery_state.rs"]
+mod recovery_state;
+use recovery_state::{RecoveryEvent, RecoveryProgress, RecoveryRetry};
+
+#[path = "actor_rotation_attempt_state.rs"]
+mod rotation_attempt_state;
+use rotation_attempt_state::{AbortEvent, AbortExchange, PeerPhasePins, RotationFences};
 
 #[path = "actor_http_stream.rs"]
 mod http_stream;
@@ -392,34 +412,144 @@ fn maintenance_authority_category(error: &CatalogError) -> MaintenanceAuthorityC
     }
 }
 
-#[derive(Clone, Default)]
+/// Where a supervised task (the actor or the maintenance ticker) is in its
+/// life.  `Running` is the only phase with a successor: the first outcome
+/// recorded is the one kept.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+enum CompletionPhase {
+    Running = 0,
+    /// The task returned.
+    Completed = 1,
+    /// The task panicked.
+    Failed = 2,
+    /// The task was aborted and an abort of it is a failure (the actor).
+    Aborted = 3,
+    /// The task was aborted and an abort of it is not a failure (the
+    /// maintenance ticker, task row M6-C175).
+    Stopped = 4,
+}
+
+/// What ended a supervised task.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CompletionEvent {
+    /// The task's own future finished; `failed` when it panicked.
+    Finished {
+        failed: bool,
+    },
+    Aborted,
+    Stopped,
+}
+
+/// An outcome offered to a completion that already has one.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CompletionAlreadyRecorded(CompletionPhase);
+
+impl CompletionPhase {
+    const ALL: [Self; 5] = [
+        Self::Running,
+        Self::Completed,
+        Self::Failed,
+        Self::Aborted,
+        Self::Stopped,
+    ];
+
+    fn from_u8(value: u8) -> Self {
+        Self::ALL
+            .into_iter()
+            .find(|phase| *phase as u8 == value)
+            .expect("a stored completion phase")
+    }
+
+    /// The whole transition table: `Running` takes any outcome, and a
+    /// recorded outcome is final.
+    fn on_event(self, event: CompletionEvent) -> Result<Self, CompletionAlreadyRecorded> {
+        match (self, event) {
+            (Self::Running, CompletionEvent::Finished { failed: false }) => Ok(Self::Completed),
+            (Self::Running, CompletionEvent::Finished { failed: true }) => Ok(Self::Failed),
+            (Self::Running, CompletionEvent::Aborted) => Ok(Self::Aborted),
+            (Self::Running, CompletionEvent::Stopped) => Ok(Self::Stopped),
+            (recorded, _) => Err(CompletionAlreadyRecorded(recorded)),
+        }
+    }
+
+    fn is_done(self) -> bool {
+        self != Self::Running
+    }
+
+    fn is_failure(self) -> bool {
+        matches!(self, Self::Failed | Self::Aborted)
+    }
+}
+
+#[derive(Clone)]
 struct ActorCompletion {
-    done: Arc<AtomicBool>,
-    failed: Arc<AtomicBool>,
+    /// A [`CompletionPhase`] discriminant.  One atomic, so an observer never
+    /// sees a failure without completion or the reverse.
+    phase: Arc<std::sync::atomic::AtomicU8>,
     notify: Arc<Notify>,
 }
 
+impl Default for ActorCompletion {
+    fn default() -> Self {
+        Self {
+            phase: Arc::new(std::sync::atomic::AtomicU8::new(
+                CompletionPhase::Running as u8,
+            )),
+            notify: Arc::default(),
+        }
+    }
+}
+
 impl ActorCompletion {
-    fn mark_done(&self, failed: bool) {
-        self.failed.store(failed, Ordering::Release);
-        self.done.store(true, Ordering::Release);
-        self.notify.notify_waiters();
+    fn phase(&self) -> CompletionPhase {
+        CompletionPhase::from_u8(self.phase.load(Ordering::Acquire))
     }
 
-    fn mark_aborted(&self) {
-        if !self.done.swap(true, Ordering::AcqRel) {
-            self.failed.store(true, Ordering::Release);
-            self.notify.notify_waiters();
+    /// The only place the phase changes.  Applies [`CompletionPhase::on_event`]
+    /// atomically and wakes the waiters on the one transition out of
+    /// `Running`; a later event is refused and changes nothing.
+    fn transition(
+        &self,
+        event: CompletionEvent,
+    ) -> Result<CompletionPhase, CompletionAlreadyRecorded> {
+        let mut current = self.phase();
+        loop {
+            let next = current.on_event(event)?;
+            match self.phase.compare_exchange(
+                current as u8,
+                next as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    self.notify.notify_waiters();
+                    return Ok(next);
+                }
+                Err(actual) => current = CompletionPhase::from_u8(actual),
+            }
         }
+    }
+
+    /// Record the task's own outcome.
+    fn mark_done(&self, failed: bool) {
+        let _ = self.transition(CompletionEvent::Finished { failed });
+    }
+
+    /// Record an abort that is a failure, unless an outcome was already
+    /// recorded.
+    fn mark_aborted(&self) {
+        let _ = self.transition(CompletionEvent::Aborted);
     }
 
     /// Record an abort that is not a failure (the maintenance ticker), unless
-    /// an outcome was already recorded.  `failed` is never written, so it is
-    /// never observed `true` for a clean abort and a recorded panic is kept.
+    /// an outcome was already recorded: a recorded panic is kept.
     fn mark_stopped(&self) {
-        if !self.done.swap(true, Ordering::AcqRel) {
-            self.notify.notify_waiters();
-        }
+        let _ = self.transition(CompletionEvent::Stopped);
+    }
+
+    fn is_done(&self) -> bool {
+        self.phase().is_done()
     }
 
     async fn wait(&self) {
@@ -427,7 +557,7 @@ impl ActorCompletion {
             let notified = self.notify.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            if self.done.load(Ordering::Acquire) {
+            if self.is_done() {
                 return;
             }
             notified.await;
@@ -435,7 +565,7 @@ impl ActorCompletion {
     }
 
     fn failed(&self) -> bool {
-        self.failed.load(Ordering::Acquire)
+        self.phase().is_failure()
     }
 
     /// Wait for the reply to a command this actor was sent, or for the actor
@@ -498,6 +628,347 @@ impl Drop for CompletionOnDrop {
     }
 }
 
+#[cfg(test)]
+mod owner_fencing_tests {
+    use std::time::{Duration, Instant};
+
+    use tunnel_catalog::OwnerToken;
+    use tunnel_protocol::OwnerFenced;
+    use uuid::Uuid;
+
+    use super::{OwnerFenceAccepted, OwnerFenceRefusal, OwnerFencing, SessionKey};
+
+    fn key_and_owner() -> (SessionKey, OwnerToken) {
+        let key = SessionKey {
+            tenant_id: Uuid::from_u128(1),
+            device_id: Uuid::from_u128(2),
+            session_id: "owner-fencing".to_owned(),
+            epoch: 3,
+        };
+        let owner = OwnerToken {
+            deployment_incarnation: "test-incarnation".to_owned(),
+            tenant_id: key.tenant_id,
+            device_id: key.device_id,
+            node_id: "test-node".to_owned(),
+            boot_id: "test-boot".to_owned(),
+            session_id: key.session_id.clone(),
+            epoch: key.epoch,
+        };
+        (key, owner)
+    }
+
+    fn awaiting(deadline: Instant) -> (OwnerFencing, OwnerFenced) {
+        let (key, owner) = key_and_owner();
+        let fence = OwnerFencing::fence_for_test(&key, &owner);
+        let ack = OwnerFenced::from_fence("ack-1", &fence);
+        (OwnerFencing::AwaitingAck { fence, deadline }, ack)
+    }
+
+    fn never() -> Instant {
+        panic!("the clock is read only when the deadline decides")
+    }
+
+    #[test]
+    fn a_session_with_no_fence_refuses_every_acknowledgement() {
+        let (_, ack) = awaiting(Instant::now());
+        let mut state = OwnerFencing::NotRequired;
+        assert_eq!(
+            state.on_owner_fenced(ack, never),
+            Err(OwnerFenceRefusal::Unexpected)
+        );
+        assert_eq!(state, OwnerFencing::NotRequired);
+        assert!(!state.is_cluster() && state.is_settled());
+        assert!(!state.is_acknowledged() && !state.is_awaiting_ack());
+        assert!(!state.handshake_expired(Instant::now()));
+        assert_eq!(
+            OwnerFenceRefusal::Unexpected.code(),
+            "UNEXPECTED_OWNER_FENCED"
+        );
+    }
+
+    #[test]
+    fn the_exact_acknowledgement_before_the_deadline_fences_the_session() {
+        let now = Instant::now();
+        let deadline = now + Duration::from_secs(1);
+        let (mut state, ack) = awaiting(deadline);
+        assert!(state.is_cluster() && state.is_awaiting_ack());
+        assert!(!state.is_settled() && !state.is_acknowledged());
+        assert!(!state.handshake_expired(now));
+        assert!(state.handshake_expired(deadline));
+
+        assert_eq!(
+            state.on_owner_fenced(ack.clone(), || now),
+            Ok(OwnerFenceAccepted::Committed)
+        );
+        assert!(matches!(&state, OwnerFencing::Fenced { ack: kept, .. } if *kept == ack));
+        assert!(state.is_cluster() && state.is_settled() && state.is_acknowledged());
+        assert!(!state.is_awaiting_ack());
+        // A fenced session has no handshake deadline left to pass.
+        assert!(!state.handshake_expired(deadline + Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn an_acknowledgement_at_or_after_the_deadline_is_refused_and_changes_nothing() {
+        let deadline = Instant::now();
+        let (mut state, ack) = awaiting(deadline);
+        let before = state.clone();
+        assert_eq!(
+            state.on_owner_fenced(ack.clone(), || deadline),
+            Err(OwnerFenceRefusal::Deadline)
+        );
+        assert_eq!(
+            state.on_owner_fenced(ack, || deadline + Duration::from_millis(1)),
+            Err(OwnerFenceRefusal::Deadline)
+        );
+        assert_eq!(state, before);
+        assert_eq!(OwnerFenceRefusal::Deadline.code(), "OWNER_FENCE_DEADLINE");
+    }
+
+    #[test]
+    fn an_acknowledgement_of_another_fence_is_refused_in_either_cluster_state() {
+        let (mut state, ack) = awaiting(Instant::now() + Duration::from_secs(1));
+        let mut wrong = ack.clone();
+        wrong.nonce = "another-nonce".to_owned();
+        let before = state.clone();
+        // The context is checked before the deadline: the clock is not read.
+        assert_eq!(
+            state.on_owner_fenced(wrong.clone(), never),
+            Err(OwnerFenceRefusal::Context)
+        );
+        assert_eq!(state, before);
+
+        assert_eq!(
+            state.on_owner_fenced(ack, Instant::now),
+            Ok(OwnerFenceAccepted::Committed)
+        );
+        let fenced = state.clone();
+        assert_eq!(
+            state.on_owner_fenced(wrong, never),
+            Err(OwnerFenceRefusal::Context)
+        );
+        assert_eq!(state, fenced);
+        assert_eq!(OwnerFenceRefusal::Context.code(), "OWNER_FENCE_CONTEXT");
+    }
+
+    #[test]
+    fn a_fenced_session_accepts_only_an_exact_repeat_of_its_acknowledgement() {
+        let (mut state, ack) = awaiting(Instant::now() + Duration::from_secs(1));
+        assert_eq!(
+            state.on_owner_fenced(ack.clone(), Instant::now),
+            Ok(OwnerFenceAccepted::Committed)
+        );
+        let fenced = state.clone();
+        assert_eq!(
+            state.on_owner_fenced(ack.clone(), never),
+            Ok(OwnerFenceAccepted::Repeated)
+        );
+        // The same fence acknowledged under another message id.
+        let mut other = ack;
+        other.message_id = "ack-2".to_owned();
+        assert_eq!(
+            state.on_owner_fenced(other, never),
+            Err(OwnerFenceRefusal::Duplicate)
+        );
+        assert_eq!(state, fenced);
+        assert_eq!(OwnerFenceRefusal::Duplicate.code(), "OWNER_FENCE_DUPLICATE");
+    }
+}
+
+#[cfg(test)]
+mod ticket_phase_tests {
+    use super::{IllegalTicketTransition, TicketEvent, TicketPhase};
+
+    #[test]
+    fn a_ticket_is_consumed_once_at_a_time_and_only_a_consuming_ticket_rolls_back() {
+        assert_eq!(
+            TicketPhase::Issued.on_event(TicketEvent::BeginConsume),
+            Ok(TicketPhase::Consuming)
+        );
+        assert_eq!(
+            TicketPhase::Consuming.on_event(TicketEvent::RollBack),
+            Ok(TicketPhase::Issued)
+        );
+        assert_eq!(
+            TicketPhase::Consuming.on_event(TicketEvent::BeginConsume),
+            Err(IllegalTicketTransition {
+                phase: TicketPhase::Consuming,
+                event: TicketEvent::BeginConsume,
+            }),
+            "a ticket being consumed was presented a second time"
+        );
+        assert_eq!(
+            TicketPhase::Issued.on_event(TicketEvent::RollBack),
+            Err(IllegalTicketTransition {
+                phase: TicketPhase::Issued,
+                event: TicketEvent::RollBack,
+            })
+        );
+    }
+}
+
+#[cfg(test)]
+mod completion_phase_tests {
+    use super::{ActorCompletion, CompletionAlreadyRecorded, CompletionEvent, CompletionPhase};
+
+    const EVENTS: [CompletionEvent; 4] = [
+        CompletionEvent::Finished { failed: false },
+        CompletionEvent::Finished { failed: true },
+        CompletionEvent::Aborted,
+        CompletionEvent::Stopped,
+    ];
+
+    #[test]
+    fn running_takes_each_outcome_and_every_outcome_is_final() {
+        let expected = [
+            CompletionPhase::Completed,
+            CompletionPhase::Failed,
+            CompletionPhase::Aborted,
+            CompletionPhase::Stopped,
+        ];
+        for (event, phase) in EVENTS.into_iter().zip(expected) {
+            assert_eq!(CompletionPhase::Running.on_event(event), Ok(phase));
+            assert!(phase.is_done());
+            for later in EVENTS {
+                assert_eq!(
+                    phase.on_event(later),
+                    Err(CompletionAlreadyRecorded(phase)),
+                    "{phase:?} accepted {later:?}"
+                );
+            }
+        }
+        assert!(!CompletionPhase::Running.is_done());
+        assert!(!CompletionPhase::Running.is_failure());
+    }
+
+    #[test]
+    fn only_a_panic_or_a_failing_abort_is_a_failure() {
+        for phase in CompletionPhase::ALL {
+            assert_eq!(
+                phase.is_failure(),
+                matches!(phase, CompletionPhase::Failed | CompletionPhase::Aborted)
+            );
+            assert_eq!(CompletionPhase::from_u8(phase as u8), phase);
+        }
+    }
+
+    #[test]
+    fn the_first_recorded_outcome_is_kept() {
+        let completion = ActorCompletion::default();
+        assert_eq!(completion.phase(), CompletionPhase::Running);
+        assert!(!completion.is_done() && !completion.failed());
+        assert_eq!(
+            completion.transition(CompletionEvent::Finished { failed: true }),
+            Ok(CompletionPhase::Failed)
+        );
+        // A stop after a recorded panic keeps the panic (task row M6-C175).
+        completion.mark_stopped();
+        completion.mark_done(false);
+        assert_eq!(
+            completion.transition(CompletionEvent::Aborted),
+            Err(CompletionAlreadyRecorded(CompletionPhase::Failed))
+        );
+        assert!(completion.is_done() && completion.failed());
+
+        let stopped = ActorCompletion::default();
+        stopped.mark_stopped();
+        stopped.mark_aborted();
+        assert_eq!(stopped.phase(), CompletionPhase::Stopped);
+        assert!(stopped.is_done() && !stopped.failed());
+
+        let aborted = ActorCompletion::default();
+        aborted.mark_aborted();
+        assert!(aborted.is_done() && aborted.failed());
+    }
+}
+
+/// The actor's supervisor before its task first runs.  A task aborted
+/// before its first poll drops this whole, and fields drop in declaration
+/// order: the actor first (its drop bequeaths its cleanup state), then the
+/// release that inherits that state, then the completion record.
+struct ActorSupervisor {
+    run: std::pin::Pin<Box<dyn Future<Output = ()> + Send>>,
+    stranded_claims: StrandedClaimRelease,
+    completion: CompletionOnDrop,
+}
+
+/// A spawned relay task as every [`RelayHandle`] clone sees it: a way to
+/// abort it and a signal that it has exited.
+///
+/// The signal is raised when the task's future has been dropped -- it
+/// returned, panicked or was aborted -- which is after everything the task
+/// owned has been dropped too.  Any number of handles can wait for it, so no
+/// handle has to own the task's `JoinHandle`.
+#[derive(Clone)]
+struct SupervisedTask {
+    abort: AbortHandle,
+    exited: CancellationToken,
+}
+
+/// Raises a [`SupervisedTask`]'s exit signal when dropped.
+struct ExitSignal(CancellationToken);
+
+impl Drop for ExitSignal {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
+/// A task's future and its exit signal.  Fields drop in declaration order,
+/// so the signal is raised only after the future is gone.
+struct SignalledOnExit {
+    future: std::pin::Pin<Box<dyn Future<Output = ()> + Send>>,
+    _exit: ExitSignal,
+}
+
+impl Future for SignalledOnExit {
+    type Output = ();
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<()> {
+        self.future.as_mut().poll(cx)
+    }
+}
+
+/// Aborts a task when a wait for its exit is abandoned before it exited.
+struct AbortUnlessExited<'a>(&'a SupervisedTask);
+
+impl Drop for AbortUnlessExited<'_> {
+    fn drop(&mut self) {
+        if !self.0.exited.is_cancelled() {
+            self.0.abort.abort();
+        }
+    }
+}
+
+impl SupervisedTask {
+    fn spawn(future: impl Future<Output = ()> + Send + 'static) -> Self {
+        let exited = CancellationToken::new();
+        let task = tokio::spawn(SignalledOnExit {
+            future: Box::pin(future),
+            _exit: ExitSignal(exited.clone()),
+        });
+        Self {
+            abort: task.abort_handle(),
+            exited,
+        }
+    }
+
+    /// Wait for the task to exit.  If the surrounding bounded shutdown
+    /// future is cancelled before it has, abort the task rather than leave
+    /// it running detached.
+    async fn join(&self) {
+        let _abort_if_abandoned = AbortUnlessExited(self);
+        self.exited.cancelled().await;
+    }
+
+    async fn abort_and_join(&self) {
+        self.abort.abort();
+        self.join().await;
+    }
+}
+
 /// Owns a join handle while it is being awaited.  If the surrounding
 /// bounded shutdown future is cancelled before the join completes, abort the
 /// task instead of dropping the handle and detaching its supervisor.
@@ -509,12 +980,6 @@ impl<T> AbortOnDropJoinHandle<T> {
     fn new(handle: JoinHandle<T>) -> Self {
         Self {
             handle: Some(handle),
-        }
-    }
-
-    fn abort(&self) {
-        if let Some(handle) = &self.handle {
-            handle.abort();
         }
     }
 
@@ -559,6 +1024,10 @@ struct CleanupDispatcher {
     backlog: OwnerBacklog,
     /// Wakes the actor to offer the backlog to the worker again.
     backlog_notify: Arc<Notify>,
+    /// A test worker with no actor behind it keeps its own backlog open for
+    /// as long as a dispatcher can still keep an item there.
+    #[cfg(test)]
+    test_backlog_drain: Option<Arc<OwnerBacklogDrain>>,
 }
 
 impl CleanupDispatcher {
@@ -634,6 +1103,7 @@ impl CleanupDispatcher {
             refused_count: Arc::new(AtomicUsize::new(0)),
             backlog,
             backlog_notify: Arc::new(Notify::new()),
+            test_backlog_drain: None,
         }
     }
 
@@ -703,11 +1173,29 @@ async fn release_cleanup_item(catalog: &SharedCatalog, item: &OwnerCleanupItem) 
     }
 }
 
-fn lock_handoffs(slots: &Mutex<ClaimHandoffSlots>) -> std::sync::MutexGuard<'_, ClaimHandoffSlots> {
-    // A panic elsewhere must not stop an ended actor's claims being released.
-    slots
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+/// One owner-claim guard parked for a registration in flight: the cleanup
+/// dispatcher its item would be queued on, and the latest item the
+/// registration task armed it with.  The task is the only writer of `armed`
+/// (through its [`ClaimHandoff`]); whoever takes the guard samples it once.
+struct ParkedClaim {
+    dispatcher: CleanupDispatcher,
+    armed: watch::Receiver<Option<OwnerCleanupItem>>,
+}
+
+impl ParkedClaim {
+    /// The item the registration task last armed, if any.
+    fn armed_item(&self) -> Option<OwnerCleanupItem> {
+        self.armed.borrow().clone()
+    }
+
+    /// The guard as the actor handles it: armed with the task's latest item.
+    fn into_guard(self) -> OwnerClaimCleanup {
+        let item = self.armed_item();
+        OwnerClaimCleanup {
+            dispatcher: self.dispatcher,
+            item,
+        }
+    }
 }
 
 /// Owner-claim guards for registrations in flight (task rows M6-C170 and
@@ -733,73 +1221,86 @@ fn lock_handoffs(slots: &Mutex<ClaimHandoffSlots>) -> std::sync::MutexGuard<'_, 
 /// or, once the actor has ended, by [`StrandedClaimRelease`], which releases
 /// it directly against the catalog.  Dropping a handoff never drops its guard.
 /// Bounded by the registrations the actor admitted (`max_devices`).
-#[derive(Clone, Default)]
-struct ClaimHandoffs {
-    slots: Arc<Mutex<ClaimHandoffSlots>>,
-}
-
+///
+/// The registry has exactly one owner at a time: the actor while it runs,
+/// then its supervisor, which inherits it when the actor is dropped (see
+/// [`ActorCleanupBequest`]).  The only state a registration task shares with
+/// it is its own guard's armed item, published over a per-guard `watch`
+/// whose single writer is that task.
 #[derive(Default)]
-struct ClaimHandoffSlots {
+struct ClaimHandoffs {
     next: u64,
     closed: bool,
-    guards: HashMap<u64, OwnerClaimCleanup>,
+    guards: HashMap<u64, ParkedClaim>,
+    /// How many guards are parked, for observers that do not own the
+    /// registry.  Written only by the registry's owner.
+    parked: Arc<AtomicUsize>,
 }
 
 impl ClaimHandoffs {
-    /// Park a guard.  Once the registry is closed (the actor has ended or is
-    /// closing) the guard stays with the handoff instead, and dropping the
-    /// handoff drops the guard, which queues its cleanup as before.
-    fn deposit(&self, guard: Option<OwnerClaimCleanup>) -> ClaimHandoff {
-        let Some(guard) = guard else {
+    /// Park a guard.  Once the registry is closed (the actor is closing) the
+    /// guard stays with the handoff instead, and dropping the handoff drops
+    /// the guard, which queues its cleanup as before.
+    fn deposit(&mut self, guard: Option<OwnerClaimCleanup>) -> ClaimHandoff {
+        let Some(mut guard) = guard else {
             return ClaimHandoff::empty();
         };
-        let mut slots = lock_handoffs(&self.slots);
-        if slots.closed {
-            drop(slots);
+        if self.closed {
             return ClaimHandoff {
-                registry: None,
-                id: 0,
+                parked: None,
                 local: Some(guard),
             };
         }
-        let id = slots.next;
-        slots.next = slots.next.wrapping_add(1);
-        slots.guards.insert(id, guard);
-        ClaimHandoff {
-            registry: Some(self.clone()),
+        let id = self.next;
+        self.next = self.next.wrapping_add(1);
+        // The guard's item moves into the parked slot; the emptied guard
+        // queues nothing when it is dropped here.
+        let (armed_tx, armed) = watch::channel(guard.item.take());
+        self.guards.insert(
             id,
+            ParkedClaim {
+                dispatcher: guard.dispatcher.clone(),
+                armed,
+            },
+        );
+        self.publish_parked();
+        ClaimHandoff {
+            parked: Some((id, armed_tx)),
             local: None,
         }
     }
 
-    fn remove(&self, id: u64) -> Option<OwnerClaimCleanup> {
-        lock_handoffs(&self.slots).guards.remove(&id)
+    fn publish_parked(&self) {
+        self.parked.store(self.guards.len(), Ordering::Release);
     }
 
-    fn with_parked(&self, id: u64, arm: impl FnOnce(&mut OwnerClaimCleanup)) {
-        if let Some(guard) = lock_handoffs(&self.slots).guards.get_mut(&id) {
-            arm(guard);
+    /// The actor's side: take the guard `handoff` names if nobody else has.
+    fn take(&mut self, handoff: &mut ClaimHandoff) -> Option<OwnerClaimCleanup> {
+        if let Some(local) = handoff.local.take() {
+            return Some(local);
         }
+        let (id, _armed) = handoff.parked.take()?;
+        let parked = self.guards.remove(&id)?;
+        self.publish_parked();
+        Some(parked.into_guard())
     }
 
     /// Close the registry: a later deposit keeps its guard with its own
     /// handoff.  Guards already parked stay parked.
-    fn close(&self) {
-        lock_handoffs(&self.slots).closed = true;
+    fn close(&mut self) {
+        self.closed = true;
     }
 
-    /// Close the registry and take the next armed guard's cleanup item,
-    /// disarming the guard so it queues nothing itself.  Unarmed guards are
-    /// discarded on the way.
-    fn take_next_after_end(&self) -> Option<OwnerCleanupItem> {
+    /// Close the registry and take the next armed guard's cleanup item; the
+    /// guard itself is never rebuilt, so it queues nothing.  Unarmed guards
+    /// are discarded on the way.
+    fn take_next_after_end(&mut self) -> Option<OwnerCleanupItem> {
+        self.closed = true;
         loop {
-            let mut guard = {
-                let mut slots = lock_handoffs(&self.slots);
-                slots.closed = true;
-                let id = slots.guards.keys().next().copied()?;
-                slots.guards.remove(&id)?
-            };
-            if let Some(item) = guard.item.take() {
+            let id = self.guards.keys().next().copied()?;
+            let parked = self.guards.remove(&id)?;
+            self.publish_parked();
+            if let Some(item) = parked.armed_item() {
                 return Some(item);
             }
         }
@@ -807,22 +1308,28 @@ impl ClaimHandoffs {
 
     #[cfg(test)]
     fn parked(&self) -> usize {
-        lock_handoffs(&self.slots).guards.len()
+        self.guards.len()
     }
 }
 
 /// A registration's claim on its parked guard.  See [`ClaimHandoffs`].
+///
+/// Dropping a handoff whose guard is parked leaves the guard parked:
+/// `close_all` or the actor's supervisor takes it.  Dropping the guard there
+/// would enqueue it on a cleanup worker that may be about to be aborted with
+/// the actor, which is how a command drained from an ending actor's queue
+/// lost its claim.  A guard the handoff carries itself (`local`) is dropped
+/// with it and queues its cleanup.
 struct ClaimHandoff {
-    registry: Option<ClaimHandoffs>,
-    id: u64,
+    /// The parked guard's id and the writing half of its armed item.
+    parked: Option<(u64, watch::Sender<Option<OwnerCleanupItem>>)>,
     local: Option<OwnerClaimCleanup>,
 }
 
 impl ClaimHandoff {
     fn empty() -> Self {
         Self {
-            registry: None,
-            id: 0,
+            parked: None,
             local: None,
         }
     }
@@ -830,45 +1337,28 @@ impl ClaimHandoff {
     /// Arm, re-arm or disarm the guard where it is parked.  A guard already
     /// taken by the actor's end is not re-created: its release has already
     /// been attempted, and lease expiry is the fallback for anything later.
-    fn update(&mut self, arm: impl FnOnce(&mut OwnerClaimCleanup)) {
+    fn set(&mut self, item: Option<OwnerCleanupItem>) {
         if let Some(local) = self.local.as_mut() {
-            arm(local);
-        } else if let Some(registry) = &self.registry {
-            registry.with_parked(self.id, arm);
+            match item {
+                Some(OwnerCleanupItem::Claim(request)) => local.arm_request(request),
+                Some(OwnerCleanupItem::Token(owner)) => local.arm_token(owner),
+                None => local.disarm(),
+            }
+        } else if let Some((_, armed)) = &self.parked {
+            armed.send_replace(item);
         }
     }
 
     fn arm_request(&mut self, request: OwnerClaimRequest) {
-        self.update(|guard| guard.arm_request(request));
+        self.set(Some(OwnerCleanupItem::Claim(request)));
     }
 
     fn arm_token(&mut self, owner: OwnerToken) {
-        self.update(|guard| guard.arm_token(owner));
+        self.set(Some(OwnerCleanupItem::Token(owner)));
     }
 
     fn disarm(&mut self) {
-        self.update(OwnerClaimCleanup::disarm);
-    }
-
-    /// The actor's side: take the guard if nobody else has.
-    fn take(&mut self) -> Option<OwnerClaimCleanup> {
-        if let Some(local) = self.local.take() {
-            return Some(local);
-        }
-        self.registry.take()?.remove(self.id)
-    }
-}
-
-impl Drop for ClaimHandoff {
-    fn drop(&mut self) {
-        // A parked guard stays parked: `close_all` or the actor's supervisor
-        // takes it.  Dropping it here would enqueue it on a cleanup worker that
-        // may be about to be aborted with the actor, which is how a command
-        // drained from an ending actor's queue lost its claim.
-        if self.registry.is_some() {
-            return;
-        }
-        drop(self.local.take());
+        self.set(None);
     }
 }
 
@@ -877,7 +1367,7 @@ impl Drop for ClaimHandoff {
 /// was in flight or still parked when the deadline passed is abandoned to
 /// lease expiry, taken out of the registry, and counted.
 async fn release_parked_until<F, Fut>(
-    handoffs: &ClaimHandoffs,
+    handoffs: &mut ClaimHandoffs,
     deadline: tokio::time::Instant,
     mut release: F,
 ) -> (usize, usize)
@@ -916,26 +1406,46 @@ where
 /// when the worker signals progress, after every command and on every tick,
 /// so a `tick` that closes more sessions than the queue holds no longer
 /// refuses the rest.  At relay shutdown `close_all` releases whatever is
-/// left, fenced, after the worker has shut down.  The list is shared with the
-/// actor's supervisor ([`StrandedClaimRelease`]), so an actor that panics or
-/// is aborted with items kept here does not drop them (task row M6-C187).
+/// left, fenced, after the worker has shut down.  An actor that panics or is
+/// aborted with items kept here does not drop them: its supervisor
+/// ([`StrandedClaimRelease`]) inherits the draining half (task row M6-C187).
 /// While the relay runs it is bounded by `max_devices`; past that an item is
 /// refused, logged once, counted and left to lease expiry.  `close_all`
 /// lifts the bound, since the live sessions (`max_devices`) bound it then.
 /// The supervisor's drain seals it in the same step that finds it empty
 /// (task row M6-C189): an item offered after that is refused and counted,
 /// never kept where nothing will release it.
+///
+/// This is the keeping half, held by every dispatcher clone: guards are
+/// dropped from arbitrary tasks, so keeping must be synchronous and must not
+/// wait.  The items travel over a channel to the one [`OwnerBacklogDrain`].
+/// The channel itself is unbounded because the bound changes at shutdown
+/// (`lift_cap`) and is `0` or `usize::MAX` in tests; the bound is enforced
+/// here instead, by reserving a place in `kept` before anything is sent, so
+/// the queue never holds more than the bound allows.  A full backlog refuses
+/// the item (`BacklogKeep::Full`); it never waits.
 #[derive(Clone)]
 struct OwnerBacklog {
-    state: Arc<Mutex<OwnerBacklogState>>,
+    tx: mpsc::UnboundedSender<OwnerCleanupItem>,
+    bound: Arc<OwnerBacklogBound>,
     counters: Arc<OwnerCleanupCounters>,
 }
 
-struct OwnerBacklogState {
-    items: VecDeque<OwnerCleanupItem>,
-    cap: usize,
-    uncapped: bool,
-    sealed: bool,
+struct OwnerBacklogBound {
+    /// Items kept and not yet drained, including a place reserved for an
+    /// item about to be sent.
+    kept: AtomicUsize,
+    cap: AtomicUsize,
+    uncapped: AtomicBool,
+}
+
+/// The draining half of the [`OwnerBacklog`].  It has exactly one owner at a
+/// time: the actor while it runs, then its supervisor (see
+/// [`ActorCleanupBequest`]).  Sealing closes the channel, after which every
+/// `try_keep` is refused.
+struct OwnerBacklogDrain {
+    rx: mpsc::UnboundedReceiver<OwnerCleanupItem>,
+    bound: Arc<OwnerBacklogBound>,
 }
 
 /// What [`OwnerBacklog::try_keep`] did with an item.
@@ -967,54 +1477,57 @@ struct OwnerCleanupCounters {
 }
 
 impl OwnerBacklog {
-    fn new(cap: usize) -> Self {
-        Self {
-            state: Arc::new(Mutex::new(OwnerBacklogState {
-                items: VecDeque::new(),
-                cap,
-                uncapped: false,
-                sealed: false,
-            })),
-            counters: Arc::default(),
-        }
+    fn new(cap: usize) -> (Self, OwnerBacklogDrain) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let bound = Arc::new(OwnerBacklogBound {
+            kept: AtomicUsize::new(0),
+            cap: AtomicUsize::new(cap),
+            uncapped: AtomicBool::new(false),
+        });
+        (
+            Self {
+                tx,
+                bound: bound.clone(),
+                counters: Arc::default(),
+            },
+            OwnerBacklogDrain { rx, bound },
+        )
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, OwnerBacklogState> {
-        // A panic elsewhere must not stop kept owners being released.
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    /// Reserve one place under the bound.
+    fn reserve(&self) -> bool {
+        if self.bound.uncapped.load(Ordering::Acquire) {
+            self.bound.kept.fetch_add(1, Ordering::AcqRel);
+            return true;
+        }
+        let cap = self.bound.cap.load(Ordering::Acquire);
+        self.bound
+            .kept
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |kept| {
+                (kept < cap).then(|| kept + 1)
+            })
+            .is_ok()
     }
 
     /// Keep `item` if the backlog is not sealed and the bound allows.
     fn try_keep(&self, item: OwnerCleanupItem) -> BacklogKeep {
-        let mut state = self.lock();
-        if state.sealed {
-            BacklogKeep::Sealed
-        } else if state.uncapped || state.items.len() < state.cap {
-            state.items.push_back(item);
-            BacklogKeep::Kept
-        } else {
-            BacklogKeep::Full
+        if self.tx.is_closed() {
+            return BacklogKeep::Sealed;
         }
-    }
-
-    /// Take the oldest kept item; when there is none, seal the backlog under
-    /// the same lock, so no item can be kept between the drain finding it
-    /// empty and the seal (task row M6-C189).  Only the supervisor's final
-    /// drain uses this.
-    fn pop_front_or_seal(&self) -> Option<OwnerCleanupItem> {
-        let mut state = self.lock();
-        let item = state.items.pop_front();
-        if item.is_none() {
-            state.sealed = true;
+        if !self.reserve() {
+            return BacklogKeep::Full;
         }
-        item
+        if self.tx.send(item).is_err() {
+            // Sealed between the check and the send: the item was not kept.
+            self.bound.kept.fetch_sub(1, Ordering::AcqRel);
+            return BacklogKeep::Sealed;
+        }
+        BacklogKeep::Kept
     }
 
     #[cfg(test)]
     fn is_sealed(&self) -> bool {
-        self.lock().sealed
+        self.tx.is_closed()
     }
 
     fn counters(&self) -> &OwnerCleanupCounters {
@@ -1024,34 +1537,145 @@ impl OwnerBacklog {
     /// Lift the running bound for `close_all`, where the live sessions bound
     /// the backlog instead.
     fn lift_cap(&self) {
-        self.lock().uncapped = true;
+        self.bound.uncapped.store(true, Ordering::Release);
     }
 
     fn cap(&self) -> usize {
-        self.lock().cap
+        self.bound.cap.load(Ordering::Acquire)
     }
 
     #[cfg(test)]
     fn set_cap(&self, cap: usize) {
-        self.lock().cap = cap;
+        self.bound.cap.store(cap, Ordering::Release);
     }
 
+    /// Keep `item` regardless of the bound.
     #[cfg(test)]
     fn push(&self, item: OwnerCleanupItem) {
-        self.lock().items.push_back(item);
-    }
-
-    fn pop_front(&self) -> Option<OwnerCleanupItem> {
-        self.lock().items.pop_front()
+        self.bound.kept.fetch_add(1, Ordering::AcqRel);
+        if self.tx.send(item).is_err() {
+            self.bound.kept.fetch_sub(1, Ordering::AcqRel);
+        }
     }
 
     #[cfg(test)]
     fn len(&self) -> usize {
-        self.lock().items.len()
+        self.bound.kept.load(Ordering::Acquire)
     }
 
     fn is_empty(&self) -> bool {
-        self.lock().items.is_empty()
+        self.bound.kept.load(Ordering::Acquire) == 0
+    }
+}
+
+impl OwnerBacklogDrain {
+    fn taken(&self, item: OwnerCleanupItem) -> OwnerCleanupItem {
+        self.bound.kept.fetch_sub(1, Ordering::AcqRel);
+        item
+    }
+
+    fn pop_front(&mut self) -> Option<OwnerCleanupItem> {
+        let item = self.rx.try_recv().ok()?;
+        Some(self.taken(item))
+    }
+
+    /// Take the oldest kept item; when there is none, seal the backlog, so
+    /// nothing is kept after the drain found it empty (task row M6-C189).
+    /// Closing the channel refuses every later `try_keep`; an item whose send
+    /// began before the close is still delivered, and is taken here or by
+    /// [`Self::next_after_seal`].  Only the supervisor's final drain uses
+    /// this.
+    fn pop_front_or_seal(&mut self) -> Option<OwnerCleanupItem> {
+        if let Some(item) = self.pop_front() {
+            return Some(item);
+        }
+        self.rx.close();
+        self.pop_front()
+    }
+
+    /// After a seal: the next item whose send was already under way when the
+    /// channel closed, or `None` once no such send is outstanding.  The wait
+    /// is only for a synchronous `try_keep` already past its closed check.
+    async fn next_after_seal(&mut self) -> Option<OwnerCleanupItem> {
+        self.rx.close();
+        let item = self.rx.recv().await?;
+        Some(self.taken(item))
+    }
+
+    /// Without waiting: `true` when the backlog is sealed and no keep is
+    /// outstanding, so nothing more can ever arrive.
+    fn sealed_and_drained(&self) -> bool {
+        // `kept` counts a place from before a send begins until its item is
+        // taken (or the send is refused), so zero means nothing is in flight.
+        self.rx.is_closed() && self.bound.kept.load(Ordering::Acquire) == 0
+    }
+}
+
+/// The owner-cleanup state only the running actor touches: the parked claim
+/// guards and the draining half of the owner backlog.
+struct ActorCleanupState {
+    claims: ClaimHandoffs,
+    backlog: OwnerBacklogDrain,
+}
+
+/// Holds the actor's [`ActorCleanupState`] and, when the actor is dropped --
+/// it returned, panicked or was aborted -- hands that state to the actor's
+/// supervisor ([`StrandedClaimRelease`]) over a one-shot channel, so the
+/// state always has exactly one owner and an actor that ends abnormally does
+/// not drop the claims it was holding (task rows M6-C170, M6-C178, M6-C187).
+struct ActorCleanupBequest {
+    state: Option<ActorCleanupState>,
+    heir: Option<oneshot::Sender<ActorCleanupState>>,
+}
+
+impl ActorCleanupBequest {
+    /// The state and the receiving half its supervisor holds.
+    fn new(state: ActorCleanupState) -> (Self, oneshot::Receiver<ActorCleanupState>) {
+        let (heir, bequest) = oneshot::channel();
+        (
+            Self {
+                state: Some(state),
+                heir: Some(heir),
+            },
+            bequest,
+        )
+    }
+
+    /// State with no supervisor to inherit it.
+    #[cfg(test)]
+    fn unsupervised(state: ActorCleanupState) -> Self {
+        Self {
+            state: Some(state),
+            heir: None,
+        }
+    }
+}
+
+impl std::ops::Deref for ActorCleanupBequest {
+    type Target = ActorCleanupState;
+
+    fn deref(&self) -> &ActorCleanupState {
+        self.state
+            .as_ref()
+            .expect("cleanup state present until drop")
+    }
+}
+
+impl std::ops::DerefMut for ActorCleanupBequest {
+    fn deref_mut(&mut self) -> &mut ActorCleanupState {
+        self.state
+            .as_mut()
+            .expect("cleanup state present until drop")
+    }
+}
+
+impl Drop for ActorCleanupBequest {
+    fn drop(&mut self) {
+        if let (Some(heir), Some(state)) = (self.heir.take(), self.state.take()) {
+            // A supervisor that is already gone drops the state here; its
+            // own drop found nothing to release.
+            let _ = heir.send(state);
+        }
     }
 }
 
@@ -1069,12 +1693,12 @@ impl OwnerBacklog {
 /// supervisor's final drain, task row M6-C189).
 async fn release_backlog_until(
     catalog: &SharedCatalog,
-    backlog: &OwnerBacklog,
+    backlog: &mut OwnerBacklogDrain,
     deadline: tokio::time::Instant,
     seal: bool,
 ) -> (usize, usize) {
     use futures_util::StreamExt as _;
-    let pop = || {
+    let mut pop = || {
         if seal {
             backlog.pop_front_or_seal()
         } else {
@@ -1085,6 +1709,9 @@ async fn release_backlog_until(
         let mut abandoned = 0_usize;
         while pop().is_some() {
             abandoned = abandoned.saturating_add(1);
+        }
+        if seal {
+            abandoned = abandoned.saturating_add(abandon_after_seal(backlog).await);
         }
         return (0, abandoned);
     }
@@ -1111,7 +1738,32 @@ async fn release_backlog_until(
             abandoned = abandoned.saturating_add(1);
         }
     }
+    if seal {
+        // The seal closed the channel; an item whose keep was already under
+        // way then is delivered after it.  Take those too, so that nothing
+        // kept is ever left behind the seal (task row M6-C189).
+        while let Some(item) = backlog.next_after_seal().await {
+            let released = tokio::time::Instant::now() < deadline
+                && tokio::time::timeout_at(deadline, release_cleanup_item(catalog, &item))
+                    .await
+                    .is_ok();
+            if released {
+                attempted = attempted.saturating_add(1);
+            } else {
+                abandoned = abandoned.saturating_add(1);
+            }
+        }
+    }
     (attempted, abandoned)
+}
+
+/// Count, without releasing, the items delivered after a seal.
+async fn abandon_after_seal(backlog: &mut OwnerBacklogDrain) -> usize {
+    let mut abandoned = 0_usize;
+    while backlog.next_after_seal().await.is_some() {
+        abandoned = abandoned.saturating_add(1);
+    }
+    abandoned
 }
 
 /// Held by the actor task's supervisor: once the actor has ended, release
@@ -1121,37 +1773,79 @@ async fn release_backlog_until(
 /// `CLEANUP_SHUTDOWN_TIMEOUT`; what does not fit is left to lease expiry and
 /// counted in the log.
 struct StrandedClaimRelease {
-    handoffs: ClaimHandoffs,
-    /// Session owner tokens the actor kept for its cleanup queue (task row
-    /// M6-C187); `close_all` empties it, so only an actor that panicked or
-    /// was aborted leaves anything here.
-    backlog: OwnerBacklog,
+    /// Receives the actor's parked claims and its owner backlog when the
+    /// actor is dropped (see [`ActorCleanupBequest`]).
+    bequest: oneshot::Receiver<ActorCleanupState>,
+    /// The inherited state.  The backlog holds session owner tokens the
+    /// actor kept for its cleanup queue (task row M6-C187); `close_all`
+    /// empties it, so only an actor that panicked or was aborted leaves
+    /// anything there.
+    state: Option<ActorCleanupState>,
+    counters: Arc<OwnerCleanupCounters>,
     catalog: SharedCatalog,
 }
 
 impl StrandedClaimRelease {
+    fn new(
+        bequest: oneshot::Receiver<ActorCleanupState>,
+        backlog: &OwnerBacklog,
+        catalog: SharedCatalog,
+    ) -> Self {
+        Self {
+            bequest,
+            state: None,
+            counters: backlog.counters.clone(),
+            catalog,
+        }
+    }
+
+    /// A supervisor that has already inherited `state`.
+    #[cfg(test)]
+    fn holding(state: ActorCleanupState, backlog: &OwnerBacklog, catalog: SharedCatalog) -> Self {
+        let (_heir, bequest) = oneshot::channel();
+        Self {
+            bequest,
+            state: Some(state),
+            counters: backlog.counters.clone(),
+            catalog,
+        }
+    }
+
+    /// Take what the ended actor left, if it has not been taken yet.
+    fn inherit(&mut self) {
+        if self.state.is_none() {
+            self.state = self.bequest.try_recv().ok();
+        }
+    }
+
     /// Returns `(released, abandoned)` over the kept session owners and the
     /// parked claims together.  The owners go first, within the same one
-    /// deadline.
-    async fn release(&self) -> (usize, usize) {
+    /// deadline.  Call only once the actor has been dropped.
+    async fn release(&mut self) -> (usize, usize) {
+        self.inherit();
         let catalog = &self.catalog;
+        let Some(state) = self.state.as_mut() else {
+            tracing::error!(
+                "the ended relay actor left no owner cleanup state; lease expiry is the fencing fallback"
+            );
+            return (0, 0);
+        };
         let deadline = tokio::time::Instant::now() + CLEANUP_SHUTDOWN_TIMEOUT;
         let (owners_released, owners_abandoned) =
-            release_backlog_until(catalog, &self.backlog, deadline, true).await;
+            release_backlog_until(catalog, &mut state.backlog, deadline, true).await;
         log_stranded_owner_release(owners_released, owners_abandoned);
         let (released, abandoned) =
-            release_parked_until(&self.handoffs, deadline, |item| async move {
+            release_parked_until(&mut state.claims, deadline, |item| async move {
                 release_cleanup_item(catalog, &item).await
             })
             .await;
         log_stranded_release(released, abandoned);
         let released = released.saturating_add(owners_released);
         let abandoned = abandoned.saturating_add(owners_abandoned);
-        let counters = self.backlog.counters();
-        counters
+        self.counters
             .stranded_released
             .fetch_add(released, Ordering::AcqRel);
-        counters
+        self.counters
             .stranded_abandoned
             .fetch_add(abandoned, Ordering::AcqRel);
         (released, abandoned)
@@ -1194,38 +1888,59 @@ impl Drop for StrandedClaimRelease {
     fn drop(&mut self) {
         // Reached with parked guards only when the supervisor was aborted
         // before `release` ran (or during it).
+        self.inherit();
+        let Some(mut state) = self.state.take() else {
+            return;
+        };
         let mut items = Vec::new();
-        while let Some(item) = self.backlog.pop_front_or_seal() {
+        while let Some(item) = state.backlog.pop_front_or_seal() {
             items.push(item);
         }
         let owners = items.len();
-        while let Some(item) = self.handoffs.take_next_after_end() {
+        while let Some(item) = state.claims.take_next_after_end() {
             items.push(item);
         }
-        if items.is_empty() {
+        // An item whose keep was under way when the backlog was sealed is
+        // delivered after the seal; only a task can wait for it.
+        let late = (!state.backlog.sealed_and_drained()).then_some(state.backlog);
+        if items.is_empty() && late.is_none() {
             return;
         }
-        let counters = self.backlog.counters();
-        counters
-            .aborted_found
-            .fetch_add(items.len(), Ordering::AcqRel);
-        counters.aborted_owners.fetch_add(owners, Ordering::AcqRel);
-        // Logged before spawning: `try_current` can succeed while the runtime
-        // is shutting down, and a spawn then is silently dropped.
-        tracing::error!(
-            count = items.len(),
-            owners,
-            "owner claims stranded behind an aborted relay actor; releasing on the runtime, lease expiry is the fencing fallback"
-        );
+        if !items.is_empty() {
+            self.counters
+                .aborted_found
+                .fetch_add(items.len(), Ordering::AcqRel);
+            self.counters
+                .aborted_owners
+                .fetch_add(owners, Ordering::AcqRel);
+            // Logged before spawning: `try_current` can succeed while the
+            // runtime is shutting down, and a spawn then is silently dropped.
+            tracing::error!(
+                count = items.len(),
+                owners,
+                "owner claims stranded behind an aborted relay actor; releasing on the runtime, lease expiry is the fencing fallback"
+            );
+        }
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             let catalog = self.catalog.clone();
+            let counters = self.counters.clone();
             runtime.spawn(async move {
                 let deadline = tokio::time::Instant::now() + CLEANUP_SHUTDOWN_TIMEOUT;
                 let mut released = 0_usize;
-                let total = items.len();
+                let mut total = items.len();
                 let _ = tokio::time::timeout_at(deadline, async {
                     for item in &items {
                         release_cleanup_item(&catalog, item).await;
+                        released = released.saturating_add(1);
+                    }
+                    let Some(mut late) = late else {
+                        return;
+                    };
+                    while let Some(item) = late.next_after_seal().await {
+                        total = total.saturating_add(1);
+                        counters.aborted_found.fetch_add(1, Ordering::AcqRel);
+                        counters.aborted_owners.fetch_add(1, Ordering::AcqRel);
+                        release_cleanup_item(&catalog, &item).await;
                         released = released.saturating_add(1);
                     }
                 })
@@ -1254,11 +1969,12 @@ struct CleanupWorker {
 impl CleanupWorker {
     #[cfg(test)]
     fn spawn(catalog: SharedCatalog) -> Self {
-        Self::spawn_with_backlog(
-            catalog,
-            OwnerBacklog::new(CLEANUP_QUEUE_CAPACITY),
-            Arc::new(Notify::new()),
-        )
+        let (backlog, drain) = OwnerBacklog::new(CLEANUP_QUEUE_CAPACITY);
+        let mut worker = Self::spawn_with_backlog(catalog, backlog, Arc::new(Notify::new()));
+        if let Some(dispatcher) = worker.dispatcher.as_mut() {
+            dispatcher.test_backlog_drain = Some(Arc::new(drain));
+        }
+        worker
     }
 
     /// `backlog_notify` is signalled after each release while anything is
@@ -1292,11 +2008,14 @@ impl CleanupWorker {
                 refused_count: Arc::new(AtomicUsize::new(0)),
                 backlog,
                 backlog_notify,
+                #[cfg(test)]
+                test_backlog_drain: None,
             }),
             task: Some(AbortOnDropJoinHandle::new(task)),
         }
     }
 
+    #[cfg(test)]
     fn dispatcher(&self) -> CleanupDispatcher {
         self.dispatcher
             .as_ref()
@@ -2061,20 +2780,27 @@ struct PendingEcho {
     consumer_expires_at: chrono::DateTime<Utc>,
     body: Vec<u8>,
     created_at: Instant,
-    dispatched: bool,
-    authorization_in_flight: bool,
-    /// An authorization result that arrived while the relay writer was
-    /// frozen for a rotation.  Dispatching then would emit DATA/FIN past the
-    /// frozen fence; the result is re-applied, with every freshness check,
-    /// once the writer resumes (task row M7-C93).
-    deferred_authorization: Option<(DeviceChallenge, ChallengeAuthorizationResult)>,
-    /// Whether this echo's authorization result was held by a rotation freeze
-    /// and, if so, whether it has been read again since (task row M6-C207).
-    freeze_authorization: FreezeAuthorization,
-    /// Where an exchange whose consumer was already answered stands on its
-    /// way to a provable terminal (task row M7-C94).
-    abandon: UnaryAbandon,
+    /// The relay's side of the exchange (see [`UnaryExchange`]): whether a
+    /// challenge's authorization is in flight, dispatch, and abandonment.
+    ///
+    /// An authorization result that arrives while the relay writer is frozen
+    /// for a rotation is held in this state.  Dispatching then would emit
+    /// DATA/FIN past the frozen fence; the result is re-applied, with every
+    /// freshness check, once the writer resumes (task row M7-C93).  The state
+    /// also records whether a held result has been read again since (task
+    /// row M6-C207).
+    ///
+    /// An exchange whose consumer was already answered is abandoned, not
+    /// removed: see [`UnaryExchange::Abandoned`] and the M7-C94 note below.
+    exchange: UnaryExchange<HeldAuthorization>,
+    /// What the connector has proved about its side: that it admitted the
+    /// OPEN, and that its own terminal was received (task row M7-C94).
+    connector: UnaryConnector,
 }
+
+/// An authorization result held across a rotation freeze, with the challenge
+/// it answers.
+type HeldAuthorization = Box<(DeviceChallenge, ChallengeAuthorizationResult)>;
 
 /// A unary echo's authorization result and a rotation freeze (task row
 /// M6-C207).  A result held across a freeze is applied when the writer
@@ -2110,23 +2836,10 @@ enum FreezeAuthorization {
 /// relay's own direction ended and acknowledged, the connector's ended and
 /// acknowledged.  It then becomes a [`UnaryTombstone`] and is forgotten under
 /// the M7-C92 rule.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-struct UnaryAbandon {
-    /// The consumer has its outcome; nothing is delivered any more.
-    abandoned: bool,
-    /// When the exchange was abandoned, for the bound in the maintenance tick.
-    abandoned_at: Option<Instant>,
-    /// The connector admitted the OPEN (its OPENED or its authorization
-    /// challenge was seen), so it holds a stream the relay must end.
-    admitted: bool,
-    /// The relay ended its own direction with RESET at sequence 1 instead of
-    /// dispatching DATA and FIN.
-    relay_reset: bool,
-    /// The connector's own terminal (FIN or RESET) was received in sequence
-    /// and acknowledged.
-    connector_terminal: bool,
-}
-
+///
+/// That state is [`UnaryExchange`] (abandonment, and the relay RESET that
+/// replaces an undispatched exchange's DATA and FIN) together with
+/// [`UnaryConnector`] (the connector's admission and its own terminal).
 impl PendingEcho {
     /// The execution outcome of an echo whose wait ended without an answer
     /// (the operation timeout or its session ending), task row M6-C205.
@@ -2136,7 +2849,7 @@ impl PendingEcho {
     /// are queued the device may have run it, whatever happened afterwards:
     /// `unknown`.
     fn interrupted_execution(&self) -> &'static str {
-        if self.dispatched {
+        if self.exchange.dispatched() {
             "unknown"
         } else {
             "not_dispatched"
@@ -2147,9 +2860,9 @@ impl PendingEcho {
     /// DATA and FIN are queued, its RESET when an abandoned exchange was
     /// ended before dispatch, nothing otherwise.
     fn relay_last_emitted(&self) -> u64 {
-        if self.dispatched {
+        if self.exchange.dispatched() {
             UNARY_ECHO_FIN_SEQUENCE
-        } else if self.abandon.relay_reset {
+        } else if self.exchange.relay_reset() {
             UNARY_ECHO_RESET_SEQUENCE
         } else {
             0
@@ -2394,9 +3107,10 @@ struct Ticket {
     issued_at_wall: chrono::DateTime<Utc>,
     expires_at_wall: chrono::DateTime<Utc>,
     expires_at: Instant,
-    consuming: bool,
+    /// Changed only by [`Ticket::transition`].
+    phase: TicketPhase,
     owner: OwnerToken,
-    candidate: bool,
+    kind: TicketKind,
     attachment_purpose: DataAttachmentPurpose,
     /// The catalog purpose is kept separately from the protocol enum because
     /// initial attachment is not a rotation purpose.  It is part of the
@@ -2404,10 +3118,84 @@ struct Ticket {
     catalog_purpose: String,
     binding_digest: String,
     locator_digest: String,
-    catalog_backed: bool,
+    authority: TicketAuthority,
+}
+
+/// Where a data-attachment ticket is between being issued and leaving the
+/// actor's table.  A ticket that was consumed, refused for good, expired or
+/// fenced is removed from the table; it has no phase of its own.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TicketPhase {
+    /// Issued to the device and not presented, or presented and rolled back.
+    Issued,
+    /// Presented; its identity, owner and catalog checks are in flight.  A
+    /// second presentation is refused while this lasts.
+    Consuming,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TicketEvent {
+    /// The device presented the ticket on a data socket.
+    BeginConsume,
+    /// The checks passed but the attachment itself was refused: the ticket
+    /// may be presented again.
+    RollBack,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct IllegalTicketTransition {
+    phase: TicketPhase,
+    event: TicketEvent,
+}
+
+impl TicketPhase {
+    fn on_event(self, event: TicketEvent) -> Result<Self, IllegalTicketTransition> {
+        match (self, event) {
+            (Self::Issued, TicketEvent::BeginConsume) => Ok(Self::Consuming),
+            (Self::Consuming, TicketEvent::RollBack) => Ok(Self::Issued),
+            (phase, event) => Err(IllegalTicketTransition { phase, event }),
+        }
+    }
+}
+
+/// Which data socket a ticket admits.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TicketKind {
+    /// A session's first data socket.
+    Initial,
+    /// A replacement data socket for a rotation or recovery attempt.
+    Candidate,
+}
+
+/// Who holds the authoritative copy of a ticket.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TicketAuthority {
+    /// This relay alone: the ticket exists only in the actor's table.
+    Relay,
+    /// The catalog: the ticket is also consumed there, atomically, against
+    /// its full binding.
+    Catalog,
 }
 
 impl Ticket {
+    /// The only place a ticket's phase changes.
+    fn transition(&mut self, event: TicketEvent) -> Result<(), IllegalTicketTransition> {
+        self.phase = self.phase.on_event(event)?;
+        Ok(())
+    }
+
+    fn is_consuming(&self) -> bool {
+        self.phase == TicketPhase::Consuming
+    }
+
+    fn is_candidate(&self) -> bool {
+        self.kind == TicketKind::Candidate
+    }
+
+    fn is_catalog_backed(&self) -> bool {
+        self.authority == TicketAuthority::Catalog
+    }
+
     fn scope(&self) -> DeviceScope {
         DeviceScope::new(self.tenant_id, self.device_id)
     }
@@ -2426,9 +3214,184 @@ impl Ticket {
     }
 }
 
+/// The owner-fence handshake of one device session.
+///
+/// M7 cluster profile is selected by the optional cluster configuration;
+/// M1/M2 development sessions retain their existing local ticket path and
+/// need no fence.  Owner fencing is a persistent session latch.  Its bounded
+/// deadline exists only while waiting for the initial OWNER_FENCED
+/// acknowledgement; ongoing dispatch freshness remains challenge-bound
+/// authorization.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum OwnerFencing {
+    /// Not a cluster-profile session: there is no fence to acknowledge.
+    NotRequired,
+    /// OWNER_FENCE was queued to the connector; nothing is dispatched until
+    /// its exact acknowledgement arrives, which must be before `deadline`.
+    AwaitingAck {
+        fence: OwnerFence,
+        deadline: Instant,
+    },
+    /// The connector acknowledged `fence` with `ack`.
+    Fenced { fence: OwnerFence, ack: OwnerFenced },
+}
+
+/// Why an OWNER_FENCED was refused.  Each closes the session with its code.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OwnerFenceRefusal {
+    /// The session has no fence to acknowledge.
+    Unexpected,
+    /// The acknowledgement does not echo the fence that was sent.
+    Context,
+    /// A second, different acknowledgement of an already acknowledged fence.
+    Duplicate,
+    /// The acknowledgement arrived at or after the handshake deadline.
+    Deadline,
+}
+
+impl OwnerFenceRefusal {
+    fn code(self) -> &'static str {
+        match self {
+            Self::Unexpected => "UNEXPECTED_OWNER_FENCED",
+            Self::Context => "OWNER_FENCE_CONTEXT",
+            Self::Duplicate => "OWNER_FENCE_DUPLICATE",
+            Self::Deadline => "OWNER_FENCE_DEADLINE",
+        }
+    }
+}
+
+/// What an accepted OWNER_FENCED did.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OwnerFenceAccepted {
+    /// The session is now fenced.
+    Committed,
+    /// An exact repeat of the acknowledgement already committed.
+    Repeated,
+}
+
+impl OwnerFencing {
+    /// Whether this is a cluster-profile session.
+    fn is_cluster(&self) -> bool {
+        !matches!(self, Self::NotRequired)
+    }
+
+    /// The fence is not outstanding: none is required, or it was
+    /// acknowledged.
+    fn is_settled(&self) -> bool {
+        !matches!(self, Self::AwaitingAck { .. })
+    }
+
+    /// A cluster-profile session whose fence the connector acknowledged.
+    fn is_acknowledged(&self) -> bool {
+        matches!(self, Self::Fenced { .. })
+    }
+
+    /// A cluster-profile session still waiting for OWNER_FENCED: nothing may
+    /// be dispatched to it.
+    fn is_awaiting_ack(&self) -> bool {
+        matches!(self, Self::AwaitingAck { .. })
+    }
+
+    /// The handshake deadline passed with no acknowledgement.
+    fn handshake_expired(&self, now: Instant) -> bool {
+        matches!(self, Self::AwaitingAck { deadline, .. } if now >= *deadline)
+    }
+
+    /// The only place the handshake changes state: commit the connector's
+    /// exact OWNER_FENCED acknowledgement.  The handshake deadline is
+    /// consumed only before this transition; `now` is read only when the
+    /// deadline is what decides.
+    fn on_owner_fenced(
+        &mut self,
+        fenced: OwnerFenced,
+        now: impl FnOnce() -> Instant,
+    ) -> Result<OwnerFenceAccepted, OwnerFenceRefusal> {
+        match self {
+            Self::NotRequired => Err(OwnerFenceRefusal::Unexpected),
+            Self::AwaitingAck { fence, .. } | Self::Fenced { fence, .. }
+                if fenced.validate_context(fence).is_err() =>
+            {
+                Err(OwnerFenceRefusal::Context)
+            }
+            Self::Fenced { ack, .. } => {
+                if *ack == fenced {
+                    Ok(OwnerFenceAccepted::Repeated)
+                } else {
+                    Err(OwnerFenceRefusal::Duplicate)
+                }
+            }
+            Self::AwaitingAck { fence, deadline } => {
+                if now() >= *deadline {
+                    return Err(OwnerFenceRefusal::Deadline);
+                }
+                *self = Self::Fenced {
+                    fence: fence.clone(),
+                    ack: fenced,
+                };
+                Ok(OwnerFenceAccepted::Committed)
+            }
+        }
+    }
+
+    /// A cluster-profile session whose fence for `key` and `owner` was
+    /// acknowledged.
+    #[cfg(test)]
+    fn fenced_for_test(key: &SessionKey, owner: &OwnerToken) -> Self {
+        let fence = Self::fence_for_test(key, owner);
+        let ack = OwnerFenced::from_fence(wire::random_token(), &fence);
+        Self::Fenced { fence, ack }
+    }
+
+    /// A cluster-profile session whose fence for `key` and `owner` is still
+    /// unacknowledged, with a deadline no test reaches.
+    #[cfg(test)]
+    fn awaiting_ack_for_test(key: &SessionKey, owner: &OwnerToken) -> Self {
+        Self::AwaitingAck {
+            fence: Self::fence_for_test(key, owner),
+            deadline: Instant::now() + Duration::from_secs(3_600),
+        }
+    }
+
+    #[cfg(test)]
+    fn fence_for_test(key: &SessionKey, owner: &OwnerToken) -> OwnerFence {
+        match wire::owner_fence(
+            &key.session_id,
+            key.epoch,
+            &runtime::owner_id(owner),
+            20_000,
+        ) {
+            ControlMessage::OwnerFence(fence) => fence,
+            _ => unreachable!("owner_fence always returns OWNER_FENCE"),
+        }
+    }
+}
+
 struct DataCarrier {
     context: CarrierContext,
     tx: mpsc::Sender<DataOutbound>,
+}
+
+impl DeviceSession {
+    /// The active data socket's writer, present exactly while the session
+    /// has an active carrier.
+    fn data_tx(&self) -> Option<&mpsc::Sender<DataOutbound>> {
+        self.active_carrier.as_ref().map(|carrier| &carrier.tx)
+    }
+
+    /// Make `tx` the active data socket's writer, on a carrier named by the
+    /// session's own generation and connection id.
+    #[cfg(test)]
+    fn attach_data_for_test(&mut self, tx: mpsc::Sender<DataOutbound>) {
+        self.active_carrier = Some(DataCarrier {
+            context: CarrierContext::new(
+                self.key.session_id.clone(),
+                self.key.epoch,
+                self.generation,
+                self.connection_id.clone(),
+            ),
+            tx,
+        });
+    }
 }
 
 /// Typed close reason when a session would owe more relay ACKs than
@@ -2518,17 +3481,19 @@ struct M2Stream {
     /// terminal FIN. This debt is separate from owner FORGET queue debt so an
     /// unrelated successful FORGET cannot clear its fail-closed deadline.
     terminal_fin_failure: bool,
-    /// True only until the connector acknowledges this exact OPEN.  A later
+    /// Admission of this exact OPEN (see [`StreamAdmission`]).
+    ///
+    /// The OPEN is pending only until the connector acknowledges it.  A later
     /// REJECTED with the same operation must not reclaim an admitted stream.
-    open_pending: bool,
-    /// The public registration disappeared before OPENED was observed.  The
+    ///
+    /// The public registration can disappear before OPENED is observed.  The
     /// OPEN remains live until the owner proves either rejection or admission;
     /// after admission the relay emits a real local FIN/RESET before FORGET.
-    registration_dropped: bool,
-    /// Typed cause supplied by a close that arrived while OPEN was still
-    /// pending.  It is applied to the deferred terminal transition once the
-    /// connector admits the stream; a rejected OPEN never has a terminal.
-    deferred_terminal_cause: Option<StreamTerminalCause>,
+    ///
+    /// A close that arrives while the OPEN is still pending may supply a
+    /// typed cause.  It is applied to the deferred terminal transition once
+    /// the connector admits the stream; a rejected OPEN never has a terminal.
+    admission: StreamAdmission,
     /// The head of the bounded relay-to-connector FIFO is parked because the
     /// connector has not advertised enough cumulative send credit for the
     /// complete record.  This is set only by the credit admission decision
@@ -2703,6 +3668,30 @@ impl StreamAdmissionReply {
 
 type PendingConsumerRecord = (Vec<u8>, oneshot::Sender<Result<Vec<u8>, EchoOutcome>>);
 
+/// The actor's side of one session's data rotation and retained recovery.
+///
+/// `state` is the pure machine and owns the phase.  The rest is the
+/// wire-level evidence and the carriers its transitions are driven by.
+/// `abort`, `peer_pins` and `fences` are explicit (see
+/// `actor_rotation_attempt_state.rs`) and `recovery` carries its own progress
+/// machine.  The other attempt-scoped fields are still options the phase does
+/// not own, because where each is valid is not a function of `RotationPhase`
+/// alone:
+///
+/// * `attempt` lasts from PREPARE or RECOVERY_BEGIN until COMPLETE, the final
+///   owner ABORTED, or recovery activation.
+/// * `attempt_deadline_ms` follows the control journal, which a recovery
+///   begin or retry replaces only when a journal for the episode deadline
+///   can be built.
+/// * `pending_ticket` is the catalog issue in flight.  Its result or a
+///   recovery begin clears it; an abort does not, so it can outlive the
+///   attempt it was reserved for, and no rotation starts while it lasts.
+/// * `candidate`, the bounded temporary third socket, attaches in
+///   `Preparing` (rotation) or `Recovering` (recovery), is held through
+///   `Quiescing`, `Draining`, `Committing` and `Aborting`, and leaves by
+///   promotion (COMMITTED, recovery activation) or release (loss, abort
+///   completion, recovery begin or retry).  There is never more than one.
+/// * `barrier_rx` exists while QUIESCE's writer-flush barrier is outstanding.
 struct RotationRuntime {
     state: RotationState,
     attempt: Option<RotationAttemptIdentity>,
@@ -2716,11 +3705,11 @@ struct RotationRuntime {
     old_connection_id: String,
     prepare_message_id: String,
     last_message_id: String,
-    /// Message id of the coordinator's unsolicited ABORT, when one has been
-    /// queued for this attempt.  A separate marker is required because an
-    /// owner ABORT has an empty `reply_to` and therefore is not a journal
-    /// completion of any peer phase message.
-    abort_message_id: Option<String>,
+    /// The coordinated abort of this attempt: the coordinator's unsolicited
+    /// ABORT once queued, and the connector's ABORTED pinned and held pending
+    /// against it until the owner-side closure proof is present.  Changed
+    /// only by [`AbortExchange::on_event`].
+    abort: AbortExchange,
     /// Most recent authenticated peer phase message.  It stays separate from
     /// owner-generated replies so COMMIT/COMPLETE never reference an outbound
     /// ID that cannot be completed in the inbound journal.
@@ -2735,18 +3724,12 @@ struct RotationRuntime {
     /// Pin the first authenticated peer message for each phase.  A fresh
     /// message ID with the same attempt and reply target is not an idempotent
     /// retry and must not overwrite the source used by the next transition.
-    peer_frozen_message_id: Option<String>,
-    peer_drained_message_id: Option<String>,
-    peer_committed_message_id: Option<String>,
-    peer_retired_message_id: Option<String>,
-    peer_aborted_message_id: Option<String>,
-    /// Connector ABORTED may arrive before the relay's physical candidate
-    /// close event.  Keep that authenticated acknowledgement pending until
-    /// the owner-side closure proof is present.
-    pending_abort_ack: Option<tunnel_protocol::rotation_control::RotateAborted>,
+    /// (The ABORTED pin lives in `abort`.)
+    peer_pins: PeerPhasePins,
     tombstones: VecDeque<RotationTombstone>,
-    remote_fences: [Option<FenceSnapshot>; 2],
-    own_fence: Option<FenceSnapshot>,
+    /// This attempt's immutable sequence fences: the relay's own and the
+    /// connector's.  Each is recorded once and dropped only with the attempt.
+    fences: RotationFences,
     replayed_frames: u64,
     pending_ticket: Option<PendingCatalogTicket>,
     journal: ControlJournal,
@@ -2842,9 +3825,9 @@ struct RecoveryRuntime {
     /// this bounded per-attempt wire proof.
     expected_closed_connection_ids: Vec<String>,
     local_closed: Option<RecoveryClosed>,
-    peer_closed: Option<RecoveryClosed>,
-    closure_digest: Option<String>,
-    candidate_ready: bool,
+    /// Where this attempt is in the closure, candidate, READY and retry
+    /// handshake.  Changed only by [`RecoveryProgress::on_event`].
+    progress: RecoveryProgress,
     resume_message_ids: [Option<String>; 2],
     snapshot_reply_ids: [Option<String>; 2],
     local_snapshots: [Vec<ResumeDirectionState>; 2],
@@ -2855,9 +3838,7 @@ struct RecoveryRuntime {
     ready_message_ids: [Option<String>; 2],
     remote_snapshots: [HashMap<u64, ResumeDirectionState>; 2],
     ready_remote_snapshots: [HashMap<u64, ResumeDirectionState>; 2],
-    remote_ready: [bool; 2],
     local_plans: HashMap<u64, RecoveryPlan>,
-    ready_sent: [bool; 2],
     deferred_frames: VecDeque<(CarrierKey, Frame, usize)>,
     deferred_bytes: usize,
     /// Candidate DATA/FIN/RESET that arrived before the connector's
@@ -2866,12 +3847,6 @@ struct RecoveryRuntime {
     /// Held, charged and bounded with `deferred_frames`, and classified the
     /// moment that snapshot arrives.
     unclassified_frames: VecDeque<(CarrierKey, Frame, usize)>,
-    activated: bool,
-    /// Candidate-loss retries are scheduled by the relay coordinator.  The
-    /// client receives the authenticated RECOVERY_BEGIN immediately when this
-    /// deadline expires and therefore never runs a second, skewed timer.
-    retry_not_before_ms: Option<u64>,
-    retry_failed_connection_id: Option<String>,
 }
 
 struct DeviceSession {
@@ -2879,21 +3854,16 @@ struct DeviceSession {
     owner: OwnerToken,
     key: SessionKey,
     control_tx: mpsc::Sender<ControlOutbound>,
-    data_tx: Option<mpsc::Sender<DataOutbound>>,
+    /// The session's one active data socket: its identity and its writer,
+    /// set and cleared as one value.  See [`DeviceSession::data_tx`].
     active_carrier: Option<DataCarrier>,
     generation: u64,
     connection_id: String,
     profile: RuntimeProfile,
-    /// M7 cluster profile is selected by the optional cluster configuration;
-    /// M1/M2 development sessions retain their existing local ticket path.
-    cluster_profile: bool,
-    /// Owner fencing is a persistent session latch.  Its bounded deadline is
-    /// used only while waiting for the initial OWNER_FENCED acknowledgement;
-    /// ongoing dispatch freshness remains challenge-bound authorization.
-    owner_fence: Option<OwnerFence>,
-    owner_fenced: bool,
-    owner_fence_ack: Option<OwnerFenced>,
-    owner_fence_deadline: Option<Instant>,
+    /// The owner-fence handshake, which also says whether this is an M7
+    /// cluster-profile session (see [`OwnerFencing`]).  Changed only by
+    /// [`OwnerFencing::on_owner_fenced`].
+    owner_fencing: OwnerFencing,
     next_stream_id: u64,
     pending: HashMap<u64, PendingEcho>,
     /// Finished unary echoes awaiting their owner `STREAM_FORGET`
@@ -2909,11 +3879,11 @@ struct DeviceSession {
     forgotten_stream_through: u64,
     /// Absolute fail-closed deadline for a critical owner FORGET that cannot
     /// enter the authenticated control queue. Retries never extend it.
-    owner_forget_deadline: Option<Instant>,
+    owner_forget_deadline: FailClosedDeadline,
     /// Independent fail-closed deadline for a terminal FIN that could not be
     /// published. It is retained while the marked stream tombstone remains,
     /// regardless of unrelated owner FORGET progress.
-    terminal_fin_failure_deadline: Option<Instant>,
+    terminal_fin_failure_deadline: FailClosedDeadline,
     /// Relay ACKs a live data carrier refused for backpressure (its bounded
     /// channel full, or the session budget spent), one cumulative ACK per
     /// stream, retried on every tick and before each later ACK (task row
@@ -2923,7 +3893,7 @@ struct DeviceSession {
     /// moved forward only when a retry puts an owed ACK on the wire, and
     /// cleared when nothing is owed.  A carrier that takes no owed ACK for
     /// the whole window closes the session `FLOW_CONTROL_UNDELIVERABLE`.
-    flow_control_owed_deadline: Option<Instant>,
+    flow_control_owed_deadline: FailClosedDeadline,
     /// When each stream now marked `terminal_fin_failure` was first refused
     /// (review of #199).  The session's `terminal_fin_failure_deadline` is
     /// the earliest of these plus the window, so one stream's progress never
@@ -2945,10 +3915,10 @@ struct DeviceSession {
     queued_bytes: usize,
     queue_budget: QueueBudget,
     last_lease_renewal: Instant,
-    maintenance_in_flight: bool,
-    /// Set while the last lease renewal has an unknown outcome; see
-    /// [`UnknownOwnerWrite`].
-    owner_write_unknown: Option<UnknownOwnerWrite>,
+    /// Whether a maintenance round is in flight and whether the last lease
+    /// renewal has an unknown outcome (see [`UnknownOwnerWrite`]).  Changed
+    /// only by [`LeaseMaintenance::on_event`].
+    lease_maintenance: LeaseMaintenance,
     closed: bool,
     /// M3-16: the connector advertised `principal-sessions-end-v1` in HELLO.
     /// A connector that did not (the v0.1.0 tester release among them)
@@ -3292,10 +4262,12 @@ pub struct RelayHandle {
     actor_completion: ActorCompletion,
     maintenance_completion: ActorCompletion,
     background_failure: Arc<AtomicBool>,
-    actor_task: Arc<Mutex<Option<JoinHandle<()>>>>,
-    maintenance_task: Arc<Mutex<Option<JoinHandle<()>>>>,
+    /// `None` only on a test handle with no task behind it.
+    actor_task: Option<SupervisedTask>,
+    maintenance_task: Option<SupervisedTask>,
+    /// How many owner-claim guards the actor has parked.
     #[cfg(test)]
-    claim_handoffs: ClaimHandoffs,
+    parked_claims: Arc<AtomicUsize>,
     #[cfg(test)]
     owner_backlog: OwnerBacklog,
 }
@@ -3360,6 +4332,24 @@ impl RelayHandle {
         (handle, ops_rx)
     }
 
+    /// Park `guard` in the live actor's handoff registry, as the actor does
+    /// for a registration it starts, and return the handoff naming it.
+    async fn deposit_claim_for_test(&self, guard: OwnerClaimCleanup) -> ClaimHandoff {
+        let (done_tx, done_rx) = oneshot::channel();
+        self.tx
+            .send(Command::TestMutate(Box::new(move |actor| {
+                let _ = done_tx.send(actor.cleanup_state.claims.deposit(Some(guard)));
+            })))
+            .await
+            .expect("actor accepts the test mutation");
+        done_rx.await.expect("the guard was parked")
+    }
+
+    /// How many owner-claim guards are parked, wherever the registry is now.
+    fn parked_claims_for_test(&self) -> usize {
+        self.parked_claims.load(Ordering::Acquire)
+    }
+
     /// Route-test hook (task row M6-C210): put `key`'s session into a frozen
     /// scheduled rotation attempt on the live actor, and wait until it is.
     pub(crate) async fn enter_rotation_freeze_for_test(&self, key: SessionKey) {
@@ -3386,7 +4376,7 @@ impl RelayHandle {
         // release is left to lease expiry and never raises the terminal
         // cleanup overflow signal that shuts the relay down (task row
         // M6-C186).
-        let owner_backlog =
+        let (owner_backlog, owner_backlog_drain) =
             OwnerBacklog::new(options.limits.max_devices.max(CLEANUP_QUEUE_CAPACITY));
         let owner_backlog_notify = Arc::new(Notify::new());
         let cleanup = CleanupWorker::spawn_with_backlog(
@@ -3399,17 +4389,23 @@ impl RelayHandle {
         let actor_completion = ActorCompletion::default();
         let maintenance_completion = ActorCompletion::default();
         let background_failure = Arc::new(AtomicBool::new(false));
-        let actor_task_slot = Arc::new(Mutex::new(None));
-        let maintenance_task_slot = Arc::new(Mutex::new(None));
         let consumer_chunk_reads = Arc::new(AtomicU64::new(0));
         let claim_handoffs = ClaimHandoffs::default();
-        let stranded_claims = StrandedClaimRelease {
-            handoffs: claim_handoffs.clone(),
-            backlog: owner_backlog.clone(),
-            catalog: catalog.clone(),
-        };
+        #[cfg(test)]
+        let parked_claims = claim_handoffs.parked.clone();
+        // The actor alone owns the parked claims and the backlog's draining
+        // half; its supervisor inherits both when the actor is dropped.
+        let (cleanup_state, cleanup_bequest) = ActorCleanupBequest::new(ActorCleanupState {
+            claims: claim_handoffs,
+            backlog: owner_backlog_drain,
+        });
+        let stranded_claims =
+            StrandedClaimRelease::new(cleanup_bequest, &owner_backlog, catalog.clone());
         let actor_load = Arc::new(ActorLoad::default());
-        let handle = Self {
+        let actor_completion_on_drop = CompletionOnDrop::actor(actor_completion.clone());
+        let maintenance_completion_on_drop =
+            CompletionOnDrop::maintenance(maintenance_completion.clone());
+        let mut handle = Self {
             tx: tx.clone(),
             actor_load: actor_load.clone(),
             cancel: options.shutdown.clone(),
@@ -3424,10 +4420,10 @@ impl RelayHandle {
             actor_completion: actor_completion.clone(),
             maintenance_completion: maintenance_completion.clone(),
             background_failure: background_failure.clone(),
-            actor_task: actor_task_slot.clone(),
-            maintenance_task: maintenance_task_slot.clone(),
+            actor_task: None,
+            maintenance_task: None,
             #[cfg(test)]
-            claim_handoffs: claim_handoffs.clone(),
+            parked_claims,
             #[cfg(test)]
             owner_backlog: owner_backlog.clone(),
         };
@@ -3463,25 +4459,35 @@ impl RelayHandle {
             peer_fault_diagnostics: handle.peer_fault_diagnostics.clone(),
             http_forward_diagnostics: handle.http_forward_diagnostics.clone(),
             http_maintenance: HttpMaintenance::default(),
-            cleanup_dispatcher: Some(cleanup.dispatcher()),
             cleanup: Some(cleanup),
             owner_backlog,
             owner_backlog_notify,
-            claim_handoffs: claim_handoffs.clone(),
+            cleanup_state,
             background_tasks: JoinSet::new(),
             background_failure,
-            shutting_down: false,
+            lifecycle: ActorLifecycle::Running,
             freeze_hold: freeze_hold::FreezeHold::default(),
             actor_load,
         };
         // Keep the actor failure boundary attached to the relay-wide
         // cancellation token.  A panic in the actor must not leave listener
         // tasks serving with no owner for their state.
-        let actor_completion = CompletionOnDrop::actor(actor_completion);
-        let actor_task = tokio::spawn(async move {
-            let completion = actor_completion;
-            let stranded_claims = stranded_claims;
-            let failed = AssertUnwindSafe(actor.run()).catch_unwind().await.is_err();
+        let supervisor = ActorSupervisor {
+            run: Box::pin(actor.run()),
+            stranded_claims,
+            completion: actor_completion_on_drop,
+        };
+        handle.actor_task = Some(SupervisedTask::spawn(async move {
+            // Bound so that, whenever this task is dropped, the actor goes
+            // first (bequeathing its cleanup state), then the release that
+            // inherits it, then the completion record: locals drop in
+            // reverse order of binding.
+            let ActorSupervisor {
+                completion,
+                mut stranded_claims,
+                run,
+            } = supervisor;
+            let failed = AssertUnwindSafe(run).catch_unwind().await.is_err();
             // Any actor termination leaves the listener pair without an
             // owner, including a normal explicit shutdown or a terminal
             // cleanup overflow.  Propagate it to every relay task.
@@ -3491,18 +4497,16 @@ impl RelayHandle {
             // still holds a committed owner claim (task row M6-C170).  Release
             // it now rather than leave it fenced until its lease expires.
             // After `mark_done`, so no reply wait is held up by catalog I/O;
-            // `shutdown()` joins this task, so it returns only after this.
+            // `shutdown()` waits for this task to exit, so it returns only
+            // after this.
             stranded_claims.release().await;
-        });
-        *actor_task_slot
-            .lock()
-            .expect("actor task slot mutex poisoned") = Some(actor_task);
-        let ticker = handle.clone();
+        }));
+        // The ticker sends on a clone taken before the tasks are recorded,
+        // so it holds no reference to either task.
+        let ticker_tx = handle.tx.clone();
         let maintenance_shared_cancel = maintenance_cancel.clone();
-        let maintenance_completion_for_task =
-            CompletionOnDrop::maintenance(maintenance_completion.clone());
-        let maintenance_task = tokio::spawn(async move {
-            let completion = maintenance_completion_for_task;
+        handle.maintenance_task = Some(SupervisedTask::spawn(async move {
+            let completion = maintenance_completion_on_drop;
             let failed = AssertUnwindSafe(async move {
                 let mut interval = tokio::time::interval(MAINTENANCE_TICK);
                 loop {
@@ -3511,7 +4515,7 @@ impl RelayHandle {
                         _ = interval.tick() => {
                             tokio::select! {
                                 _ = maintenance_cancel.cancelled() => break,
-                                result = ticker.tx.send(Command::Tick) => {
+                                result = ticker_tx.send(Command::Tick) => {
                                     if result.is_err() {
                                         break;
                                     }
@@ -3528,10 +4532,7 @@ impl RelayHandle {
                 maintenance_shared_cancel.cancel();
             }
             completion.completion.mark_done(failed);
-        });
-        *maintenance_task_slot
-            .lock()
-            .expect("maintenance task slot mutex poisoned") = Some(maintenance_task);
+        }));
         handle
     }
 
@@ -4150,7 +5151,7 @@ impl RelayHandle {
         // queued Shutdown command.  Observe its recorded outcome first so a
         // panic or externally-aborted task is reported instead of awaiting a
         // response that can never arrive.
-        if self.actor_completion.done.load(Ordering::Acquire) {
+        if self.actor_completion.is_done() {
             self.maintenance_completion.wait().await;
             self.join_actor_task().await;
             self.join_maintenance_task().await;
@@ -4198,55 +5199,29 @@ impl RelayHandle {
 
     async fn abort_actor_task(&self) {
         self.cancel.cancel();
-        let task = self
-            .actor_task
-            .lock()
-            .expect("actor task slot mutex poisoned")
-            .take();
-        if let Some(task) = task {
-            let task = AbortOnDropJoinHandle::new(task);
-            task.abort();
-            let _ = task.join().await;
+        if let Some(task) = &self.actor_task {
+            task.abort_and_join().await;
             self.actor_completion.mark_aborted();
         }
     }
 
     async fn abort_maintenance_task(&self) {
         self.cancel.cancel();
-        let task = self
-            .maintenance_task
-            .lock()
-            .expect("maintenance task slot mutex poisoned")
-            .take();
-        if let Some(task) = task {
-            let task = AbortOnDropJoinHandle::new(task);
-            task.abort();
-            let _ = task.join().await;
+        if let Some(task) = &self.maintenance_task {
+            task.abort_and_join().await;
             self.maintenance_completion.mark_stopped();
         }
     }
 
     async fn join_actor_task(&self) {
-        let task = self
-            .actor_task
-            .lock()
-            .expect("actor task slot mutex poisoned")
-            .take();
-        if let Some(task) = task {
-            let task = AbortOnDropJoinHandle::new(task);
-            let _ = task.join().await;
+        if let Some(task) = &self.actor_task {
+            task.join().await;
         }
     }
 
     async fn join_maintenance_task(&self) {
-        let task = self
-            .maintenance_task
-            .lock()
-            .expect("maintenance task slot mutex poisoned")
-            .take();
-        if let Some(task) = task {
-            let task = AbortOnDropJoinHandle::new(task);
-            let _ = task.join().await;
+        if let Some(task) = &self.maintenance_task {
+            task.join().await;
         }
     }
 }
@@ -4287,6 +5262,156 @@ struct PrincipalWatch {
     tenant_id: Uuid,
     next_check: Instant,
     in_flight: bool,
+}
+
+/// Why the actor stopped running.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StopCause {
+    /// A `Shutdown` command, the relay-wide shutdown token, or a direct
+    /// close.
+    Requested,
+    /// Every command sender is gone.
+    CommandChannelClosed,
+    /// A background task panicked.
+    BackgroundPanic,
+    /// The terminal cleanup queue overflowed: a terminal transport event
+    /// could not be delivered, so no session's state can be trusted.
+    CleanupOverflow,
+}
+
+impl StopCause {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Requested => "requested",
+            Self::CommandChannelClosed => "command_channel_closed",
+            Self::BackgroundPanic => "background_panic",
+            Self::CleanupOverflow => "cleanup_overflow",
+        }
+    }
+}
+
+/// The relay actor's lifecycle.  It only moves forward, and the cause that
+/// stopped it is kept to the end.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ActorLifecycle {
+    /// Serving commands.
+    Running,
+    /// Leaving the command loop; `close_all` has not begun.
+    Stopping(StopCause),
+    /// `close_all` is closing every session and releasing owner claims.
+    Closing(StopCause),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LifecycleEvent {
+    Stop(StopCause),
+    Close,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct IllegalLifecycleTransition {
+    from: ActorLifecycle,
+    event: LifecycleEvent,
+}
+
+impl ActorLifecycle {
+    fn on_event(self, event: LifecycleEvent) -> Result<Self, IllegalLifecycleTransition> {
+        match (self, event) {
+            (Self::Running, LifecycleEvent::Stop(cause)) => Ok(Self::Stopping(cause)),
+            (Self::Stopping(cause), LifecycleEvent::Close) => Ok(Self::Closing(cause)),
+            (from, event) => Err(IllegalLifecycleTransition { from, event }),
+        }
+    }
+
+    fn is_running(self) -> bool {
+        self == Self::Running
+    }
+}
+
+/// The dispatcher of the owner cleanup worker the actor holds, if it still
+/// holds one.  A free function so a caller can keep borrowing other fields.
+fn owner_cleanup_dispatcher(cleanup: &Option<CleanupWorker>) -> Option<&CleanupDispatcher> {
+    cleanup
+        .as_ref()
+        .and_then(|worker| worker.dispatcher.as_ref())
+}
+
+#[cfg(test)]
+mod actor_lifecycle_state_tests {
+    use super::{ActorLifecycle, IllegalLifecycleTransition, LifecycleEvent, StopCause};
+
+    const CAUSES: [StopCause; 4] = [
+        StopCause::Requested,
+        StopCause::CommandChannelClosed,
+        StopCause::BackgroundPanic,
+        StopCause::CleanupOverflow,
+    ];
+
+    #[test]
+    fn the_actor_stops_once_then_closes_and_keeps_its_first_cause() {
+        for cause in CAUSES {
+            let stopping = ActorLifecycle::Running
+                .on_event(LifecycleEvent::Stop(cause))
+                .expect("a running actor stops");
+            assert_eq!(stopping, ActorLifecycle::Stopping(cause));
+            assert!(!stopping.is_running());
+            for later in CAUSES {
+                assert_eq!(
+                    stopping.on_event(LifecycleEvent::Stop(later)),
+                    Err(IllegalLifecycleTransition {
+                        from: stopping,
+                        event: LifecycleEvent::Stop(later),
+                    }),
+                    "a second cause replaced {cause:?}"
+                );
+            }
+            let closing = stopping
+                .on_event(LifecycleEvent::Close)
+                .expect("a stopping actor closes");
+            assert_eq!(closing, ActorLifecycle::Closing(cause));
+            assert!(!closing.is_running());
+            for event in CAUSES
+                .into_iter()
+                .map(LifecycleEvent::Stop)
+                .chain([LifecycleEvent::Close])
+            {
+                assert_eq!(
+                    closing.on_event(event),
+                    Err(IllegalLifecycleTransition {
+                        from: closing,
+                        event,
+                    }),
+                    "a closing actor accepted {event:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_running_actor_cannot_close_without_a_cause() {
+        assert!(ActorLifecycle::Running.is_running());
+        assert_eq!(
+            ActorLifecycle::Running.on_event(LifecycleEvent::Close),
+            Err(IllegalLifecycleTransition {
+                from: ActorLifecycle::Running,
+                event: LifecycleEvent::Close,
+            })
+        );
+    }
+
+    #[test]
+    fn stop_causes_have_distinct_stable_labels() {
+        let labels: Vec<_> = CAUSES.into_iter().map(StopCause::label).collect();
+        assert_eq!(
+            labels,
+            [
+                "requested",
+                "command_channel_closed",
+                "background_panic",
+                "cleanup_overflow"
+            ]
+        );
+    }
 }
 
 struct RelayActor {
@@ -4358,21 +5483,27 @@ struct RelayActor {
     peer_fault_diagnostics: PeerFaultDiagnostics,
     http_forward_diagnostics: HttpForwardDiagnostics,
     http_maintenance: HttpMaintenance,
-    cleanup_dispatcher: Option<CleanupDispatcher>,
+    /// The owner cleanup worker and its dispatcher, as one value: present
+    /// until `close_all` takes the worker to shut it down, absent after.
     cleanup: Option<CleanupWorker>,
     /// Owner cleanup the worker's bounded queue had no room for, offered back
     /// to it as room frees up and released by `close_all` at shutdown (task
-    /// rows M6-C185 and M6-C186).  Shared with the dispatcher and the actor's
-    /// supervisor (task row M6-C187).
+    /// rows M6-C185 and M6-C186).  This is the keeping half, shared with the
+    /// dispatcher; the draining half is in `cleanup_state`.
     owner_backlog: OwnerBacklog,
     /// Signalled when something is kept and after each worker release while
     /// something is kept.
     owner_backlog_notify: Arc<Notify>,
-    /// Owner-claim guards in transit to this actor (task row M6-C170).
-    claim_handoffs: ClaimHandoffs,
+    /// Owner-claim guards in transit to this actor (task row M6-C170) and
+    /// the owner backlog's draining half, inherited by the supervisor when
+    /// this actor is dropped (task row M6-C187).
+    cleanup_state: ActorCleanupBequest,
     background_tasks: JoinSet<()>,
+    /// Published to every [`RelayHandle`]: a background task panicked or
+    /// could not be joined, or the cleanup worker failed to shut down.
     background_failure: Arc<AtomicBool>,
-    shutting_down: bool,
+    /// Changed only by [`RelayActor::lifecycle_event`].
+    lifecycle: ActorLifecycle,
     /// New OPENs held across a data-rotation freeze (task row M3-15).
     freeze_hold: freeze_hold::FreezeHold,
     actor_load: Arc<ActorLoad>,
@@ -4390,13 +5521,13 @@ impl RelayActor {
                 biased;
                 _ = self.terminal_cleanup_notify.notified() => {
                     if self.terminal_cleanup_overflowed.load(Ordering::Acquire) {
-                        self.shutting_down = true;
+                        self.stop(StopCause::CleanupOverflow);
                     } else {
                         self.drain_terminal_cleanup().await;
                     }
                 }
                 _ = self.options.shutdown.cancelled() => {
-                    self.shutting_down = true;
+                    self.stop(StopCause::Requested);
                 }
                 () = self.owner_backlog_notify.notified() => {
                     self.offer_owner_backlog();
@@ -4418,14 +5549,17 @@ impl RelayActor {
                                 // customer command.
                                 self.options.shutdown.cancel();
                                 self.background_failure.store(true, Ordering::Release);
-                                self.shutting_down = true;
+                                self.stop(StopCause::BackgroundPanic);
                             }
                         }
                         None => {}
                     }
                 }
                 command = self.rx.recv() => {
-                    let Some(command) = command else { break; };
+                    let Some(command) = command else {
+                        self.stop(StopCause::CommandChannelClosed);
+                        break;
+                    };
                     let shutdown = matches!(command, Command::Shutdown(_));
                     let scope = command.http_maintenance_scope();
                     let started = Instant::now();
@@ -4438,7 +5572,7 @@ impl RelayActor {
                         self.service_held_opens(tokio::time::Instant::now());
                     }
                     self.actor_load.record(started.elapsed());
-                    if shutdown || self.shutting_down {
+                    if shutdown || !self.lifecycle.is_running() {
                         break;
                     }
                 }
@@ -4448,7 +5582,7 @@ impl RelayActor {
                     self.service_held_opens(tokio::time::Instant::now());
                 }
             }
-            if self.shutting_down {
+            if !self.lifecycle.is_running() {
                 break;
             }
             // Owner tokens a burst of closes left kept go back to the cleanup
@@ -4459,14 +5593,36 @@ impl RelayActor {
         self.close_all().await;
     }
 
+    /// The only place the actor's lifecycle changes.
+    fn lifecycle_event(
+        &mut self,
+        event: LifecycleEvent,
+    ) -> Result<ActorLifecycle, IllegalLifecycleTransition> {
+        self.lifecycle = self.lifecycle.on_event(event)?;
+        Ok(self.lifecycle)
+    }
+
+    /// Stop running for `cause`.  The first cause recorded is the one kept:
+    /// an actor that is already stopping or closing refuses a second.
+    fn stop(&mut self, cause: StopCause) {
+        let _ = self.lifecycle_event(LifecycleEvent::Stop(cause));
+    }
+
+    /// The owner cleanup dispatcher, while the worker is still held.
+    #[cfg(test)]
+    fn owner_cleanup_dispatcher(&self) -> Option<CleanupDispatcher> {
+        owner_cleanup_dispatcher(&self.cleanup).cloned()
+    }
+
     /// Hand kept owner tokens to the cleanup worker, oldest first, while its
     /// bounded queue has room.  Never waits.
-    fn offer_owner_backlog(&self) {
+    fn offer_owner_backlog(&mut self) {
         if self.owner_backlog.is_empty() {
             return;
         }
-        if let Some(dispatcher) = self.cleanup_dispatcher.as_ref() {
-            while dispatcher.enqueue_if_room(|| self.owner_backlog.pop_front()) {}
+        if let Some(dispatcher) = owner_cleanup_dispatcher(&self.cleanup) {
+            let backlog = &mut self.cleanup_state.backlog;
+            while dispatcher.enqueue_if_room(|| backlog.pop_front()) {}
         }
     }
 
@@ -4526,14 +5682,14 @@ impl RelayActor {
     async fn drain_terminal_cleanup(&mut self) {
         for _ in 0..TERMINAL_CLEANUP_QUEUE_CAPACITY {
             if self.terminal_cleanup_overflowed.load(Ordering::Acquire) {
-                self.shutting_down = true;
+                self.stop(StopCause::CleanupOverflow);
                 return;
             }
             let Ok(cleanup) = self.terminal_cleanup_rx.try_recv() else {
                 return;
             };
             self.handle_terminal_cleanup(cleanup).await;
-            if self.shutting_down {
+            if !self.lifecycle.is_running() {
                 return;
             }
         }
@@ -4573,7 +5729,7 @@ impl RelayActor {
                 mut owner_cleanup,
                 result,
             } => {
-                let owner_cleanup = owner_cleanup.take();
+                let owner_cleanup = self.cleanup_state.claims.take(&mut owner_cleanup);
                 self.finish_register_control(
                     RegistrationTarget {
                         device_id,
@@ -4822,7 +5978,7 @@ impl RelayActor {
                 let _ = response.send(surrendered);
             }
             Command::Shutdown(response) => {
-                self.shutting_down = true;
+                self.stop(StopCause::Requested);
                 let _ = response.send(());
             }
         }
@@ -4906,9 +6062,11 @@ impl RelayActor {
         // Parked before the task exists, so a task aborted mid-claim with the
         // actor leaves its armed guard where the actor's end finds it (task
         // row M6-C178).
-        let mut owner_cleanup = self
-            .claim_handoffs
-            .deposit(self.cleanup_dispatcher.clone().map(OwnerClaimCleanup::new));
+        let mut owner_cleanup = self.cleanup_state.claims.deposit(
+            owner_cleanup_dispatcher(&self.cleanup)
+                .cloned()
+                .map(OwnerClaimCleanup::new),
+        );
         self.spawn_background(async move {
             let result = async {
                 let at = Utc::now();
@@ -5072,9 +6230,11 @@ impl RelayActor {
         // Parked before the task exists, so a task aborted mid-claim with the
         // actor leaves its armed guard where the actor's end finds it (task
         // row M6-C178).
-        let mut owner_cleanup = self
-            .claim_handoffs
-            .deposit(self.cleanup_dispatcher.clone().map(OwnerClaimCleanup::new));
+        let mut owner_cleanup = self.cleanup_state.claims.deposit(
+            owner_cleanup_dispatcher(&self.cleanup)
+                .cloned()
+                .map(OwnerClaimCleanup::new),
+        );
         self.spawn_background(async move {
             let result = async {
                 let at = Utc::now();
@@ -5164,7 +6324,7 @@ impl RelayActor {
     }
 
     async fn enqueue_cleanup(&mut self, owner: OwnerToken) {
-        if let Some(dispatcher) = self.cleanup_dispatcher.as_ref() {
+        if self.cleanup.is_some() {
             // `close_all` and the actor's `tick` close many sessions with no
             // await in between, so a synchronous `try_send` per session
             // refused every token past the queue's capacity as `saturated`
@@ -5175,16 +6335,14 @@ impl RelayActor {
             // fenced release; past the backlog's bound it refuses without
             // touching the relay's lifecycle.
             self.offer_owner_backlog();
-            dispatcher.enqueue(OwnerCleanupItem::Token(owner));
+            if let Some(cleanup) = self.cleanup.as_ref() {
+                cleanup.enqueue(owner);
+            }
             return;
         }
-        if let Some(cleanup) = self.cleanup.as_ref() {
-            cleanup.enqueue(owner);
-        } else {
-            // The worker is only absent after shutdown has taken ownership of
-            // it. Keep cleanup exact if a late command races with teardown.
-            release_owner_bounded(&self.catalog, &owner).await;
-        }
+        // The worker is only absent after shutdown has taken ownership of
+        // it. Keep cleanup exact if a late command races with teardown.
+        release_owner_bounded(&self.catalog, &owner).await;
     }
 
     async fn finish_register_control(
@@ -5377,9 +6535,9 @@ impl RelayActor {
                 issued_at_wall: ticket_issued_at_wall,
                 expires_at_wall: ticket_expires_at_wall,
                 expires_at: Instant::now() + wire::TICKET_TTL,
-                consuming: false,
+                phase: TicketPhase::Issued,
                 owner: claim.token.clone(),
-                candidate: false,
+                kind: TicketKind::Initial,
                 attachment_purpose: DataAttachmentPurpose::RotationCandidate,
                 catalog_purpose: catalog_ticket
                     .as_ref()
@@ -5387,7 +6545,11 @@ impl RelayActor {
                     .unwrap_or_default(),
                 binding_digest: ticket_binding_digest,
                 locator_digest: ticket_locator_digest,
-                catalog_backed: cluster_profile,
+                authority: if cluster_profile {
+                    TicketAuthority::Catalog
+                } else {
+                    TicketAuthority::Relay
+                },
             },
         );
         let welcome = match profile {
@@ -5428,7 +6590,7 @@ impl RelayActor {
                 return;
             }
         };
-        let (owner_fence, owner_fence_deadline) = if cluster_profile {
+        let owner_fencing = if cluster_profile {
             // The owner fence's relative budget bounds only the one-time
             // OWNER_FENCE -> OWNER_FENCED handshake; dispatch is guarded by
             // the wall-clock checks `OWNER_LEASE_SAFETY_MARGIN` protects.
@@ -5469,12 +6631,12 @@ impl RelayActor {
                 let _ = response.send(Err(RelayError::Overloaded("control queue is full")));
                 return;
             }
-            (
-                Some(fence),
-                Some(Instant::now() + Duration::from_millis(remaining_ms)),
-            )
+            OwnerFencing::AwaitingAck {
+                fence,
+                deadline: Instant::now() + Duration::from_millis(remaining_ms),
+            }
         } else {
-            (None, None)
+            OwnerFencing::NotRequired
         };
         let trace_tenant_id = device_identity.tenant_id;
         let trace_epoch = claim.token.epoch;
@@ -5513,21 +6675,15 @@ impl RelayActor {
                     old_connection_id: data_connection_id.clone(),
                     prepare_message_id: String::new(),
                     last_message_id: String::new(),
-                    abort_message_id: None,
+                    abort: crate::actor::AbortExchange::NotSent,
                     peer_message_id: String::new(),
                     quiesce_message_id: String::new(),
                     frozen_message_id: String::new(),
                     commit_message_id: String::new(),
                     retire_message_id: String::new(),
-                    peer_frozen_message_id: None,
-                    peer_drained_message_id: None,
-                    peer_committed_message_id: None,
-                    peer_retired_message_id: None,
-                    peer_aborted_message_id: None,
-                    pending_abort_ack: None,
+                    peer_pins: crate::actor::PeerPhasePins::default(),
                     tombstones: VecDeque::new(),
-                    remote_fences: [None, None],
-                    own_fence: None,
+                    fences: crate::actor::RotationFences::default(),
                     replayed_frames: 0,
                     pending_ticket: None,
                     journal: ControlJournal::new(
@@ -5560,27 +6716,22 @@ impl RelayActor {
                 owner: claim.token,
                 key: key.clone(),
                 control_tx,
-                data_tx: None,
                 active_carrier: None,
                 generation: 1,
                 connection_id: data_connection_id.clone(),
                 profile,
-                cluster_profile,
-                owner_fence,
-                owner_fenced: !cluster_profile,
-                owner_fence_ack: None,
-                owner_fence_deadline,
+                owner_fencing,
                 next_stream_id: 1,
                 pending: HashMap::new(),
                 unary_tombstones: HashMap::new(),
                 connector_rejected_log: connector_rejected::RejectedLogWindow::default(),
                 streams: HashMap::new(),
                 forgotten_stream_through: 0,
-                owner_forget_deadline: None,
-                terminal_fin_failure_deadline: None,
+                owner_forget_deadline: crate::actor::FailClosedDeadline::Idle,
+                terminal_fin_failure_deadline: crate::actor::FailClosedDeadline::Idle,
                 owed_acks: Default::default(),
                 terminal_fin_failed_at: Default::default(),
-                flow_control_owed_deadline: None,
+                flow_control_owed_deadline: crate::actor::FailClosedDeadline::Idle,
                 http_freeze_published: false,
                 rotation,
                 last_rotation: Instant::now(),
@@ -5590,8 +6741,7 @@ impl RelayActor {
                 queued_bytes: 0,
                 queue_budget: queue_budget.clone(),
                 last_lease_renewal: Instant::now(),
-                maintenance_in_flight: false,
-                owner_write_unknown: None,
+                lease_maintenance: crate::actor::LeaseMaintenance::Idle,
                 closed: false,
                 principal_sessions_end: advertises_principal_sessions_end,
             },
@@ -5634,8 +6784,8 @@ impl RelayActor {
             || now_wall < existing_ticket.issued_at_wall
             || now_wall >= existing_ticket.expires_at_wall
             || existing_ticket.spki != spki
-            || existing_ticket.consuming
-            || (existing_ticket.catalog_backed
+            || existing_ticket.is_consuming()
+            || (existing_ticket.is_catalog_backed()
                 && !runtime::attachment_locator_matches(
                     &existing_ticket.value,
                     &existing_ticket.locator_digest,
@@ -5644,14 +6794,14 @@ impl RelayActor {
             let _ = response.send(Err(RelayError::Unauthorized));
             return;
         }
-        if existing_ticket.catalog_backed
+        if existing_ticket.is_catalog_backed()
             && !self
                 .sessions
                 .get(&existing_ticket.scope())
                 .is_some_and(|session| {
                     session.key.session_id == existing_ticket.session_id
                         && session.key.epoch == existing_ticket.epoch
-                        && session.owner_fenced
+                        && session.owner_fencing.is_settled()
                 })
         {
             let _ = response.send(Err(RelayError::Unauthorized));
@@ -5661,7 +6811,10 @@ impl RelayActor {
             let _ = response.send(Err(RelayError::Unauthorized));
             return;
         };
-        ticket.consuming = true;
+        if ticket.transition(TicketEvent::BeginConsume).is_err() {
+            let _ = response.send(Err(RelayError::Unauthorized));
+            return;
+        }
         let ticket = ticket.clone();
         let catalog = self.catalog.clone();
         let command_tx = self.command_tx.clone();
@@ -5679,7 +6832,7 @@ impl RelayActor {
                     .current_owner(device.tenant_id, ticket.device_id, Utc::now())
                     .await
                     .map_err(|error| error.to_string())?;
-                let consumed = if ticket.catalog_backed {
+                let consumed = if ticket.is_catalog_backed() {
                     let consumed = catalog
                         .consume_attachment_ticket(&AttachmentTicketConsumeRequest {
                             ticket: ticket.value.clone(),
@@ -5743,8 +6896,8 @@ impl RelayActor {
             || now_wall < existing_ticket.issued_at_wall
             || now_wall >= existing_ticket.expires_at_wall
             || existing_ticket.spki != spki
-            || existing_ticket.consuming
-            || (existing_ticket.catalog_backed
+            || existing_ticket.is_consuming()
+            || (existing_ticket.is_catalog_backed()
                 && !runtime::attachment_locator_matches(
                     &existing_ticket.value,
                     &existing_ticket.locator_digest,
@@ -5753,14 +6906,14 @@ impl RelayActor {
             let _ = response.send(Err(RelayError::Unauthorized));
             return;
         }
-        if existing_ticket.catalog_backed
+        if existing_ticket.is_catalog_backed()
             && !self
                 .sessions
                 .get(&existing_ticket.scope())
                 .is_some_and(|session| {
                     session.key.session_id == existing_ticket.session_id
                         && session.key.epoch == existing_ticket.epoch
-                        && session.owner_fenced
+                        && session.owner_fencing.is_settled()
                 })
         {
             let _ = response.send(Err(RelayError::Unauthorized));
@@ -5770,7 +6923,10 @@ impl RelayActor {
             let _ = response.send(Err(RelayError::Unauthorized));
             return;
         };
-        ticket.consuming = true;
+        if ticket.transition(TicketEvent::BeginConsume).is_err() {
+            let _ = response.send(Err(RelayError::Unauthorized));
+            return;
+        }
         let ticket = ticket.clone();
         let catalog = self.catalog.clone();
         let command_tx = self.command_tx.clone();
@@ -5781,7 +6937,7 @@ impl RelayActor {
                     .current_owner(device.tenant_id, ticket.device_id, Utc::now())
                     .await
                     .map_err(|error| error.to_string())?;
-                let consumed = if ticket.catalog_backed {
+                let consumed = if ticket.is_catalog_backed() {
                     let consumed = catalog
                         .consume_attachment_ticket(&AttachmentTicketConsumeRequest {
                             ticket: ticket.value.clone(),
@@ -5859,7 +7015,7 @@ impl RelayActor {
             let _ = response.send(Err(RelayError::Unauthorized));
             return;
         };
-        if ticket.catalog_backed
+        if ticket.is_catalog_backed()
             && consumed
                 .as_ref()
                 .is_none_or(|consumed| consumed.binding != ticket.catalog_binding())
@@ -5870,13 +7026,13 @@ impl RelayActor {
         }
         let result = self.attach_data_verified(spki, ticket.clone(), device_identity, owner_result);
         let should_start_recovery = result.is_ok()
-            && ticket.candidate
+            && ticket.is_candidate()
             && matches!(
                 &ticket.attachment_purpose,
                 DataAttachmentPurpose::Recovery { .. }
             );
         let should_quiesce = result.is_ok()
-            && ticket.candidate
+            && ticket.is_candidate()
             && matches!(
                 &ticket.attachment_purpose,
                 DataAttachmentPurpose::RotationCandidate
@@ -5884,7 +7040,8 @@ impl RelayActor {
         if result.is_ok() {
             self.remove_ticket_if_matches(&ticket);
         } else if let Some(pending) = self.tickets.get_mut(&ticket.value) {
-            pending.consuming = false;
+            // A ticket that is not being consumed has nothing to roll back.
+            let _ = pending.transition(TicketEvent::RollBack);
         }
         if should_quiesce {
             let key = SessionKey {
@@ -5951,14 +7108,14 @@ impl RelayActor {
             .ok_or(RelayError::Conflict("control connection is not active"))?;
         if session.key.session_id != ticket.session_id
             || session.key.epoch != ticket.epoch
-            || (ticket.candidate && !session.profile.supports_rotation())
+            || (ticket.is_candidate() && !session.profile.supports_rotation())
         {
             return Err(RelayError::Unauthorized);
         }
-        if ticket.catalog_backed && (!session.cluster_profile || !session.owner_fenced) {
+        if ticket.is_catalog_backed() && !session.owner_fencing.is_acknowledged() {
             return Err(RelayError::Unauthorized);
         }
-        if !ticket.candidate && session.data_tx.is_some() {
+        if !ticket.is_candidate() && session.data_tx().is_some() {
             return Err(RelayError::Conflict("data connection is already active"));
         }
         if session.identity.spki_fingerprint != spki {
@@ -5987,7 +7144,7 @@ impl RelayActor {
             connection_id: ticket.connection_id.clone(),
         };
         let context = carrier.context();
-        if ticket.candidate {
+        if ticket.is_candidate() {
             let Some(rotation) = session.rotation.as_mut() else {
                 return Err(RelayError::Conflict("rotation candidate is not expected"));
             };
@@ -6020,7 +7177,7 @@ impl RelayActor {
                     };
                     if recovery.episode_id != *episode_id
                         || recovery.attempt_no != *attempt_no
-                        || recovery.closure_digest.as_deref() != Some(closure_digest.as_str())
+                        || recovery.progress.closure_digest() != Some(closure_digest.as_str())
                     {
                         return Err(RelayError::Unauthorized);
                     }
@@ -6031,7 +7188,7 @@ impl RelayActor {
                 }
             }
         }
-        if !ticket.candidate && ticket.generation != session.generation {
+        if !ticket.is_candidate() && ticket.generation != session.generation {
             // A stale initial-generation ticket cannot attach once the session
             // has moved on.  Refuse it before DATA_READY is queued so the
             // connector never observes readiness for a carrier that was not
@@ -6048,7 +7205,7 @@ impl RelayActor {
         .map_err(|error| RelayError::Protocol(error.to_string()))?;
         queue_control(&session.control_tx, &session.queue_budget, ready)
             .map_err(|_| RelayError::Overloaded("control queue is full"))?;
-        if ticket.candidate {
+        if ticket.is_candidate() {
             let rotation = session
                 .rotation
                 .as_mut()
@@ -6062,14 +7219,16 @@ impl RelayActor {
                 DataAttachmentPurpose::Recovery { .. }
             ) && let Some(recovery) = rotation.recovery.as_mut()
             {
-                recovery.candidate_ready = true;
+                // The ticket's digest matched the agreed closure above, so
+                // this attempt is past `ClosureAgreed`; a repeat is refused
+                // and leaves the attached state as it is.
+                let _ = recovery.progress.on_event(RecoveryEvent::CandidateAttached);
             }
         } else {
             session.active_carrier = Some(DataCarrier {
                 context,
                 tx: data_tx.clone(),
             });
-            session.data_tx = Some(data_tx.clone());
         }
         tracing::info!(
             tenant_id = %session.identity.tenant_id,
@@ -6128,21 +7287,21 @@ impl RelayActor {
             });
             return freeze_hold::Admission::Refused;
         };
-        if session.identity.tenant_id != consumer.tenant_id || session.data_tx.is_none() {
+        if session.identity.tenant_id != consumer.tenant_id || session.data_tx().is_none() {
             let _ = response.send(EchoOutcome::Failure {
                 code: "DEVICE_OFFLINE",
                 execution: "not_dispatched",
             });
             return freeze_hold::Admission::Refused;
         }
-        if session.cluster_profile && !session.owner_fenced {
+        if session.owner_fencing.is_awaiting_ack() {
             let _ = response.send(EchoOutcome::Failure {
                 code: "OWNER_FENCING_REQUIRED",
                 execution: "not_dispatched",
             });
             return freeze_hold::Admission::Refused;
         }
-        if session.owner_write_unknown.is_some() {
+        if session.lease_maintenance.is_outcome_unknown() {
             // The last lease renewal may or may not have committed.  Until
             // the authority is re-read the owner is unready: nothing new is
             // dispatched under a lease this relay cannot vouch for.
@@ -6295,11 +7454,8 @@ impl RelayActor {
                 consumer_expires_at,
                 body,
                 created_at: Instant::now(),
-                dispatched: false,
-                authorization_in_flight: false,
-                deferred_authorization: None,
-                freeze_authorization: FreezeAuthorization::NotHeld,
-                abandon: UnaryAbandon::default(),
+                exchange: UnaryExchange::AwaitingChallenge,
+                connector: UnaryConnector::NotAdmitted,
             },
         );
         session.queued_bytes = session.queued_bytes.saturating_add(queued_len);
@@ -6454,8 +7610,8 @@ impl RelayActor {
             return freeze_hold::Admission::Refused;
         }
         if session.active_carrier.is_none()
-            || (session.cluster_profile && !session.owner_fenced)
-            || session.owner_write_unknown.is_some()
+            || session.owner_fencing.is_awaiting_ack()
+            || session.lease_maintenance.is_outcome_unknown()
         {
             let _ = response.send(Err(RelayError::OwnerNotReady));
             return freeze_hold::Admission::Refused;
@@ -6648,9 +7804,7 @@ impl RelayActor {
                 terminal: false,
                 pending_terminal: None,
                 terminal_fin_failure: false,
-                open_pending: true,
-                registration_dropped: false,
-                deferred_terminal_cause: None,
+                admission: StreamAdmission::OpenPending,
                 credit_held: false,
                 closed: closed.clone(),
                 admission_lease: admission_lease.clone(),
@@ -6732,7 +7886,7 @@ impl RelayActor {
         if stream.operation_id != operation_id {
             return;
         }
-        if stream.open_pending {
+        if stream.admission.open_pending() {
             // A dropped registration does not prove that the connector
             // rejected OPEN. Keep the exact OPEN identity until OPENED or a
             // matching REJECTED arrives; after OPENED, the branch below uses
@@ -6801,7 +7955,7 @@ impl RelayActor {
         session: &DeviceSession,
         stream: &M2Stream,
     ) -> Option<ResumeDirectionState> {
-        if !stream.terminal || stream.open_pending {
+        if !stream.terminal || stream.admission.open_pending() {
             return None;
         }
         if Self::rotation_blocks_owner_forget(session) {
@@ -6853,7 +8007,7 @@ impl RelayActor {
     /// the connector, so an admitted OPEN is never refused "stream limit
     /// reached" after the consumer's upgrade.
     fn occupies_connector_stream_slot(stream: &M2Stream) -> bool {
-        if !stream.terminal || stream.open_pending {
+        if !stream.terminal || stream.admission.open_pending() {
             return true;
         }
         stream
@@ -6956,10 +8110,10 @@ impl RelayActor {
     /// closed authenticated control path must close the owner session instead
     /// of retaining terminal state indefinitely.
     fn arm_owner_forget_deadline(&mut self, key: &SessionKey) {
-        if let Some(session) = self.session_mut(key)
-            && session.owner_forget_deadline.is_none()
-        {
-            session.owner_forget_deadline = Some(Instant::now() + OWNER_FORGET_FAILURE_TIMEOUT);
+        if let Some(session) = self.session_mut(key) {
+            session
+                .owner_forget_deadline
+                .arm_once(|| Instant::now() + OWNER_FORGET_FAILURE_TIMEOUT);
         }
     }
 
@@ -6984,12 +8138,10 @@ impl RelayActor {
                 .entry(stream_id)
                 .or_insert(now);
         }
-        if session.terminal_fin_failure_deadline.is_none() {
-            session.terminal_fin_failure_deadline = Some(
-                Self::earliest_terminal_fin_deadline(session)
-                    .unwrap_or(now + OWNER_FORGET_FAILURE_TIMEOUT),
-            );
-        }
+        let earliest = Self::earliest_terminal_fin_deadline(session);
+        session
+            .terminal_fin_failure_deadline
+            .arm_once(|| earliest.unwrap_or(now + OWNER_FORGET_FAILURE_TIMEOUT));
     }
 
     /// The earliest per-stream terminal-failure window still running.
@@ -7038,7 +8190,7 @@ impl RelayActor {
                 {
                     session.owed_acks.remove(&stream_id);
                     if session.owed_acks.is_empty() {
-                        session.flow_control_owed_deadline = None;
+                        session.flow_control_owed_deadline.clear();
                     }
                 }
                 Ok(())
@@ -7068,7 +8220,7 @@ impl RelayActor {
                 }
                 session
                     .flow_control_owed_deadline
-                    .get_or_insert_with(|| Instant::now() + OWNER_FORGET_FAILURE_TIMEOUT);
+                    .arm_once(|| Instant::now() + OWNER_FORGET_FAILURE_TIMEOUT);
                 Ok(())
             }
         }
@@ -7124,7 +8276,7 @@ impl RelayActor {
                 || unary_tombstones.contains_key(stream_id)
         });
         if session.owed_acks.is_empty() {
-            session.flow_control_owed_deadline = None;
+            session.flow_control_owed_deadline.clear();
         }
     }
 
@@ -7136,7 +8288,7 @@ impl RelayActor {
     /// proof for that stream would wait for an ACK that never comes.  The
     /// caller retries them once the commit is applied.
     fn readdress_owed_acks_to_active(session: &mut DeviceSession) {
-        let Some(tx) = session.data_tx.clone() else {
+        let Some(tx) = session.data_tx().cloned() else {
             return;
         };
         let generation = session.generation;
@@ -7158,7 +8310,7 @@ impl RelayActor {
             return;
         };
         if session.owed_acks.is_empty() {
-            session.flow_control_owed_deadline = None;
+            session.flow_control_owed_deadline.clear();
             return;
         }
         let epoch = session.key.epoch;
@@ -7191,10 +8343,11 @@ impl RelayActor {
             }
         }
         if session.owed_acks.is_empty() {
-            session.flow_control_owed_deadline = None;
+            session.flow_control_owed_deadline.clear();
         } else if progressed {
-            session.flow_control_owed_deadline =
-                Some(Instant::now() + OWNER_FORGET_FAILURE_TIMEOUT);
+            session
+                .flow_control_owed_deadline
+                .set(Some(Instant::now() + OWNER_FORGET_FAILURE_TIMEOUT));
         }
     }
 
@@ -7209,7 +8362,7 @@ impl RelayActor {
                 .any(|stream| stream.terminal_fin_failure)
         });
         if clear && let Some(session) = self.session_mut(key) {
-            session.terminal_fin_failure_deadline = None;
+            session.terminal_fin_failure_deadline.clear();
             session.terminal_fin_failed_at.clear();
         }
     }
@@ -7312,7 +8465,7 @@ impl RelayActor {
             let is_rejected_open = self
                 .session_for(key)
                 .and_then(|session| session.streams.get(&stream_id))
-                .is_some_and(|stream| stream.open_pending);
+                .is_some_and(|stream| stream.admission.open_pending());
             let unary_state = self.session_for(key).and_then(|session| {
                 session
                     .unary_tombstones
@@ -7436,7 +8589,7 @@ impl RelayActor {
             if pending_empty {
                 self.owner_forgets.remove(key);
                 if let Some(session) = self.session_mut(key) {
-                    session.owner_forget_deadline = None;
+                    session.owner_forget_deadline.clear();
                 }
             }
         }
@@ -7505,7 +8658,7 @@ impl RelayActor {
         terminal: Terminal,
         reset_after_fin: bool,
     ) -> bool {
-        let Some(data_tx) = session.data_tx.clone() else {
+        let Some(data_tx) = session.data_tx().cloned() else {
             return false;
         };
         let queue_budget = session.queue_budget.clone();
@@ -7562,7 +8715,7 @@ impl RelayActor {
     fn flush_frozen_writes(&mut self, key: &SessionKey) {
         let ready = self
             .session_for(key)
-            .is_some_and(|session| !Self::rotation_frozen(session) && session.data_tx.is_some());
+            .is_some_and(|session| !Self::rotation_frozen(session) && session.data_tx().is_some());
         if !ready {
             return;
         }
@@ -7587,10 +8740,13 @@ impl RelayActor {
                         .pending
                         .iter_mut()
                         .filter_map(|(stream_id, pending)| {
-                            pending
-                                .deferred_authorization
-                                .take()
-                                .map(|(challenge, result)| (*stream_id, challenge, result))
+                            let held = pending
+                                .exchange
+                                .apply(UnaryEvent::HeldResultTaken)
+                                .ok()
+                                .flatten()?;
+                            let (challenge, result) = *held;
+                            Some((*stream_id, challenge, result))
                         })
                         .collect();
                 deferred.sort_unstable_by_key(|(stream_id, _, _)| *stream_id);
@@ -7607,7 +8763,7 @@ impl RelayActor {
                 let mut ids: Vec<u64> = session
                     .pending
                     .iter()
-                    .filter(|(_, pending)| pending.abandon.abandoned)
+                    .filter(|(_, pending)| pending.exchange.abandoned())
                     .map(|(stream_id, _)| *stream_id)
                     .collect();
                 ids.sort_unstable();
@@ -7626,7 +8782,7 @@ impl RelayActor {
     /// terminal keeps its place at the tail of the stream's sequence space.
     fn flush_pending_terminal(&mut self, key: &SessionKey, stream_id: u64) {
         let terminal = self.session_for(key).and_then(|session| {
-            if Self::rotation_frozen(session) || session.data_tx.is_none() {
+            if Self::rotation_frozen(session) || session.data_tx().is_none() {
                 return None;
             }
             let stream = session.streams.get(&stream_id)?;
@@ -7661,9 +8817,9 @@ impl RelayActor {
             // review of #199).  Another stream's progress never extends it.
             if let Some(session) = self.session_mut(key) {
                 session.terminal_fin_failed_at.remove(&stream_id);
-                if session.terminal_fin_failure_deadline.is_some() {
-                    session.terminal_fin_failure_deadline =
-                        Self::earliest_terminal_fin_deadline(session);
+                if session.terminal_fin_failure_deadline.is_armed() {
+                    let earliest = Self::earliest_terminal_fin_deadline(session);
+                    session.terminal_fin_failure_deadline.set(earliest);
                 }
             }
             self.clear_terminal_fin_failure_deadline_if_clear(key);
@@ -7717,7 +8873,7 @@ impl RelayActor {
             }));
             return;
         };
-        let data_tx = session.data_tx.clone();
+        let data_tx = session.data_tx().cloned();
         let recovering = session
             .rotation
             .as_ref()
@@ -8117,7 +9273,7 @@ impl RelayActor {
                     if Self::rotation_frozen(session) {
                         return None;
                     }
-                    writer_room = session.data_tx.as_ref()?.capacity();
+                    writer_room = session.data_tx()?.capacity();
                     session.streams.get(&stream_id)
                 })
                 .and_then(|stream| {
@@ -8231,7 +9387,7 @@ impl RelayActor {
             let room = self.session_for(&key).map(|session| {
                 (
                     !Self::rotation_frozen(session) && session.owed_acks.is_empty(),
-                    session.data_tx.as_ref().map_or(0, mpsc::Sender::capacity),
+                    session.data_tx().map_or(0, mpsc::Sender::capacity),
                 )
             });
             match room {
@@ -8297,14 +9453,14 @@ impl RelayActor {
             let queue_budget = session.queue_budget.clone();
             if let Some(stream) = session.streams.get_mut(&stream_id)
                 && stream.operation_id == operation_id
-                && stream.open_pending
+                && stream.admission.open_pending()
                 && !stream.terminal
             {
-                stream.registration_dropped = true;
+                // Idempotent for a repeated close; the first cause is kept.
+                stream
+                    .admission
+                    .apply(AdmissionEvent::RegistrationDropped { cause });
                 stream.admission_lease.cancel();
-                if stream.deferred_terminal_cause.is_none() {
-                    stream.deferred_terminal_cause = cause;
-                }
                 // EC-061 ordering: every guard that decides this release has
                 // already passed, and the release is the next statement.  A
                 // closure tuple with a lower sequence is therefore provably
@@ -8408,12 +9564,10 @@ impl RelayActor {
                 // closed or unencodable carrier is carrier loss, which this
                 // site deliberately leaves unclassified.
                 let carrier_live = session
-                    .data_tx
-                    .as_ref()
+                    .data_tx()
                     .is_some_and(|data_tx| !data_tx.is_closed());
                 let slots_full = session
-                    .data_tx
-                    .as_ref()
+                    .data_tx()
                     .is_some_and(|data_tx| data_tx.capacity() == 0);
                 let budget_full = session.queue_budget.data_exhausted();
                 queue_exhausted = carrier_live && (slots_full || budget_full);
@@ -8580,7 +9734,7 @@ impl RelayActor {
     ) -> RotationStart {
         if self
             .session_for(key)
-            .is_some_and(|session| session.cluster_profile)
+            .is_some_and(|session| session.owner_fencing.is_cluster())
         {
             return self.start_catalog_rotation(key, reply_to, reason, request);
         }
@@ -8613,7 +9767,7 @@ impl RelayActor {
                 return RotationStart::Rejected;
             };
             if !session.profile.supports_rotation()
-                || session.data_tx.is_none()
+                || session.data_tx().is_none()
                 || session.rotation.as_ref().is_some_and(|rotation| {
                     !matches!(rotation.state.phase(), RotationPhase::Active)
                         || rotation.pending_ticket.is_some()
@@ -8675,12 +9829,10 @@ impl RelayActor {
             rotation.old_connection_id = session.connection_id.clone();
             rotation.prepare_message_id.clear();
             rotation.last_message_id.clear();
-            rotation.abort_message_id = None;
+            rotation.abort.reset();
             rotation.peer_message_id = reply_to.unwrap_or_default();
-            rotation.pending_abort_ack = None;
             Self::clear_phase_message_ids(rotation);
-            rotation.remote_fences = [None, None];
-            rotation.own_fence = None;
+            rotation.fences.clear();
             (
                 attempt,
                 session.owner.clone(),
@@ -8781,7 +9933,7 @@ impl RelayActor {
                 return RotationStart::Rejected;
             };
             if !session.profile.supports_rotation()
-                || session.data_tx.is_none()
+                || session.data_tx().is_none()
                 || session.rotation.as_ref().is_some_and(|rotation| {
                     !matches!(rotation.state.phase(), RotationPhase::Active)
                 })
@@ -8874,14 +10026,14 @@ impl RelayActor {
                 issued_at_wall,
                 expires_at_wall,
                 expires_at: Instant::now() + wire::TICKET_TTL,
-                consuming: false,
+                phase: TicketPhase::Issued,
                 owner,
-                candidate: true,
+                kind: TicketKind::Candidate,
                 attachment_purpose: DataAttachmentPurpose::RotationCandidate,
                 catalog_purpose: String::new(),
                 binding_digest: String::new(),
                 locator_digest: String::new(),
-                catalog_backed: false,
+                authority: TicketAuthority::Relay,
             },
         );
         let journal_response = encoded.clone();
@@ -8903,12 +10055,10 @@ impl RelayActor {
             rotation.old_connection_id = session.connection_id.clone();
             rotation.prepare_message_id = prepare_message_id.clone();
             rotation.last_message_id = prepare_message_id.clone();
-            rotation.abort_message_id = None;
+            rotation.abort.reset();
             rotation.peer_message_id = reply_to.unwrap_or_default();
-            rotation.pending_abort_ack = None;
             Self::clear_phase_message_ids(rotation);
-            rotation.remote_fences = [None, None];
-            rotation.own_fence = None;
+            rotation.fences.clear();
         }
         tracing::info!(
             device_id = %key.device_id,
@@ -9011,14 +10161,14 @@ impl RelayActor {
             issued_at_wall: now,
             expires_at_wall: expires_at,
             expires_at: Instant::now() + expires_in,
-            consuming: false,
+            phase: TicketPhase::Issued,
             owner,
-            candidate: true,
+            kind: TicketKind::Candidate,
             attachment_purpose: pending.purpose.clone(),
             catalog_purpose: pending.catalog_purpose.clone(),
             binding_digest: pending.binding_digest.clone(),
             locator_digest: ticket.locator.digest,
-            catalog_backed: true,
+            authority: TicketAuthority::Catalog,
         };
         self.tickets.insert(expected.value.clone(), expected);
         if queue_control(&control_tx, &budget, encoded.clone()).is_err() {
@@ -9070,7 +10220,7 @@ impl RelayActor {
             let Some(session) = self.session_mut(key) else {
                 return false;
             };
-            if !session.profile.supports_rotation() || session.data_tx.is_some() {
+            if !session.profile.supports_rotation() || session.data_tx().is_some() {
                 return false;
             }
             let Some(rotation) = session.rotation.as_mut() else {
@@ -9260,12 +10410,10 @@ impl RelayActor {
             rotation.snapshot_id = snapshot_id;
             rotation.prepare_message_id = begin_id.clone();
             rotation.last_message_id = begin_id;
-            rotation.abort_message_id = None;
+            rotation.abort.reset();
             rotation.peer_message_id.clear();
-            rotation.pending_abort_ack = None;
             Self::clear_phase_message_ids(rotation);
-            rotation.remote_fences = [None, None];
-            rotation.own_fence = None;
+            rotation.fences.clear();
             rotation.barrier_rx = None;
             rotation.candidate = None;
             rotation.pending_ticket = None;
@@ -9276,9 +10424,7 @@ impl RelayActor {
                 roster,
                 expected_closed_connection_ids: local_closed.closed_connection_ids.clone(),
                 local_closed: Some(local_closed.clone()),
-                peer_closed: None,
-                closure_digest: Some(local_closed.closure_digest.clone()),
-                candidate_ready: false,
+                progress: RecoveryProgress::local_closed(),
                 resume_message_ids: [None, None],
                 snapshot_reply_ids: [None, None],
                 local_snapshots: [Vec::new(), Vec::new()],
@@ -9286,15 +10432,10 @@ impl RelayActor {
                 ready_message_ids: [None, None],
                 remote_snapshots: [HashMap::new(), HashMap::new()],
                 ready_remote_snapshots: [HashMap::new(), HashMap::new()],
-                remote_ready: [false, false],
                 local_plans: HashMap::new(),
-                ready_sent: [false, false],
                 deferred_frames: VecDeque::new(),
                 deferred_bytes: 0,
                 unclassified_frames: VecDeque::new(),
-                activated: false,
-                retry_not_before_ms: None,
-                retry_failed_connection_id: None,
             });
             // Recovery has its own immutable retention window.  This journal
             // cannot silently inherit an expired overlap deadline.
@@ -9323,7 +10464,7 @@ impl RelayActor {
                     && ticket.epoch == key.epoch
                     && ticket.generation == canceled_attempt.new_generation
                     && ticket.connection_id == canceled_attempt.new_connection_id
-                    && ticket.candidate)
+                    && ticket.is_candidate())
             });
         }
         queue_control(&control_tx, &budget, begin).is_ok()
@@ -9383,16 +10524,18 @@ impl RelayActor {
                 return None;
             }
             let recovery = rotation.recovery.as_mut()?;
-            if !recovery.candidate_ready
-                || recovery.retry_not_before_ms.is_some()
-                || recovery.retry_failed_connection_id.is_some()
-            {
+            if !recovery.progress.candidate_attached() || recovery.progress.retry().is_some() {
                 return None;
             }
             let delay_ms = recovery_retry_delay_ms(recovery.attempt_no)?;
             let not_before_ms = now_ms.checked_add(delay_ms)?;
-            recovery.retry_not_before_ms = Some(not_before_ms);
-            recovery.retry_failed_connection_id = Some(failed_connection_id.to_owned());
+            recovery
+                .progress
+                .on_event(RecoveryEvent::RetryScheduled(RecoveryRetry {
+                    not_before_ms,
+                    failed_connection_id: failed_connection_id.to_owned(),
+                }))
+                .ok()?;
             delay_ms
         };
         self.spawn_recovery_retry_timer(key.clone(), delay_ms);
@@ -9424,9 +10567,10 @@ impl RelayActor {
             .and_then(|session| session.rotation.as_ref())
             .and_then(|rotation| rotation.recovery.as_ref())
             .and_then(|recovery| {
+                let retry = recovery.progress.retry()?;
                 Some((
-                    recovery.retry_not_before_ms?,
-                    recovery.retry_failed_connection_id.clone()?,
+                    retry.not_before_ms,
+                    retry.failed_connection_id.clone(),
                     recovery.episode_deadline_ms,
                 ))
             })
@@ -9441,13 +10585,17 @@ impl RelayActor {
         if now_ms >= episode_deadline_ms {
             return RecoveryRetryDispatch::DeadlineExpired;
         }
-        if let Some(session) = self.session_mut(key)
-            && let Some(rotation) = session.rotation.as_mut()
-            && let Some(recovery) = rotation.recovery.as_mut()
-        {
-            recovery.retry_not_before_ms = None;
-            recovery.retry_failed_connection_id = None;
-        } else {
+        let dispatched = self
+            .session_mut(key)
+            .and_then(|session| session.rotation.as_mut())
+            .and_then(|rotation| rotation.recovery.as_mut())
+            .is_some_and(|recovery| {
+                recovery
+                    .progress
+                    .on_event(RecoveryEvent::RetryDispatched)
+                    .is_ok()
+            });
+        if !dispatched {
             return RecoveryRetryDispatch::NotPending;
         }
         if self.retry_recovery_after_candidate_loss(key, &failed_connection_id) {
@@ -9501,7 +10649,7 @@ impl RelayActor {
                 return false;
             };
             if rotation.state.phase() != RotationPhase::Recovering
-                || !previous_recovery.candidate_ready
+                || !previous_recovery.progress.candidate_attached()
                 || previous_attempt.new_connection_id != failed_connection_id
             {
                 return false;
@@ -9601,9 +10749,8 @@ impl RelayActor {
             rotation.candidate = None;
             rotation.prepare_message_id = begin_id.clone();
             rotation.last_message_id = begin_id;
-            rotation.abort_message_id = None;
+            rotation.abort.reset();
             rotation.peer_message_id.clear();
-            rotation.pending_abort_ack = None;
             Self::clear_phase_message_ids(rotation);
             rotation.snapshot_id = roster.snapshot_id.clone();
             rotation.recovery = Some(RecoveryRuntime {
@@ -9613,9 +10760,7 @@ impl RelayActor {
                 roster,
                 expected_closed_connection_ids: expected,
                 local_closed: Some(local_closed),
-                peer_closed: None,
-                closure_digest: None,
-                candidate_ready: false,
+                progress: RecoveryProgress::local_closed(),
                 resume_message_ids: [None, None],
                 snapshot_reply_ids: [None, None],
                 local_snapshots: [Vec::new(), Vec::new()],
@@ -9623,15 +10768,10 @@ impl RelayActor {
                 ready_message_ids: [None, None],
                 remote_snapshots: [HashMap::new(), HashMap::new()],
                 ready_remote_snapshots: [HashMap::new(), HashMap::new()],
-                remote_ready: [false, false],
                 local_plans: HashMap::new(),
-                ready_sent: [false, false],
                 deferred_frames: VecDeque::new(),
                 deferred_bytes: 0,
                 unclassified_frames: VecDeque::new(),
-                activated: false,
-                retry_not_before_ms: None,
-                retry_failed_connection_id: None,
             });
             if let Ok(journal) = ControlJournal::new(128, journal_bytes, now_ms, previous_deadline)
             {
@@ -9860,7 +11000,11 @@ impl RelayActor {
                 Direction::RelayToConnector,
                 monotonic_millis(),
             )?;
-            rotation.own_fence = Some(snapshot.clone());
+            rotation.fences.record_own(snapshot.clone()).map_err(|_| {
+                tunnel_protocol::rotation::RotationError::ConflictingFrozenFence {
+                    direction: Direction::RelayToConnector,
+                }
+            })?;
             Ok::<(), tunnel_protocol::rotation::RotationError>(())
         }) {
             tracing::warn!(
@@ -9917,7 +11061,7 @@ impl RelayActor {
                     .attempt
                     .clone()
                     .ok_or(tunnel_protocol::rotation::RotationError::MissingAttempt)?;
-                let snapshot = rotation.own_fence.clone().ok_or(
+                let snapshot = rotation.fences.own().cloned().ok_or(
                     tunnel_protocol::rotation::RotationError::MissingFrozenFence {
                         direction: Direction::RelayToConnector,
                     },
@@ -9936,7 +11080,7 @@ impl RelayActor {
                 && !status.drain_proofs[direction_index(Direction::ConnectorToRelay)]
             {
                 let direction = Direction::ConnectorToRelay;
-                let Some(fences) = rotation.remote_fences[direction_index(direction)].clone()
+                let Some(fences) = rotation.fences.remote(direction_index(direction)).cloned()
                 else {
                     return Ok::<(), tunnel_protocol::rotation::RotationError>(());
                 };
@@ -9991,8 +11135,10 @@ impl RelayActor {
                 // message. Use the phase-pinned ID so a crossed DRAINED
                 // cannot make the next retry fail client correlation.
                 let source = rotation
-                    .peer_frozen_message_id
-                    .clone()
+                    .peer_pins
+                    .frozen
+                    .get()
+                    .map(str::to_owned)
                     .ok_or(tunnel_protocol::rotation::RotationError::MissingAttempt)?;
                 let message = wire::rotate_drained(&source, attempt, proof);
                 let encoded = wire::encode_control_message(&message)
@@ -10235,25 +11381,9 @@ impl RelayActor {
         rotation.frozen_message_id.clear();
         rotation.commit_message_id.clear();
         rotation.retire_message_id.clear();
-        rotation.peer_frozen_message_id = None;
-        rotation.peer_drained_message_id = None;
-        rotation.peer_committed_message_id = None;
-        rotation.peer_retired_message_id = None;
-        rotation.peer_aborted_message_id = None;
-    }
-
-    fn peer_message_id_is_acceptable(pinned: Option<&str>, incoming: &str) -> bool {
-        !incoming.is_empty() && pinned.is_none_or(|existing| existing == incoming)
-    }
-
-    fn pin_peer_message_id(pinned: &mut Option<String>, incoming: &str) -> bool {
-        if !Self::peer_message_id_is_acceptable(pinned.as_deref(), incoming) {
-            return false;
-        }
-        if pinned.is_none() {
-            *pinned = Some(incoming.to_owned());
-        }
-        true
+        // The ABORTED pin is dropped by the `rotation.abort.reset()` every
+        // caller pairs with this.
+        rotation.peer_pins.clear();
     }
 
     fn placeholder_journal() -> ControlJournal {
@@ -10365,10 +11495,7 @@ impl RelayActor {
             || frozen.attempt.epoch != key.epoch
             || frozen.attempt.owner_id != runtime::owner_id(&session.owner)
             || frozen.reply_to != rotation.quiesce_message_id
-            || !Self::peer_message_id_is_acceptable(
-                rotation.peer_frozen_message_id.as_deref(),
-                &frozen.message_id,
-            )
+            || !rotation.peer_pins.frozen.is_acceptable(&frozen.message_id)
         {
             return;
         }
@@ -10412,11 +11539,17 @@ impl RelayActor {
                 direction,
                 monotonic_millis(),
             )?;
-            if !Self::pin_peer_message_id(&mut rotation.peer_frozen_message_id, &frozen.message_id)
-            {
+            if !rotation.peer_pins.frozen.pin(&frozen.message_id) {
                 return Err(tunnel_protocol::rotation::RotationError::AttemptMismatch);
             }
-            rotation.remote_fences[direction_index(direction)] = Some(frozen.snapshot.clone());
+            rotation
+                .fences
+                .record_remote(direction_index(direction), frozen.snapshot.clone())
+                .map_err(
+                    |_| tunnel_protocol::rotation::RotationError::ConflictingFrozenFence {
+                        direction,
+                    },
+                )?;
             rotation.peer_message_id = frozen.message_id.clone();
             Ok::<(), tunnel_protocol::rotation::RotationError>(())
         });
@@ -10462,10 +11595,10 @@ impl RelayActor {
         };
         if !Self::attempt_matches(rotation, &drained.attempt)
             || drained.reply_to != rotation.frozen_message_id
-            || !Self::peer_message_id_is_acceptable(
-                rotation.peer_drained_message_id.as_deref(),
-                &drained.message_id,
-            )
+            || !rotation
+                .peer_pins
+                .drained
+                .is_acceptable(&drained.message_id)
         {
             return;
         }
@@ -10473,10 +11606,7 @@ impl RelayActor {
             rotation
                 .state
                 .drained(&drained.attempt, drained.proof.clone(), monotonic_millis())?;
-            if !Self::pin_peer_message_id(
-                &mut rotation.peer_drained_message_id,
-                &drained.message_id,
-            ) {
+            if !rotation.peer_pins.drained.pin(&drained.message_id) {
                 return Err(tunnel_protocol::rotation::RotationError::AttemptMismatch);
             }
             // The coordinator's COMMIT must reply to the connector's proof
@@ -10526,18 +11656,19 @@ impl RelayActor {
         };
         if !Self::attempt_matches(rotation, &committed.attempt)
             || committed.reply_to != rotation.commit_message_id
-            || !Self::peer_message_id_is_acceptable(
-                rotation.peer_committed_message_id.as_deref(),
-                &committed.message_id,
-            )
+            || !rotation
+                .peer_pins
+                .committed
+                .is_acceptable(&committed.message_id)
         {
             return;
         }
         let _ = self.with_rotation_mut(key, |session, rotation| {
-            if !Self::peer_message_id_is_acceptable(
-                rotation.peer_committed_message_id.as_deref(),
-                &committed.message_id,
-            ) {
+            if !rotation
+                .peer_pins
+                .committed
+                .is_acceptable(&committed.message_id)
+            {
                 return Err(tunnel_protocol::rotation::RotationError::AttemptMismatch);
             }
             rotation
@@ -10545,10 +11676,7 @@ impl RelayActor {
                 .committed(&committed.attempt, monotonic_millis())?;
             let status_after_commit = rotation.state.status();
             Self::latch_rotation_lifecycle(rotation, &status_after_commit);
-            if !Self::pin_peer_message_id(
-                &mut rotation.peer_committed_message_id,
-                &committed.message_id,
-            ) {
+            if !rotation.peer_pins.committed.pin(&committed.message_id) {
                 return Err(tunnel_protocol::rotation::RotationError::AttemptMismatch);
             }
             let Some(candidate) = rotation.candidate.take() else {
@@ -10556,10 +11684,6 @@ impl RelayActor {
             };
             let old = session.active_carrier.take();
             session.active_carrier = Some(candidate);
-            session.data_tx = session
-                .active_carrier
-                .as_ref()
-                .map(|carrier| carrier.tx.clone());
             session.generation = committed.attempt.new_generation;
             session.connection_id = committed.attempt.new_connection_id.clone();
             Self::readdress_owed_acks_to_active(session);
@@ -10608,18 +11732,19 @@ impl RelayActor {
         };
         if !Self::attempt_matches(rotation, &retired.attempt)
             || retired.reply_to != rotation.retire_message_id
-            || !Self::peer_message_id_is_acceptable(
-                rotation.peer_retired_message_id.as_deref(),
-                &retired.message_id,
-            )
+            || !rotation
+                .peer_pins
+                .retired
+                .is_acceptable(&retired.message_id)
         {
             return;
         }
         let _ = self.with_rotation_mut(key, |_session, rotation| {
-            if !Self::peer_message_id_is_acceptable(
-                rotation.peer_retired_message_id.as_deref(),
-                &retired.message_id,
-            ) {
+            if !rotation
+                .peer_pins
+                .retired
+                .is_acceptable(&retired.message_id)
+            {
                 return Err(tunnel_protocol::rotation::RotationError::AttemptMismatch);
             }
             let status_before_close = rotation.state.status();
@@ -10634,10 +11759,7 @@ impl RelayActor {
             )?;
             let status_after_close = rotation.state.status();
             Self::latch_rotation_lifecycle(rotation, &status_after_close);
-            if !Self::pin_peer_message_id(
-                &mut rotation.peer_retired_message_id,
-                &retired.message_id,
-            ) {
+            if !rotation.peer_pins.retired.pin(&retired.message_id) {
                 return Err(tunnel_protocol::rotation::RotationError::AttemptMismatch);
             }
             // The connector's RETIRED is only one half of physical closure.
@@ -10710,12 +11832,10 @@ impl RelayActor {
             rotation.attempt = None;
             rotation.attempt_deadline_ms = None;
             rotation.snapshot_id.clear();
-            rotation.abort_message_id = None;
+            rotation.abort.reset();
             rotation.peer_message_id.clear();
-            rotation.pending_abort_ack = None;
             Self::clear_phase_message_ids(rotation);
-            rotation.remote_fences = [None, None];
-            rotation.own_fence = None;
+            rotation.fences.clear();
             rotation.completed_rotation_diagnostics = completed_diagnostics;
             session.rotations_completed = session.rotations_completed.saturating_add(1);
             session.last_rotation = Instant::now();
@@ -11041,13 +12161,11 @@ impl RelayActor {
                 expired = true;
                 return Ok::<(), tunnel_protocol::rotation::RotationError>(());
             }
-            if rotation.abort_message_id.is_none()
-                && rotation.state.phase() == RotationPhase::Preparing
-            {
+            if !rotation.abort.is_sent() && rotation.state.phase() == RotationPhase::Preparing {
                 let _ = rotation.state.tick(now_ms);
             }
-            send_abort = rotation.abort_message_id.is_none()
-                && rotation.state.phase() == RotationPhase::Aborting;
+            send_abort =
+                !rotation.abort.is_sent() && rotation.state.phase() == RotationPhase::Aborting;
             Ok::<(), tunnel_protocol::rotation::RotationError>(())
         });
         if result.is_err() {
@@ -11165,9 +12283,7 @@ impl RelayActor {
         let Some((attempt, remaining_ms, control_tx, budget)) =
             self.session_for(key).and_then(|session| {
                 let rotation = session.rotation.as_ref()?;
-                if rotation.abort_message_id.is_some()
-                    || rotation.state.phase() != RotationPhase::Aborting
-                {
+                if rotation.abort.is_sent() || rotation.state.phase() != RotationPhase::Aborting {
                     return None;
                 }
                 let attempt = rotation.attempt.clone()?;
@@ -11215,7 +12331,7 @@ impl RelayActor {
                 && ticket.epoch == key.epoch
                 && ticket.generation == attempt.new_generation
                 && ticket.connection_id == attempt.new_connection_id
-                && ticket.candidate
+                && ticket.is_candidate()
         };
         // Reject any still-unconsumed candidate ticket before claiming the
         // relay side has no outstanding attachment.  An accepted candidate
@@ -11226,7 +12342,7 @@ impl RelayActor {
             && let Some(rotation) = session.rotation.as_mut()
             && rotation.attempt.as_ref() == Some(&attempt)
             && rotation.state.phase() == RotationPhase::Aborting
-            && rotation.abort_message_id.is_none()
+            && !rotation.abort.is_sent()
         {
             if rotation.candidate.is_some() {
                 if let Some(candidate) = rotation.candidate.as_ref() {
@@ -11250,7 +12366,10 @@ impl RelayActor {
                 );
                 return;
             }
-            rotation.abort_message_id = Some(message.message_id().to_owned());
+            // Guarded above: no abort was queued for this attempt yet.
+            let _ = rotation
+                .abort
+                .on_event(AbortEvent::Queued(message.message_id().to_owned()));
             rotation.last_message_id = message.message_id().to_owned();
         }
     }
@@ -11265,7 +12384,7 @@ impl RelayActor {
             }
             let Some(aborted) = Self::pending_abort_ack_if_active(
                 rotation.state.phase(),
-                &rotation.pending_abort_ack,
+                &rotation.abort.pending_ack().cloned(),
             ) else {
                 return Ok(());
             };
@@ -11281,18 +12400,16 @@ impl RelayActor {
             queue_control(&session.control_tx, &session.queue_budget, encoded)
                 .map_err(|_| tunnel_protocol::rotation::RotationError::Closed)?;
             Self::retain_rotation_tombstone(rotation);
-            rotation.pending_abort_ack = None;
             rotation.candidate = None;
             rotation.attempt = None;
             rotation.attempt_deadline_ms = None;
             rotation.snapshot_id.clear();
             rotation.prepare_message_id.clear();
             rotation.last_message_id = response.message_id().to_owned();
-            rotation.abort_message_id = None;
+            rotation.abort.reset();
             rotation.peer_message_id.clear();
             Self::clear_phase_message_ids(rotation);
-            rotation.remote_fences = [None, None];
-            rotation.own_fence = None;
+            rotation.fences.clear();
             rotation.barrier_rx = None;
             session.last_rotation = Instant::now();
             Ok(())
@@ -11308,13 +12425,13 @@ impl RelayActor {
             if !Self::attempt_matches(rotation, &aborted.attempt) {
                 return Err(tunnel_protocol::rotation::RotationError::MissingAttempt);
             }
-            if rotation.abort_message_id.as_deref() != Some(aborted.reply_to.as_str()) {
+            if rotation.abort.message_id() != Some(aborted.reply_to.as_str()) {
                 return Err(tunnel_protocol::rotation::RotationError::AttemptMismatch);
             }
-            if !Self::peer_message_id_is_acceptable(
-                rotation.peer_aborted_message_id.as_deref(),
-                &aborted.message_id,
-            ) {
+            if !rotation
+                .abort
+                .peer_message_id_is_acceptable(&aborted.message_id)
+            {
                 return Err(tunnel_protocol::rotation::RotationError::AttemptMismatch);
             }
             rotation.state.aborted(
@@ -11325,17 +12442,16 @@ impl RelayActor {
                 ),
                 monotonic_millis(),
             )?;
-            if !Self::pin_peer_message_id(
-                &mut rotation.peer_aborted_message_id,
-                &aborted.message_id,
-            ) {
-                return Err(tunnel_protocol::rotation::RotationError::AttemptMismatch);
-            }
             // Keep the inbound journal entry pending until the owner's local
             // closure proof is also present.  The final owner response is
             // emitted by the shared helper, either now or after the local
             // DisconnectData event.
-            rotation.pending_abort_ack = Some(aborted.clone());
+            // Pinning the connector's message and holding it pending are one
+            // transition; a fresh id for the same abort is refused by it.
+            rotation
+                .abort
+                .on_event(AbortEvent::PeerAborted(Box::new(aborted.clone())))
+                .map_err(|_| tunnel_protocol::rotation::RotationError::AttemptMismatch)?;
             Ok::<(), tunnel_protocol::rotation::RotationError>(())
         });
         if let Err(error) = result {
@@ -11394,7 +12510,7 @@ impl RelayActor {
             || closed
                 .verify_closure_digest(RecoverySide::Connector)
                 .is_err()
-            || recovery.peer_closed.is_some()
+            || recovery.progress.peer_closure_accepted()
         {
             return;
         }
@@ -11411,7 +12527,7 @@ impl RelayActor {
         if remaining_ms == 0 {
             return;
         }
-        if session.cluster_profile {
+        if session.owner_fencing.is_cluster() {
             let purpose = DataAttachmentPurpose::Recovery {
                 episode_id: episode_id.clone(),
                 attempt_no,
@@ -11434,6 +12550,12 @@ impl RelayActor {
             if let Some(session) = self.session_mut(key)
                 && let Some(rotation) = session.rotation.as_mut()
                 && let Some(recovery) = rotation.recovery.as_mut()
+                && recovery
+                    .progress
+                    .on_event(RecoveryEvent::PeerClosureAccepted {
+                        digest: combined_digest.clone(),
+                    })
+                    .is_ok()
             {
                 rotation.pending_ticket = Some(PendingCatalogTicket {
                     attempt: attempt.clone(),
@@ -11443,8 +12565,6 @@ impl RelayActor {
                     reply_to: closed.message_id.clone(),
                     request: None,
                 });
-                recovery.peer_closed = Some(closed.clone());
-                recovery.closure_digest = Some(combined_digest.clone());
             } else {
                 return;
             }
@@ -11537,9 +12657,9 @@ impl RelayActor {
                 issued_at_wall,
                 expires_at_wall,
                 expires_at: Instant::now() + wire::TICKET_TTL,
-                consuming: false,
+                phase: TicketPhase::Issued,
                 owner,
-                candidate: true,
+                kind: TicketKind::Candidate,
                 attachment_purpose: DataAttachmentPurpose::Recovery {
                     episode_id: episode_id.clone(),
                     attempt_no,
@@ -11548,19 +12668,22 @@ impl RelayActor {
                 catalog_purpose: String::new(),
                 binding_digest: String::new(),
                 locator_digest: String::new(),
-                catalog_backed: false,
+                authority: TicketAuthority::Relay,
             },
         );
         if let Some(session) = self.session_mut(key)
             && let Some(rotation) = session.rotation.as_mut()
             && let Some(recovery) = rotation.recovery.as_mut()
+            && recovery
+                .progress
+                .on_event(RecoveryEvent::PeerClosureAccepted {
+                    digest: combined_digest,
+                })
+                .is_ok()
         {
-            recovery.peer_closed = Some(closed);
-            recovery.closure_digest = Some(combined_digest);
             rotation.prepare_message_id = prepare_message_id.clone();
             rotation.last_message_id = prepare_message_id;
-            rotation.abort_message_id = None;
-            rotation.pending_abort_ack = None;
+            rotation.abort.reset();
             Self::clear_phase_message_ids(rotation);
         }
     }
@@ -11583,7 +12706,7 @@ impl RelayActor {
                 return;
             };
             if rotation.state.phase() != RotationPhase::Recovering
-                || !recovery.candidate_ready
+                || !recovery.progress.candidate_attached()
                 || rotation.candidate.is_none()
             {
                 return;
@@ -11646,9 +12769,11 @@ impl RelayActor {
             recovery.ready_message_ids = [None, None];
             recovery.remote_snapshots = [HashMap::new(), HashMap::new()];
             recovery.ready_remote_snapshots = [HashMap::new(), HashMap::new()];
-            recovery.remote_ready = [false, false];
             recovery.local_plans.clear();
-            recovery.ready_sent = [false, false];
+            // Restart the READY exchange.  The guard above required an
+            // attached candidate, and an activated attempt has given its
+            // candidate up, so this is never refused.
+            let _ = recovery.progress.on_event(RecoveryEvent::SnapshotsSent);
             // Frames held for an earlier attempt's snapshot arrived on a
             // candidate that attempt has released; return their charge.
             for (_, frame, charged) in std::mem::take(&mut recovery.unclassified_frames) {
@@ -11706,7 +12831,7 @@ impl RelayActor {
             };
             if rotation.state.phase() != RotationPhase::Recovering
                 || recovery.snapshot_reply_ids.iter().any(Option::is_none)
-                || recovery.ready_sent != [false, false]
+                || !recovery.progress.is_resuming()
             {
                 return Ok(RecoveryReadyProgress::Pending);
             }
@@ -11819,7 +12944,10 @@ impl RelayActor {
             Some(messages[0].1.message_id().to_owned()),
             Some(messages[1].1.message_id().to_owned()),
         ];
-        recovery.ready_sent = [true, true];
+        recovery
+            .progress
+            .on_event(RecoveryEvent::ReadySent)
+            .map_err(|_| RelayError::Conflict("recovery state is unavailable"))?;
         rotation.last_message_id = messages[1].1.message_id().to_owned();
         Ok(RecoveryReadyProgress::Sent)
     }
@@ -11896,22 +13024,25 @@ impl RelayActor {
                 }
             }
             ResumeStage::Ready => {
-                if !recovery.ready_sent[index] || recovery.remote_ready[index] {
+                if !recovery.progress.awaits_remote_ready(index) {
                     return;
                 }
                 if let Some(session) = self.session_mut(key)
                     && let Some(rotation) = session.rotation.as_mut()
                     && let Some(recovery) = rotation.recovery.as_mut()
+                    && recovery
+                        .progress
+                        .on_event(RecoveryEvent::RemoteReady(index))
+                        .is_ok()
                 {
                     recovery.ready_remote_snapshots[index] = entries;
-                    recovery.remote_ready[index] = true;
                 }
                 let ready_pair = self.session_for(key).is_some_and(|session| {
                     session
                         .rotation
                         .as_ref()
                         .and_then(|rotation| rotation.recovery.as_ref())
-                        .is_some_and(|recovery| recovery.remote_ready == [true, true])
+                        .is_some_and(|recovery| recovery.progress.remote_ready_pair())
                 });
                 if !ready_pair {
                     return;
@@ -12001,7 +13132,7 @@ impl RelayActor {
             {
                 return;
             }
-            if recovery.ready_sent != [false, false] {
+            if recovery.progress.ready_sent() {
                 return;
             }
             let mut plans = HashMap::with_capacity(recovery.roster.stream_ids.len());
@@ -12173,10 +13304,15 @@ impl RelayActor {
             && let Some(rotation) = session.rotation.as_mut()
             && let Some(recovery) = rotation.recovery.as_mut()
         {
-            if recovery.activated {
+            // Activation happens once, and only from the acknowledged READY
+            // pair that `handle_recovery_resumed` checked before calling.
+            if recovery
+                .progress
+                .on_event(RecoveryEvent::Activated)
+                .is_err()
+            {
                 return;
             }
-            recovery.activated = true;
             // Latched before `reconcile_validated` below, which closes the
             // episode and clears the machine's own live reason.
             session.last_activated_recovery_reason = rotation
@@ -12226,10 +13362,6 @@ impl RelayActor {
             && let Some(candidate_carrier) = rotation.candidate.take()
         {
             session.active_carrier = Some(candidate_carrier);
-            session.data_tx = session
-                .active_carrier
-                .as_ref()
-                .map(|carrier| carrier.tx.clone());
             session.generation = attempt.new_generation;
             session.connection_id = attempt.new_connection_id.clone();
             {
@@ -12238,7 +13370,7 @@ impl RelayActor {
                     .owed_acks
                     .retain(|_, owed| owed.generation == generation);
                 if session.owed_acks.is_empty() {
-                    session.flow_control_owed_deadline = None;
+                    session.flow_control_owed_deadline.clear();
                 }
             }
             Self::retain_rotation_tombstone(rotation);
@@ -12248,12 +13380,10 @@ impl RelayActor {
             rotation.snapshot_id.clear();
             rotation.prepare_message_id.clear();
             rotation.last_message_id.clear();
-            rotation.abort_message_id = None;
+            rotation.abort.reset();
             rotation.peer_message_id.clear();
-            rotation.pending_abort_ack = None;
             Self::clear_phase_message_ids(rotation);
-            rotation.remote_fences = [None, None];
-            rotation.own_fence = None;
+            rotation.fences.clear();
             session.last_rotation = Instant::now();
         }
         for (carrier, frame, charged) in deferred {
@@ -12503,14 +13633,14 @@ impl RelayActor {
                             stream.operation_id == opened.operation_id
                                 && stream.open_message_id == opened.reply_to
                         })
-                        .map(|stream| stream.registration_dropped)
+                        .map(|stream| stream.admission.registration_dropped())
                         .unwrap_or(false);
                     if let Some(session) = self.session_mut(&key)
                         && let Some(stream) = session.streams.get_mut(&opened.stream_id)
                         && stream.operation_id == opened.operation_id
                         && stream.open_message_id == opened.reply_to
                     {
-                        stream.open_pending = false;
+                        stream.admission.apply(AdmissionEvent::Admitted);
                     }
                     // A unary echo's OPENED: the connector now holds a stream
                     // an abandoned exchange must end (task row M7-C94).
@@ -12523,8 +13653,8 @@ impl RelayActor {
                                     && pending.forget.open_message_id == opened.reply_to
                             })
                             .is_some_and(|pending| {
-                                pending.abandon.admitted = true;
-                                pending.abandon.abandoned
+                                pending.connector.apply(UnaryConnectorEvent::Admitted);
+                                pending.exchange.abandoned()
                             })
                     });
                     if unary_abandoned {
@@ -12539,7 +13669,7 @@ impl RelayActor {
                         let cause = self
                             .session_for(&key)
                             .and_then(|session| session.streams.get(&opened.stream_id))
-                            .and_then(|stream| stream.deferred_terminal_cause);
+                            .and_then(|stream| stream.admission.deferred_terminal_cause());
                         self.close_echo_stream_with_cause(
                             &key,
                             opened.stream_id,
@@ -12642,7 +13772,7 @@ impl RelayActor {
                         .session_for(&key)
                         .and_then(|session| session.streams.get(&rejected.stream_id))
                         .is_some_and(|stream| {
-                            stream.open_pending
+                            stream.admission.open_pending()
                                 && !stream.open_message_id.is_empty()
                                 && stream.operation_id == rejected.operation_id
                                 && stream.open_message_id == rejected.reply_to
@@ -13086,8 +14216,8 @@ impl RelayActor {
                 .pending
                 .get_mut(&message.stream_id)
                 .is_some_and(|pending| {
-                    pending.abandon.admitted = true;
-                    pending.abandon.abandoned
+                    pending.connector.apply(UnaryConnectorEvent::Admitted);
+                    pending.exchange.abandoned()
                 })
         });
         if abandoned_unary {
@@ -13098,7 +14228,7 @@ impl RelayActor {
             return;
         };
         let resolved = if let Some(pending) = session.pending.get_mut(&message.stream_id) {
-            if pending.dispatched || pending.authorization_in_flight {
+            if pending.exchange.dispatched() || pending.exchange.authorization_in_flight() {
                 return;
             }
             let expected_digest =
@@ -13110,7 +14240,9 @@ impl RelayActor {
                 mismatched = Some(MismatchedChallenge::Pending);
                 None
             } else {
-                pending.authorization_in_flight = true;
+                // Legal exactly here: not dispatched, none in flight, and an
+                // abandoned exchange returned above.
+                let _ = pending.exchange.apply(UnaryEvent::ChallengeAccepted);
                 pending.challenge_id = Some(challenge.challenge_id.clone());
                 Some((
                     pending.consumer.clone(),
@@ -13151,7 +14283,7 @@ impl RelayActor {
                 mismatched = Some(MismatchedChallenge::Stream);
                 None
             } else {
-                stream.open_pending = false;
+                stream.admission.apply(AdmissionEvent::Admitted);
                 stream.authorization_in_flight = true;
                 stream.authorization_started_at_ms = Some(authorization_started_at_ms);
                 stream.authorization_deadline_ms = Some(authorization_deadline_ms);
@@ -13282,8 +14414,8 @@ impl RelayActor {
         let Some(pending) = session.pending.get(&challenge.stream_id) else {
             return;
         };
-        if !pending.authorization_in_flight
-            || pending.dispatched
+        if !pending.exchange.authorization_in_flight()
+            || pending.exchange.dispatched()
             || pending.grant.revision != challenge.grant_revision
             || pending.service_id.to_string() != challenge.service_id
         {
@@ -13296,10 +14428,13 @@ impl RelayActor {
             // including authorization liveness, runs then.
             if let Some(session) = self.session_mut(&key)
                 && let Some(pending) = session.pending.get_mut(&challenge.stream_id)
-                && pending.deferred_authorization.is_none()
             {
-                pending.deferred_authorization = Some((challenge, result));
-                pending.freeze_authorization = FreezeAuthorization::Held;
+                // Refused while a result is already held: the first is kept.
+                let _ = pending
+                    .exchange
+                    .apply(UnaryEvent::ResultHeldByFreeze(Box::new((
+                        challenge, result,
+                    ))));
             }
             return;
         }
@@ -13312,7 +14447,7 @@ impl RelayActor {
         // Only an authorizing result is re-read: a held refusal stands, and
         // the fresh read applies every check below, so a grant revoked during
         // the freeze is still refused.
-        let freeze_authorization = pending.freeze_authorization;
+        let freeze_authorization = pending.exchange.freeze_authorization();
         if freeze_authorization == FreezeAuthorization::Held
             && let Ok((Some(held), _, _, _)) = &result
             && (held.valid_until <= Utc::now()
@@ -13324,7 +14459,7 @@ impl RelayActor {
             if let Some(session) = self.session_mut(&key)
                 && let Some(pending) = session.pending.get_mut(&challenge.stream_id)
             {
-                pending.freeze_authorization = FreezeAuthorization::Reread;
+                let _ = pending.exchange.apply(UnaryEvent::RereadStarted);
             }
             self.spawn_challenge_read(key, challenge, consumer, service_id, Utc::now(), spki);
             return;
@@ -13483,7 +14618,7 @@ impl RelayActor {
 
         if self
             .session_for(&key)
-            .and_then(|session| session.data_tx.as_ref())
+            .and_then(|session| session.data_tx())
             .is_none()
         {
             self.fail_pending(
@@ -13501,7 +14636,10 @@ impl RelayActor {
             let Some(pending) = session.pending.get(&challenge.stream_id) else {
                 return;
             };
-            let data_tx = session.data_tx.clone().expect("data socket checked above");
+            let data_tx = session
+                .data_tx()
+                .cloned()
+                .expect("data socket checked above");
             (
                 session.control_tx.clone(),
                 data_tx,
@@ -13647,8 +14785,10 @@ impl RelayActor {
         {
             let body_len = pending.body.len();
             pending.body.clear();
-            pending.authorization_in_flight = false;
-            pending.dispatched = true;
+            // The authorization was in flight when this result was accepted
+            // above and every exit since returned, so this is always legal.
+            let dispatched = pending.exchange.apply(UnaryEvent::Dispatched).is_ok();
+            debug_assert!(dispatched, "dispatch without an authorization in flight");
             session.queued_bytes = session.queued_bytes.saturating_sub(body_len);
             session.queue_budget.release(body_len);
             application_dispatched = true;
@@ -14276,14 +15416,19 @@ impl RelayActor {
                             .and_then(|rotation| rotation.candidate.as_ref())
                             .map(|candidate| candidate.tx.clone())
                     } else {
-                        session.data_tx.clone()
+                        // Field access, not `data_tx()`: `pending` borrows
+                        // another field of the session.
+                        session
+                            .active_carrier
+                            .as_ref()
+                            .map(|carrier| carrier.tx.clone())
                     };
                     let queue_budget = session.queue_budget.clone();
                     let tenant_id = session.identity.tenant_id;
                     let operation_id = pending.operation_id.clone();
-                    discard_response = pending.abandon.abandoned;
-                    let invalid_frame = !pending.dispatched
-                        || pending.abandon.connector_terminal
+                    discard_response = pending.exchange.abandoned();
+                    let invalid_frame = !pending.exchange.dispatched()
+                        || pending.connector.terminal()
                         || frame.ack > pending.send_sequence.saturating_add(1)
                         || frame.sequence <= pending.response_sequence
                         || frame.sequence != pending.response_sequence.saturating_add(1)
@@ -14504,8 +15649,8 @@ impl RelayActor {
                     .session_for(&key)
                     .and_then(|session| session.pending.get(&stream_id))
                     .is_some_and(|pending| {
-                        (pending.dispatched || forgets_unary)
-                            && !pending.abandon.connector_terminal
+                        (pending.exchange.dispatched() || forgets_unary)
+                            && !pending.connector.terminal()
                             && frame.ack <= pending.relay_last_emitted()
                             && pending.response_sequence.checked_add(1) == Some(frame.sequence)
                     });
@@ -14531,14 +15676,14 @@ impl RelayActor {
                             .and_then(|rotation| rotation.candidate.as_ref())
                             .map(|candidate| candidate.tx.clone())
                     } else {
-                        session.data_tx.clone()
+                        session.data_tx().cloned()
                     };
                     let queue_budget = session.queue_budget.clone();
                     if let Some(pending) = session.pending.get_mut(&stream_id) {
                         pending.response_sequence = frame.sequence;
                         pending.forget.peer_acked = pending.forget.peer_acked.max(frame.ack);
-                        pending.abandon.connector_terminal = true;
-                        pending.abandon.admitted = true;
+                        // The connector's terminal also proves admission.
+                        pending.connector.apply(UnaryConnectorEvent::Terminal);
                     }
                     (data_tx, queue_budget)
                 };
@@ -14573,7 +15718,7 @@ impl RelayActor {
                 let execution = if self
                     .session_for(&key)
                     .and_then(|session| session.pending.get(&stream_id))
-                    .is_some_and(|pending| pending.dispatched)
+                    .is_some_and(|pending| pending.exchange.dispatched())
                 {
                     "unknown"
                 } else {
@@ -14659,8 +15804,9 @@ impl RelayActor {
                     .rotation
                     .as_ref()
                     .and_then(|rotation| {
-                        rotation.remote_fences[direction_index(Direction::ConnectorToRelay)]
-                            .as_ref()
+                        rotation
+                            .fences
+                            .remote(direction_index(Direction::ConnectorToRelay))
                     })
                     .is_some_and(|fence| {
                         let attested = fence
@@ -14687,7 +15833,7 @@ impl RelayActor {
                     .as_ref()
                     .and_then(|rotation| rotation.recovery.as_ref())
                     .is_some_and(|recovery| {
-                        if recovery.activated {
+                        if recovery.progress.activated() {
                             return false;
                         }
                         let immutable_fence = recovery.remote_snapshots
@@ -14703,7 +15849,7 @@ impl RelayActor {
                         // snapshot is legal only after the coordinator has
                         // issued both READY decisions.  Before that point a
                         // frame would be an unaccounted application write.
-                        recovery.ready_sent == [true, true]
+                        recovery.progress.ready_sent()
                     });
             if carrier_is_candidate
                 && matches!(
@@ -14716,12 +15862,12 @@ impl RelayActor {
                     .as_ref()
                     .and_then(|rotation| rotation.recovery.as_ref())
                     .is_some_and(|recovery| {
-                        !recovery.activated
+                        !recovery.progress.activated()
                             && recovery.remote_snapshots
                                 [direction_index(Direction::ConnectorToRelay)]
                             .get(&frame.stream_id)
                             .is_none_or(|entry| frame.sequence > entry.last_emitted)
-                            && recovery.ready_sent != [true, true]
+                            && !recovery.progress.ready_sent()
                     })
             {
                 // Replay rides the candidate data socket and the connector's
@@ -14821,7 +15967,7 @@ impl RelayActor {
                     .and_then(|rotation| rotation.candidate.as_ref())
                     .map(|candidate| candidate.tx.clone())
             } else {
-                session.data_tx.clone()
+                session.data_tx().cloned()
             };
             let Some(data_tx) = data_tx else {
                 return;
@@ -15435,21 +16581,17 @@ impl RelayActor {
             .collect();
         let mut maintenance_candidates = Vec::with_capacity(keys.len());
         for key in keys {
-            let owner_fence_expired = self.session_for(&key).is_some_and(|session| {
-                session.cluster_profile
-                    && !session.owner_fenced
-                    && session
-                        .owner_fence_deadline
-                        .is_some_and(|deadline| now >= deadline)
-            });
+            let owner_fence_expired = self
+                .session_for(&key)
+                .is_some_and(|session| session.owner_fencing.handshake_expired(now));
             if owner_fence_expired {
                 self.close_session(&key, "OWNER_FENCE_TIMEOUT").await;
                 continue;
             }
             let detached_open_expired = self.session_for(&key).is_some_and(|session| {
                 session.streams.values().any(|stream| {
-                    stream.registration_dropped
-                        && stream.open_pending
+                    stream.admission.registration_dropped()
+                        && stream.admission.open_pending()
                         && now >= stream.admission_deadline
                 })
             });
@@ -15494,29 +16636,23 @@ impl RelayActor {
                 Self::prune_owed_acks(session);
             }
             self.retry_owed_acks(&key);
-            let flow_control_owed_expired = self.session_for(&key).is_some_and(|session| {
-                session
-                    .flow_control_owed_deadline
-                    .is_some_and(|deadline| now >= deadline)
-            });
+            let flow_control_owed_expired = self
+                .session_for(&key)
+                .is_some_and(|session| session.flow_control_owed_deadline.expired(now));
             if flow_control_owed_expired {
                 self.close_session(&key, FLOW_CONTROL_UNDELIVERABLE).await;
                 continue;
             }
-            let terminal_fin_failure_expired = self.session_for(&key).is_some_and(|session| {
-                session
-                    .terminal_fin_failure_deadline
-                    .is_some_and(|deadline| now >= deadline)
-            });
+            let terminal_fin_failure_expired = self
+                .session_for(&key)
+                .is_some_and(|session| session.terminal_fin_failure_deadline.expired(now));
             if terminal_fin_failure_expired {
                 self.close_session(&key, "TERMINAL_FIN_TIMEOUT").await;
                 continue;
             }
-            let owner_forget_expired = self.session_for(&key).is_some_and(|session| {
-                session
-                    .owner_forget_deadline
-                    .is_some_and(|deadline| now >= deadline)
-            });
+            let owner_forget_expired = self
+                .session_for(&key)
+                .is_some_and(|session| session.owner_forget_deadline.expired(now));
             if owner_forget_expired {
                 self.close_session(&key, "OWNER_FORGET_TIMEOUT").await;
                 continue;
@@ -15546,7 +16682,7 @@ impl RelayActor {
             self.flush_frozen_writes(&key);
             let rotation_due = self.session_for(&key).is_some_and(|session| {
                 session.profile.supports_rotation()
-                    && session.data_tx.is_some()
+                    && session.data_tx().is_some()
                     && session.rotation.as_ref().is_some_and(|rotation| {
                         matches!(rotation.state.phase(), RotationPhase::Active)
                             && session.last_rotation.elapsed()
@@ -15572,8 +16708,8 @@ impl RelayActor {
                 let bound = self.unary_abandon_bound(session);
                 session.pending.values().any(|pending| {
                     pending
-                        .abandon
-                        .abandoned_at
+                        .exchange
+                        .abandoned_at()
                         .is_some_and(|at| at.elapsed() > bound)
                 })
             });
@@ -15586,7 +16722,7 @@ impl RelayActor {
             // confirmed lease ran out, the owner may already be fenced:
             // close explicitly instead of dispatching under it.
             let unknown_lease_expired = self.session_for(&key).is_some_and(|session| {
-                session.owner_write_unknown.is_some()
+                session.lease_maintenance.is_outcome_unknown()
                     && session.last_lease_renewal.elapsed() >= self.options.owner_lease
             });
             if unknown_lease_expired {
@@ -15594,12 +16730,12 @@ impl RelayActor {
                 continue;
             }
             let Some(candidate) = self.session_for(&key).and_then(|session| {
-                (!session.maintenance_in_flight).then(|| MaintenanceCandidate {
+                (!session.lease_maintenance.is_in_flight()).then(|| MaintenanceCandidate {
                     key: key.clone(),
                     spki_fingerprint: session.identity.spki_fingerprint.clone(),
                     owner: session.owner.clone(),
                     last_lease_renewal: session.last_lease_renewal,
-                    owner_write_unknown: session.owner_write_unknown.is_some(),
+                    owner_write_unknown: session.lease_maintenance.is_outcome_unknown(),
                 })
             }) else {
                 continue;
@@ -15628,7 +16764,7 @@ impl RelayActor {
         let in_flight = self
             .sessions
             .values()
-            .filter(|session| session.maintenance_in_flight)
+            .filter(|session| session.lease_maintenance.is_in_flight())
             .count();
         let budget = MAX_MAINTENANCE_AUTHORITY_IN_FLIGHT.saturating_sub(in_flight);
         if budget == 0 {
@@ -15668,8 +16804,10 @@ impl RelayActor {
             self.maintenance_cursor = Some(last_recheck);
         }
         for (candidate, renew) in selected {
+            // Candidates are sessions with no round in flight, so the start
+            // is never refused.
             if let Some(session) = self.session_mut(&candidate.key) {
-                session.maintenance_in_flight = true;
+                let _ = session.lease_maintenance.on_event(LeaseEvent::RoundStarted);
             }
             let catalog = self.catalog.clone();
             let command_tx = self.command_tx.clone();
@@ -15766,8 +16904,10 @@ impl RelayActor {
             if session.key != key {
                 return;
             }
-            session.maintenance_in_flight = false;
-            let Some(unknown) = session.owner_write_unknown else {
+            let _ = session
+                .lease_maintenance
+                .on_event(LeaseEvent::OwnerReadReturned);
+            let Some(unknown) = session.lease_maintenance.unknown() else {
                 return;
             };
             match read {
@@ -15782,7 +16922,9 @@ impl RelayActor {
                         session.last_lease_renewal = Instant::now()
                             .checked_sub(consumed)
                             .unwrap_or_else(Instant::now);
-                        session.owner_write_unknown = None;
+                        let _ = session
+                            .lease_maintenance
+                            .on_event(LeaseEvent::OwnerConfirmed);
                         tracing::info!(
                             device_id = %key.device_id,
                             session_id = %key.session_id,
@@ -15873,7 +17015,22 @@ impl RelayActor {
             if session.key != key {
                 return;
             }
-            session.maintenance_in_flight = false;
+            // The round is settled here; only a renewal whose reply was lost
+            // leaves the unknown-outcome state behind.
+            let lost_reply = match &renewed {
+                Some(Err(error))
+                    if error.category == MaintenanceAuthorityCategory::OutcomeUnknown =>
+                {
+                    Some(UnknownOwnerWrite {
+                        since: Instant::now(),
+                        cause: error.unknown_cause,
+                    })
+                }
+                _ => None,
+            };
+            let _ = session
+                .lease_maintenance
+                .on_event(LeaseEvent::RoundFinished { lost_reply });
             if let Some(renewed) = renewed {
                 match renewed {
                     Ok(true) => session.last_lease_renewal = Instant::now(),
@@ -15886,13 +17043,8 @@ impl RelayActor {
                         // authority nor a fenced owner: keep the session
                         // unready and let the next maintenance round read
                         // the owner back.  `last_lease_renewal` is left at
-                        // its pre-write value.
-                        if session.owner_write_unknown.is_none() {
-                            session.owner_write_unknown = Some(UnknownOwnerWrite {
-                                since: Instant::now(),
-                                cause: error.unknown_cause,
-                            });
-                        }
+                        // its pre-write value.  The unknown outcome itself was
+                        // recorded by the `RoundFinished` transition above.
                         tracing::warn!(
                             device_id = %key.device_id,
                             session_id = %key.session_id,
@@ -16020,7 +17172,6 @@ impl RelayActor {
                     &key,
                     OwnerUnregisterKind::DataCarrier,
                 ));
-                session.data_tx = None;
                 session.active_carrier = None;
                 active_lost = true;
             }
@@ -16202,8 +17353,12 @@ impl RelayActor {
                                 {
                                     candidate_failure = true;
                                 } else {
-                                    rotation.abort_message_id =
-                                        Some(message.message_id().to_owned());
+                                    // This loss is what moved the attempt
+                                    // into `Aborting`, so no abort was
+                                    // queued for it before.
+                                    let _ = rotation.abort.on_event(AbortEvent::Queued(
+                                        message.message_id().to_owned(),
+                                    ));
                                     rotation.last_message_id = message.message_id().to_owned();
                                 }
                             } else {
@@ -16346,10 +17501,7 @@ impl RelayActor {
         // teardown had some other cause.  It is the difference between a
         // reason that *names* the reverse channel and a reverse channel that
         // is actually gone, and M4-35 turns on exactly that distinction.
-        let data_carrier_closed = session
-            .data_tx
-            .as_ref()
-            .is_some_and(mpsc::Sender::is_closed);
+        let data_carrier_closed = session.data_tx().is_some_and(mpsc::Sender::is_closed);
         tracing::info!(
             tenant_id = %session.identity.tenant_id,
             device_id = %key.device_id,
@@ -16372,7 +17524,7 @@ impl RelayActor {
             let _ = queue_control(&session.control_tx, &session.queue_budget, text);
         }
         let _ = session.control_tx.try_send(ControlOutbound::Close);
-        if let Some(data) = session.data_tx.take() {
+        if let Some(data) = session.data_tx() {
             let _ = data.try_send(DataOutbound::Close);
         }
         if let Some(rotation) = session.rotation.as_ref()
@@ -16577,10 +17729,17 @@ impl RelayActor {
     }
 
     async fn close_all(&mut self) {
+        // A close with no recorded cause was asked for directly.
+        self.stop(StopCause::Requested);
+        if let Ok(ActorLifecycle::Closing(cause)) = self.lifecycle_event(LifecycleEvent::Close) {
+            tracing::debug!(
+                cause = cause.label(),
+                phase = "closing",
+                "relay actor is closing"
+            );
+        }
         let deadline = tokio::time::Instant::now() + CLEANUP_SHUTDOWN_TIMEOUT;
-        let refused_count = self
-            .cleanup_dispatcher
-            .as_ref()
+        let refused_count = owner_cleanup_dispatcher(&self.cleanup)
             .map(|dispatcher| dispatcher.refused_count.clone());
         // Stop every background result sender before the actor stops draining
         // commands.  A queued registration command dropped by the drain
@@ -16604,8 +17763,8 @@ impl RelayActor {
         // only while its bounded queue has room; the rest are kept, behind
         // any a running `tick` already kept, and released below, after the
         // worker has shut down, within this same deadline (task rows M6-C185
-        // and M6-C186).  The kept list is shared with the supervisor, so a
-        // panic or abort from here on does not drop it (task row M6-C187).
+        // and M6-C186).  The supervisor inherits the kept list, so a panic
+        // or abort from here on does not drop it (task row M6-C187).
         self.owner_backlog.lift_cap();
         for key in keys {
             self.close_session(&key, "SHUTDOWN").await;
@@ -16636,14 +17795,16 @@ impl RelayActor {
         // below, after the worker has shut down, within this same deadline.
         // The registry is closed first either way, so a later deposit keeps
         // its guard with its own handoff.
-        self.claim_handoffs.close();
+        self.cleanup_state.claims.close();
         // The worker may have drained while background tasks were joined:
         // offer it the kept session owners again first (task row M6-C187).
         self.offer_owner_backlog();
-        if let Some(dispatcher) = self.cleanup_dispatcher.as_ref() {
-            while dispatcher.enqueue_if_room(|| self.claim_handoffs.take_next_after_end()) {}
+        if let Some(dispatcher) = owner_cleanup_dispatcher(&self.cleanup) {
+            let claims = &mut self.cleanup_state.claims;
+            while dispatcher.enqueue_if_room(|| claims.take_next_after_end()) {}
         }
-        self.cleanup_dispatcher.take();
+        // Shutting the worker down drops its dispatcher, the last one the
+        // actor holds, so the worker drains what its queue accepted and ends.
         if let Some(cleanup) = self.cleanup.take()
             && !cleanup.shutdown_until(deadline).await
         {
@@ -16666,8 +17827,9 @@ impl RelayActor {
         // dispatcher is gone, so a late close now finds no worker and
         // releases its token directly, as before.
         let catalog = &self.catalog;
+        let cleanup_state = &mut *self.cleanup_state;
         let (owners_attempted, owners_abandoned) =
-            release_backlog_until(catalog, &self.owner_backlog, deadline, false).await;
+            release_backlog_until(catalog, &mut cleanup_state.backlog, deadline, false).await;
         let counters = self.owner_backlog.counters();
         counters
             .shutdown_attempted
@@ -16698,7 +17860,7 @@ impl RelayActor {
             );
         }
         let (released, abandoned) =
-            release_parked_until(&self.claim_handoffs, deadline, |item| async move {
+            release_parked_until(&mut cleanup_state.claims, deadline, |item| async move {
                 release_cleanup_item(catalog, &item).await
             })
             .await;
@@ -16785,13 +17947,17 @@ impl RelayActor {
             snapshot_id: (!rotation.snapshot_id.is_empty()).then(|| rotation.snapshot_id.clone()),
             attempt: rotation.attempt.clone(),
             attempt_active: rotation.attempt.is_some(),
-            relay_fence_digest: fence_digest(rotation.own_fence.as_ref()),
+            relay_fence_digest: fence_digest(rotation.fences.own()),
             connector_fence_digest: fence_digest(
-                rotation.remote_fences[direction_index(Direction::ConnectorToRelay)].as_ref(),
+                rotation
+                    .fences
+                    .remote(direction_index(Direction::ConnectorToRelay)),
             ),
-            relay_fence_sequences: fence_sequences(rotation.own_fence.as_ref()),
+            relay_fence_sequences: fence_sequences(rotation.fences.own()),
             connector_fence_sequences: fence_sequences(
-                rotation.remote_fences[direction_index(Direction::ConnectorToRelay)].as_ref(),
+                rotation
+                    .fences
+                    .remote(direction_index(Direction::ConnectorToRelay)),
             ),
             relay_ack_sequences: ack_sequences(
                 drain_set
@@ -16851,7 +18017,7 @@ impl RelayActor {
             });
             let sockets = status
                 .as_ref()
-                .map_or(if session.data_tx.is_some() { 2 } else { 1 }, |status| {
+                .map_or(if session.data_tx().is_some() { 2 } else { 1 }, |status| {
                     status.socket_count
                 });
             let rotation_started_at_ms = status.as_ref().and_then(|status| status.started_at_ms);
@@ -16878,7 +18044,7 @@ impl RelayActor {
             // channels hold, which is the only way to distinguish a saturated
             // queue from a session that merely admitted many streams.
             let control_queue = control_occupancy(&session.control_tx);
-            let data_queue = session.data_tx.as_ref().map(data_occupancy);
+            let data_queue = session.data_tx().map(data_occupancy);
             let mut streams = Vec::with_capacity(session.pending.len() + session.streams.len());
             let mut replay_frames = 0usize;
             let mut replay_bytes = 0usize;
@@ -16898,7 +18064,7 @@ impl RelayActor {
                         .saturating_add(pending.response_body.len()),
                     terminal: false,
                     admission_claimed: false,
-                    authorization_in_flight: pending.authorization_in_flight,
+                    authorization_in_flight: pending.exchange.authorization_in_flight(),
                     authorization_started_at_ms: None,
                     authorization_deadline_ms: None,
                     authorization_admission_deadline_ms: None,
@@ -16947,7 +18113,8 @@ impl RelayActor {
                 epoch: session.key.epoch,
                 profile: session.profile.as_str(),
                 owner_write_unknown: session
-                    .owner_write_unknown
+                    .lease_maintenance
+                    .unknown()
                     .map(UnknownOwnerWrite::cause_str),
                 phase,
                 active_generation,
@@ -17069,9 +18236,9 @@ impl RelayActor {
                 && pending.epoch == ticket.epoch
                 && pending.generation == ticket.generation
                 && pending.connection_id == ticket.connection_id
-                && pending.candidate == ticket.candidate
+                && pending.kind == ticket.kind
                 && pending.attachment_purpose == ticket.attachment_purpose
-                && pending.consuming
+                && pending.is_consuming()
                 && pending.expires_at == ticket.expires_at
                 && pending.expires_at_wall == ticket.expires_at_wall
         })
@@ -17131,7 +18298,7 @@ impl RelayActor {
                     .pending
                     .iter()
                     .filter(|(_, pending)| {
-                        !pending.abandon.abandoned
+                        !pending.exchange.abandoned()
                             && (pending.response.is_closed()
                                 || pending.created_at.elapsed()
                                     > self.options.limits.operation_timeout)
@@ -17192,16 +18359,17 @@ impl RelayActor {
         let Some(pending) = session.pending.get_mut(&stream_id) else {
             return;
         };
-        if pending.abandon.abandoned {
+        if pending.exchange.abandoned() {
             return;
         }
         let (dummy, _) = oneshot::channel();
         let response = std::mem::replace(&mut pending.response, dummy);
         let _ = response.send(EchoOutcome::Failure { code, execution });
-        pending.abandon.abandoned = true;
-        pending.abandon.abandoned_at = Some(Instant::now());
-        pending.deferred_authorization = None;
-        pending.authorization_in_flight = false;
+        // Legal from every state that is not already abandoned (checked
+        // above); it ends any authorization in flight and drops a held result.
+        let _ = pending
+            .exchange
+            .apply(UnaryEvent::Abandoned { at: Instant::now() });
         // Nothing is delivered any more: return the undispatched body and
         // any partial response to the session budget now.
         let released = pending
@@ -17231,16 +18399,17 @@ impl RelayActor {
             let Some(pending) = session.pending.get(&stream_id) else {
                 return true;
             };
-            if !pending.abandon.abandoned {
+            if !pending.exchange.abandoned() {
                 return true;
             }
-            let owes_reset =
-                !pending.dispatched && !pending.abandon.relay_reset && pending.abandon.admitted;
+            let owes_reset = !pending.exchange.dispatched()
+                && !pending.exchange.relay_reset()
+                && pending.connector.admitted();
             // No writable carrier means the session is ending or recovering;
             // recovery resumes the writer and flushes this again.
             if owes_reset
                 && !frozen
-                && let Some(data_tx) = session.data_tx.clone()
+                && let Some(data_tx) = session.data_tx().cloned()
             {
                 let frame = Frame::reset(
                     session.key.epoch,
@@ -17264,7 +18433,9 @@ impl RelayActor {
                 match queued {
                     Ok(()) => {
                         if let Some(pending) = session.pending.get_mut(&stream_id) {
-                            pending.abandon.relay_reset = true;
+                            // Legal: abandoned, undispatched and not yet
+                            // reset is exactly `owes_reset` above.
+                            let _ = pending.exchange.apply(UnaryEvent::RelayReset);
                         }
                     }
                     Err(QueueRefusal::Budget | QueueRefusal::Full) => {}
@@ -17289,8 +18460,8 @@ impl RelayActor {
         let Some(pending) = session.pending.get(&stream_id) else {
             return true;
         };
-        let relay_ended = pending.dispatched || pending.abandon.relay_reset;
-        if !(relay_ended && pending.abandon.connector_terminal) {
+        let relay_ended = pending.exchange.dispatched() || pending.exchange.relay_reset();
+        if !(relay_ended && pending.connector.terminal()) {
             return true;
         }
         let frozen_snapshot_id = Self::frozen_snapshot_id(session);
@@ -17300,7 +18471,7 @@ impl RelayActor {
         release_pending_budget(session, &pending);
         let mut identity = pending.forget.clone();
         identity.response_sequence = pending.response_sequence;
-        let evidence = if pending.dispatched {
+        let evidence = if pending.exchange.dispatched() {
             UnaryTombstoneEvidence::Completed(identity)
         } else {
             UnaryTombstoneEvidence::RelayReset(identity)
@@ -17358,38 +18529,15 @@ impl RelayActor {
             .map_err(|_| RelayError::Overloaded("control queue is full"))
     }
 
-    /// Commit the connector's exact OWNER_FENCED acknowledgement.  The
-    /// handshake deadline is consumed only before this transition; after the
-    /// latch is established, normal dispatch freshness is enforced by the
-    /// existing challenge-bound authorization path.
+    /// Apply the connector's OWNER_FENCED to the session's handshake (see
+    /// [`OwnerFencing::on_owner_fenced`]); a refused acknowledgement closes
+    /// the session with its typed reason.
     async fn handle_owner_fenced(&mut self, key: &SessionKey, fenced: OwnerFenced) {
-        let mut failure = None;
-        if let Some(session) = self.session_mut(key) {
-            if !session.cluster_profile {
-                failure = Some("UNEXPECTED_OWNER_FENCED");
-            } else if let Some(expected) = session.owner_fence.as_ref() {
-                if fenced.validate_context(expected).is_err() {
-                    failure = Some("OWNER_FENCE_CONTEXT");
-                } else if session.owner_fenced {
-                    if session.owner_fence_ack.as_ref() != Some(&fenced) {
-                        failure = Some("OWNER_FENCE_DUPLICATE");
-                    }
-                } else if session
-                    .owner_fence_deadline
-                    .is_some_and(|deadline| Instant::now() >= deadline)
-                {
-                    failure = Some("OWNER_FENCE_DEADLINE");
-                } else {
-                    session.owner_fenced = true;
-                    session.owner_fence_ack = Some(fenced);
-                    session.owner_fence_deadline = None;
-                }
-            } else {
-                failure = Some("OWNER_FENCE_MISSING");
-            }
-        }
-        if let Some(reason) = failure {
-            self.protocol_failure(key, reason).await;
+        let Some(session) = self.session_mut(key) else {
+            return;
+        };
+        if let Err(refusal) = session.owner_fencing.on_owner_fenced(fenced, Instant::now) {
+            self.protocol_failure(key, refusal.code()).await;
         }
     }
 }
@@ -18493,7 +19641,6 @@ mod stream_identity_tests {
         {
             let session = actor.sessions.get_mut(&key.scope()).expect("test session");
             session.profile = super::RuntimeProfile::M2;
-            session.data_tx = Some(data_tx.clone());
             session.active_carrier = Some(DataCarrier {
                 context: carrier.context(),
                 tx: data_tx,
@@ -18528,9 +19675,7 @@ mod stream_identity_tests {
                     terminal: false,
                     pending_terminal: None,
                     terminal_fin_failure: false,
-                    open_pending: false,
-                    registration_dropped: false,
-                    deferred_terminal_cause: None,
+                    admission: crate::actor::StreamAdmission::Admitted,
                     credit_held: false,
                     closed: tokio_util::sync::CancellationToken::new(),
                     admission_lease: tokio_util::sync::CancellationToken::new(),
@@ -18652,7 +19797,6 @@ mod stream_identity_tests {
         {
             let session = actor.sessions.get_mut(&key.scope()).expect("test session");
             session.profile = super::RuntimeProfile::M2;
-            session.data_tx = Some(data_tx.clone());
             session.active_carrier = Some(DataCarrier {
                 context: carrier.context(),
                 tx: data_tx,
@@ -18689,9 +19833,7 @@ mod stream_identity_tests {
                     terminal: false,
                     pending_terminal: None,
                     terminal_fin_failure: false,
-                    open_pending: false,
-                    registration_dropped: false,
-                    deferred_terminal_cause: None,
+                    admission: crate::actor::StreamAdmission::Admitted,
                     credit_held: false,
                     closed: tokio_util::sync::CancellationToken::new(),
                     admission_lease: tokio_util::sync::CancellationToken::new(),
@@ -19008,7 +20150,6 @@ mod stream_identity_tests {
         };
         {
             let session = actor.sessions.get_mut(&key.scope()).expect("test session");
-            session.data_tx = Some(data_tx.clone());
             session.active_carrier = Some(DataCarrier {
                 context: carrier.context(),
                 tx: data_tx,
@@ -19027,7 +20168,7 @@ mod stream_identity_tests {
 
         let session = actor.sessions.get(&key.scope()).expect("session retained");
         assert!(
-            session.active_carrier.is_none() && session.data_tx.is_none(),
+            session.active_carrier.is_none() && session.data_tx().is_none(),
             "the data carrier registration is actually gone"
         );
 
@@ -19205,6 +20346,39 @@ mod stream_identity_tests {
         );
     }
 
+    /// The data writer is the active carrier's own sender: a session has
+    /// both or neither.
+    #[tokio::test]
+    async fn the_data_writer_exists_exactly_while_a_carrier_is_active() {
+        let now = Utc::now();
+        let key = SessionKey {
+            tenant_id: Uuid::from_u128(1),
+            device_id: Uuid::from_u128(2),
+            session_id: "carrier-writer".to_owned(),
+            epoch: 1,
+        };
+        let (mut actor, _registration) =
+            admitted_control_actor(ec061_identity(&key, now), key.clone());
+        let session = actor.sessions.get_mut(&key.scope()).expect("session");
+        assert!(session.active_carrier.is_none() && session.data_tx().is_none());
+
+        let (data_tx, _data_rx) = mpsc::channel(1);
+        session.attach_data_for_test(data_tx.clone());
+        assert!(
+            session
+                .data_tx()
+                .is_some_and(|writer| writer.same_channel(&data_tx))
+        );
+        let carrier = session.active_carrier.as_ref().expect("active carrier");
+        assert_eq!(
+            carrier.context,
+            CarrierContext::new(key.session_id.clone(), key.epoch, 1, "test-data")
+        );
+
+        session.active_carrier = None;
+        assert!(session.data_tx().is_none());
+    }
+
     pub(super) fn admitted_control_actor(
         identity: DeviceIdentity,
         key: SessionKey,
@@ -19235,27 +20409,22 @@ mod stream_identity_tests {
             owner,
             key: key.clone(),
             control_tx,
-            data_tx: None,
             active_carrier: None,
             generation: 1,
             connection_id: "test-data".to_owned(),
             profile: super::RuntimeProfile::M1,
-            cluster_profile: false,
-            owner_fence: None,
-            owner_fenced: true,
-            owner_fence_ack: None,
-            owner_fence_deadline: None,
+            owner_fencing: super::OwnerFencing::NotRequired,
             next_stream_id: 1,
             pending: HashMap::new(),
             unary_tombstones: HashMap::new(),
             connector_rejected_log: Default::default(),
             streams: HashMap::new(),
             forgotten_stream_through: 0,
-            owner_forget_deadline: None,
-            terminal_fin_failure_deadline: None,
+            owner_forget_deadline: crate::actor::FailClosedDeadline::Idle,
+            terminal_fin_failure_deadline: crate::actor::FailClosedDeadline::Idle,
             owed_acks: Default::default(),
             terminal_fin_failed_at: Default::default(),
-            flow_control_owed_deadline: None,
+            flow_control_owed_deadline: crate::actor::FailClosedDeadline::Idle,
             http_freeze_published: false,
             rotation: None,
             last_rotation: std::time::Instant::now(),
@@ -19265,8 +20434,7 @@ mod stream_identity_tests {
             queued_bytes: 0,
             queue_budget: queue_budget.clone(),
             last_lease_renewal: std::time::Instant::now(),
-            maintenance_in_flight: false,
-            owner_write_unknown: None,
+            lease_maintenance: crate::actor::LeaseMaintenance::Idle,
             closed: false,
             principal_sessions_end: false,
         };
@@ -19276,6 +20444,8 @@ mod stream_identity_tests {
         let dispatcher = TerminalCleanupDispatcher::new(terminal_tx);
         let mut sessions = HashMap::new();
         sessions.insert(key.scope(), session);
+        let (owner_backlog, owner_backlog_drain) =
+            super::OwnerBacklog::new(super::CLEANUP_QUEUE_CAPACITY);
         let actor = RelayActor {
             #[cfg(test)]
             dispatch_race_delay: None,
@@ -19308,14 +20478,16 @@ mod stream_identity_tests {
             peer_fault_diagnostics: super::PeerFaultDiagnostics::default(),
             http_forward_diagnostics: super::HttpForwardDiagnostics::default(),
             http_maintenance: super::HttpMaintenance::default(),
-            cleanup_dispatcher: None,
             cleanup: None,
-            owner_backlog: super::OwnerBacklog::new(super::CLEANUP_QUEUE_CAPACITY),
+            owner_backlog,
             owner_backlog_notify: Arc::new(tokio::sync::Notify::new()),
-            claim_handoffs: super::ClaimHandoffs::default(),
+            cleanup_state: super::ActorCleanupBequest::unsupervised(super::ActorCleanupState {
+                claims: super::ClaimHandoffs::default(),
+                backlog: owner_backlog_drain,
+            }),
             background_tasks: tokio::task::JoinSet::new(),
             background_failure: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            shutting_down: false,
+            lifecycle: super::ActorLifecycle::Running,
             freeze_hold: super::freeze_hold::FreezeHold::default(),
             actor_load: Arc::default(),
         };
@@ -19471,7 +20643,6 @@ mod stream_identity_tests {
             session.profile = super::RuntimeProfile::M2;
             session.generation = carrier.generation;
             session.connection_id = carrier.connection_id.clone();
-            session.data_tx = Some(data_tx.clone());
             session.active_carrier = Some(DataCarrier {
                 context: carrier.context(),
                 tx: data_tx,
@@ -19890,7 +21061,6 @@ mod stream_identity_tests {
             session.profile = super::RuntimeProfile::M2;
             session.generation = carrier.generation;
             session.connection_id = carrier.connection_id.clone();
-            session.data_tx = Some(data_tx.clone());
             session.active_carrier = Some(DataCarrier {
                 context: carrier.context(),
                 tx: data_tx,
@@ -20142,7 +21312,6 @@ mod stream_identity_tests {
             session.profile = super::RuntimeProfile::M2;
             session.generation = carrier.generation;
             session.connection_id = carrier.connection_id.clone();
-            session.data_tx = Some(data_tx.clone());
             session.active_carrier = Some(DataCarrier {
                 context: carrier.context(),
                 tx: data_tx,
@@ -20392,7 +21561,6 @@ mod stream_identity_tests {
         };
         if let Some(session) = actor.sessions.get_mut(&carrier.session.scope()) {
             session.profile = super::RuntimeProfile::M2;
-            session.data_tx = Some(data_tx.clone());
             session.active_carrier = Some(DataCarrier {
                 context: carrier.context(),
                 tx: data_tx,
@@ -20492,7 +21660,7 @@ mod stream_identity_tests {
             .sessions
             .get_mut(&key.scope())
             .expect("test session")
-            .data_tx = Some(data_tx);
+            .attach_data_for_test(data_tx);
 
         let consumer = AuthenticatedConsumer {
             tenant_id,
@@ -20532,7 +21700,13 @@ mod stream_identity_tests {
                 .get_mut(&stream_id)
                 .expect("owner-local pending request");
             assert!(pending.body.is_empty());
-            pending.authorization_in_flight = true;
+            // Rebuilt through the transition (was a direct flag write).
+            assert!(
+                pending
+                    .exchange
+                    .apply(crate::actor::UnaryEvent::ChallengeAccepted)
+                    .is_ok()
+            );
             pending.challenge_id = Some(challenge_id.to_owned());
         } else {
             panic!("test session disappeared before authorization");
@@ -20573,7 +21747,7 @@ mod stream_identity_tests {
                 .sessions
                 .get(&key.scope())
                 .and_then(|session| session.pending.get(&stream_id))
-                .is_some_and(|pending| pending.dispatched)
+                .is_some_and(|pending| pending.exchange.dispatched())
         );
 
         let Some(DataOutbound::Binary(mut bytes)) = data_rx.recv().await else {
@@ -20684,9 +21858,8 @@ mod stream_identity_tests {
         let (data_tx, _data_rx) = mpsc::channel(actor.options.limits.max_queue_messages);
         if let Some(session) = actor.sessions.get_mut(&key.scope()) {
             session.profile = super::RuntimeProfile::M2;
-            session.cluster_profile = true;
-            session.owner_fenced = false;
-            session.data_tx = Some(data_tx.clone());
+            session.owner_fencing =
+                super::OwnerFencing::awaiting_ack_for_test(&session.key, &session.owner);
             session.active_carrier = Some(DataCarrier {
                 context: CarrierKey {
                     session: key.clone(),
@@ -21213,27 +22386,22 @@ mod stream_identity_tests {
                     },
                     key: successor_key.clone(),
                     control_tx,
-                    data_tx: None,
                     active_carrier: None,
                     generation: 1,
                     connection_id: "successor-data".to_owned(),
                     profile: super::RuntimeProfile::M1,
-                    cluster_profile: false,
-                    owner_fence: None,
-                    owner_fenced: true,
-                    owner_fence_ack: None,
-                    owner_fence_deadline: None,
+                    owner_fencing: super::OwnerFencing::NotRequired,
                     next_stream_id: 1,
                     pending: HashMap::new(),
                     unary_tombstones: HashMap::new(),
                     connector_rejected_log: Default::default(),
                     streams: HashMap::new(),
                     forgotten_stream_through: 0,
-                    owner_forget_deadline: None,
-                    terminal_fin_failure_deadline: None,
+                    owner_forget_deadline: crate::actor::FailClosedDeadline::Idle,
+                    terminal_fin_failure_deadline: crate::actor::FailClosedDeadline::Idle,
                     owed_acks: Default::default(),
                     terminal_fin_failed_at: Default::default(),
-                    flow_control_owed_deadline: None,
+                    flow_control_owed_deadline: crate::actor::FailClosedDeadline::Idle,
                     http_freeze_published: false,
                     rotation: None,
                     last_rotation: std::time::Instant::now(),
@@ -21243,8 +22411,7 @@ mod stream_identity_tests {
                     queued_bytes: 0,
                     queue_budget: queue_budget.clone(),
                     last_lease_renewal: std::time::Instant::now(),
-                    maintenance_in_flight: false,
-                    owner_write_unknown: None,
+                    lease_maintenance: crate::actor::LeaseMaintenance::Idle,
                     closed: false,
                     principal_sessions_end: false,
                 },
@@ -21270,7 +22437,6 @@ mod stream_identity_tests {
             connection_id: "dropped-data".to_owned(),
         };
         if let Some(session) = data_actor.sessions.get_mut(&stale_key.scope()) {
-            session.data_tx = Some(data_tx.clone());
             session.active_carrier = Some(DataCarrier {
                 context: CarrierContext::new(
                     stale_key.session_id.clone(),
@@ -21295,7 +22461,7 @@ mod stream_identity_tests {
                 .sessions
                 .get(&stale_key.scope())
                 .is_some_and(
-                    |session| session.data_tx.is_none() && session.active_carrier.is_none()
+                    |session| session.data_tx().is_none() && session.active_carrier.is_none()
                 )
         );
         drop(control_registration);
@@ -21306,7 +22472,6 @@ mod stream_identity_tests {
             mpsc::channel(echo_actor.options.limits.max_queue_messages);
         if let Some(session) = echo_actor.sessions.get_mut(&stale_key.scope()) {
             session.profile = super::RuntimeProfile::M2;
-            session.data_tx = Some(echo_data_tx.clone());
             session.active_carrier = Some(DataCarrier {
                 context: carrier.context(),
                 tx: echo_data_tx,
@@ -21374,8 +22539,8 @@ mod stream_identity_tests {
                 .is_some_and(|session| {
                     session.streams.len() == baseline_streams + 1
                         && session.streams.get(&stream_id).is_some_and(|stream| {
-                            stream.open_pending
-                                && stream.registration_dropped
+                            stream.admission.open_pending()
+                                && stream.admission.registration_dropped()
                                 && stream.closed.is_cancelled()
                         })
                 })
@@ -21505,16 +22670,17 @@ mod stream_identity_tests {
                             .streams
                             .get(&opened_stream_id)
                             .is_some_and(|stream| {
-                                !stream.open_pending
-                                    && stream.registration_dropped
+                                !stream.admission.open_pending()
+                                    && stream.admission.registration_dropped()
                                     && stream.terminal
                                     && stream.terminal_fin_failure
                             })
                 })
         );
         if let Some(session) = echo_actor.sessions.get_mut(&stale_key.scope()) {
-            session.terminal_fin_failure_deadline =
-                Some(std::time::Instant::now() - std::time::Duration::from_millis(1));
+            session.terminal_fin_failure_deadline.set(Some(
+                std::time::Instant::now() - std::time::Duration::from_millis(1),
+            ));
         }
         echo_actor.tick().await;
         assert!(
@@ -21582,7 +22748,6 @@ mod stream_identity_tests {
             let (data_tx, mut data_rx) = mpsc::channel(actor.options.limits.max_queue_messages);
             let session = actor.sessions.get_mut(&key.scope()).expect("test session");
             session.profile = super::RuntimeProfile::M2;
-            session.data_tx = Some(data_tx.clone());
             session.active_carrier = Some(DataCarrier {
                 context: CarrierContext::new(
                     key.session_id.clone(),
@@ -21613,7 +22778,9 @@ mod stream_identity_tests {
                 .streams
                 .get_mut(&admitted.stream_id)
                 .expect("admitted stream");
-            stream.open_pending = false;
+            stream
+                .admission
+                .apply(crate::actor::AdmissionEvent::Admitted);
             stream.authorization_in_flight = true;
             stream.authorization_failure_code = prior_code;
             if expired {
@@ -21704,7 +22871,6 @@ mod stream_identity_tests {
         let (data_tx, _data_rx) = mpsc::channel(actor.options.limits.max_queue_messages);
         let session = actor.sessions.get_mut(&key.scope()).expect("test session");
         session.profile = super::RuntimeProfile::M2;
-        session.data_tx = Some(data_tx.clone());
         session.active_carrier = Some(DataCarrier {
             context: CarrierContext::new(
                 key.session_id.clone(),
@@ -21742,7 +22908,9 @@ mod stream_identity_tests {
                 .streams
                 .get_mut(&admitted.stream_id)
                 .expect("admitted stream");
-            stream.open_pending = false;
+            stream
+                .admission
+                .apply(crate::actor::AdmissionEvent::Admitted);
             stream.authorization_in_flight = true;
             stream.authorization_started_at_ms = Some(started_at_ms);
             stream.authorization_deadline_ms = Some(started_at_ms + 2_000);
@@ -21865,7 +23033,6 @@ mod stream_identity_tests {
         let (data_tx, mut data_rx) = mpsc::channel(actor.options.limits.max_queue_messages);
         let session = actor.sessions.get_mut(&key.scope()).expect("test session");
         session.profile = super::RuntimeProfile::M2;
-        session.data_tx = Some(data_tx.clone());
         session.active_carrier = Some(DataCarrier {
             context: CarrierContext::new(
                 key.session_id.clone(),
@@ -21901,7 +23068,9 @@ mod stream_identity_tests {
                 .streams
                 .get_mut(&admitted.stream_id)
                 .expect("admitted stream");
-            stream.open_pending = false;
+            stream
+                .admission
+                .apply(crate::actor::AdmissionEvent::Admitted);
             stream.authorization_in_flight = true;
             stream.authorization_started_at_ms = Some(started_at_ms);
             stream.authorization_deadline_ms = Some(started_at_ms + 2_000);
@@ -21966,7 +23135,7 @@ mod stream_identity_tests {
         // whose FIN was queued normally above.
         let session = &actor.sessions[&key.scope()];
         assert!(!session.streams[&admitted.stream_id].terminal_fin_failure);
-        assert!(session.terminal_fin_failure_deadline.is_none());
+        assert!(session.terminal_fin_failure_deadline.is_idle());
     }
 
     /// A refused challenge on a **live** filesystem stream must reach the
@@ -22035,7 +23204,6 @@ mod stream_identity_tests {
         let (data_tx, _data_rx) = mpsc::channel(actor.options.limits.max_queue_messages);
         let session = actor.sessions.get_mut(&key.scope()).expect("test session");
         session.profile = super::RuntimeProfile::M2;
-        session.data_tx = Some(data_tx.clone());
         session.active_carrier = Some(DataCarrier {
             context: CarrierContext::new(
                 key.session_id.clone(),
@@ -22076,7 +23244,9 @@ mod stream_identity_tests {
                 .streams
                 .get_mut(&stream_id)
                 .expect("admitted stream");
-            stream.open_pending = false;
+            stream
+                .admission
+                .apply(crate::actor::AdmissionEvent::Admitted);
             stream.authorization_in_flight = true;
             stream.authorization_started_at_ms = Some(started_at_ms);
             stream.authorization_deadline_ms = Some(started_at_ms + 2_000);
@@ -22199,7 +23369,6 @@ mod stream_identity_tests {
             let (data_tx, _data_rx) = mpsc::channel(actor.options.limits.max_queue_messages);
             let session = actor.sessions.get_mut(&key.scope()).expect("test session");
             session.profile = super::RuntimeProfile::M2;
-            session.data_tx = Some(data_tx.clone());
             session.active_carrier = Some(DataCarrier {
                 context: CarrierContext::new(
                     key.session_id.clone(),
@@ -22238,7 +23407,9 @@ mod stream_identity_tests {
                     .streams
                     .get_mut(&stream_id)
                     .expect("admitted stream");
-                stream.open_pending = false;
+                stream
+                    .admission
+                    .apply(crate::actor::AdmissionEvent::Admitted);
                 stream.authorization_in_flight = true;
                 stream.authorization_started_at_ms = Some(started_at_ms);
                 stream.authorization_deadline_ms = Some(started_at_ms + 2_000);
@@ -22342,7 +23513,6 @@ mod stream_identity_tests {
         let (data_tx, _data_rx) = mpsc::channel(actor.options.limits.max_queue_messages);
         let session = actor.sessions.get_mut(&key.scope()).expect("test session");
         session.profile = super::RuntimeProfile::M2;
-        session.data_tx = Some(data_tx.clone());
         session.active_carrier = Some(DataCarrier {
             context: CarrierContext::new(
                 key.session_id.clone(),
@@ -22383,7 +23553,9 @@ mod stream_identity_tests {
                 .streams
                 .get_mut(&stream_id)
                 .expect("admitted stream");
-            stream.open_pending = false;
+            stream
+                .admission
+                .apply(crate::actor::AdmissionEvent::Admitted);
             stream.authorization_in_flight = true;
             stream.authorization_started_at_ms = Some(started_at_ms);
             stream.authorization_deadline_ms = Some(started_at_ms + 2_000);
@@ -22491,7 +23663,6 @@ mod stream_identity_tests {
         let (data_tx, mut data_rx) = mpsc::channel(actor.options.limits.max_queue_messages);
         let session = actor.sessions.get_mut(&key.scope()).expect("test session");
         session.profile = super::RuntimeProfile::M2;
-        session.data_tx = Some(data_tx.clone());
         session.active_carrier = Some(DataCarrier {
             context: CarrierContext::new(
                 key.session_id.clone(),
@@ -22532,7 +23703,9 @@ mod stream_identity_tests {
                 .streams
                 .get_mut(&stream_id)
                 .expect("admitted stream");
-            stream.open_pending = false;
+            stream
+                .admission
+                .apply(crate::actor::AdmissionEvent::Admitted);
             assert!(
                 stream
                     .http
@@ -22548,7 +23721,6 @@ mod stream_identity_tests {
                 .receive_credit();
             // The data socket failed: no active carrier until recovery
             // activates its successor.
-            session.data_tx = None;
             session.active_carrier = None;
             credit
         };
@@ -22576,7 +23748,6 @@ mod stream_identity_tests {
         // Recovery installs the successor carrier.
         {
             let session = actor.sessions.get_mut(&key.scope()).expect("test session");
-            session.data_tx = Some(data_tx.clone());
             session.active_carrier = Some(DataCarrier {
                 context: CarrierContext::new(
                     key.session_id.clone(),
@@ -22702,8 +23873,8 @@ mod stream_identity_tests {
         drain(&mut data_rx);
         // The successor's channel is full at activation.
         let data_tx = actor.sessions[&key.scope()]
-            .data_tx
-            .clone()
+            .data_tx()
+            .cloned()
             .expect("live carrier");
         let budget = actor.sessions[&key.scope()].queue_budget.clone();
         while data_tx.capacity() > 0 {
@@ -22885,7 +24056,7 @@ mod stream_identity_tests {
             actor
                 .sessions
                 .get(&key.scope())
-                .and_then(|session| session.terminal_fin_failure_deadline)
+                .and_then(|session| session.terminal_fin_failure_deadline.deadline())
                 .is_some(),
             "a failed terminal FIN must start a bounded fail-closed fence"
         );
@@ -22933,7 +24104,7 @@ mod stream_identity_tests {
             actor
                 .sessions
                 .get(&key.scope())
-                .and_then(|session| session.terminal_fin_failure_deadline)
+                .and_then(|session| session.terminal_fin_failure_deadline.deadline())
                 .is_some(),
             "an unrelated successful FORGET must not clear failed-FIN debt"
         );
@@ -23006,7 +24177,6 @@ mod stream_identity_tests {
             .expect("fill the data writer queue");
         if let Some(session) = actor.sessions.get_mut(&key.scope()) {
             session.profile = super::RuntimeProfile::M2;
-            session.data_tx = Some(data_tx.clone());
             session.active_carrier = Some(DataCarrier {
                 context: CarrierContext::new(
                     key.session_id.clone(),
@@ -23092,14 +24262,15 @@ mod stream_identity_tests {
             actor
                 .sessions
                 .get(&key.scope())
-                .and_then(|session| session.terminal_fin_failure_deadline)
+                .and_then(|session| session.terminal_fin_failure_deadline.deadline())
                 .is_some(),
             "a full terminal writer queue must start a bounded fail-closed fence"
         );
         assert!(matches!(data_rx.try_recv(), Ok(DataOutbound::Close)));
         if let Some(session) = actor.sessions.get_mut(&key.scope()) {
-            session.terminal_fin_failure_deadline =
-                Some(std::time::Instant::now() - std::time::Duration::from_secs(1));
+            session.terminal_fin_failure_deadline.set(Some(
+                std::time::Instant::now() - std::time::Duration::from_secs(1),
+            ));
         }
         actor.tick().await;
         assert!(
@@ -23163,7 +24334,6 @@ mod stream_identity_tests {
         };
         if let Some(session) = actor.sessions.get_mut(&key.scope()) {
             session.profile = super::RuntimeProfile::M2;
-            session.data_tx = Some(data_tx.clone());
             session.active_carrier = Some(DataCarrier {
                 context: carrier.context(),
                 tx: data_tx,
@@ -23203,8 +24373,8 @@ mod stream_identity_tests {
         actor.send_echo_registration(dropped_response, admitted);
         assert!(actor.sessions.get(&key.scope()).is_some_and(|session| {
             session.streams.get(&stream_id).is_some_and(|stream| {
-                stream.open_pending
-                    && stream.registration_dropped
+                stream.admission.open_pending()
+                    && stream.admission.registration_dropped()
                     && !stream.terminal
                     && stream.closed.is_cancelled()
             })
@@ -23324,7 +24494,7 @@ mod stream_identity_tests {
             tx: actor
                 .sessions
                 .get(&key.scope())
-                .and_then(|session| session.data_tx.clone())
+                .and_then(|session| session.data_tx().cloned())
                 .expect("active data writer for candidate retry"),
         });
         actor
@@ -23496,7 +24666,6 @@ mod stream_identity_tests {
         };
         if let Some(session) = actor.sessions.get_mut(&key.scope()) {
             session.profile = super::RuntimeProfile::M2;
-            session.data_tx = Some(data_tx.clone());
             session.active_carrier = Some(DataCarrier {
                 context: carrier.context(),
                 tx: data_tx,
@@ -23654,7 +24823,6 @@ mod stream_identity_tests {
         };
         if let Some(session) = actor.sessions.get_mut(&key.scope()) {
             session.profile = super::RuntimeProfile::M2;
-            session.data_tx = Some(data_tx.clone());
             session.active_carrier = Some(DataCarrier {
                 context: carrier.context(),
                 tx: data_tx,
@@ -23954,8 +25122,8 @@ mod stream_identity_tests {
         let (mut actor, mut control, mut data_rx, carrier, key, registration) =
             m4_37_opened_echo_stream(4_381, "m6-c160-full-ack").await;
         let data_tx = actor.sessions[&key.scope()]
-            .data_tx
-            .clone()
+            .data_tx()
+            .cloned()
             .expect("live carrier");
         let budget = actor.sessions[&key.scope()].queue_budget.clone();
         let filler = m6c160_fill_live_carrier(&data_tx, &budget);
@@ -23979,7 +25147,7 @@ mod stream_identity_tests {
             Some(1),
             "the refused ACK is owed, not dropped"
         );
-        assert!(session.flow_control_owed_deadline.is_some());
+        assert!(session.flow_control_owed_deadline.is_armed());
 
         // The writer drains; the next retry puts the owed ACK on the wire.
         assert!(m6c160_drain_kinds(&mut data_rx).is_empty());
@@ -23987,7 +25155,7 @@ mod stream_identity_tests {
         assert!(m6c160_drain_kinds(&mut data_rx).contains(&FrameKind::Ack));
         let session = &actor.sessions[&key.scope()];
         assert!(session.owed_acks.is_empty());
-        assert_eq!(session.flow_control_owed_deadline, None);
+        assert_eq!(session.flow_control_owed_deadline.deadline(), None);
         drop(registration);
     }
 
@@ -23999,8 +25167,8 @@ mod stream_identity_tests {
         let (mut actor, mut control, mut data_rx, carrier, key, registration) =
             m4_37_opened_echo_stream(4_382, "m6-c160-full-reset").await;
         let data_tx = actor.sessions[&key.scope()]
-            .data_tx
-            .clone()
+            .data_tx()
+            .cloned()
             .expect("live carrier");
         let budget = actor.sessions[&key.scope()].queue_budget.clone();
         assert!(m6c160_fill_live_carrier(&data_tx, &budget) > 0);
@@ -24042,8 +25210,8 @@ mod stream_identity_tests {
         let (mut actor, _control, mut data_rx, carrier, key, registration) =
             m4_37_opened_echo_stream(4_383, "m6-c160-stuck").await;
         let data_tx = actor.sessions[&key.scope()]
-            .data_tx
-            .clone()
+            .data_tx()
+            .cloned()
             .expect("live carrier");
         let budget = actor.sessions[&key.scope()].queue_budget.clone();
         assert!(m6c160_fill_live_carrier(&data_tx, &budget) > 0);
@@ -24056,7 +25224,9 @@ mod stream_identity_tests {
         );
 
         if let Some(session) = actor.sessions.get_mut(&key.scope()) {
-            session.flow_control_owed_deadline = Some(std::time::Instant::now());
+            session
+                .flow_control_owed_deadline
+                .set(Some(std::time::Instant::now()));
         }
         actor.tick().await;
         assert!(!actor.sessions.contains_key(&key.scope()), "fenced");
@@ -24089,8 +25259,8 @@ mod stream_identity_tests {
         let (mut actor, _control, mut data_rx, carrier, key, registration) =
             m4_37_opened_echo_stream(4_384, "m6-c160-forgotten").await;
         let data_tx = actor.sessions[&key.scope()]
-            .data_tx
-            .clone()
+            .data_tx()
+            .cloned()
             .expect("live carrier");
         let budget = actor.sessions[&key.scope()].queue_budget.clone();
         assert!(m6c160_fill_live_carrier(&data_tx, &budget) > 0);
@@ -24113,7 +25283,7 @@ mod stream_identity_tests {
             session.owed_acks.is_empty(),
             "the ACK for a gone stream is dropped"
         );
-        assert_eq!(session.flow_control_owed_deadline, None);
+        assert_eq!(session.flow_control_owed_deadline.deadline(), None);
         let _ = m6c160_drain_kinds(&mut data_rx);
         drop(registration);
     }
@@ -24127,8 +25297,8 @@ mod stream_identity_tests {
         let (mut actor, _control, mut data_rx, carrier, key, registration) =
             m4_37_opened_echo_stream(4_389, "m6-c160-out-of-order").await;
         let data_tx = actor.sessions[&key.scope()]
-            .data_tx
-            .clone()
+            .data_tx()
+            .cloned()
             .expect("live carrier");
         let budget = actor.sessions[&key.scope()].queue_budget.clone();
         assert!(m6c160_fill_live_carrier(&data_tx, &budget) > 0);
@@ -24164,8 +25334,8 @@ mod stream_identity_tests {
         let (mut actor, _control, mut data_rx, carrier, key, registration) =
             m4_37_opened_echo_stream(4_385, "m6-c160-cap").await;
         let data_tx = actor.sessions[&key.scope()]
-            .data_tx
-            .clone()
+            .data_tx()
+            .cloned()
             .expect("live carrier");
         let budget = actor.sessions[&key.scope()].queue_budget.clone();
         assert!(m6c160_fill_live_carrier(&data_tx, &budget) > 0);
@@ -24236,7 +25406,7 @@ mod stream_identity_tests {
             session.owed_acks.is_empty(),
             "the ACK on the new carrier supersedes the owed one on the old"
         );
-        assert_eq!(session.flow_control_owed_deadline, None);
+        assert_eq!(session.flow_control_owed_deadline.deadline(), None);
         assert_eq!(m6c160_drain_kinds(&mut new_rx), vec![FrameKind::Ack]);
         let _ = m6c160_drain_kinds(&mut old_rx);
         let _ = m6c160_drain_kinds(&mut data_rx);
@@ -24269,7 +25439,9 @@ mod stream_identity_tests {
                     sequence: 1,
                 },
             );
-            session.flow_control_owed_deadline = Some(std::time::Instant::now());
+            session
+                .flow_control_owed_deadline
+                .set(Some(std::time::Instant::now()));
         }
         actor.retry_owed_acks(&key);
         let session = &actor.sessions[&key.scope()];
@@ -24284,6 +25456,7 @@ mod stream_identity_tests {
         assert!(
             session
                 .flow_control_owed_deadline
+                .deadline()
                 .is_some_and(|deadline| deadline > std::time::Instant::now()),
             "progress restarted the window"
         );
@@ -24320,8 +25493,8 @@ mod stream_identity_tests {
         );
         assert_eq!(m6c160_drain_kinds(&mut data_rx), vec![FrameKind::Data]);
         let data_tx = actor.sessions[&key.scope()]
-            .data_tx
-            .clone()
+            .data_tx()
+            .cloned()
             .expect("live carrier");
         let budget = actor.sessions[&key.scope()].queue_budget.clone();
         assert!(m6c160_fill_live_carrier(&data_tx, &budget) > 0);
@@ -24485,7 +25658,7 @@ mod stream_identity_tests {
                 generation: carrier.generation,
                 connection_id: old_connection_id,
             };
-            let data_tx = session.data_tx.clone().expect("active data writer");
+            let data_tx = session.data_tx().cloned().expect("active data writer");
             session.active_carrier = Some(DataCarrier {
                 context: active.context(),
                 tx: data_tx,
@@ -24600,8 +25773,8 @@ mod stream_identity_tests {
                 .rotation
                 .as_ref()
                 .and_then(|rotation| rotation.recovery.as_ref())
-                .map(|recovery| recovery.ready_sent),
-            Some([true, true]),
+                .map(|recovery| recovery.progress.ready_sent()),
+            Some(true),
             "READY is sent without waiting for an ACK frame that cannot come"
         );
         let r2c = session.streams[&stream_id]
@@ -24648,8 +25821,8 @@ mod stream_identity_tests {
                 .rotation
                 .as_ref()
                 .and_then(|rotation| rotation.recovery.as_ref())
-                .map(|recovery| recovery.ready_sent),
-            Some([false, false]),
+                .map(|recovery| recovery.progress.ready_sent()),
+            Some(false),
             "READY is not sent on an unreconciled pair"
         );
         drop(registration);
@@ -24680,7 +25853,6 @@ mod stream_identity_tests {
             let session = actor.sessions.get_mut(&key.scope()).expect("session");
             // The active data socket failed; a recovery candidate is attached
             // and no RESUMED has arrived from the connector yet.
-            session.data_tx = None;
             session.active_carrier = None;
             let mut rotation = test_rotation_runtime(
                 now_ms,
@@ -24896,7 +26068,6 @@ mod stream_identity_tests {
         };
         if let Some(session) = actor.sessions.get_mut(&key.scope()) {
             session.profile = super::RuntimeProfile::M2;
-            session.data_tx = Some(data_tx.clone());
             session.active_carrier = Some(DataCarrier {
                 context: carrier.context(),
                 tx: data_tx,
@@ -24951,7 +26122,6 @@ mod stream_identity_tests {
         // can reclaim it; a connector-originated FORGET cannot substitute for
         // that proof.
         if let Some(session) = actor.sessions.get_mut(&key.scope()) {
-            session.data_tx = None;
             session.active_carrier = None;
         }
         assert!(actor.close_echo_stream(&key, registration.stream_id, &registration.operation_id,));
@@ -24960,7 +26130,7 @@ mod stream_identity_tests {
                 .streams
                 .get(&registration.stream_id)
                 .is_some_and(|stream| stream.terminal_fin_failure)
-                && session.terminal_fin_failure_deadline.is_some()
+                && session.terminal_fin_failure_deadline.is_armed()
         }));
 
         // Restore a live carrier only to account the connector's terminal
@@ -24968,7 +26138,6 @@ mod stream_identity_tests {
         // the forged opposite-direction FORGET evidence realistic.
         let (peer_tx, mut peer_rx) = mpsc::channel(actor.options.limits.max_queue_messages);
         if let Some(session) = actor.sessions.get_mut(&key.scope()) {
-            session.data_tx = Some(peer_tx.clone());
             session.active_carrier = Some(DataCarrier {
                 context: carrier.context(),
                 tx: peer_tx,
@@ -25217,27 +26386,22 @@ mod stream_identity_tests {
             },
             key,
             control_tx,
-            data_tx: None,
             active_carrier: None,
             generation: 1,
             connection_id: "test-data".to_owned(),
             profile: super::RuntimeProfile::M1,
-            cluster_profile: false,
-            owner_fence: None,
-            owner_fenced: true,
-            owner_fence_ack: None,
-            owner_fence_deadline: None,
+            owner_fencing: super::OwnerFencing::NotRequired,
             next_stream_id: 1,
             pending: HashMap::new(),
             unary_tombstones: HashMap::new(),
             connector_rejected_log: Default::default(),
             streams: HashMap::new(),
             forgotten_stream_through: 0,
-            owner_forget_deadline: None,
-            terminal_fin_failure_deadline: None,
+            owner_forget_deadline: crate::actor::FailClosedDeadline::Idle,
+            terminal_fin_failure_deadline: crate::actor::FailClosedDeadline::Idle,
             owed_acks: Default::default(),
             terminal_fin_failed_at: Default::default(),
-            flow_control_owed_deadline: None,
+            flow_control_owed_deadline: crate::actor::FailClosedDeadline::Idle,
             http_freeze_published: false,
             rotation: None,
             last_rotation: std::time::Instant::now(),
@@ -25247,8 +26411,7 @@ mod stream_identity_tests {
             queued_bytes: 0,
             queue_budget,
             last_lease_renewal: std::time::Instant::now(),
-            maintenance_in_flight: false,
-            owner_write_unknown: None,
+            lease_maintenance: crate::actor::LeaseMaintenance::Idle,
             closed: false,
             principal_sessions_end: false,
         }
@@ -25322,13 +26485,16 @@ mod stream_identity_tests {
             actor
                 .sessions
                 .values()
-                .filter(|session| session.maintenance_in_flight)
+                .filter(|session| session.lease_maintenance.is_in_flight())
                 .map(|session| session.key.scope())
                 .collect()
         };
         let complete = |actor: &mut RelayActor| {
             for session in actor.sessions.values_mut() {
-                session.maintenance_in_flight = false;
+                session
+                    .lease_maintenance
+                    .on_event(crate::actor::LeaseEvent::RoundFinished { lost_reply: None })
+                    .expect("a finished round is always accepted");
             }
         };
 
@@ -25507,21 +26673,15 @@ mod stream_identity_tests {
             old_connection_id: String::new(),
             prepare_message_id: String::new(),
             last_message_id: String::new(),
-            abort_message_id: None,
+            abort: crate::actor::AbortExchange::NotSent,
             peer_message_id: String::new(),
             quiesce_message_id: String::new(),
             frozen_message_id: String::new(),
             commit_message_id: String::new(),
             retire_message_id: String::new(),
-            peer_frozen_message_id: None,
-            peer_drained_message_id: None,
-            peer_committed_message_id: None,
-            peer_retired_message_id: None,
-            peer_aborted_message_id: None,
-            pending_abort_ack: None,
+            peer_pins: crate::actor::PeerPhasePins::default(),
             tombstones: VecDeque::new(),
-            remote_fences: [None, None],
-            own_fence: None,
+            fences: crate::actor::RotationFences::default(),
             replayed_frames: 0,
             pending_ticket: None,
             journal: ControlJournal::new(128, 4 * 1024 * 1024, now, deadline)
@@ -25539,9 +26699,7 @@ mod stream_identity_tests {
             roster: StreamRoster::new("recovery-roster", vec![stream_id]),
             expected_closed_connection_ids: Vec::new(),
             local_closed: None,
-            peer_closed: None,
-            closure_digest: None,
-            candidate_ready: false,
+            progress: crate::actor::RecoveryProgress::local_closed(),
             resume_message_ids: [None, None],
             snapshot_reply_ids: [None, None],
             local_snapshots: [Vec::new(), Vec::new()],
@@ -25549,15 +26707,10 @@ mod stream_identity_tests {
             ready_message_ids: [None, None],
             remote_snapshots: [HashMap::new(), HashMap::new()],
             ready_remote_snapshots: [HashMap::new(), HashMap::new()],
-            remote_ready: [false, false],
             local_plans: HashMap::new(),
-            ready_sent: [false, false],
             deferred_frames: VecDeque::new(),
             deferred_bytes: 0,
             unclassified_frames: VecDeque::new(),
-            activated: false,
-            retry_not_before_ms: None,
-            retry_failed_connection_id: None,
         }
     }
 
@@ -25577,7 +26730,8 @@ mod stream_identity_tests {
             .recovery
             .as_mut()
             .expect("recovery runtime")
-            .candidate_ready = true;
+            .progress
+            .attach_candidate_for_test();
         let context = CarrierContext::new(
             key.session_id.clone(),
             key.epoch,
@@ -25636,9 +26790,9 @@ mod stream_identity_tests {
         let (data_tx, _data_rx) = mpsc::channel(actor.options.limits.max_queue_messages);
         if let Some(session) = actor.sessions.get_mut(&key.scope()) {
             session.profile = super::RuntimeProfile::M2;
-            session.cluster_profile = true;
+            session.owner_fencing =
+                super::OwnerFencing::fenced_for_test(&session.key, &session.owner);
             session.connection_id = old_connection_id.clone();
-            session.data_tx = Some(data_tx.clone());
             session.active_carrier = Some(DataCarrier {
                 context: CarrierContext::new(
                     key.session_id.clone(),
@@ -25789,9 +26943,9 @@ mod stream_identity_tests {
         let (data_tx, _data_rx) = mpsc::channel(actor.options.limits.max_queue_messages);
         if let Some(session) = actor.sessions.get_mut(&key.scope()) {
             session.profile = super::RuntimeProfile::M2;
-            session.cluster_profile = true;
+            session.owner_fencing =
+                super::OwnerFencing::fenced_for_test(&session.key, &session.owner);
             session.connection_id = old_connection_id.clone();
-            session.data_tx = Some(data_tx.clone());
             session.active_carrier = Some(DataCarrier {
                 context: CarrierContext::new(
                     key.session_id.clone(),
@@ -25818,7 +26972,7 @@ mod stream_identity_tests {
             .sessions
             .get(&key.scope())
             .expect("request/disconnect race must retain session");
-        assert!(session.data_tx.is_none());
+        assert!(session.data_tx().is_none());
         assert!(session.active_carrier.is_none());
         let rotation = session.rotation.as_ref().expect("recovery state retained");
         assert!(rotation.pending_ticket.is_none());
@@ -25917,9 +27071,9 @@ mod stream_identity_tests {
         let (data_tx, _data_rx) = mpsc::channel(actor.options.limits.max_queue_messages);
         if let Some(session) = actor.sessions.get_mut(&key.scope()) {
             session.profile = super::RuntimeProfile::M2;
-            session.cluster_profile = true;
+            session.owner_fencing =
+                super::OwnerFencing::fenced_for_test(&session.key, &session.owner);
             session.connection_id = old_connection_id.clone();
-            session.data_tx = Some(data_tx.clone());
             session.active_carrier = Some(DataCarrier {
                 context: CarrierContext::new(
                     key.session_id.clone(),
@@ -26038,9 +27192,9 @@ mod stream_identity_tests {
         let (data_tx, _data_rx) = mpsc::channel(actor.options.limits.max_queue_messages);
         if let Some(session) = actor.sessions.get_mut(&key.scope()) {
             session.profile = super::RuntimeProfile::M2;
-            session.cluster_profile = true;
+            session.owner_fencing =
+                super::OwnerFencing::fenced_for_test(&session.key, &session.owner);
             session.connection_id = old_connection_id.clone();
-            session.data_tx = Some(data_tx.clone());
             session.active_carrier = Some(DataCarrier {
                 context: CarrierContext::new(
                     key.session_id.clone(),
@@ -26144,9 +27298,9 @@ mod stream_identity_tests {
         let (data_tx, _data_rx) = mpsc::channel(actor.options.limits.max_queue_messages);
         if let Some(session) = actor.sessions.get_mut(&key.scope()) {
             session.profile = super::RuntimeProfile::M2;
-            session.cluster_profile = true;
+            session.owner_fencing =
+                super::OwnerFencing::fenced_for_test(&session.key, &session.owner);
             session.connection_id = old_connection_id.clone();
-            session.data_tx = Some(data_tx.clone());
             session.active_carrier = Some(DataCarrier {
                 context: CarrierContext::new(
                     key.session_id.clone(),
@@ -26190,7 +27344,7 @@ mod stream_identity_tests {
             RotationPhase::Recovering,
             "a data_loss report naming the active carrier enters retained recovery (M7-C178)"
         );
-        assert!(session.data_tx.is_none());
+        assert!(session.data_tx().is_none());
         assert!(session.active_carrier.is_none());
         let status = rotation.state.status();
         assert_eq!(status.active_generation, 1);
@@ -26280,9 +27434,9 @@ mod stream_identity_tests {
             let (data_tx, _data_rx) = mpsc::channel(actor.options.limits.max_queue_messages);
             if let Some(session) = actor.sessions.get_mut(&key.scope()) {
                 session.profile = super::RuntimeProfile::M2;
-                session.cluster_profile = true;
+                session.owner_fencing =
+                    super::OwnerFencing::fenced_for_test(&session.key, &session.owner);
                 session.connection_id = old_connection_id.clone();
-                session.data_tx = Some(data_tx.clone());
                 session.active_carrier = Some(DataCarrier {
                     context: CarrierContext::new(
                         key.session_id.clone(),
@@ -26315,7 +27469,7 @@ mod stream_identity_tests {
                 .get(&key.scope())
                 .expect("the session is retained");
             assert!(
-                session.active_carrier.is_some() && session.data_tx.is_some(),
+                session.active_carrier.is_some() && session.data_tx().is_some(),
                 "{name}: the owner's active carrier must not be released"
             );
             assert_ne!(
@@ -26372,7 +27526,6 @@ mod stream_identity_tests {
         if let Some(session) = actor.sessions.get_mut(&key.scope()) {
             session.profile = super::RuntimeProfile::M2;
             session.connection_id = old_connection_id.clone();
-            session.data_tx = Some(active_tx.clone());
             session.active_carrier = Some(DataCarrier {
                 context: CarrierContext::new(
                     key.session_id.clone(),
@@ -26434,13 +27587,17 @@ mod stream_identity_tests {
         assert_eq!(recovery.attempt_no, 1);
         assert_eq!(rotation.attempt.as_ref(), Some(&first_attempt));
         assert_eq!(
-            recovery.retry_failed_connection_id.as_deref(),
+            recovery
+                .progress
+                .retry()
+                .map(|retry| retry.failed_connection_id.as_str()),
             Some(candidate_connection_id.as_str())
         );
         assert!(
             recovery
-                .retry_not_before_ms
-                .is_some_and(|not_before| not_before >= observed_loss_at_ms + 100)
+                .progress
+                .retry()
+                .is_some_and(|retry| retry.not_before_ms >= observed_loss_at_ms + 100)
         );
         assert!(matches!(
             actor.rx.try_recv(),
@@ -26518,8 +27675,9 @@ mod stream_identity_tests {
         assert_eq!(recovery.attempt_no, 2);
         assert!(
             recovery
-                .retry_not_before_ms
-                .is_some_and(|not_before| not_before >= second_loss_at_ms + 200)
+                .progress
+                .retry()
+                .is_some_and(|retry| retry.not_before_ms >= second_loss_at_ms + 200)
         );
         assert!(matches!(
             actor.rx.try_recv(),
@@ -26629,7 +27787,6 @@ mod stream_identity_tests {
         if let Some(session) = actor.sessions.get_mut(&key.scope()) {
             session.profile = super::RuntimeProfile::M2;
             session.connection_id = old_connection_id.clone();
-            session.data_tx = Some(active_tx.clone());
             session.active_carrier = Some(DataCarrier {
                 context: CarrierContext::new(
                     key.session_id.clone(),
@@ -26667,8 +27824,7 @@ mod stream_identity_tests {
             .and_then(|session| session.rotation.as_ref())
             .and_then(|rotation| rotation.recovery.as_ref())
             .expect("pending retry recovery");
-        assert!(recovery.retry_not_before_ms.is_some());
-        assert!(recovery.retry_failed_connection_id.is_some());
+        assert!(recovery.progress.retry().is_some());
         assert_eq!(actor.background_tasks.len(), 1);
         assert!(matches!(
             actor.rx.try_recv(),
@@ -27059,14 +28215,19 @@ mod stream_identity_tests {
             .expect("connector fence is accepted");
         rotation.snapshot_id = "drained-reply".to_owned();
         rotation.frozen_message_id = "relay-frozen".to_owned();
-        rotation.peer_frozen_message_id = Some("connector-frozen".to_owned());
+        assert!(rotation.peer_pins.frozen.pin("connector-frozen"));
         // This is the ordering that used to corrupt the next reply: the
         // connector's DRAINED proof is accepted before the relay's own ACK
         // cursor reaches its fence, so the generic peer ID becomes the
         // connector DRAINED ID instead of the pinned FROZEN ID.
         rotation.peer_message_id = "connector-frozen".to_owned();
-        rotation.remote_fences[super::direction_index(Direction::ConnectorToRelay)] =
-            Some(connector_fence);
+        rotation
+            .fences
+            .record_remote(
+                super::direction_index(Direction::ConnectorToRelay),
+                connector_fence,
+            )
+            .expect("the connector fence is recorded once");
         actor
             .sessions
             .get_mut(&key.scope())
@@ -27118,21 +28279,12 @@ mod stream_identity_tests {
     #[test]
     fn peer_phase_message_ids_reject_fresh_same_attempt_messages() {
         for first in ["frozen-first", "retired-first", "aborted-first"] {
-            let mut pinned = None;
-            assert!(RelayActor::pin_peer_message_id(&mut pinned, first));
-            assert!(RelayActor::peer_message_id_is_acceptable(
-                pinned.as_deref(),
-                first,
-            ));
-            assert!(!RelayActor::peer_message_id_is_acceptable(
-                pinned.as_deref(),
-                "fresh-conflicting-id",
-            ));
-            assert!(!RelayActor::pin_peer_message_id(
-                &mut pinned,
-                "fresh-conflicting-id",
-            ));
-            assert_eq!(pinned.as_deref(), Some(first));
+            let mut pinned = super::rotation_attempt_state::MessagePin::default();
+            assert!(pinned.pin(first));
+            assert!(pinned.is_acceptable(first));
+            assert!(!pinned.is_acceptable("fresh-conflicting-id"));
+            assert!(!pinned.pin("fresh-conflicting-id"));
+            assert_eq!(pinned.get(), Some(first));
         }
     }
 
@@ -27161,7 +28313,6 @@ mod stream_identity_tests {
         session.profile = super::RuntimeProfile::M2;
         session.generation = 1;
         session.connection_id = old_connection_id.to_owned();
-        session.data_tx = Some(data_tx.clone());
         session.active_carrier = Some(DataCarrier {
             context: CarrierContext::new(
                 key.session_id.clone(),
@@ -27539,11 +28690,12 @@ mod cleanup_tests {
     fn owner_claim_guard_enqueues_exact_token_and_fails_closed_on_overflow() {
         let (tx, mut rx) = mpsc::channel(1);
         let overflowed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (backlog, _drain) = super::OwnerBacklog::new(0);
         let dispatcher = CleanupDispatcher::for_test(
             tx,
             Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             overflowed.clone(),
-            super::OwnerBacklog::new(0),
+            backlog,
         );
         let owner = owner_token(7);
         {
@@ -27558,11 +28710,12 @@ mod cleanup_tests {
 
         let (tx, _rx) = mpsc::channel(CLEANUP_QUEUE_CAPACITY);
         // A backlog with no room: the refusal is flagged and counted.
+        let (backlog, _drain) = super::OwnerBacklog::new(0);
         let dispatcher = CleanupDispatcher::for_test(
             tx.clone(),
             Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             overflowed.clone(),
-            super::OwnerBacklog::new(0),
+            backlog,
         );
         for index in 0..CLEANUP_QUEUE_CAPACITY {
             tx.try_send(OwnerCleanupItem::Token(owner_token(index as u64)))
@@ -28110,11 +29263,12 @@ mod cleanup_tests {
     async fn saturated_cleanup_queue_does_not_stall_the_actor() {
         let (tx, _rx) = mpsc::channel(CLEANUP_QUEUE_CAPACITY);
         let pending = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (backlog, _drain) = super::OwnerBacklog::new(0);
         let dispatcher = CleanupDispatcher::for_test(
             tx.clone(),
             pending.clone(),
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            super::OwnerBacklog::new(0),
+            backlog,
         );
         let worker = CleanupWorker {
             dispatcher: Some(dispatcher),
@@ -28250,13 +29404,13 @@ mod cleanup_tests {
     #[tokio::test]
     async fn backlog_release_leaves_a_superseded_owner_untouched() {
         let (catalog, first, successor) = superseded_catalog().await;
-        let backlog = super::OwnerBacklog::new(usize::MAX);
+        let (backlog, mut drain) = super::OwnerBacklog::new(usize::MAX);
         backlog.push(OwnerCleanupItem::Token(first.clone()));
         backlog.push(OwnerCleanupItem::Token(first));
         let shared: SharedCatalog = Arc::new(catalog.clone());
         let (released, abandoned) = super::release_backlog_until(
             &shared,
-            &backlog,
+            &mut drain,
             tokio::time::Instant::now() + super::CLEANUP_SHUTDOWN_TIMEOUT,
             false,
         )
@@ -28280,13 +29434,16 @@ mod cleanup_tests {
             .await
             .expect("kept owner")
             .token;
-        let backlog = super::OwnerBacklog::new(usize::MAX);
+        let (backlog, drain) = super::OwnerBacklog::new(usize::MAX);
         backlog.push(OwnerCleanupItem::Token(owner));
-        let stranded = super::StrandedClaimRelease {
-            handoffs: super::ClaimHandoffs::default(),
-            backlog: backlog.clone(),
-            catalog: Arc::new(catalog.clone()),
-        };
+        let mut stranded = super::StrandedClaimRelease::holding(
+            super::ActorCleanupState {
+                claims: super::ClaimHandoffs::default(),
+                backlog: drain,
+            },
+            &backlog,
+            Arc::new(catalog.clone()),
+        );
         assert_eq!(stranded.release().await, (1, 0));
         assert!(backlog.is_empty());
         assert_eq!(
@@ -28309,13 +29466,16 @@ mod cleanup_tests {
             .await
             .expect("kept owner")
             .token;
-        let backlog = super::OwnerBacklog::new(usize::MAX);
+        let (backlog, drain) = super::OwnerBacklog::new(usize::MAX);
         backlog.push(OwnerCleanupItem::Token(owner));
-        drop(super::StrandedClaimRelease {
-            handoffs: super::ClaimHandoffs::default(),
-            backlog: backlog.clone(),
-            catalog: Arc::new(catalog.clone()),
-        });
+        drop(super::StrandedClaimRelease::holding(
+            super::ActorCleanupState {
+                claims: super::ClaimHandoffs::default(),
+                backlog: drain,
+            },
+            &backlog,
+            Arc::new(catalog.clone()),
+        ));
         let counters = backlog.counters();
         assert_eq!(
             (
@@ -28345,7 +29505,7 @@ mod cleanup_tests {
     #[tokio::test]
     async fn a_guard_dropped_after_the_supervisors_drain_is_refused_and_counted() {
         let catalog = seeded_cleanup_catalog().await;
-        let backlog = super::OwnerBacklog::new(usize::MAX);
+        let (backlog, drain) = super::OwnerBacklog::new(usize::MAX);
         // The cleanup worker ended with the actor: its queue is closed.
         let (tx, rx) = mpsc::channel(CLEANUP_QUEUE_CAPACITY);
         drop(rx);
@@ -28355,11 +29515,14 @@ mod cleanup_tests {
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
             backlog.clone(),
         );
-        let stranded = super::StrandedClaimRelease {
-            handoffs: super::ClaimHandoffs::default(),
-            backlog: backlog.clone(),
-            catalog: Arc::new(catalog.clone()),
-        };
+        let mut stranded = super::StrandedClaimRelease::holding(
+            super::ActorCleanupState {
+                claims: super::ClaimHandoffs::default(),
+                backlog: drain,
+            },
+            &backlog,
+            Arc::new(catalog.clone()),
+        );
 
         // Control: a guard dropped before the drain is kept, then released.
         let early = catalog

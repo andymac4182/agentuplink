@@ -23,7 +23,7 @@ use std::{
     io::Write,
     net::SocketAddr,
     sync::{
-        Arc, Mutex,
+        Arc,
         atomic::{AtomicU64, Ordering},
     },
     time::Duration,
@@ -31,7 +31,7 @@ use std::{
 use tokio::{
     io::AsyncReadExt,
     net::{TcpListener, TcpStream},
-    sync::{Semaphore, watch},
+    sync::{Semaphore, mpsc, watch},
     task::{JoinHandle, JoinSet},
     time::{Instant, sleep, timeout, timeout_at},
 };
@@ -520,11 +520,30 @@ async fn echo(cluster: &ProductionCluster, harness: &RunningHarness, bytes: &[u8
 /// Eight concurrent carriers at most; completed tasks are joined as they
 /// finish. Only the two generation-zero sockets can be cut and retained.
 /// All later TCP connections preserve opaque TLS bytes and flow normally.
+/// How many route events may wait for the route ledger.  At most eight
+/// routes run at once and each reports at most three events, so the queue
+/// cannot fill; if it ever did, the reporting route would wait.
+const ROUTE_EVENT_QUEUE: usize = 32;
+
+/// What a route reports to the ledger task that owns the route sets.
+enum RouteEvent {
+    Active(u64),
+    Held(u64),
+    Ended(u64),
+}
+
+/// The proxy's routes, as one published snapshot.
+#[derive(Clone, Default)]
+struct RouteSets {
+    active: BTreeSet<u64>,
+    held: BTreeSet<u64>,
+}
+
 struct CutPaths {
     address: SocketAddr,
     generation: watch::Sender<u64>,
-    active: Arc<Mutex<BTreeSet<u64>>>,
-    held: Arc<Mutex<BTreeSet<u64>>>,
+    /// The route sets, owned and published by the proxy's ledger task.
+    routes: watch::Receiver<RouteSets>,
     discarded: Arc<AtomicU64>,
     stop: CancellationToken,
     task: Option<JoinHandle<Result<()>>>,
@@ -537,19 +556,30 @@ impl CutPaths {
             .map_err(HarnessError::Io)?;
         let address = listener.local_addr().map_err(HarnessError::Io)?;
         let (generation, _) = watch::channel(0);
-        let active = Arc::new(Mutex::new(BTreeSet::new()));
-        let held = Arc::new(Mutex::new(BTreeSet::new()));
+        let (route_events, mut reported) = mpsc::channel(ROUTE_EVENT_QUEUE);
+        let (published, route_sets) = watch::channel(RouteSets::default());
         let accepted = Arc::new(AtomicU64::new(0));
         let discarded = Arc::new(AtomicU64::new(0));
         let stop = CancellationToken::new();
         let task = tokio::spawn({
             let generation = generation.clone();
-            let active = Arc::clone(&active);
-            let held = Arc::clone(&held);
             let accepted = Arc::clone(&accepted);
             let discarded = Arc::clone(&discarded);
             let stop = stop.clone();
             async move {
+                // The ledger owns both sets and applies route events in the
+                // order they were reported, publishing each new state whole.
+                let ledger = tokio::spawn(async move {
+                    let mut sets = RouteSets::default();
+                    while let Some(event) = reported.recv().await {
+                        match event {
+                            RouteEvent::Active(index) => sets.active.insert(index),
+                            RouteEvent::Held(index) => sets.held.insert(index),
+                            RouteEvent::Ended(index) => sets.active.remove(&index),
+                        };
+                        published.send_replace(sets.clone());
+                    }
+                });
                 let slots = Arc::new(Semaphore::new(8));
                 let mut routes: JoinSet<Result<()>> = JoinSet::new();
                 let outcome: Result<()> = async {
@@ -570,8 +600,7 @@ impl CutPaths {
                         let index = accepted.fetch_add(1, Ordering::AcqRel);
                         let mut cut = generation.subscribe();
                         let born = *cut.borrow_and_update();
-                        let active = Arc::clone(&active);
-                        let held = Arc::clone(&held);
+                        let route_events = route_events.clone();
                         let discarded = Arc::clone(&discarded);
                         let stop = stop.clone();
                         routes.spawn(async move {
@@ -579,7 +608,8 @@ impl CutPaths {
                             let mut relay = timeout(PHASE, TcpStream::connect(upstream)).await
                                 .map_err(|_| failure("cut proxy", "upstream connect timed out"))?
                                 .map_err(HarnessError::Io)?;
-                            active.lock().expect("active routes").insert(index);
+                            route_events.send(RouteEvent::Active(index)).await
+                                .map_err(|_| failure("cut proxy", "route ledger ended"))?;
                             let cut_path = tokio::select! {
                                 _ = stop.cancelled() => false,
                                 _ = tokio::io::copy_bidirectional(&mut device, &mut relay) => false,
@@ -587,7 +617,8 @@ impl CutPaths {
                             };
                             if cut_path {
                                 drop(device);
-                                held.lock().expect("held routes").insert(index);
+                                route_events.send(RouteEvent::Held(index)).await
+                                    .map_err(|_| failure("cut proxy", "route ledger ended"))?;
                                 let mut buffer = [0; 8192];
                                 loop {
                                     let read = tokio::select! {
@@ -600,7 +631,8 @@ impl CutPaths {
                                     }
                                 }
                             }
-                            active.lock().expect("active routes").remove(&index);
+                            route_events.send(RouteEvent::Ended(index)).await
+                                .map_err(|_| failure("cut proxy", "route ledger ended"))?;
                             Ok(())
                         });
                     }
@@ -610,14 +642,18 @@ impl CutPaths {
                 while let Some(result) = routes.join_next().await {
                     result.map_err(|_| failure("cut proxy cleanup", "route panicked"))??;
                 }
+                // Every route has ended, so this is the last event sender.
+                drop(route_events);
+                ledger
+                    .await
+                    .map_err(|_| failure("cut proxy cleanup", "route ledger panicked"))?;
                 outcome
             }
         });
         Ok(Self {
             address,
             generation,
-            active,
-            held,
+            routes: route_sets,
             discarded,
             stop,
             task: Some(task),
@@ -625,10 +661,10 @@ impl CutPaths {
     }
 
     fn active_indices(&self) -> BTreeSet<u64> {
-        self.active.lock().expect("active routes").clone()
+        self.routes.borrow().active.clone()
     }
     fn held_indices(&self) -> BTreeSet<u64> {
-        self.held.lock().expect("held routes").clone()
+        self.routes.borrow().held.clone()
     }
 
     async fn shutdown(mut self) -> Result<()> {

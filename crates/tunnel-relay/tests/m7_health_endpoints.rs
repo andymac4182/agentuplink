@@ -23,7 +23,7 @@ use axum::body::Body;
 use chrono::Utc;
 use http::{Method, Request, StatusCode};
 use http_body_util::BodyExt;
-use tokio::sync::RwLock;
+use tokio::sync::watch;
 use tower::ServiceExt;
 use tunnel_catalog::{MemoryCatalog, SharedCatalog, SignedMembershipRecord};
 use tunnel_cluster::membership::{
@@ -87,20 +87,22 @@ impl CheckpointAuthority for TestCheckpointAuthority {
 
 #[derive(Clone)]
 struct TestMembershipSource {
-    records: Arc<RwLock<Vec<SignedMembershipRecord>>>,
+    /// The catalog's current records: the test replaces the whole list and
+    /// every read samples the latest one.
+    records: Arc<watch::Sender<Vec<SignedMembershipRecord>>>,
     fail_reads: Arc<AtomicBool>,
 }
 
 impl TestMembershipSource {
     fn new(records: Vec<SignedMembershipRecord>) -> Self {
         Self {
-            records: Arc::new(RwLock::new(records)),
+            records: Arc::new(watch::Sender::new(records)),
             fail_reads: Arc::new(AtomicBool::new(false)),
         }
     }
 
     async fn replace(&self, records: Vec<SignedMembershipRecord>) {
-        *self.records.write().await = records;
+        self.records.send_replace(records);
     }
 
     fn set_fail_reads(&self, fail: bool) {
@@ -116,7 +118,7 @@ impl MembershipRecordSource for TestMembershipSource {
             if self.fail_reads.load(Ordering::Acquire) {
                 return Err(MembershipSourceError::Catalog);
             }
-            Ok(self.records.read().await.clone())
+            Ok(self.records.borrow().clone())
         })
     }
 }
@@ -380,7 +382,10 @@ struct PinnedRuntime {
     client: PeerClient,
 }
 
-fn pinned_peer_runtime(runtime: Arc<MembershipRuntime>, catalog: SharedCatalog) -> PinnedRuntime {
+async fn pinned_peer_runtime(
+    runtime: Arc<MembershipRuntime>,
+    catalog: SharedCatalog,
+) -> PinnedRuntime {
     let identity =
         RelayIdentity::new(DEPLOYMENT_INCARNATION, NODE_ID, BOOT_ID).expect("relay identity");
     let router: Arc<OwnerRouter<dyn tunnel_catalog::Catalog>> =
@@ -398,8 +403,9 @@ fn pinned_peer_runtime(runtime: Arc<MembershipRuntime>, catalog: SharedCatalog) 
     readiness.set_listener_state(PeerListenerState::Bound);
     readiness
         .replace_required_routes(std::iter::empty())
+        .await
         .expect("verified one-node route set");
-    readiness.set_available_capacity(1);
+    readiness.set_available_capacity(1).await;
     let peer = Arc::new(PeerRuntime::new_with_readiness(
         client.clone(),
         router,
@@ -447,7 +453,7 @@ async fn readiness_and_admission_withdraw_with_the_transport_pin_set() {
     let fixture = RuntimeFixture::ready().await;
     let catalog: SharedCatalog = Arc::new(MemoryCatalog::new());
     let oidc = oidc();
-    let pinned = pinned_peer_runtime(Arc::clone(&fixture.runtime), Arc::clone(&catalog));
+    let pinned = pinned_peer_runtime(Arc::clone(&fixture.runtime), Arc::clone(&catalog)).await;
     let handle = Relay::spawn(RelayOptions::new(Arc::clone(&oidc)), Arc::clone(&catalog))
         .await
         .expect("relay actor");
@@ -557,7 +563,7 @@ async fn readiness_and_admission_withdraw_with_the_transport_pin_set() {
 async fn a_membership_recovery_that_leaves_the_pin_set_empty_is_not_ready() {
     let fixture = RuntimeFixture::ready().await;
     let catalog: SharedCatalog = Arc::new(MemoryCatalog::new());
-    let pinned = pinned_peer_runtime(Arc::clone(&fixture.runtime), Arc::clone(&catalog));
+    let pinned = pinned_peer_runtime(Arc::clone(&fixture.runtime), Arc::clone(&catalog)).await;
     let calls = Arc::new(AtomicU64::new(0));
     {
         let membership = Arc::clone(&fixture.runtime);
@@ -573,11 +579,13 @@ async fn a_membership_recovery_that_leaves_the_pin_set_empty_is_not_ready() {
                     pins.replace(std::iter::empty::<SpkiSha256>())
                         .expect("fail-closed pins");
                 }
-            })));
+            })))
+            .await;
     }
     let _admission = fixture
         .runtime
         .admit_peer(MembershipPeerIdentity::new(NODE_ID, BOOT_ID, SPKI_SHA256))
+        .await
         .expect("an active admission for the invalidation to reach");
     assert!(pinned.peer.is_ready(), "control: ready before the blip");
 

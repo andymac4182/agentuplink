@@ -37,7 +37,8 @@
 
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use agent_client_protocol::schema::ProtocolVersion;
@@ -125,6 +126,10 @@ enum OnPermission {
     HoldForCancel,
 }
 
+/// How many failed steps the session can report. It has four checked steps,
+/// each of which fails at most once, so this queue cannot fill.
+const FAILURE_QUEUE: usize = 8;
+
 fn http_client(arguments: &Arguments) -> Result<reqwest::Client, String> {
     let ca = std::fs::read(&arguments.ca)
         .map_err(|error| format!("reading --ca {}: {error}", arguments.ca.display()))?;
@@ -166,11 +171,14 @@ async fn main() -> ExitCode {
         }
     };
 
-    let mode = Arc::new(Mutex::new(OnPermission::Allow));
-    let callback_mode = Arc::clone(&mode);
+    // One flag with one writer (the session task) and one reader (the
+    // permission callback): set means `OnPermission::HoldForCancel`.
+    let hold_for_cancel = Arc::new(AtomicBool::new(false));
+    let callback_mode = Arc::clone(&hold_for_cancel);
     let (held_tx, mut held_rx) = mpsc::unbounded_channel::<()>();
-    let failures: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-    let failed = Arc::clone(&failures);
+    // The session task reports each failed step here, in order, and `main`
+    // reads them once the session has finished.
+    let (failed, mut failures) = mpsc::channel::<String>(FAILURE_QUEUE);
     let cwd = arguments.cwd.clone();
 
     let session = agent_client_protocol::Client
@@ -199,9 +207,11 @@ async fn main() -> ExitCode {
                     })
                     .unwrap_or_default();
                 println!("demo: permission requested \"{title}\" options={offered:?}");
-                let mode = *callback_mode
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mode = if callback_mode.load(Ordering::SeqCst) {
+                    OnPermission::HoldForCancel
+                } else {
+                    OnPermission::Allow
+                };
                 match mode {
                     OnPermission::Allow => {
                         // The allow option, chosen by kind rather than by name
@@ -249,10 +259,8 @@ async fn main() -> ExitCode {
                     println!("demo: ok {step} {detail}");
                 } else {
                     println!("demo: FAILED {step} {detail}");
-                    failed
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .push(step.to_owned());
+                    // Never full: see `FAILURE_QUEUE`.
+                    let _ = failed.try_send(step.to_owned());
                 }
             };
 
@@ -307,9 +315,7 @@ async fn main() -> ExitCode {
             );
 
             // 4. the same callback, left pending and cancelled.
-            *mode
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = OnPermission::HoldForCancel;
+            hold_for_cancel.store(true, Ordering::SeqCst);
             let pending = connection.send_request(PromptRequest::new(
                 id.clone(),
                 vec![ContentBlock::Text(TextContent::new(
@@ -345,10 +351,7 @@ async fn main() -> ExitCode {
             ExitCode::from(1)
         }
         Ok(Ok(())) => {
-            let failures = failures
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone();
+            let failures: Vec<String> = core::iter::from_fn(|| failures.try_recv().ok()).collect();
             if failures.is_empty() {
                 println!(
                     "demo: PASS initialize, session, streaming, permission and cancel through the relay"

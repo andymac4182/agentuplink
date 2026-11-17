@@ -28,7 +28,7 @@
 use std::{
     collections::BTreeMap,
     fmt::Write as _,
-    sync::{Arc, LazyLock, Mutex, PoisonError},
+    sync::{Arc, atomic::AtomicU64},
     time::Duration,
 };
 
@@ -41,7 +41,12 @@ use axum::{
 };
 use tokio::sync::Semaphore;
 
-use crate::{RelayHandle, RelaySnapshot, health::ReadinessChecks, peer_runtime::PeerRuntime};
+use crate::{
+    RelayHandle, RelaySnapshot,
+    health::ReadinessChecks,
+    peer_runtime::PeerRuntime,
+    peer_transport_diagnostics::cells::{LabelTable, bump, read},
+};
 
 /// The longest a scrape waits for the relay actor's snapshot.
 pub(crate) const SNAPSHOT_DEADLINE: Duration = Duration::from_secs(2);
@@ -116,19 +121,36 @@ pub(crate) async fn serve_bounded(
 
 const CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
 
+/// Distinct route labels counted apart; the public routes are a closed set
+/// well below this.
+const REFUSAL_ROUTES: usize = 15;
+/// Distinct stage labels counted apart (M6-C52's vocabulary is closed and
+/// well below this).
+const REFUSAL_STAGES: usize = 31;
+
+static REFUSAL_ROUTE_LABELS: LabelTable<REFUSAL_ROUTES> = LabelTable::new();
+static REFUSAL_STAGE_LABELS: LabelTable<REFUSAL_STAGES> = LabelTable::new();
+
 /// Consumer refusals by `(route, stage)`, both fixed labels (M6-C52's
-/// vocabulary).  Counted before the log rate limit, so suppressed lines are
-/// still counted.  Process-wide, like the log limiter it sits beside.
-static CONSUMER_REFUSALS: LazyLock<Mutex<BTreeMap<(&'static str, &'static str), u64>>> =
-    LazyLock::new(|| Mutex::new(BTreeMap::new()));
+/// vocabulary): one counter per pair, indexed by the two labels' table
+/// positions, so a count is exact and never waits on another.  A label
+/// beyond a table's capacity is counted under `other` rather than lost.
+/// Counted before the log rate limit, so suppressed lines are still
+/// counted.  Process-wide, like the log limiter it sits beside.
+static CONSUMER_REFUSALS: [AtomicU64; (REFUSAL_ROUTES + 1) * (REFUSAL_STAGES + 1)] =
+    [const { AtomicU64::new(0) }; (REFUSAL_ROUTES + 1) * (REFUSAL_STAGES + 1)];
 
 /// Count one refused consumer request.
 pub(crate) fn count_consumer_refusal(route: &'static str, stage: &'static str) {
-    let mut counts = CONSUMER_REFUSALS
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner);
-    let count = counts.entry((route, stage)).or_insert(0);
-    *count = count.saturating_add(1);
+    let route = REFUSAL_ROUTE_LABELS.index(route);
+    let stage = REFUSAL_STAGE_LABELS.index(stage);
+    let index = route * REFUSAL_STAGE_LABELS.indices() as u64 + stage;
+    if let Some(count) = usize::try_from(index)
+        .ok()
+        .and_then(|index| CONSUMER_REFUSALS.get(index))
+    {
+        bump(count);
+    }
 }
 
 /// Count one consumer request this relay, as the device's owner, refused
@@ -157,10 +179,23 @@ pub(crate) fn route_label(route: &str) -> &'static str {
 }
 
 pub(crate) fn consumer_refusals() -> BTreeMap<(&'static str, &'static str), u64> {
-    CONSUMER_REFUSALS
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .clone()
+    let stages = REFUSAL_STAGE_LABELS.indices();
+    let mut refusals = BTreeMap::new();
+    for (index, count) in CONSUMER_REFUSALS.iter().enumerate() {
+        let count = read(count);
+        if count == 0 {
+            continue;
+        }
+        let route = REFUSAL_ROUTE_LABELS.label((index / stages) as u64);
+        let stage = REFUSAL_STAGE_LABELS.label((index % stages) as u64);
+        if let (Some(route), Some(stage)) = (route, stage) {
+            // A table's overflow index shares the label `other` with a pair
+            // counted under that name, so the two are reported together.
+            let total: &mut u64 = refusals.entry((route, stage)).or_insert(0);
+            *total = total.saturating_add(count);
+        }
+    }
+    refusals
 }
 
 /// Everything one scrape renders.

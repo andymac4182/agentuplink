@@ -1570,9 +1570,54 @@ async fn online_authority_publishes_for_three_relays_and_fails_closed_across_lif
     outcome.expect("online authority real-process acceptance");
 }
 
-// These two faults share only the disposable wrapper-owned Redis daemon.
-// Serialize them even when someone omits the wrapper's --test-threads=1.
-static FAULT_TEST_SERIALIZER: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+// These two faults share only the disposable wrapper-owned Redis daemon, so
+// one lane owns it and runs the fault cases one at a time, in the order they
+// were handed over, even when someone omits the wrapper's --test-threads=1.
+struct FaultRun {
+    case: FaultCase,
+    done: tokio::sync::oneshot::Sender<GateResult>,
+}
+
+/// One queued run per fault test in this binary, so handing a case over never
+/// waits.
+const FAULT_LANE_QUEUE: usize = 2;
+
+static FAULT_LANE: std::sync::OnceLock<std::sync::mpsc::SyncSender<FaultRun>> =
+    std::sync::OnceLock::new();
+
+/// The lane is its own thread with its own runtime of the same shape the
+/// tests ask for, because each `#[tokio::test]` brings a separate runtime
+/// that ends with its test.
+fn fault_lane() -> &'static std::sync::mpsc::SyncSender<FaultRun> {
+    FAULT_LANE.get_or_init(|| {
+        let (runs, queue) = std::sync::mpsc::sync_channel::<FaultRun>(FAULT_LANE_QUEUE);
+        // If the thread or its runtime cannot start, `queue` is dropped and
+        // every fault test reports that the lane stopped.
+        let _ = std::thread::Builder::new()
+            .name("authority-fault-lane".into())
+            .spawn(move || {
+                let Ok(runtime) = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(4)
+                    .enable_all()
+                    .build()
+                else {
+                    return;
+                };
+                for run in queue {
+                    let _ = run.done.send(runtime.block_on(run_owned_fault(run.case)));
+                }
+            });
+        runs
+    })
+}
+
+async fn run_owned_fault_in_lane(case: FaultCase) -> GateResult {
+    let (done, outcome) = tokio::sync::oneshot::channel();
+    fault_lane()
+        .send(FaultRun { case, done })
+        .map_err(|_| "authority fault lane stopped")?;
+    outcome.await.map_err(|_| "authority fault lane stopped")?
+}
 
 struct OwnedRedis {
     container_id: String,
@@ -1740,7 +1785,7 @@ async fn raw_memberships(
 
 async fn committed_reply_fault(
     fixture: &mut Fixture,
-    proxy: &FaultProxy,
+    proxy: &mut FaultProxy,
     catalog: &RedisCatalog,
 ) -> GateResult {
     proxy.arm_next_committed_publish()?;
@@ -1989,7 +2034,7 @@ async fn run_owned_fault(case: FaultCase) -> GateResult {
             FaultCase::CommittedReply => {
                 committed_reply_fault(
                     fixture,
-                    proxy.as_ref().ok_or("lost-reply proxy missing")?,
+                    proxy.as_mut().ok_or("lost-reply proxy missing")?,
                     catalog,
                 )
                 .await
@@ -2060,8 +2105,7 @@ async fn run_owned_fault(case: FaultCase) -> GateResult {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "run scripts/m6-authority-faults-verify.sh; requires its owned isolated Redis container"]
 async fn online_authority_fault_committed_publish_reply_uses_a_higher_round() {
-    let _serial = FAULT_TEST_SERIALIZER.lock().await;
-    run_owned_fault(FaultCase::CommittedReply)
+    run_owned_fault_in_lane(FaultCase::CommittedReply)
         .await
         .expect("actual daemon committed lost-reply acceptance");
 }
@@ -2069,8 +2113,7 @@ async fn online_authority_fault_committed_publish_reply_uses_a_higher_round() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "run scripts/m6-authority-faults-verify.sh; never restart a shared Redis instance"]
 async fn online_authority_fault_actual_redis_restart_requires_independent_approval() {
-    let _serial = FAULT_TEST_SERIALIZER.lock().await;
-    run_owned_fault(FaultCase::RedisRestart)
+    run_owned_fault_in_lane(FaultCase::RedisRestart)
         .await
         .expect("actual daemon owned Redis restart acceptance");
 }

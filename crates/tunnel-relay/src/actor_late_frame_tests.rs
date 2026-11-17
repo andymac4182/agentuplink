@@ -113,7 +113,6 @@ impl LateFixture {
         session.profile = runtime::RuntimeProfile::M2;
         session.generation = GENERATION;
         session.connection_id = carrier.connection_id.clone();
-        session.data_tx = Some(data_tx.clone());
         session.active_carrier = Some(DataCarrier {
             context: carrier.context(),
             tx: data_tx,
@@ -123,7 +122,6 @@ impl LateFixture {
             session.streams.insert(
                 stream_id,
                 M2Stream {
-                    deferred_terminal_cause: None,
                     credit_held: false,
                     open_message_id: format!("late-open-{stream_id}"),
                     operation_id: operation_id(stream_id),
@@ -153,8 +151,7 @@ impl LateFixture {
                     terminal: false,
                     pending_terminal: None,
                     terminal_fin_failure: false,
-                    open_pending: false,
-                    registration_dropped: false,
+                    admission: crate::actor::StreamAdmission::Admitted,
                     closed: CancellationToken::new(),
                     admission_lease: CancellationToken::new(),
                     admission_deadline: Instant::now() + StdDuration::from_secs(60),
@@ -546,8 +543,7 @@ async fn refused_records_never_advance_the_relay_sequence_or_leak_budget() {
             .sessions
             .get_mut(&fixture.key.scope())
             .expect("fixture session");
-        let original = session.data_tx.clone().expect("active writer");
-        session.data_tx = Some(full_tx.clone());
+        let original = session.data_tx().cloned().expect("active writer");
         session.active_carrier = Some(DataCarrier {
             context: fixture.carrier.context(),
             tx: full_tx,
@@ -589,7 +585,6 @@ async fn refused_records_never_advance_the_relay_sequence_or_leak_budget() {
             .sessions
             .get_mut(&fixture.key.scope())
             .expect("fixture session");
-        session.data_tx = Some(original_tx.clone());
         session.active_carrier = Some(DataCarrier {
             context: fixture.carrier.context(),
             tx: original_tx,
@@ -1469,8 +1464,8 @@ async fn connector_terminal_releases_a_partial_response_and_keeps_the_tombstone_
 fn saturate_carrier_slots(fixture: &mut LateFixture) -> Vec<oneshot::Receiver<()>> {
     let data_tx = fixture
         .session_mut()
-        .data_tx
-        .clone()
+        .data_tx()
+        .cloned()
         .expect("fixture carrier sender");
     let mut held = Vec::new();
     loop {
@@ -1547,8 +1542,8 @@ async fn terminal_refused_by_a_lost_carrier_is_not_queue_exhaustion() {
     while session.queue_budget.reserve_data(1) {}
     let queue_budget = session.queue_budget.clone();
     let data_tx = session
-        .data_tx
-        .clone()
+        .data_tx()
+        .cloned()
         .expect("carrier sender outlives the receiver");
     assert!(data_tx.is_closed(), "the carrier is gone");
     assert!(
@@ -1739,7 +1734,7 @@ async fn a_stalled_physical_write_latches_its_timeout_before_stream_forget() {
             .actor
             .sessions
             .get(&fixture.key.scope())
-            .is_some_and(|session| session.terminal_fin_failure_deadline.is_none()),
+            .is_some_and(|session| session.terminal_fin_failure_deadline.is_idle()),
         "cleanup joined: no terminal-FIN debt is left armed"
     );
 
@@ -1826,7 +1821,9 @@ async fn an_expired_unclaimed_admission_lease_latches_lease_expiry() {
 async fn an_expired_lease_on_a_pending_open_defers_its_cause_to_the_real_terminal() {
     let mut fixture = LateFixture::new("cause-admission-lease-pending");
     let now = Instant::now();
-    fixture.stream_mut(STREAM_A).open_pending = true;
+    // The fixture builds admitted streams and an admitted stream never
+    // becomes pending again, so this one is rebuilt in its initial state.
+    fixture.stream_mut(STREAM_A).admission = crate::actor::StreamAdmission::OpenPending;
     fixture.stream_mut(STREAM_A).admission_deadline = now - StdDuration::from_secs(1);
 
     let key = fixture.key.clone();
@@ -1841,12 +1838,12 @@ async fn an_expired_lease_on_a_pending_open_defers_its_cause_to_the_real_termina
         "and no terminal tombstone is invented for it"
     );
     assert_eq!(
-        fixture.stream(STREAM_A).deferred_terminal_cause,
+        fixture.stream(STREAM_A).admission.deferred_terminal_cause(),
         Some(StreamTerminalCause::AdmissionLeaseExpired),
         "the cause is held for the terminal the admitted OPEN will produce"
     );
     assert!(
-        fixture.stream(STREAM_A).registration_dropped,
+        fixture.stream(STREAM_A).admission.registration_dropped(),
         "the registration is recorded as dropped, exactly as before"
     );
     assert!(fixture.session_alive());

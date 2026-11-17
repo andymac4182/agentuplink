@@ -11,10 +11,12 @@ use crate::error::{HarnessError, Result};
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::watch;
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{timeout, timeout_at};
 use tokio_util::sync::CancellationToken;
@@ -158,14 +160,21 @@ pub struct FanoutRouteFlow {
     pub closed_by_fixture: bool,
 }
 
-#[derive(Debug, Default)]
-struct RouteControl {
-    faults: BTreeMap<u64, FanoutRouteFault>,
-    cancels: BTreeMap<u64, CancellationToken>,
-    flows: BTreeMap<u64, Arc<Mutex<FanoutRouteFlow>>>,
+/// The fixture's handle on one accepted route's flow record.
+///
+/// The route's forwarding task is the only writer of the burst and byte
+/// counters and publishes them as one record, so a reader always samples a
+/// record the task actually produced. Whether the fixture closed the route is
+/// the fixture's own independent flag.
+#[derive(Debug)]
+struct RouteFlowView {
+    flow: watch::Receiver<FanoutRouteFlow>,
+    closed_by_fixture: Arc<AtomicBool>,
 }
 
-type SharedRouteControl = Arc<Mutex<RouteControl>>;
+/// Faults armed by the fixture, keyed by accept index. The fixture handle is
+/// the only writer; the accept loop samples the table when it accepts.
+type RouteFaults = BTreeMap<u64, FanoutRouteFault>;
 
 /// Bounded status for one fanout listener.
 ///
@@ -204,6 +213,20 @@ impl FanoutProxyDiagnostics {
     pub fn retained_closed_count(&self) -> usize {
         self.closed.len()
     }
+}
+
+/// Everything the accept loop publishes about its routes.
+///
+/// The accept loop is the only writer: it records each accept together with
+/// the route's cancel token and flow view, and each completion together with
+/// the token's removal, so the handle samples one consistent view.
+#[derive(Debug)]
+struct ListenerView {
+    diagnostics: DiagnosticsState,
+    /// Cancel tokens of the routes that are currently open.
+    cancels: BTreeMap<u64, CancellationToken>,
+    /// Flow views of a bounded number of routes, in accept order.
+    flows: BTreeMap<u64, RouteFlowView>,
 }
 
 #[derive(Debug)]
@@ -272,8 +295,6 @@ impl DiagnosticsState {
     }
 }
 
-type SharedDiagnostics = Arc<Mutex<DiagnosticsState>>;
-
 /// A one-listener TCP fanout proxy.  The listener is intentionally
 /// TLS-agnostic: mTLS handshakes pass through as opaque bytes.
 pub struct FanoutProxy;
@@ -291,13 +312,13 @@ impl FanoutProxy {
         let listener = TcpListener::bind(config.bind_addr).await?;
         let local_addr = listener.local_addr()?;
         let cancellation = CancellationToken::new();
-        let diagnostics = Arc::new(Mutex::new(DiagnosticsState::new(
-            config.diagnostics_capacity,
-        )));
-        let routes = Arc::new(Mutex::new(RouteControl::default()));
+        let (publish_view, view) = watch::channel(ListenerView {
+            diagnostics: DiagnosticsState::new(config.diagnostics_capacity),
+            cancels: BTreeMap::new(),
+            flows: BTreeMap::new(),
+        });
+        let (faults, armed_faults) = watch::channel(RouteFaults::new());
         let task_cancellation = cancellation.clone();
-        let task_diagnostics = Arc::clone(&diagnostics);
-        let task_routes = Arc::clone(&routes);
         let task_targets = Arc::from(targets.into_boxed_slice());
         let listener_targets = Arc::clone(&task_targets);
         let task_config = config.clone();
@@ -306,8 +327,8 @@ impl FanoutProxy {
                 listener,
                 listener_targets,
                 task_config,
-                task_diagnostics,
-                task_routes,
+                publish_view,
+                armed_faults,
                 task_cancellation,
             )
             .await
@@ -316,8 +337,8 @@ impl FanoutProxy {
         Ok(FanoutProxyHandle {
             local_addr,
             targets: task_targets,
-            diagnostics,
-            routes,
+            view,
+            faults,
             cancellation,
             task: Some(task),
         })
@@ -341,8 +362,8 @@ impl FanoutProxy {
 pub struct FanoutProxyHandle {
     local_addr: SocketAddr,
     targets: Arc<[SocketAddr]>,
-    diagnostics: SharedDiagnostics,
-    routes: SharedRouteControl,
+    view: watch::Receiver<ListenerView>,
+    faults: watch::Sender<RouteFaults>,
     cancellation: CancellationToken,
     task: Option<JoinHandle<Result<()>>>,
 }
@@ -376,10 +397,7 @@ impl FanoutProxyHandle {
 
     /// Return the bounded listener diagnostics snapshot.
     pub fn diagnostics(&self) -> FanoutProxyDiagnostics {
-        self.diagnostics
-            .lock()
-            .map(|state| state.snapshot())
-            .unwrap_or_default()
+        self.view.borrow().diagnostics.snapshot()
     }
 
     /// Arm one deterministic fault for a route that has not been accepted
@@ -392,26 +410,25 @@ impl FanoutProxyHandle {
                 "fanout route hold requires a nonzero client burst".to_owned(),
             ));
         }
-        let accepted = self
-            .diagnostics
-            .lock()
-            .map(|state| state.accepted)
-            .map_err(|_| HarnessError::Proxy("fanout diagnostics poisoned".to_owned()))?;
+        let accepted = self.view.borrow().diagnostics.accepted;
         if accept_index < accepted {
             return Err(HarnessError::InvalidInput(format!(
                 "fanout route {accept_index} was already accepted; faults must be armed first"
             )));
         }
-        let mut routes = self
-            .routes
-            .lock()
-            .map_err(|_| HarnessError::Proxy("fanout route control poisoned".to_owned()))?;
-        if routes.faults.len() >= MAX_CONNECTIONS {
+        let mut full = false;
+        self.faults.send_modify(|faults| {
+            if faults.len() >= MAX_CONNECTIONS {
+                full = true;
+            } else {
+                faults.insert(accept_index, fault);
+            }
+        });
+        if full {
             return Err(HarnessError::InvalidInput(
                 "fanout route fault table is full".to_owned(),
             ));
         }
-        routes.faults.insert(accept_index, fault);
         Ok(())
     }
 
@@ -419,17 +436,12 @@ impl FanoutProxyHandle {
     /// target socket are dropped once the route task observes the request.
     /// Returns `false` when the index is not currently open.
     pub fn close_route(&self, accept_index: u64) -> Result<bool> {
-        let routes = self
-            .routes
-            .lock()
-            .map_err(|_| HarnessError::Proxy("fanout route control poisoned".to_owned()))?;
-        let Some(cancel) = routes.cancels.get(&accept_index) else {
+        let view = self.view.borrow();
+        let Some(cancel) = view.cancels.get(&accept_index) else {
             return Ok(false);
         };
-        if let Some(flow) = routes.flows.get(&accept_index)
-            && let Ok(mut flow) = flow.lock()
-        {
-            flow.closed_by_fixture = true;
+        if let Some(route) = view.flows.get(&accept_index) {
+            route.closed_by_fixture.store(true, Ordering::Release);
         }
         cancel.cancel();
         Ok(true)
@@ -438,12 +450,11 @@ impl FanoutProxyHandle {
     /// Payload-free flow record for one accepted route.  Records are retained
     /// for a bounded number of routes in accept order.
     pub fn route_flow(&self, accept_index: u64) -> Option<FanoutRouteFlow> {
-        self.routes
-            .lock()
-            .ok()?
-            .flows
-            .get(&accept_index)
-            .and_then(|flow| flow.lock().ok().map(|flow| *flow))
+        let view = self.view.borrow();
+        let route = view.flows.get(&accept_index)?;
+        let mut flow = *route.flow.borrow();
+        flow.closed_by_fixture = route.closed_by_fixture.load(Ordering::Acquire);
+        Some(flow)
     }
 
     /// Cancel the listener and join the accept and forwarding tasks.
@@ -587,56 +598,50 @@ async fn accept_loop(
     listener: TcpListener,
     targets: Arc<[SocketAddr]>,
     config: FanoutProxyConfig,
-    diagnostics: SharedDiagnostics,
-    routes: SharedRouteControl,
+    view: watch::Sender<ListenerView>,
+    faults: watch::Receiver<RouteFaults>,
     cancellation: CancellationToken,
 ) -> Result<()> {
     let mut connections = JoinSet::new();
 
     loop {
-        let open_count = diagnostics
-            .lock()
-            .map(|state| state.open.len())
-            .unwrap_or(config.max_concurrent_connections);
+        let open_count = view.borrow().diagnostics.open.len();
         tokio::select! {
             _ = cancellation.cancelled() => break,
             Some(joined) = connections.join_next(), if open_count != 0 => {
-                complete_connection(joined, &diagnostics);
+                complete_connection(joined, &view);
             }
             result = listener.accept(), if open_count < config.max_concurrent_connections => {
                 let (client, _source_addr) = result?;
-                let accept_index = diagnostics
-                    .lock()
-                    .map(|state| state.accepted)
-                    .unwrap_or(0);
+                let accept_index = view.borrow().diagnostics.accepted;
                 let target = targets[(accept_index % targets.len() as u64) as usize];
-                let route = diagnostics
-                    .lock()
-                    .map(|mut state| state.accepted(target))
-                    .unwrap_or(FanoutConnection {
-                        index: accept_index,
-                        target,
-                    });
                 let task_cancellation = cancellation.clone();
                 let route_cancel = CancellationToken::new();
-                let flow = Arc::new(Mutex::new(FanoutRouteFlow {
-                    index: route.index,
+                let (flow, flow_view) = watch::channel(FanoutRouteFlow {
+                    index: accept_index,
                     ..FanoutRouteFlow::default()
-                }));
-                let fault = match routes.lock() {
-                    Ok(mut control) => {
-                        control.cancels.insert(route.index, route_cancel.clone());
-                        if control.flows.len() >= MAX_CONNECTIONS
-                            && let Some(oldest) = control.flows.keys().next().copied()
-                        {
-                            control.flows.remove(&oldest);
-                        }
-                        control.flows.insert(route.index, Arc::clone(&flow));
-                        control.faults.get(&route.index).copied()
-                    }
-                    Err(_) => None,
+                });
+                let route = FanoutConnection {
+                    index: accept_index,
+                    target,
                 };
-                let task_routes = Arc::clone(&routes);
+                view.send_modify(|view| {
+                    view.diagnostics.accepted(target);
+                    view.cancels.insert(route.index, route_cancel.clone());
+                    if view.flows.len() >= MAX_CONNECTIONS
+                        && let Some(oldest) = view.flows.keys().next().copied()
+                    {
+                        view.flows.remove(&oldest);
+                    }
+                    view.flows.insert(
+                        route.index,
+                        RouteFlowView {
+                            flow: flow_view,
+                            closed_by_fixture: Arc::new(AtomicBool::new(false)),
+                        },
+                    );
+                });
+                let fault = faults.borrow().get(&route.index).copied();
                 connections.spawn(async move {
                     let _ = forward_connection(
                         client,
@@ -650,9 +655,6 @@ async fn accept_loop(
                         },
                     )
                     .await;
-                    if let Ok(mut control) = task_routes.lock() {
-                        control.cancels.remove(&route.index);
-                    }
                     route
                 });
             }
@@ -661,29 +663,31 @@ async fn accept_loop(
 
     cancellation.cancel();
     while let Some(joined) = connections.join_next().await {
-        complete_connection(joined, &diagnostics);
+        complete_connection(joined, &view);
     }
     Ok(())
 }
 
 fn complete_connection(
     joined: std::result::Result<FanoutConnection, tokio::task::JoinError>,
-    diagnostics: &SharedDiagnostics,
+    view: &watch::Sender<ListenerView>,
 ) {
     let route = match joined {
         Ok(route) => route,
         Err(_) => return,
     };
-    if let Ok(mut state) = diagnostics.lock() {
-        state.closed(route);
-    }
+    view.send_modify(|view| {
+        view.cancels.remove(&route.index);
+        view.diagnostics.closed(route);
+    });
 }
 
 /// Per-route fault state handed to the forwarding task.
 struct RouteFault {
     fault: Option<FanoutRouteFault>,
     cancel: CancellationToken,
-    flow: Arc<Mutex<FanoutRouteFlow>>,
+    /// This route's flow record; the forwarding task is its only writer.
+    flow: watch::Sender<FanoutRouteFlow>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -695,38 +699,39 @@ enum BurstDirection {
 /// Record one opaque burst and return whether the target-to-client direction
 /// must now be withheld.
 fn record_burst(
-    flow: &Arc<Mutex<FanoutRouteFlow>>,
+    flow: &watch::Sender<FanoutRouteFlow>,
     last: &mut Option<BurstDirection>,
     direction: BurstDirection,
     bytes: usize,
     fault: Option<FanoutRouteFault>,
 ) -> bool {
-    let Ok(mut flow) = flow.lock() else {
-        return false;
-    };
     let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
     let new_burst = *last != Some(direction);
     *last = Some(direction);
-    match direction {
-        BurstDirection::ClientToTarget => {
-            if new_burst {
-                flow.client_bursts = flow.client_bursts.saturating_add(1);
+    let mut held = false;
+    flow.send_modify(|flow| {
+        match direction {
+            BurstDirection::ClientToTarget => {
+                if new_burst {
+                    flow.client_bursts = flow.client_bursts.saturating_add(1);
+                }
+                flow.client_bytes = flow.client_bytes.saturating_add(bytes);
             }
-            flow.client_bytes = flow.client_bytes.saturating_add(bytes);
-        }
-        BurstDirection::TargetToClient => {
-            if new_burst {
-                flow.target_bursts = flow.target_bursts.saturating_add(1);
+            BurstDirection::TargetToClient => {
+                if new_burst {
+                    flow.target_bursts = flow.target_bursts.saturating_add(1);
+                }
+                flow.target_bytes = flow.target_bytes.saturating_add(bytes);
             }
-            flow.target_bytes = flow.target_bytes.saturating_add(bytes);
         }
-    }
-    if let Some(FanoutRouteFault::HoldTargetToClientAfterClientFlight(flight)) = fault
-        && flow.client_bursts >= flight
-    {
-        flow.held = true;
-    }
-    flow.held
+        if let Some(FanoutRouteFault::HoldTargetToClientAfterClientFlight(flight)) = fault
+            && flow.client_bursts >= flight
+        {
+            flow.held = true;
+        }
+        held = flow.held;
+    });
+    held
 }
 
 async fn forward_connection(

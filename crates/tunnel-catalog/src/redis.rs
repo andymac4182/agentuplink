@@ -741,7 +741,9 @@ impl RedisCatalog {
     /// `rebind-redis-run`, or, with a continuity witness, one holding this
     /// process's last acknowledged token.  A catalog that never calls this,
     /// including every `[cluster]` relay's, refuses any run but the one it
-    /// connected to, as before M6-C65.
+    /// connected to, as before M6-C65.  Calling it again is a no-op; after the
+    /// configured incarnation changed it is a `Conflict` and the first scope
+    /// is kept.
     pub fn enable_run_rebinding(&self) -> Result<(), CatalogError> {
         let incarnation = self.configured_incarnation()?;
         self.lane_group.binding().set_scope(RebindScope {
@@ -749,8 +751,7 @@ impl RedisCatalog {
             incarnation_key: self.active_incarnation_key(),
             run_key: self.redis_run_id_key(),
             continuity_key: self.continuity_key(),
-        });
-        Ok(())
+        })
     }
 
     /// Compatibility bootstrap/fixture path for setting the configured
@@ -910,7 +911,7 @@ impl RedisCatalog {
         if !self.bound_persistence_is_sound().await? {
             return Err(CatalogError::Conflict(PERSISTENCE_UNSOUND));
         }
-        self.lane_group.binding().enable_witness(interval);
+        self.lane_group.binding().enable_witness(interval).await;
         self.advance_restart_continuity().await
     }
 
@@ -950,13 +951,13 @@ impl RedisCatalog {
     pub async fn advance_restart_continuity(&self) -> Result<(), CatalogError> {
         let incarnation = self.configured_incarnation()?.to_owned();
         let binding = self.lane_group.binding();
-        if !binding.witness_enabled() {
+        if !binding.witness_enabled().await {
             return Err(CatalogError::InvalidInput(
                 "restart continuity is not enabled",
             ));
         }
         let token = Uuid::new_v4().simple().to_string();
-        binding.continuity_dispatching(&token);
+        binding.continuity_dispatching(&token).await;
         let result: Result<Vec<String>, CatalogError> = self
             .connection
             .query_eval(
@@ -984,7 +985,7 @@ impl RedisCatalog {
                     // token stays a candidate either way.
                     return match self.bound_persistence_is_sound().await {
                         Ok(true) => {
-                            binding.continuity_acknowledged(&token);
+                            binding.continuity_acknowledged(&token).await;
                             Ok(())
                         }
                         Ok(false) => Err(CatalogError::Conflict(PERSISTENCE_UNSOUND)),
@@ -999,7 +1000,7 @@ impl RedisCatalog {
             Err(error @ CatalogError::WriteOutcomeUnknown(_)) => return Err(error),
             Err(error) => error,
         };
-        binding.continuity_not_written(&token);
+        binding.continuity_not_written(&token).await;
         Err(refused)
     }
 

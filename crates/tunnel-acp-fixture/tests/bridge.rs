@@ -1557,14 +1557,14 @@ async fn open_session(
 /// keeps the stream established until a test asks for a break with
 /// [`HeldStream::break_now`], which is the only place a break should come from.
 struct HeldStream {
-    payloads: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+    /// Published by the drain task, which is its only writer.
+    payloads: tokio::sync::watch::Receiver<Vec<Vec<u8>>>,
     task: tokio::task::JoinHandle<()>,
 }
 
 impl HeldStream {
     fn hold(response: http::Response<ChannelBody>) -> Self {
-        let payloads = Arc::new(std::sync::Mutex::new(Vec::<Vec<u8>>::new()));
-        let sink = Arc::clone(&payloads);
+        let (sink, payloads) = tokio::sync::watch::channel(Vec::<Vec<u8>>::new());
         let task = tokio::spawn(async move {
             let mut body = std::pin::pin!(response.into_body());
             let mut buffer = Vec::new();
@@ -1576,10 +1576,7 @@ impl HeldStream {
                 }
                 let all = sse_payloads(&buffer);
                 if all.len() > taken {
-                    let mut guard = sink
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    guard.extend_from_slice(&all[taken..]);
+                    sink.send_modify(|seen| seen.extend_from_slice(&all[taken..]));
                     taken = all.len();
                 }
             }
@@ -1594,10 +1591,7 @@ impl HeldStream {
     }
 
     fn seen(&self) -> Vec<Vec<u8>> {
-        self.payloads
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
+        self.payloads.borrow().clone()
     }
 
     /// Wait for a payload whose JSON pointer resolves to a string.

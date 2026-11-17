@@ -12,7 +12,7 @@ use std::{
     net::SocketAddr,
     pin::Pin,
     sync::{
-        Arc, Mutex as StdMutex, OnceLock,
+        Arc, OnceLock,
         atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
@@ -22,7 +22,7 @@ use bytes::{Buf, Bytes};
 use http::{Request, Response};
 use thiserror::Error;
 use tokio::{
-    sync::{Mutex, OwnedSemaphorePermit, Semaphore, watch},
+    sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch},
     task::{JoinHandle, JoinSet},
     time::{Instant, sleep_until, timeout, timeout_at},
 };
@@ -423,14 +423,16 @@ pub struct PeerPoolStats {
 /// The transport stage currently executing for one request-stream open.
 ///
 /// This observer is optional and read-only.  It exists for bounded fixtures
-/// that need to distinguish stream-permit checkout, sender-mutex wait, and
+/// that need to distinguish stream-permit checkout, taking a sender, and
 /// HTTP/3 dispatch when their outer deadline cancels an open attempt.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
 pub enum PeerTransportOpenStage {
     /// Waiting for the configured per-connection stream permit.
     StreamPermitCheckout = 0,
-    /// Waiting for the shared HTTP/3 sender mutex.
+    /// Waiting for an HTTP/3 sender.  Each request dispatches on its own
+    /// sender, so no attempt waits here and the stage is never recorded; the
+    /// variant is kept so stage vocabularies stay stable.
     SenderLock = 1,
     /// Dispatching the HTTP/3 request, including QUIC bidi-stream checkout.
     H3Dispatch = 2,
@@ -929,7 +931,7 @@ fn map_probe_error(error: PeerProbeError) -> PeerTransportError {
 }
 
 /// Await one checkout step without resetting the caller's absolute deadline.
-/// Pool lock, capacity, handshake, and H3 setup waits all use the same
+/// Pool turn, capacity, handshake, and H3 setup waits all use the same
 /// deadline so a slow or cancelled creator cannot strand later waiters behind
 /// a sequence of fresh per-phase timers.
 async fn with_checkout_deadline<F, T>(
@@ -1745,27 +1747,293 @@ struct ClientConnection {
     identity: TlsIdentity,
     pin_provider: SharedPeerPins,
     connection: quinn::Connection,
-    sender: Mutex<ClientSender>,
+    /// The connection's HTTP/3 request sender as it was built.  It is never
+    /// used in place: every open dispatches on its own clone, which is how
+    /// HTTP/3 shares one connection between concurrent requests.
+    ///
+    /// As built it still carries the connection's one GREASE frame, and so
+    /// does every clone of it: a clone's first dispatched request stream
+    /// writes that frame when it finishes.  Only opens that find
+    /// `dispatched_sender` empty clone this one.
+    sender: ClientSender,
+    /// A sender that has dispatched a request, set once by the first open
+    /// that succeeds.  Its GREASE frame is spent, so the clones every later
+    /// open dispatches on write none: the frame goes out once per
+    /// connection, as it did when all opens shared one sender.  Opens that
+    /// race the connection's very first dispatch each still carry one.
+    dispatched_sender: OnceLock<ClientSender>,
+    /// Join requests to the one task that owns the handles of this
+    /// connection's driver and pin watcher
+    /// ([`supervise_client_connection`]).
+    joins: mpsc::Sender<JoinRequest>,
     stream_permits: Arc<Semaphore>,
     connection_bytes: Arc<AtomicUsize>,
     limits: PeerTransportLimits,
+    /// Emergency and local close.  Also cancelled from outside this
+    /// connection: by the owning client's shutdown (it is a child of the
+    /// client's token) and by the pin watcher on revocation.
     cancel: CancellationToken,
-    /// A peer-observed H3 GOAWAY asks the client driver to acknowledge it
-    /// after every existing stream lease has been returned.  This is kept
-    /// separate from `cancel`, which is reserved for emergency/local close.
-    planned_remote_closing: CancellationToken,
-    driver: Mutex<Option<JoinHandle<Result<(), PeerTransportError>>>>,
-    pin_watcher: Mutex<Option<JoinHandle<()>>>,
+    /// Where this connection is in its life; see [`ClientConnectionPhase`].
+    /// A peer-observed GOAWAY is kept apart from `cancel` so existing
+    /// streams stay alive until their leases are returned.
+    phase: watch::Sender<ClientConnectionPhase>,
     /// The local peer identity generation read immediately before this
     /// connection's handshake began (0 when the client has no rotating
     /// identity).  Read *before* the dial, so a rotation racing the handshake
     /// can only make a connection look older than it is -- which retires it
     /// early -- and never newer.
     local_generation: u64,
-    /// Set when [`PeerClient::retire_local_generations_before`] closes this
-    /// connection, so its streams report the typed cause.
-    retired: AtomicBool,
     _connection_permit: OwnedSemaphorePermit,
+}
+
+/// Why this side closed a pooled client connection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LocalCloseCause {
+    /// An ordinary shutdown, replacement or drop.
+    Shutdown,
+    /// [`PeerClient::retire_local_generations_before`] closed it; its streams
+    /// report [`PeerTransportError::LocalIdentityRetired`].
+    IdentityRetired,
+}
+
+/// The life of one pooled client connection.
+///
+/// `Live -> RemoteGoAway -> Closed`, or `Live -> Closed` directly.  The
+/// tasks behind a closed connection are joined by its supervisor
+/// ([`supervise_client_connection`]), whose own `Serving -> Joining ->
+/// Joined` progress is that task's control flow.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ClientConnectionPhase {
+    /// Usable for new request streams.
+    Live,
+    /// The peer sent (or implied) an HTTP/3 GOAWAY: no new stream is opened,
+    /// and the driver acknowledges it once every stream lease is returned.
+    RemoteGoAway,
+    /// This side closed the connection.  `remote_goaway` records whether a
+    /// peer GOAWAY had also been observed, so a later open is still refused
+    /// as the pre-dispatch [`PeerTransportError::GoAway`].
+    Closed {
+        cause: LocalCloseCause,
+        remote_goaway: bool,
+    },
+}
+
+/// What can move a [`ClientConnectionPhase`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ClientConnectionEvent {
+    /// A peer GOAWAY was observed, at request open, on an open stream, or by
+    /// the driver.
+    RemoteGoAway,
+    /// This side is shutting the connection down.
+    Shutdown,
+    /// This side is closing the connection because its local identity was
+    /// retired.
+    IdentityRetired,
+}
+
+impl ClientConnectionPhase {
+    /// The next phase, or `None` when `event` changes nothing.
+    ///
+    /// The phases only advance.  A repeated event is absorbed; a shutdown
+    /// never demotes an identity retirement, so the typed cause is kept; and
+    /// a retirement arriving after a shutdown takes the cause over, as the
+    /// retirement is what the connection's streams then report.
+    fn on_event(self, event: ClientConnectionEvent) -> Option<Self> {
+        use ClientConnectionEvent as Event;
+        let next = match (self, event) {
+            (Self::Live, Event::RemoteGoAway) => Self::RemoteGoAway,
+            (Self::RemoteGoAway, Event::RemoteGoAway) => return None,
+            (
+                Self::Closed {
+                    cause,
+                    remote_goaway: false,
+                },
+                Event::RemoteGoAway,
+            ) => Self::Closed {
+                cause,
+                remote_goaway: true,
+            },
+            (
+                Self::Closed {
+                    remote_goaway: true,
+                    ..
+                },
+                Event::RemoteGoAway,
+            ) => return None,
+            (Self::Live, Event::Shutdown) => Self::Closed {
+                cause: LocalCloseCause::Shutdown,
+                remote_goaway: false,
+            },
+            (Self::RemoteGoAway, Event::Shutdown) => Self::Closed {
+                cause: LocalCloseCause::Shutdown,
+                remote_goaway: true,
+            },
+            (Self::Closed { .. }, Event::Shutdown) => return None,
+            (Self::Live, Event::IdentityRetired) => Self::Closed {
+                cause: LocalCloseCause::IdentityRetired,
+                remote_goaway: false,
+            },
+            (Self::RemoteGoAway, Event::IdentityRetired) => Self::Closed {
+                cause: LocalCloseCause::IdentityRetired,
+                remote_goaway: true,
+            },
+            (
+                Self::Closed {
+                    cause: LocalCloseCause::Shutdown,
+                    remote_goaway,
+                },
+                Event::IdentityRetired,
+            ) => Self::Closed {
+                cause: LocalCloseCause::IdentityRetired,
+                remote_goaway,
+            },
+            (
+                Self::Closed {
+                    cause: LocalCloseCause::IdentityRetired,
+                    ..
+                },
+                Event::IdentityRetired,
+            ) => return None,
+        };
+        Some(next)
+    }
+
+    /// Whether a peer GOAWAY has been observed on this connection.
+    fn remote_goaway(self) -> bool {
+        matches!(
+            self,
+            Self::RemoteGoAway
+                | Self::Closed {
+                    remote_goaway: true,
+                    ..
+                }
+        )
+    }
+
+    /// Whether this connection was closed because its identity was retired.
+    fn identity_retired(self) -> bool {
+        matches!(
+            self,
+            Self::Closed {
+                cause: LocalCloseCause::IdentityRetired,
+                ..
+            }
+        )
+    }
+}
+
+/// Apply `event` to a connection's published phase.  This is the only place
+/// the phase changes; it returns whether it did.
+fn publish_client_connection_event(
+    phase: &watch::Sender<ClientConnectionPhase>,
+    event: ClientConnectionEvent,
+) -> bool {
+    phase.send_if_modified(|phase| match phase.on_event(event) {
+        Some(next) => {
+            *phase = next;
+            true
+        }
+        None => false,
+    })
+}
+
+/// Resolve once a peer GOAWAY has been observed on the connection.
+async fn remote_goaway_observed(phase: &mut watch::Receiver<ClientConnectionPhase>) {
+    if phase.wait_for(|phase| phase.remote_goaway()).await.is_err() {
+        // Every publisher is gone, so no GOAWAY can be published any more.
+        std::future::pending::<()>().await;
+    }
+}
+
+/// A request to join one client connection's driver and pin watcher.  The
+/// first one joins them under its deadline; every later one is answered `Ok`
+/// at once, whether or not that join has finished.
+struct JoinRequest {
+    deadline: Instant,
+    reply: oneshot::Sender<Result<(), PeerTransportError>>,
+}
+
+/// Join requests buffered for one client connection's supervisor.
+///
+/// One: a caller whose request does not fit waits in `send`.  The supervisor
+/// answers every request after the first without waiting, so the queue
+/// drains as fast as the task is scheduled.
+const CONNECTION_JOIN_QUEUE: usize = 1;
+
+/// Own the handles of one client connection's driver and pin watcher.
+///
+/// Single ownership replaces a shared take-once slot: the two handles are
+/// joined here exactly once.  The task is `Serving` until the first join
+/// request, `Joining` while it joins the two tasks under that request's
+/// deadline, and `Joined` afterwards.  When the connection is dropped
+/// without a join, the request channel closes and both tasks are aborted.
+async fn supervise_client_connection(
+    mut joins: mpsc::Receiver<JoinRequest>,
+    driver: JoinHandle<Result<(), PeerTransportError>>,
+    pin_watcher: JoinHandle<()>,
+) {
+    // Serving.
+    let Some(JoinRequest { deadline, reply }) = joins.recv().await else {
+        driver.abort();
+        pin_watcher.abort();
+        return;
+    };
+
+    // Joining.  Later requests are answered while the join is in progress.
+    let join = join_client_connection_tasks(driver, pin_watcher, deadline);
+    tokio::pin!(join);
+    let mut connection_alive = true;
+    let result = loop {
+        tokio::select! {
+            biased;
+            result = &mut join => break result,
+            request = joins.recv(), if connection_alive => match request {
+                Some(request) => {
+                    let _ = request.reply.send(Ok(()));
+                }
+                None => connection_alive = false,
+            },
+        }
+    };
+    let _ = reply.send(result);
+
+    // Joined.
+    while let Some(request) = joins.recv().await {
+        let _ = request.reply.send(Ok(()));
+    }
+}
+
+/// Join a closed client connection's driver and pin watcher under one
+/// absolute deadline, aborting whichever does not stop in time.
+async fn join_client_connection_tasks(
+    driver: JoinHandle<Result<(), PeerTransportError>>,
+    pin_watcher: JoinHandle<()>,
+    deadline: Instant,
+) -> Result<(), PeerTransportError> {
+    let mut first_error = None;
+    match join_handle_until(driver, deadline).await {
+        Some(Err(error)) => first_error = Some(PeerTransportError::Task(error)),
+        Some(Ok(Err(error))) => first_error = Some(error),
+        None => {
+            first_error.get_or_insert(PeerTransportError::Timeout);
+            tracing::warn!("peer HTTP/3 driver exceeded drain timeout");
+        }
+        Some(Ok(Ok(()))) => {}
+    }
+    match join_handle_until(pin_watcher, deadline).await {
+        Some(Err(error)) => {
+            first_error.get_or_insert(PeerTransportError::Task(error));
+        }
+        None => {
+            first_error.get_or_insert(PeerTransportError::Timeout);
+            tracing::warn!("peer pin watcher exceeded drain timeout");
+        }
+        Some(Ok(())) => {}
+    }
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
 }
 
 /// The QUIC application close code a relay uses when it closes a connection
@@ -1778,6 +2046,23 @@ pub const LOCAL_IDENTITY_RETIRED_CODE: u32 = 0x4b52;
 pub const LOCAL_IDENTITY_RETIRED_REASON: &[u8] = b"local identity retired";
 
 impl ClientConnection {
+    fn phase(&self) -> ClientConnectionPhase {
+        *self.phase.borrow()
+    }
+
+    /// Apply `event` to this connection.  Closing it, for either cause, also
+    /// cancels its token, as every local close does (M7-C105), so the driver
+    /// classifies the close as the one this side asked for.
+    fn on_event(&self, event: ClientConnectionEvent) {
+        publish_client_connection_event(&self.phase, event);
+        match event {
+            ClientConnectionEvent::RemoteGoAway => {}
+            ClientConnectionEvent::Shutdown | ClientConnectionEvent::IdentityRetired => {
+                self.cancel.cancel();
+            }
+        }
+    }
+
     /// Record a stream-level outcome on its pooled connection.
     ///
     /// A typed [`PeerTransportError::GoAway`] observed on an already opened
@@ -1790,11 +2075,11 @@ impl ClientConnection {
         result: Result<T, PeerTransportError>,
     ) -> Result<T, PeerTransportError> {
         if matches!(result, Err(PeerTransportError::GoAway)) {
-            self.planned_remote_closing.cancel();
+            self.on_event(ClientConnectionEvent::RemoteGoAway);
         }
         match result {
             // The typed cause wins over whatever the torn-down stream reported.
-            Err(_) if self.retired.load(Ordering::Acquire) => {
+            Err(_) if self.phase().identity_retired() => {
                 Err(PeerTransportError::LocalIdentityRetired)
             }
             other => other,
@@ -1803,10 +2088,9 @@ impl ClientConnection {
 
     /// Close this connection because its local identity was retired.
     async fn retire_local_identity(&self, deadline: Instant) {
-        self.retired.store(true, Ordering::Release);
         // Cancel before closing, as every local close does (M7-C105), so the
         // driver classifies the close as the one this side asked for.
-        self.cancel.cancel();
+        self.on_event(ClientConnectionEvent::IdentityRetired);
         self.connection.close(
             quinn::VarInt::from_u32(LOCAL_IDENTITY_RETIRED_CODE),
             LOCAL_IDENTITY_RETIRED_REASON,
@@ -1826,9 +2110,9 @@ impl ClientConnection {
     ///
     /// The permit wait has its own configured stream checkout bound, clipped
     /// to the caller deadline, and is the only setup step classified as
-    /// [`PeerTransportError::Capacity`] on expiry.  The sender lock and H3
-    /// request dispatch retain the ordinary [`PeerTransportError::Timeout`]
-    /// classification when their shared deadline expires.
+    /// [`PeerTransportError::Capacity`] on expiry.  The H3 request dispatch
+    /// retains the ordinary [`PeerTransportError::Timeout`] classification
+    /// when its deadline expires.
     async fn open_until(
         self: &Arc<Self>,
         request: Request<()>,
@@ -1852,7 +2136,7 @@ impl ClientConnection {
                 "peer connection is closed".to_owned(),
             ));
         }
-        if self.planned_remote_closing.is_cancelled() {
+        if self.phase().remote_goaway() {
             // Once a peer GOAWAY has been observed, do not acquire a permit
             // or touch the sender again.  The existing driver owns the
             // bounded acknowledgement and stream-lease drain.
@@ -1865,10 +2149,12 @@ impl ClientConnection {
         let permit =
             acquire_stream_permit_until(&self.cancel, permit_deadline, self.stream_permits.clone())
                 .await?;
-        if let Some(progress) = progress {
-            progress.set_stage(PeerTransportOpenStage::SenderLock);
-        }
-        let mut sender = with_checkout_deadline(&self.cancel, deadline, self.sender.lock()).await?;
+        // `SenderLock` is never recorded: dispatch is no longer serialised
+        // per connection, so no open waits for a sender.
+        let (mut sender, first_dispatch) = match self.dispatched_sender.get() {
+            Some(sender) => (sender.clone(), false),
+            None => (self.sender.clone(), true),
+        };
         if let Some(progress) = progress {
             progress.set_stage(PeerTransportOpenStage::H3Dispatch);
         }
@@ -1882,11 +2168,17 @@ impl ClientConnection {
                     // `H3_REQUEST_REJECTED` reset of a raced stream), while
                     // existing streams must remain alive until their leases are
                     // returned.
-                    self.planned_remote_closing.cancel();
+                    self.on_event(ClientConnectionEvent::RemoteGoAway);
                 }
                 classified
             })?;
-        drop(sender);
+        if first_dispatch {
+            // This sender's GREASE frame went to the stream just opened.
+            // Losing the race to another first dispatch drops it instead.
+            let _ = self.dispatched_sender.set(sender);
+        } else {
+            drop(sender);
+        }
 
         let budget = body_budget(&self.limits, self.connection_bytes.clone());
         if let Some(progress) = progress {
@@ -1901,40 +2193,27 @@ impl ClientConnection {
         })
     }
 
-    async fn shutdown_until(&self, deadline: Instant) -> Result<(), PeerTransportError> {
-        self.cancel.cancel();
+    /// Cancel this connection's token and close QUIC, in that order and
+    /// without yielding in between.
+    fn close_for_shutdown(&self) {
+        self.on_event(ClientConnectionEvent::Shutdown);
         self.connection
             .close(quinn::VarInt::from_u32(0), b"shutdown");
-        let driver = self.driver.lock().await.take();
-        let watcher = self.pin_watcher.lock().await.take();
-        let mut first_error = None;
-        if let Some(driver) = driver {
-            match join_handle_until(driver, deadline).await {
-                Some(Err(error)) => first_error = Some(PeerTransportError::Task(error)),
-                Some(Ok(Err(error))) => first_error = Some(error),
-                None => {
-                    first_error.get_or_insert(PeerTransportError::Timeout);
-                    tracing::warn!("peer HTTP/3 driver exceeded drain timeout");
-                }
-                Some(Ok(Ok(()))) => {}
-            }
+    }
+
+    async fn shutdown_until(&self, deadline: Instant) -> Result<(), PeerTransportError> {
+        self.close_for_shutdown();
+        let (reply, joined) = oneshot::channel();
+        if self
+            .joins
+            .send(JoinRequest { deadline, reply })
+            .await
+            .is_err()
+        {
+            // The supervisor is gone, and the tasks it owned with it.
+            return Ok(());
         }
-        if let Some(watcher) = watcher {
-            match join_handle_until(watcher, deadline).await {
-                Some(Err(error)) => {
-                    first_error.get_or_insert(PeerTransportError::Task(error));
-                }
-                None => {
-                    first_error.get_or_insert(PeerTransportError::Timeout);
-                    tracing::warn!("peer pin watcher exceeded drain timeout");
-                }
-                Some(Ok(())) => {}
-            }
-        }
-        if let Some(error) = first_error {
-            return Err(error);
-        }
-        Ok(())
+        joined.await.unwrap_or(Ok(()))
     }
 
     async fn shutdown(&self) -> Result<(), PeerTransportError> {
@@ -1977,10 +2256,29 @@ async fn join_handle_until_bounded<T>(
 
 const FORCED_JOIN_GRACE: Duration = Duration::from_millis(100);
 
+/// How the bounded join of one task group ended.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-struct DrainOutcome {
-    forced: bool,
-    incomplete: bool,
+enum DrainOutcome {
+    /// Every task joined before the deadline.
+    #[default]
+    Joined,
+    /// The deadline passed and the remaining tasks were aborted; they then
+    /// joined.
+    Forced,
+    /// The aborted tasks did not join within the final bounded window.
+    Incomplete,
+}
+
+impl DrainOutcome {
+    /// Whether tasks had to be aborted at the deadline.
+    fn forced(self) -> bool {
+        self != Self::Joined
+    }
+
+    /// Whether aborted tasks were left unjoined.
+    fn incomplete(self) -> bool {
+        self == Self::Incomplete
+    }
 }
 
 async fn drain_peer_tasks(
@@ -2067,7 +2365,7 @@ async fn drain_peer_tasks_with_grace(
                     task_group = label,
                     "peer drain deadline exceeded; aborting tasks"
                 );
-                outcome.forced = true;
+                outcome = DrainOutcome::Forced;
                 // A forced abort is a terminal timeout outcome even when all
                 // cancelled tasks subsequently join. Never report a forced
                 // drain as a clean success. Emergency cancellation preserves
@@ -2086,7 +2384,7 @@ async fn drain_peer_tasks_with_grace(
                         Ok(Some(_)) => {}
                         Ok(None) => break,
                         Err(_) => {
-                            outcome.incomplete = true;
+                            outcome = DrainOutcome::Incomplete;
                             first_error.get_or_insert(PeerTransportError::Timeout);
                             tasks.abort_all();
                             break;
@@ -2102,15 +2400,11 @@ async fn drain_peer_tasks_with_grace(
 
 impl Drop for ClientConnection {
     fn drop(&mut self) {
-        self.cancel.cancel();
+        self.on_event(ClientConnectionEvent::Shutdown);
         self.connection
             .close(quinn::VarInt::from_u32(0), b"connection dropped");
-        if let Some(driver) = self.driver.get_mut().take() {
-            driver.abort();
-        }
-        if let Some(watcher) = self.pin_watcher.get_mut().take() {
-            watcher.abort();
-        }
+        // Dropping `joins` closes the supervisor's channel: if the driver
+        // and the pin watcher were never joined, it aborts them.
     }
 }
 
@@ -2151,8 +2445,8 @@ impl PeerConnectionHandle {
     ///
     /// This is used by bounded health probes so stream-permit exhaustion can
     /// be reported as capacity even when the probe deadline is shorter than
-    /// the connection's normal stream checkout timeout.  Sender locking and
-    /// HTTP/3 dispatch retain their normal timeout classification.
+    /// the connection's normal stream checkout timeout.  HTTP/3 dispatch
+    /// retains its normal timeout classification.
     pub async fn open_until(
         &self,
         request: Request<()>,
@@ -2203,14 +2497,26 @@ impl PeerConnectionHandle {
     }
 }
 
-struct PeerPoolState {
-    connections: Mutex<HashMap<PeerDestination, Arc<ClientConnection>>>,
-    dial_locks: Mutex<HashMap<PeerDestination, Arc<DialEntry>>>,
-    /// Connections established under a superseded local peer identity that
-    /// still carry in-flight streams.  Bounded by
-    /// [`MAX_ROTATION_DRAINING_CONNECTIONS`]; each is closed when its streams
-    /// finish, at the drain budget, or when its generation is retired.
-    draining: StdMutex<Vec<DrainingConnection>>,
+/// What every clone of one [`PeerClient`] shares: the way to its pool task
+/// and the pool's published drain set.
+struct PeerPoolShared {
+    /// Commands to the pool task ([`run_peer_pool`]).  Set once, by the
+    /// first asynchronous use of the client, which is where the task is
+    /// spawned: constructing a client needs no runtime.
+    commands: OnceLock<mpsc::Sender<PoolCommand>>,
+    /// The connections draining under a superseded local identity, as last
+    /// published by the pool task, its only writer.  Read synchronously by
+    /// [`PeerClient::draining_connection_count`].
+    draining: watch::Sender<Vec<std::sync::Weak<ClientConnection>>>,
+}
+
+impl PeerPoolShared {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            commands: OnceLock::new(),
+            draining: watch::Sender::new(Vec::new()),
+        })
+    }
 }
 
 struct DrainingConnection {
@@ -2232,84 +2538,490 @@ struct DrainingConnection {
 /// is still approved during the overlap -- instead of tearing it down.
 pub const MAX_ROTATION_DRAINING_CONNECTIONS: usize = 4;
 
-struct DialEntry {
-    lock: Mutex<()>,
-    users: AtomicUsize,
-    retired: std::sync::atomic::AtomicBool,
+/// Commands buffered for a client's pool task.
+///
+/// The pool task never waits on the network: every command is answered from
+/// the state it owns, so the queue only fills for as long as the task is not
+/// scheduled.  A caller whose command does not fit waits in `send`; a
+/// checkout waits under its handshake deadline and the client's cancellation
+/// and reports their expiry as it did when it waited for the pool.
+const POOL_COMMAND_QUEUE: usize = 64;
+
+/// A request to the task that owns a client's connection pool.
+enum PoolCommand {
+    /// Ask for a connection to `destination`: the pooled one, or the turn to
+    /// dial it.  At most one turn per destination is out at a time; a
+    /// checkout that arrives meanwhile is answered when that turn ends.
+    Checkout {
+        destination: PeerDestination,
+        /// The caller's pin snapshot, taken when its checkout began.
+        pins: PeerPinSnapshot,
+        /// Read by the pool task when it answers, so a caller that waited
+        /// for a turn decides with the identity current at that moment.
+        local_identity: Option<Arc<crate::RotatingPeerIdentity>>,
+        reply: oneshot::Sender<Result<Checkout, PeerTransportError>>,
+    },
+    /// The pooled connection for `destination`, left in the pool.
+    Get {
+        destination: PeerDestination,
+        reply: oneshot::Sender<Option<Arc<ClientConnection>>>,
+    },
+    /// Every pooled connection, left in the pool.
+    List {
+        reply: oneshot::Sender<Vec<Arc<ClientConnection>>>,
+    },
+    /// Remove and return the pooled connection for `destination`.
+    Take {
+        destination: PeerDestination,
+        reply: oneshot::Sender<Option<Arc<ClientConnection>>>,
+    },
+    /// Remove and return every pooled connection whose pin `pins` no longer
+    /// approves.
+    TakeUnpinned {
+        pins: PeerPinSnapshot,
+        reply: oneshot::Sender<Vec<Arc<ClientConnection>>>,
+    },
+    /// Remove and return every connection, draining first and then pooled,
+    /// established under a local identity generation older than `generation`.
+    TakeGenerationsBefore {
+        generation: u64,
+        reply: oneshot::Sender<Vec<Arc<ClientConnection>>>,
+    },
+    /// Begin the client's shutdown: cancel its token, close every pooled
+    /// connection, and return them, still pooled, to be joined.  Cancelling
+    /// and closing are one step of the pool task, so no pooled connection's
+    /// driver is left cancelled but not yet closed while the caller waits to
+    /// be scheduled (M7-C105).
+    BeginShutdown {
+        reply: oneshot::Sender<Vec<Arc<ClientConnection>>>,
+    },
+    /// Forget every pooled connection.
+    Clear { reply: oneshot::Sender<()> },
 }
 
-impl DialEntry {
-    fn new() -> Self {
+/// The pool's answer to a checkout.
+enum Checkout {
+    /// The pooled connection is usable as it is.
+    Reuse(Arc<ClientConnection>),
+    /// The caller holds the destination's dial turn.
+    Dial {
+        /// An unusable pooled connection the pool removed for this
+        /// destination.  The caller shuts it down before dialing.
+        previous: Option<Arc<ClientConnection>>,
+        /// The local identity generation the pool read when it granted the
+        /// turn; the dialed connection records it.
+        local_generation: u64,
+        turn: DialTurn,
+    },
+}
+
+/// The right to dial one destination, held by exactly one caller at a time.
+///
+/// Handing the dialed connection back pools it and ends the turn.  Dropping
+/// the turn -- a failed dial, an expired deadline, a cancelled caller -- ends
+/// it as well: the pool task observes either without the holder awaiting
+/// anything, so a turn is released from synchronous code and from `Drop`.
+struct DialTurn {
+    outcome: oneshot::Sender<DialOutcome>,
+}
+
+impl DialTurn {
+    /// Hand the dialed connection to the pool.  The receiver resolves with
+    /// whether the pool kept it: `false` once the client has begun shutting
+    /// down, in which case the pool closed it and the caller joins it.  It
+    /// resolves with an error only when the pool task is gone.
+    fn connected(self, connection: Arc<ClientConnection>) -> oneshot::Receiver<bool> {
+        let (pooled, answer) = oneshot::channel();
+        let _ = self.outcome.send(DialOutcome { connection, pooled });
+        answer
+    }
+}
+
+/// What a successful dial turn hands back to the pool.
+struct DialOutcome {
+    connection: Arc<ClientConnection>,
+    /// Told whether the pool kept the connection.
+    pooled: oneshot::Sender<bool>,
+}
+
+/// A checkout waiting for its destination's dial turn to end.
+struct CheckoutWaiter {
+    pins: PeerPinSnapshot,
+    local_identity: Option<Arc<crate::RotatingPeerIdentity>>,
+    reply: oneshot::Sender<Result<Checkout, PeerTransportError>>,
+}
+
+/// The dial state of one destination a client has a slot for.
+///
+/// `Idle <-> Dialing`.  A slot exists from a destination's first checkout
+/// and counts against `max_destinations`.  It is kept, `Idle`, while its
+/// latest checkout succeeded, and removed when a turn ends in failure with
+/// no caller left waiting.
+enum DialSlot {
+    /// No dial in flight: the next checkout is answered at once.
+    Idle,
+    /// One caller holds the turn.  `outcome` resolves when the turn ends:
+    /// with the dialed connection, or with an error when it was dropped.
+    /// Checkouts that arrive meanwhile wait, in arrival order; there is one
+    /// entry per suspended caller.
+    Dialing {
+        outcome: oneshot::Receiver<DialOutcome>,
+        waiters: std::collections::VecDeque<CheckoutWaiter>,
+    },
+}
+
+/// How a queued or new checkout was answered.
+enum Served {
+    /// The caller is no longer waiting; nothing was decided.
+    Gone,
+    /// The pooled connection was usable.
+    Reused,
+    /// The caller was given the dial turn.
+    TurnGranted(oneshot::Receiver<DialOutcome>),
+    /// The pool decided to dial but the caller had stopped waiting.
+    TurnAbandoned,
+}
+
+/// Everything a client's pool task owns.
+struct PeerPool {
+    limits: PeerTransportLimits,
+    /// The owning client's token: cancels rotation drains at shutdown.
+    cancel: CancellationToken,
+    /// One usable connection per destination.
+    connections: HashMap<PeerDestination, Arc<ClientConnection>>,
+    /// One slot per admitted destination; see [`DialSlot`].
+    dials: HashMap<PeerDestination, DialSlot>,
+    /// Connections established under a superseded local peer identity that
+    /// still carry in-flight streams.  Bounded by
+    /// [`MAX_ROTATION_DRAINING_CONNECTIONS`]; each is closed when its streams
+    /// finish, at the drain budget, or when its generation is retired.
+    draining: Vec<DrainingConnection>,
+    /// Where `draining` is published for synchronous readers.
+    draining_view: watch::Sender<Vec<std::sync::Weak<ClientConnection>>>,
+}
+
+impl PeerPool {
+    fn new(
+        limits: PeerTransportLimits,
+        cancel: CancellationToken,
+        draining_view: watch::Sender<Vec<std::sync::Weak<ClientConnection>>>,
+    ) -> Self {
         Self {
-            lock: Mutex::new(()),
-            users: AtomicUsize::new(0),
-            retired: std::sync::atomic::AtomicBool::new(false),
+            limits,
+            cancel,
+            connections: HashMap::new(),
+            dials: HashMap::new(),
+            draining: Vec::new(),
+            draining_view,
         }
     }
-}
 
-fn acquire_dial_entry(
-    locks: &mut HashMap<PeerDestination, Arc<DialEntry>>,
-    destination: &PeerDestination,
-    max_destinations: usize,
-) -> Result<Arc<DialEntry>, PeerTransportError> {
-    if let Some(entry) = locks.get(destination).cloned() {
-        if !entry.retired.load(Ordering::Acquire) {
-            return Ok(entry);
-        }
-        // A creator can be cancelled after releasing its users count but
-        // before it can await the pool map.  Remove only that retired marker;
-        // other destinations remain accounted against the pool bound.
-        locks.remove(destination);
+    fn publish_draining(&self) {
+        self.draining_view.send_replace(
+            self.draining
+                .iter()
+                .map(|entry| entry.connection.clone())
+                .collect(),
+        );
     }
-    if locks.len() >= max_destinations {
-        return Err(PeerTransportError::Capacity);
-    }
-    let entry = Arc::new(DialEntry::new());
-    locks.insert(destination.clone(), entry.clone());
-    Ok(entry)
-}
 
-struct DialLease {
-    state: Arc<PeerPoolState>,
-    destination: PeerDestination,
-    entry: Arc<DialEntry>,
-    released: bool,
-}
-
-impl DialLease {
-    async fn release(mut self, retain: bool) {
-        let last_user = self.entry.users.fetch_sub(1, Ordering::AcqRel) == 1;
-        self.released = true;
-        if !last_user || retain {
-            return;
+    fn handle(&mut self, command: PoolCommand) {
+        match command {
+            PoolCommand::Checkout {
+                destination,
+                pins,
+                local_identity,
+                reply,
+            } => self.checkout(
+                destination,
+                CheckoutWaiter {
+                    pins,
+                    local_identity,
+                    reply,
+                },
+            ),
+            PoolCommand::Get { destination, reply } => {
+                let _ = reply.send(self.connections.get(&destination).cloned());
+            }
+            PoolCommand::List { reply } => {
+                let _ = reply.send(self.connections.values().cloned().collect());
+            }
+            PoolCommand::Take { destination, reply } => {
+                let _ = reply.send(self.connections.remove(&destination));
+            }
+            PoolCommand::TakeUnpinned { pins, reply } => {
+                let stale: Vec<PeerDestination> = self
+                    .connections
+                    .iter()
+                    .filter(|(_, connection)| !pins.contains(connection.identity.spki_sha256()))
+                    .map(|(destination, _)| destination.clone())
+                    .collect();
+                let _ = reply.send(
+                    stale
+                        .into_iter()
+                        .filter_map(|destination| self.connections.remove(&destination))
+                        .collect(),
+                );
+            }
+            PoolCommand::TakeGenerationsBefore { generation, reply } => {
+                let _ = reply.send(self.take_generations_before(generation));
+            }
+            PoolCommand::BeginShutdown { reply } => {
+                self.cancel.cancel();
+                for connection in self.connections.values() {
+                    connection.close_for_shutdown();
+                }
+                let _ = reply.send(self.connections.values().cloned().collect());
+            }
+            PoolCommand::Clear { reply } => {
+                self.connections.clear();
+                let _ = reply.send(());
+            }
         }
-        // Mark before awaiting the map lock.  If cancellation drops this
-        // release future while the lock is contended, the next creator can
-        // still retire this exact marker instead of inheriting a zero-user
-        // entry forever.
-        self.entry.retired.store(true, Ordering::Release);
-        let mut locks = self.state.dial_locks.lock().await;
-        if locks
-            .get(&self.destination)
-            .is_some_and(|entry| Arc::ptr_eq(entry, &self.entry))
+    }
+
+    /// Admit one checkout: answer it now when its destination has no dial in
+    /// flight, queue it behind the turn that is, or refuse a destination
+    /// beyond the pool bound.
+    fn checkout(&mut self, destination: PeerDestination, waiter: CheckoutWaiter) {
+        match self.dials.get_mut(&destination) {
+            Some(DialSlot::Dialing { waiters, .. }) => {
+                waiters.push_back(waiter);
+                return;
+            }
+            Some(DialSlot::Idle) => {}
+            None => {
+                if self.dials.len() >= self.limits.max_destinations {
+                    let _ = waiter.reply.send(Err(PeerTransportError::Capacity));
+                    return;
+                }
+                self.dials.insert(destination.clone(), DialSlot::Idle);
+            }
+        }
+        // The slot is `Idle`: whether it is kept is decided by this checkout
+        // and the ones that queue behind it.
+        let mut queue = std::collections::VecDeque::new();
+        queue.push_back(waiter);
+        self.settle(destination, queue, false);
+    }
+
+    /// A dial turn ended: pool what it dialed, then answer the waiters.
+    ///
+    /// Once the client has begun shutting down nothing is pooled any more:
+    /// shutdown has already taken the connections it joins, so one pooled
+    /// now would stay open, holding its connection permit, until the last
+    /// clone of the client is dropped.  It is closed here instead and its
+    /// dialer, told so, joins it.
+    fn finish_turn(&mut self, destination: PeerDestination, outcome: Option<DialOutcome>) {
+        let waiters = match self.dials.remove(&destination) {
+            Some(DialSlot::Dialing { waiters, .. }) => waiters,
+            Some(DialSlot::Idle) | None => std::collections::VecDeque::new(),
+        };
+        let mut connected = false;
+        if let Some(DialOutcome { connection, pooled }) = outcome {
+            if self.cancel.is_cancelled() {
+                connection.close_for_shutdown();
+            } else {
+                self.connections.insert(destination.clone(), connection);
+                connected = true;
+            }
+            let _ = pooled.send(connected);
+        }
+        self.settle(destination, waiters, connected);
+    }
+
+    /// Answer `waiters` in arrival order until one of them takes the dial
+    /// turn, then leave the destination's slot in the state that follows.
+    ///
+    /// This is the only place a [`DialSlot`] changes.  `retain` is whether
+    /// the latest decided checkout for the destination succeeded: with no
+    /// turn out and nobody waiting, a slot is kept `Idle` after a success and
+    /// removed after a failure.
+    fn settle(
+        &mut self,
+        destination: PeerDestination,
+        mut waiters: std::collections::VecDeque<CheckoutWaiter>,
+        mut retain: bool,
+    ) {
+        while let Some(waiter) = waiters.pop_front() {
+            match self.serve(&destination, waiter) {
+                Served::Gone => {}
+                Served::Reused => retain = true,
+                Served::TurnAbandoned => retain = false,
+                Served::TurnGranted(outcome) => {
+                    self.dials
+                        .insert(destination, DialSlot::Dialing { outcome, waiters });
+                    return;
+                }
+            }
+        }
+        if retain {
+            self.dials.insert(destination, DialSlot::Idle);
+        } else {
+            self.dials.remove(&destination);
+        }
+    }
+
+    /// Decide one checkout against the pooled connection for its destination.
+    fn serve(&mut self, destination: &PeerDestination, waiter: CheckoutWaiter) -> Served {
+        let CheckoutWaiter {
+            pins,
+            local_identity,
+            reply,
+        } = waiter;
+        if reply.is_closed() {
+            return Served::Gone;
+        }
+        let local_generation = local_identity
+            .as_ref()
+            .map_or(0, |identity| identity.generation());
+        let usable = self
+            .connections
+            .get(destination)
+            .filter(|connection| {
+                connection.connection.close_reason().is_none()
+                    && !connection.cancel.is_cancelled()
+                    && pins.verify(&connection.identity).is_ok()
+            })
+            .cloned();
+        let previous = match usable {
+            Some(connection) => {
+                // Same local identity: reuse.  A superseded local identity:
+                // drain the predecessor and dial with the current one -- unless
+                // the bounded drain set is full, in which case the predecessor
+                // (still approved during the overlap) keeps serving.
+                if connection.local_generation >= local_generation
+                    || !self.begin_rotation_drain(&connection)
+                {
+                    let _ = reply.send(Ok(Checkout::Reuse(connection)));
+                    return Served::Reused;
+                }
+                self.connections.remove(destination);
+                None
+            }
+            // An unusable pooled connection is replaced: the turn holder
+            // shuts it down before it dials.
+            None => self.connections.remove(destination),
+        };
+        let (outcome, turn_ended) = oneshot::channel();
+        match reply.send(Ok(Checkout::Dial {
+            previous,
+            local_generation,
+            turn: DialTurn { outcome },
+        })) {
+            Ok(()) => Served::TurnGranted(turn_ended),
+            Err(_) => Served::TurnAbandoned,
+        }
+    }
+
+    /// Move `connection` into the bounded drain set, or refuse when the set
+    /// is full.  A drained connection closes when its last stream lease is
+    /// returned, at the drain budget, or when its generation is retired.
+    fn begin_rotation_drain(&mut self, connection: &Arc<ClientConnection>) -> bool {
+        self.draining
+            .retain(|entry| entry.connection.strong_count() > 0);
+        if self
+            .draining
+            .iter()
+            .any(|entry| std::ptr::eq(entry.connection.as_ptr(), Arc::as_ptr(connection)))
         {
-            locks.remove(&self.destination);
+            self.publish_draining();
+            return true;
         }
+        if self.draining.len() >= MAX_ROTATION_DRAINING_CONNECTIONS {
+            self.publish_draining();
+            return false;
+        }
+        self.draining.push(DrainingConnection {
+            connection: Arc::downgrade(connection),
+            local_generation: connection.local_generation,
+        });
+        self.publish_draining();
+        let weak = Arc::downgrade(connection);
+        let permits = connection.stream_permits.clone();
+        let permit_count =
+            u32::try_from(self.limits.max_streams_per_connection).unwrap_or(u32::MAX);
+        let budget = self.limits.drain_timeout;
+        let cancel = self.cancel.clone();
+        tokio::spawn(async move {
+            let deadline = Instant::now() + budget;
+            tokio::select! {
+                _ = cancel.cancelled() => {}
+                _ = timeout_at(deadline, permits.acquire_many_owned(permit_count)) => {}
+            }
+            if let Some(connection) = weak.upgrade() {
+                let _ = connection
+                    .shutdown_until(Instant::now() + Duration::from_secs(1))
+                    .await;
+            }
+        });
+        true
+    }
+
+    fn take_generations_before(&mut self, generation: u64) -> Vec<Arc<ClientConnection>> {
+        let mut retired: Vec<Arc<ClientConnection>> = Vec::new();
+        self.draining.retain(|entry| {
+            if entry.local_generation < generation {
+                if let Some(connection) = entry.connection.upgrade() {
+                    retired.push(connection);
+                }
+                false
+            } else {
+                entry.connection.strong_count() > 0
+            }
+        });
+        self.publish_draining();
+        let stale: Vec<PeerDestination> = self
+            .connections
+            .iter()
+            .filter(|(_, connection)| connection.local_generation < generation)
+            .map(|(destination, _)| destination.clone())
+            .collect();
+        for destination in stale {
+            if let Some(connection) = self.connections.remove(&destination) {
+                retired.push(connection);
+            }
+        }
+        retired
+    }
+
+    /// Resolve when a dial turn ends, with its destination and what it
+    /// dialed (`None` when the turn was dropped).  Pending while no turn is
+    /// out.
+    async fn turn_ended(&mut self) -> (PeerDestination, Option<DialOutcome>) {
+        std::future::poll_fn(|context| {
+            for (destination, slot) in &mut self.dials {
+                if let DialSlot::Dialing { outcome, .. } = slot
+                    && let std::task::Poll::Ready(result) = Pin::new(outcome).poll(context)
+                {
+                    return std::task::Poll::Ready((destination.clone(), result.ok()));
+                }
+            }
+            std::task::Poll::Pending
+        })
+        .await
     }
 }
 
-impl Drop for DialLease {
-    fn drop(&mut self) {
-        if self.released {
-            return;
-        }
-        if self.entry.users.fetch_sub(1, Ordering::AcqRel) == 1 {
-            // Drop cannot await the pool map.  Mark the exact entry retired so
-            // the next creator removes it before checking destination
-            // capacity; waiters that already hold a lease continue to share
-            // the old marker safely.
-            self.entry.retired.store(true, Ordering::Release);
+/// Own one client's connection pool: its pooled connections, its
+/// per-destination dial turns and its rotation drain set.
+///
+/// Everything that used to be serialised around those three maps is now a
+/// step of this one task.  Ended dial turns are handled before commands, so
+/// a connection handed back by a caller is pooled before any command that
+/// caller, or anyone it wakes, sends afterwards.  The task ends when the
+/// last clone of its client is dropped.
+async fn run_peer_pool(mut commands: mpsc::Receiver<PoolCommand>, mut pool: PeerPool) {
+    loop {
+        tokio::select! {
+            biased;
+            (destination, outcome) = pool.turn_ended() => {
+                pool.finish_turn(destination, outcome);
+            }
+            command = commands.recv() => match command {
+                Some(command) => pool.handle(command),
+                None => break,
+            },
         }
     }
 }
@@ -2322,7 +3034,7 @@ pub struct PeerClient {
     pin_provider: SharedPeerPins,
     limits: PeerTransportLimits,
     connections: Arc<Semaphore>,
-    state: Arc<PeerPoolState>,
+    state: Arc<PeerPoolShared>,
     cancel: CancellationToken,
     local_identity: Option<Arc<crate::RotatingPeerIdentity>>,
 }
@@ -2352,11 +3064,7 @@ impl PeerClient {
             endpoint,
             pin_provider,
             connections: Arc::new(Semaphore::new(limits.max_connections)),
-            state: Arc::new(PeerPoolState {
-                connections: Mutex::new(HashMap::new()),
-                dial_locks: Mutex::new(HashMap::new()),
-                draining: StdMutex::new(Vec::new()),
-            }),
+            state: PeerPoolShared::new(),
             cancel: CancellationToken::new(),
             limits,
             local_identity: None,
@@ -2377,90 +3085,41 @@ impl PeerClient {
         self
     }
 
-    fn local_generation(&self) -> u64 {
-        self.local_identity
-            .as_ref()
-            .map_or(0, |identity| identity.generation())
+    /// The way to this client's pool task, which the first use spawns.
+    fn pool(&self) -> &mpsc::Sender<PoolCommand> {
+        self.state.commands.get_or_init(|| {
+            let (commands, receiver) = mpsc::channel(POOL_COMMAND_QUEUE);
+            tokio::spawn(run_peer_pool(
+                receiver,
+                PeerPool::new(
+                    self.limits.clone(),
+                    self.cancel.clone(),
+                    self.state.draining.clone(),
+                ),
+            ));
+            commands
+        })
     }
 
-    /// Move `connection` into the bounded drain set, or refuse when the set
-    /// is full.  A drained connection closes when its last stream lease is
-    /// returned, at the drain budget, or when its generation is retired.
-    fn begin_rotation_drain(&self, connection: &Arc<ClientConnection>) -> bool {
-        let mut draining = match self.state.draining.lock() {
-            Ok(draining) => draining,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        draining.retain(|entry| entry.connection.strong_count() > 0);
-        if draining
-            .iter()
-            .any(|entry| std::ptr::eq(entry.connection.as_ptr(), Arc::as_ptr(connection)))
-        {
-            return true;
-        }
-        if draining.len() >= MAX_ROTATION_DRAINING_CONNECTIONS {
-            return false;
-        }
-        draining.push(DrainingConnection {
-            connection: Arc::downgrade(connection),
-            local_generation: connection.local_generation,
-        });
-        drop(draining);
-        let weak = Arc::downgrade(connection);
-        let permits = connection.stream_permits.clone();
-        let permit_count =
-            u32::try_from(self.limits.max_streams_per_connection).unwrap_or(u32::MAX);
-        let budget = self.limits.drain_timeout;
-        let cancel = self.cancel.clone();
-        tokio::spawn(async move {
-            let deadline = Instant::now() + budget;
-            tokio::select! {
-                _ = cancel.cancelled() => {}
-                _ = timeout_at(deadline, permits.acquire_many_owned(permit_count)) => {}
-            }
-            if let Some(connection) = weak.upgrade() {
-                let _ = connection
-                    .shutdown_until(Instant::now() + Duration::from_secs(1))
-                    .await;
-            }
-        });
-        true
+    /// Send one command to the pool task and wait for its answer.  `None`
+    /// when the task is gone, which only a stopped runtime causes.
+    async fn ask_pool<T>(
+        &self,
+        command: impl FnOnce(oneshot::Sender<T>) -> PoolCommand,
+    ) -> Option<T> {
+        let (reply, answer) = oneshot::channel();
+        self.pool().send(command(reply)).await.ok()?;
+        answer.await.ok()
     }
 
     /// Close every connection -- pooled or draining -- established under a
     /// local identity generation older than `generation`, and return how many
     /// were closed.  In-flight streams on them end with a transport error.
     pub async fn retire_local_generations_before(&self, generation: u64) -> usize {
-        let mut retired: Vec<Arc<ClientConnection>> = Vec::new();
-        {
-            let mut draining = match self.state.draining.lock() {
-                Ok(draining) => draining,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            draining.retain(|entry| {
-                if entry.local_generation < generation {
-                    if let Some(connection) = entry.connection.upgrade() {
-                        retired.push(connection);
-                    }
-                    false
-                } else {
-                    entry.connection.strong_count() > 0
-                }
-            });
-        }
-        {
-            let mut pooled = self.state.connections.lock().await;
-            let stale: Vec<PeerDestination> = pooled
-                .iter()
-                .filter(|(_, connection)| connection.local_generation < generation)
-                .map(|(destination, _)| destination.clone())
-                .collect();
-            for destination in stale {
-                if let Some(connection) = pooled.remove(&destination) {
-                    retired.push(connection);
-                }
-            }
-        }
+        let retired = self
+            .ask_pool(|reply| PoolCommand::TakeGenerationsBefore { generation, reply })
+            .await
+            .unwrap_or_default();
         let count = retired.len();
         let deadline = Instant::now() + Duration::from_secs(1);
         for connection in retired {
@@ -2473,13 +3132,11 @@ impl PeerClient {
     /// peer identity.  Bounded by [`MAX_ROTATION_DRAINING_CONNECTIONS`].
     #[must_use]
     pub fn draining_connection_count(&self) -> usize {
-        let draining = match self.state.draining.lock() {
-            Ok(draining) => draining,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        draining
+        self.state
+            .draining
+            .borrow()
             .iter()
-            .filter(|entry| entry.connection.strong_count() > 0)
+            .filter(|connection| connection.strong_count() > 0)
             .count()
     }
 
@@ -2497,332 +3154,336 @@ impl PeerClient {
             return Err(PeerTransportError::PinsUnavailable);
         }
         let deadline = Instant::now() + self.limits.handshake_timeout;
-        let entry = {
-            let mut locks =
-                with_checkout_deadline(&self.cancel, deadline, self.state.dial_locks.lock())
-                    .await?;
-            acquire_dial_entry(&mut locks, &destination, self.limits.max_destinations)?
+        let (reply, checkout) = oneshot::channel();
+        with_checkout_deadline(
+            &self.cancel,
+            deadline,
+            self.pool().send(PoolCommand::Checkout {
+                destination: destination.clone(),
+                pins: current_pins,
+                local_identity: self.local_identity.clone(),
+                reply,
+            }),
+        )
+        .await?
+        .map_err(|_| PeerTransportError::Cancelled)?;
+        // Waiting here is waiting for this destination's dial turn: the pool
+        // answers once no other caller is dialing it.
+        let checkout = with_checkout_deadline(&self.cancel, deadline, checkout)
+            .await?
+            .map_err(|_| PeerTransportError::Cancelled)??;
+        let (previous, local_generation, turn) = match checkout {
+            Checkout::Reuse(connection) => return Ok(PeerConnectionHandle { inner: connection }),
+            Checkout::Dial {
+                previous,
+                local_generation,
+                turn,
+            } => (previous, local_generation, turn),
         };
-        entry.users.fetch_add(1, Ordering::AcqRel);
-        let lease = DialLease {
-            state: self.state.clone(),
-            destination: destination.clone(),
-            entry: entry.clone(),
-            released: false,
-        };
-        let dial_guard =
-            match with_checkout_deadline(&self.cancel, deadline, entry.lock.lock()).await {
-                Ok(guard) => guard,
-                Err(error) => {
-                    lease.release(false).await;
-                    return Err(error);
-                }
-            };
+        // An error below drops `turn`, which ends it as a failed dial.
+        if let Some(previous) = previous {
+            previous.shutdown_until(deadline).await?;
+        }
+        let dialed = self.dial(destination, local_generation, deadline).await?;
+        self.finish_dial(turn, dialed).await
+    }
 
-        let result: Result<PeerConnectionHandle, PeerTransportError> = async {
-            let local_generation = self.local_generation();
-            let usable =
-                with_checkout_deadline(&self.cancel, deadline, self.state.connections.lock())
-                    .await?
-                    .get(&destination)
-                    .filter(|connection| {
-                        connection.connection.close_reason().is_none()
-                            && !connection.cancel.is_cancelled()
-                            && current_pins.verify(&connection.identity).is_ok()
-                    })
-                    .cloned();
-            if let Some(connection) = usable {
-                // Same local identity: reuse.  A superseded local identity:
-                // drain the predecessor and dial with the current one -- unless
-                // the bounded drain set is full, in which case the predecessor
-                // (still approved during the overlap) keeps serving.
-                if connection.local_generation >= local_generation
-                    || !self.begin_rotation_drain(&connection)
-                {
-                    return Ok(PeerConnectionHandle { inner: connection });
-                }
-                let mut pooled =
-                    with_checkout_deadline(&self.cancel, deadline, self.state.connections.lock())
-                        .await?;
-                if pooled
-                    .get(&destination)
-                    .is_some_and(|current| Arc::ptr_eq(current, &connection))
-                {
-                    pooled.remove(&destination);
-                }
-            } else {
-                let previous =
-                    with_checkout_deadline(&self.cancel, deadline, self.state.connections.lock())
-                        .await?
-                        .remove(&destination);
-                if let Some(previous) = previous {
-                    previous.shutdown_until(deadline).await?;
+    /// End a dial turn with the connection it dialed.
+    ///
+    /// A dial that finishes after [`Self::shutdown`] began is not pooled:
+    /// the pool closes it, this joins its tasks as shutdown joins the
+    /// others, and the caller gets the same `Cancelled` a dial interrupted
+    /// by shutdown gets.  Its connection permit is released with it.
+    async fn finish_dial(
+        &self,
+        turn: DialTurn,
+        dialed: Arc<ClientConnection>,
+    ) -> Result<PeerConnectionHandle, PeerTransportError> {
+        match turn.connected(dialed.clone()).await {
+            // No pool task is left to refuse it, which only a stopped
+            // runtime causes.
+            Ok(true) | Err(_) => Ok(PeerConnectionHandle { inner: dialed }),
+            Ok(false) => {
+                let _ = dialed
+                    .shutdown_until(Instant::now() + self.limits.drain_timeout)
+                    .await;
+                Err(PeerTransportError::Cancelled)
+            }
+        }
+    }
+
+    /// Dial `destination` and build its pooled connection.  Only the holder
+    /// of the destination's [`DialTurn`] calls this.
+    async fn dial(
+        &self,
+        destination: PeerDestination,
+        local_generation: u64,
+        deadline: Instant,
+    ) -> Result<Arc<ClientConnection>, PeerTransportError> {
+        // Connection-pool exhaustion is a typed capacity condition and must
+        // be reported as one, promptly.  Waiting on the semaphore under the
+        // handshake deadline reported `Timeout` instead: it is
+        // `with_checkout_deadline` that maps deadline expiry to `Timeout`,
+        // and the `?` propagated that before the `map_err` intended to
+        // produce `Capacity`, which only ever saw the semaphore's own closed
+        // error.  So a caller learned nothing about capacity, and learned it
+        // only after the whole handshake budget: the readiness probe
+        // recorded the route `Unreachable` rather than `CapacityExhausted`,
+        // collapsing the distinction that model is built on.
+        //
+        // A permit can also be moments from release: the caller has just
+        // shut down the unusable pooled connection the pool removed for this
+        // destination, and its permit lands when the last handle to it
+        // drops.  Refusing instantly turns that ordinary replacement into a
+        // spurious capacity error (measured: the peer-capacity gate went
+        // from roughly one failure in six to five in fourteen).  So take a
+        // free permit immediately, otherwise wait a short bounded grace
+        // that stays well inside a probe's budget, and report exhaustion as
+        // typed capacity either way.
+        let connection_permit = match self.connections.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                let grace = deadline.min(Instant::now() + CAPACITY_RELEASE_GRACE);
+                match timeout_at(grace, self.connections.clone().acquire_owned()).await {
+                    Ok(Ok(permit)) => permit,
+                    Ok(Err(_)) | Err(_) => return Err(PeerTransportError::Capacity),
                 }
             }
+        };
+        let connecting = self
+            .endpoint
+            .connect(destination.address, &destination.server_name)
+            .map_err(|error| PeerTransportError::Quic(error.to_string()))?;
+        let connection = with_checkout_deadline(&self.cancel, deadline, connecting)
+            .await?
+            .map_err(|error| PeerTransportError::Quic(error.to_string()))?;
+        configure_quic_connection(&connection, &self.limits)?;
+        let identity = verified_peer_identity(&connection).map_err(map_probe_error)?;
+        self.pin_provider
+            .snapshot()
+            .verify(&identity)
+            .map_err(map_probe_error)?;
 
-            // Connection-pool exhaustion is a typed capacity condition and must
-            // be reported as one, promptly.  Waiting on the semaphore under the
-            // handshake deadline reported `Timeout` instead: it is
-            // `with_checkout_deadline` that maps deadline expiry to `Timeout`,
-            // and the `?` propagated that before the `map_err` intended to
-            // produce `Capacity`, which only ever saw the semaphore's own closed
-            // error.  So a caller learned nothing about capacity, and learned it
-            // only after the whole handshake budget: the readiness probe
-            // recorded the route `Unreachable` rather than `CapacityExhausted`,
-            // collapsing the distinction that model is built on.
-            //
-            // A permit can also be moments from release: the branch above
-            // removes and shuts down an unusable pooled connection for this
-            // destination, and its permit lands when the last handle to it
-            // drops.  Refusing instantly turns that ordinary replacement into a
-            // spurious capacity error (measured: the peer-capacity gate went
-            // from roughly one failure in six to five in fourteen).  So take a
-            // free permit immediately, otherwise wait a short bounded grace
-            // that stays well inside a probe's budget, and report exhaustion as
-            // typed capacity either way.
-            let connection_permit = match self.connections.clone().try_acquire_owned() {
-                Ok(permit) => permit,
-                Err(_) => {
-                    let grace = deadline.min(Instant::now() + CAPACITY_RELEASE_GRACE);
-                    match timeout_at(grace, self.connections.clone().acquire_owned()).await {
-                        Ok(Ok(permit)) => permit,
-                        Ok(Err(_)) | Err(_) => return Err(PeerTransportError::Capacity),
-                    }
-                }
-            };
-            let connecting = self
-                .endpoint
-                .connect(destination.address, &destination.server_name)
-                .map_err(|error| PeerTransportError::Quic(error.to_string()))?;
-            let connection = with_checkout_deadline(&self.cancel, deadline, connecting)
+        let quic = h3_quinn::Connection::new(connection.clone());
+        let mut builder = h3::client::builder();
+        builder.max_field_section_size(self.limits.max_header_bytes as u64);
+        let (driver, sender) =
+            with_checkout_deadline(&self.cancel, deadline, builder.build::<_, _, Bytes>(quic))
                 .await?
-                .map_err(|error| PeerTransportError::Quic(error.to_string()))?;
-            configure_quic_connection(&connection, &self.limits)?;
-            let identity = verified_peer_identity(&connection).map_err(map_probe_error)?;
-            self.pin_provider
-                .snapshot()
-                .verify(&identity)
-                .map_err(map_probe_error)?;
-
-            let quic = h3_quinn::Connection::new(connection.clone());
-            let mut builder = h3::client::builder();
-            builder.max_field_section_size(self.limits.max_header_bytes as u64);
-            let (driver, sender) =
-                with_checkout_deadline(&self.cancel, deadline, builder.build::<_, _, Bytes>(quic))
-                    .await?
-                    .map_err(|error| PeerTransportError::H3(error.to_string()))?;
-            let connection_cancel = self.cancel.child_token();
-            let driver_cancel = connection_cancel.clone();
-            let planned_remote_closing = CancellationToken::new();
-            let driver_planned_remote_closing = planned_remote_closing.clone();
-            let driver_stream_permits =
-                Arc::new(Semaphore::new(self.limits.max_streams_per_connection));
-            let driver_wait_permits = driver_stream_permits.clone();
-            let driver_max_streams = self.limits.max_streams_per_connection;
-            let driver_drain_timeout = self.limits.drain_timeout;
-            let driver_connection = connection.clone();
-            let driver_task = tokio::spawn(async move {
-                let mut driver = driver;
-                loop {
-                    tokio::select! {
-                        biased;
-                        _ = driver_cancel.cancelled() => {
-                            let _ = driver.shutdown(0).await;
-                            break Ok(());
-                        }
-                        _ = driver_planned_remote_closing.cancelled() => {
-                        let permit_count = match u32::try_from(driver_max_streams) {
-                            Ok(count) => count,
-                            Err(_) => {
-                                driver_connection.close(
-                                    quinn::VarInt::from_u32(0),
-                                    b"invalid peer stream permit bound",
-                                );
-                                return Err(PeerTransportError::InvalidLimits);
-                            }
-                        };
-                        let deadline = Instant::now() + driver_drain_timeout;
-                        // Keep polling the HTTP/3 driver while existing stream
-                        // leases drain.  Waiting only on the semaphore can
-                        // starve control/QPACK progress for an admitted stream.
-                        let mut idle = Box::pin(driver.wait_idle());
-                        let all_streams = tokio::select! {
-                            biased;
-                            _ = driver_cancel.cancelled() => {
-                                driver_connection.close(
-                                    quinn::VarInt::from_u32(0),
-                                    b"peer emergency during GOAWAY acknowledgement",
-                                );
-                                return Ok(());
-                            }
-                            connection_result = &mut idle => {
-                                // The connection went idle before the stream
-                                // leases drained.  That is only a failure if
-                                // the close itself was one: a peer that
-                                // finished its own planned close first ends
-                                // the connection with no error, and the wait
-                                // below classifies exactly that case with
-                                // `planned_idle_result`.  Classifying it the
-                                // same way here is what keeps a benign close
-                                // from being reported as a transport failure
-                                // depending on which branch of this race wins.
-                                let result =
-                                    planned_drain_result(connection_result, &driver_cancel);
-                                driver_connection.close(
-                                    quinn::VarInt::from_u32(0),
-                                    if result.is_ok() {
-                                        b"peer connection closed cleanly during GOAWAY drain"
-                                            as &[u8]
-                                    } else {
-                                        b"peer HTTP/3 driver stopped during GOAWAY drain" as &[u8]
-                                    },
-                                );
-                                return result;
-                            }
-                            result = timeout_at(
-                                deadline,
-                                driver_wait_permits.acquire_many_owned(permit_count),
-                            ) => result,
-                        };
-                        drop(idle);
-                        let Ok(Ok(_all_streams)) = all_streams else {
+                .map_err(|error| PeerTransportError::H3(error.to_string()))?;
+        let connection_cancel = self.cancel.child_token();
+        let driver_cancel = connection_cancel.clone();
+        let phase = watch::Sender::new(ClientConnectionPhase::Live);
+        let driver_phase = phase.clone();
+        let mut driver_phase_updates = phase.subscribe();
+        let driver_stream_permits =
+            Arc::new(Semaphore::new(self.limits.max_streams_per_connection));
+        let driver_wait_permits = driver_stream_permits.clone();
+        let driver_max_streams = self.limits.max_streams_per_connection;
+        let driver_drain_timeout = self.limits.drain_timeout;
+        let driver_connection = connection.clone();
+        let driver_task = tokio::spawn(async move {
+            let mut driver = driver;
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = driver_cancel.cancelled() => {
+                        let _ = driver.shutdown(0).await;
+                        break Ok(());
+                    }
+                    _ = remote_goaway_observed(&mut driver_phase_updates) => {
+                    let permit_count = match u32::try_from(driver_max_streams) {
+                        Ok(count) => count,
+                        Err(_) => {
                             driver_connection.close(
                                 quinn::VarInt::from_u32(0),
-                                b"peer GOAWAY stream drain deadline",
+                                b"invalid peer stream permit bound",
+                            );
+                            return Err(PeerTransportError::InvalidLimits);
+                        }
+                    };
+                    let deadline = Instant::now() + driver_drain_timeout;
+                    // Keep polling the HTTP/3 driver while existing stream
+                    // leases drain.  Waiting only on the semaphore can
+                    // starve control/QPACK progress for an admitted stream.
+                    let mut idle = Box::pin(driver.wait_idle());
+                    let all_streams = tokio::select! {
+                        biased;
+                        _ = driver_cancel.cancelled() => {
+                            driver_connection.close(
+                                quinn::VarInt::from_u32(0),
+                                b"peer emergency during GOAWAY acknowledgement",
+                            );
+                            return Ok(());
+                        }
+                        connection_result = &mut idle => {
+                            // The connection went idle before the stream
+                            // leases drained.  That is only a failure if
+                            // the close itself was one: a peer that
+                            // finished its own planned close first ends
+                            // the connection with no error, and the wait
+                            // below classifies exactly that case with
+                            // `planned_idle_result`.  Classifying it the
+                            // same way here is what keeps a benign close
+                            // from being reported as a transport failure
+                            // depending on which branch of this race wins.
+                            let result =
+                                planned_drain_result(connection_result, &driver_cancel);
+                            driver_connection.close(
+                                quinn::VarInt::from_u32(0),
+                                if result.is_ok() {
+                                    b"peer connection closed cleanly during GOAWAY drain"
+                                        as &[u8]
+                                } else {
+                                    b"peer HTTP/3 driver stopped during GOAWAY drain" as &[u8]
+                                },
+                            );
+                            return result;
+                        }
+                        result = timeout_at(
+                            deadline,
+                            driver_wait_permits.acquire_many_owned(permit_count),
+                        ) => result,
+                    };
+                    drop(idle);
+                    let Ok(Ok(_all_streams)) = all_streams else {
+                        driver_connection.close(
+                            quinn::VarInt::from_u32(0),
+                            b"peer GOAWAY stream drain deadline",
+                        );
+                        return Err(PeerTransportError::Timeout);
+                    };
+                    let shutdown = tokio::select! {
+                        biased;
+                        _ = driver_cancel.cancelled() => {
+                            driver_connection.close(
+                                quinn::VarInt::from_u32(0),
+                                b"peer emergency during GOAWAY acknowledgement",
+                            );
+                            return Ok(());
+                        }
+                        result = timeout_at(deadline, driver.shutdown(0)) => result,
+                    };
+                    match shutdown {
+                        Ok(Ok(())) => {}
+                        // This connection's own shutdown, drop or pin
+                        // withdrawal closed it while the acknowledgement
+                        // was being written (M7-C105).
+                        Ok(Err(_)) if driver_cancel.is_cancelled() => return Ok(()),
+                        // The peer finished its own planned close first:
+                        // it closed the connection cleanly (application
+                        // code 0 or H3_NO_ERROR) while this side was
+                        // writing its acknowledgement.  That is the end
+                        // the drain waits for, not a failure, and the
+                        // idle wait below classifies it the same way
+                        // (M7-C116).
+                        Ok(Err(error))
+                            if error.is_h3_no_error()
+                                || error.is_remote_no_error_application_close() =>
+                        {
+                            return Ok(());
+                        }
+                        Ok(Err(error)) => {
+                            driver_connection.close(
+                                quinn::VarInt::from_u32(0),
+                                b"peer GOAWAY acknowledgement failed",
+                            );
+                            return Err(PeerTransportError::H3(error.to_string()));
+                        }
+                        Err(_) => {
+                            driver_connection.close(
+                                quinn::VarInt::from_u32(0),
+                                b"peer GOAWAY acknowledgement deadline",
                             );
                             return Err(PeerTransportError::Timeout);
-                        };
-                        let shutdown = tokio::select! {
-                            biased;
-                            _ = driver_cancel.cancelled() => {
-                                driver_connection.close(
-                                    quinn::VarInt::from_u32(0),
-                                    b"peer emergency during GOAWAY acknowledgement",
-                                );
-                                return Ok(());
-                            }
-                            result = timeout_at(deadline, driver.shutdown(0)) => result,
-                        };
-                        match shutdown {
-                            Ok(Ok(())) => {}
-                            // This connection's own shutdown, drop or pin
-                            // withdrawal closed it while the acknowledgement
-                            // was being written (M7-C105).
-                            Ok(Err(_)) if driver_cancel.is_cancelled() => return Ok(()),
-                            // The peer finished its own planned close first:
-                            // it closed the connection cleanly (application
-                            // code 0 or H3_NO_ERROR) while this side was
-                            // writing its acknowledgement.  That is the end
-                            // the drain waits for, not a failure, and the
-                            // idle wait below classifies it the same way
-                            // (M7-C116).
-                            Ok(Err(error))
-                                if error.is_h3_no_error()
-                                    || error.is_remote_no_error_application_close() =>
-                            {
-                                return Ok(());
-                            }
-                            Ok(Err(error)) => {
-                                driver_connection.close(
-                                    quinn::VarInt::from_u32(0),
-                                    b"peer GOAWAY acknowledgement failed",
-                                );
-                                return Err(PeerTransportError::H3(error.to_string()));
-                            }
-                            Err(_) => {
-                                driver_connection.close(
-                                    quinn::VarInt::from_u32(0),
-                                    b"peer GOAWAY acknowledgement deadline",
-                                );
-                                return Err(PeerTransportError::Timeout);
-                            }
                         }
-                        let idle = tokio::select! {
-                            biased;
-                            _ = driver_cancel.cancelled() => {
-                                driver_connection.close(
-                                    quinn::VarInt::from_u32(0),
-                                    b"peer emergency during GOAWAY wait",
-                                );
-                                return Ok(());
-                            }
-                            result = timeout_at(deadline, driver.wait_idle()) => result,
-                        };
-                        let idle_result = match idle {
-                            Err(_) => {
-                                driver_connection.close(
-                                    quinn::VarInt::from_u32(0),
-                                    b"peer GOAWAY idle deadline",
-                                );
-                                Err(PeerTransportError::Timeout)
-                            }
-                            Ok(connection_result) => {
-                                let result =
-                                    planned_drain_result(connection_result, &driver_cancel);
-                                if result.is_err() {
-                                    driver_connection.close(
-                                        quinn::VarInt::from_u32(0),
-                                        b"peer GOAWAY idle failure",
-                                    );
-                                }
-                                result
-                            }
-                        };
-                        break idle_result;
+                    }
+                    let idle = tokio::select! {
+                        biased;
+                        _ = driver_cancel.cancelled() => {
+                            driver_connection.close(
+                                quinn::VarInt::from_u32(0),
+                                b"peer emergency during GOAWAY wait",
+                            );
+                            return Ok(());
                         }
-                        result = driver.wait_for_remote_goaway() => {
-                            if result.is_ok() {
-                                // Reuse the same bounded acknowledgement path
-                                // as an attempted post-GOAWAY open. The typed
-                                // gate remains in `open_until`; this passive
-                                // event only removes the need for a failed
-                                // probe to wake the driver.
-                                driver_planned_remote_closing.cancel();
-                            } else {
-                                // A normal close or protocol error before
-                                // GOAWAY preserves the existing terminal
-                                // driver behavior and is never promoted to a
-                                // planned drain.
-                                break Ok(());
+                        result = timeout_at(deadline, driver.wait_idle()) => result,
+                    };
+                    let idle_result = match idle {
+                        Err(_) => {
+                            driver_connection.close(
+                                quinn::VarInt::from_u32(0),
+                                b"peer GOAWAY idle deadline",
+                            );
+                            Err(PeerTransportError::Timeout)
+                        }
+                        Ok(connection_result) => {
+                            let result =
+                                planned_drain_result(connection_result, &driver_cancel);
+                            if result.is_err() {
+                                driver_connection.close(
+                                    quinn::VarInt::from_u32(0),
+                                    b"peer GOAWAY idle failure",
+                                );
                             }
+                            result
+                        }
+                    };
+                    break idle_result;
+                    }
+                    result = driver.wait_for_remote_goaway() => {
+                        if result.is_ok() {
+                            // Reuse the same bounded acknowledgement path
+                            // as an attempted post-GOAWAY open. The typed
+                            // gate remains in `open_until`; this passive
+                            // event only removes the need for a failed
+                            // probe to wake the driver.
+                            publish_client_connection_event(
+                                &driver_phase,
+                                ClientConnectionEvent::RemoteGoAway,
+                            );
+                        } else {
+                            // A normal close or protocol error before
+                            // GOAWAY preserves the existing terminal
+                            // driver behavior and is never promoted to a
+                            // planned drain.
+                            break Ok(());
                         }
                     }
                 }
-            });
-            let pin_watcher = spawn_pin_watcher(
-                &identity,
-                &self.pin_provider,
-                &connection,
-                connection_cancel.clone(),
-            );
+            }
+        });
+        let pin_watcher = spawn_pin_watcher(
+            &identity,
+            &self.pin_provider,
+            &connection,
+            connection_cancel.clone(),
+        );
 
-            let pooled = Arc::new(ClientConnection {
-                destination: destination.clone(),
-                identity,
-                pin_provider: self.pin_provider.clone(),
-                connection,
-                sender: Mutex::new(sender),
-                stream_permits: driver_stream_permits,
-                connection_bytes: Arc::new(AtomicUsize::new(0)),
-                limits: self.limits.clone(),
-                cancel: connection_cancel,
-                planned_remote_closing,
-                driver: Mutex::new(Some(driver_task)),
-                pin_watcher: Mutex::new(Some(pin_watcher)),
-                local_generation,
-                retired: AtomicBool::new(false),
-                _connection_permit: connection_permit,
-            });
-            with_checkout_deadline(&self.cancel, deadline, self.state.connections.lock())
-                .await?
-                .insert(destination, pooled.clone());
-            Ok(PeerConnectionHandle { inner: pooled })
-        }
-        .await;
-        drop(dial_guard);
-        let retain = result.is_ok();
-        lease.release(retain).await;
-        result
+        let (joins, join_requests) = mpsc::channel(CONNECTION_JOIN_QUEUE);
+        tokio::spawn(supervise_client_connection(
+            join_requests,
+            driver_task,
+            pin_watcher,
+        ));
+
+        let pooled = Arc::new(ClientConnection {
+            destination,
+            identity,
+            pin_provider: self.pin_provider.clone(),
+            connection,
+            sender,
+            dispatched_sender: OnceLock::new(),
+            joins,
+            stream_permits: driver_stream_permits,
+            connection_bytes: Arc::new(AtomicUsize::new(0)),
+            limits: self.limits.clone(),
+            cancel: connection_cancel,
+            phase,
+            local_generation,
+            _connection_permit: connection_permit,
+        });
+        Ok(pooled)
     }
 
     /// Return the current dynamic peer pin snapshot used for admission.
@@ -2831,20 +3492,26 @@ impl PeerClient {
         self.pin_provider.snapshot()
     }
 
+    fn connection_stats(&self, connection: &ClientConnection) -> PeerPoolConnectionStats {
+        PeerPoolConnectionStats {
+            available_stream_permits: connection.stream_permits.available_permits(),
+            max_stream_permits: self.limits.max_streams_per_connection,
+            closed: connection.connection.close_reason().is_some()
+                || connection.cancel.is_cancelled(),
+        }
+    }
+
     /// Return bounded, redacted pool admission counters for diagnostics.
     ///
     /// The snapshot deliberately reports only semaphore counts and terminal
     /// state.  It is read-only and does not keep any pooled connection alive.
     pub async fn pool_stats(&self) -> PeerPoolStats {
-        let connections = self.state.connections.lock().await;
-        let pooled_connections = connections
-            .values()
-            .map(|connection| PeerPoolConnectionStats {
-                available_stream_permits: connection.stream_permits.available_permits(),
-                max_stream_permits: self.limits.max_streams_per_connection,
-                closed: connection.connection.close_reason().is_some()
-                    || connection.cancel.is_cancelled(),
-            })
+        let pooled_connections = self
+            .ask_pool(|reply| PoolCommand::List { reply })
+            .await
+            .unwrap_or_default()
+            .iter()
+            .map(|connection| self.connection_stats(connection))
             .collect();
         PeerPoolStats {
             available_connection_permits: self.connections.available_permits(),
@@ -2861,15 +3528,11 @@ impl PeerClient {
         &self,
         destination: &PeerDestination,
     ) -> Option<PeerPoolConnectionStats> {
-        let connections = self.state.connections.lock().await;
-        connections
-            .get(destination)
-            .map(|connection| PeerPoolConnectionStats {
-                available_stream_permits: connection.stream_permits.available_permits(),
-                max_stream_permits: self.limits.max_streams_per_connection,
-                closed: connection.connection.close_reason().is_some()
-                    || connection.cancel.is_cancelled(),
-            })
+        let destination = destination.clone();
+        self.ask_pool(|reply| PoolCommand::Get { destination, reply })
+            .await
+            .flatten()
+            .map(|connection| self.connection_stats(&connection))
     }
 
     /// Close and join one pooled peer connection, if present.
@@ -2877,7 +3540,11 @@ impl PeerClient {
         &self,
         destination: &PeerDestination,
     ) -> Result<(), PeerTransportError> {
-        let connection = self.state.connections.lock().await.remove(destination);
+        let destination = destination.clone();
+        let connection = self
+            .ask_pool(|reply| PoolCommand::Take { destination, reply })
+            .await
+            .flatten();
         if let Some(connection) = connection {
             connection
                 .shutdown_until(Instant::now() + self.limits.drain_timeout)
@@ -2892,19 +3559,11 @@ impl PeerClient {
     /// Pin watchers close revoked connections immediately; this method gives
     /// callers an explicit joined cleanup point after publishing a snapshot.
     pub async fn refresh_pins(&self) -> Result<usize, PeerTransportError> {
-        let snapshot = self.pin_provider.snapshot();
-        let stale = {
-            let mut connections = self.state.connections.lock().await;
-            let destinations = connections
-                .iter()
-                .filter(|(_, connection)| !snapshot.contains(connection.identity.spki_sha256()))
-                .map(|(destination, _)| destination.clone())
-                .collect::<Vec<_>>();
-            destinations
-                .into_iter()
-                .filter_map(|destination| connections.remove(&destination))
-                .collect::<Vec<_>>()
-        };
+        let pins = self.pin_provider.snapshot();
+        let stale = self
+            .ask_pool(|reply| PoolCommand::TakeUnpinned { pins, reply })
+            .await
+            .unwrap_or_default();
         let count = stale.len();
         let deadline = Instant::now() + self.limits.drain_timeout;
         let mut first_error = None;
@@ -2946,15 +3605,12 @@ impl PeerClient {
 
     /// Cancel and join every pooled connection driver task.
     pub async fn shutdown(&self) -> Result<(), PeerTransportError> {
-        self.cancel.cancel();
         let connections = self
-            .state
-            .connections
-            .lock()
+            .ask_pool(|reply| PoolCommand::BeginShutdown { reply })
             .await
-            .values()
-            .cloned()
-            .collect::<Vec<_>>();
+            .unwrap_or_default();
+        // Already cancelled by the pool task; this covers one that is gone.
+        self.cancel.cancel();
         let deadline = Instant::now() + self.limits.drain_timeout;
         let mut first_error = None;
         for connection in connections {
@@ -2965,7 +3621,7 @@ impl PeerClient {
         if let Some(error) = first_error {
             return Err(error);
         }
-        self.state.connections.lock().await.clear();
+        let _ = self.ask_pool(|reply| PoolCommand::Clear { reply }).await;
         Ok(())
     }
 }
@@ -2976,37 +3632,102 @@ enum PeerShutdownMode {
     PlannedDrain,
 }
 
+/// Where one planned listener drain is.
+///
+/// `Serving -> AdmissionClosed -> Draining(deadline)`.  The deadline exists
+/// only once the drain has begun, and the drain can only begin after
+/// admission closed, so every connection task that observes the drain reads
+/// the same absolute budget with it.  Emergency server shutdown never leaves
+/// `Serving`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PlannedDrainPhase {
+    /// Streams are admitted.
+    Serving,
+    /// The admission boundary: a stream not yet dispatched is refused as
+    /// not processed.
+    AdmissionClosed,
+    /// Established connections send GOAWAY and join their admitted streams
+    /// before this shared absolute deadline.
+    Draining(Instant),
+}
+
+/// What can move a [`PlannedDrainPhase`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PlannedDrainEvent {
+    CloseAdmission,
+    BeginDrain(Instant),
+}
+
+/// An event its planned-drain phase has no transition for.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct IllegalPlannedDrainEvent;
+
+impl PlannedDrainPhase {
+    /// The only place a planned drain changes phase.
+    fn on_event(self, event: PlannedDrainEvent) -> Result<Self, IllegalPlannedDrainEvent> {
+        match (self, event) {
+            (Self::Serving, PlannedDrainEvent::CloseAdmission) => Ok(Self::AdmissionClosed),
+            (Self::AdmissionClosed, PlannedDrainEvent::BeginDrain(deadline)) => {
+                Ok(Self::Draining(deadline))
+            }
+            (Self::Serving, PlannedDrainEvent::BeginDrain(_))
+            | (Self::AdmissionClosed | Self::Draining(_), PlannedDrainEvent::CloseAdmission)
+            | (Self::Draining(_), PlannedDrainEvent::BeginDrain(_)) => {
+                Err(IllegalPlannedDrainEvent)
+            }
+        }
+    }
+}
+
 /// Shared signal for one planned server drain.
 ///
-/// The deadline is written before the token is cancelled so every connection
-/// task uses the same absolute budget.  Emergency server shutdown never
-/// cancels this token.
+/// The listener supervisor is its only writer; connection and stream tasks
+/// sample the published [`PlannedDrainPhase`] and wait for it to change.
 #[derive(Clone)]
 struct PlannedDrainSignal {
-    token: CancellationToken,
-    deadline: Arc<OnceLock<Instant>>,
-    admission_closed: Arc<AtomicBool>,
+    phase: watch::Sender<PlannedDrainPhase>,
 }
 
 impl PlannedDrainSignal {
     fn new() -> Self {
         Self {
-            token: CancellationToken::new(),
-            deadline: Arc::new(OnceLock::new()),
-            admission_closed: Arc::new(AtomicBool::new(false)),
+            phase: watch::Sender::new(PlannedDrainPhase::Serving),
         }
     }
 
-    fn set_deadline(&self, deadline: Instant) {
-        let _ = self.deadline.set(deadline);
+    fn on_event(&self, event: PlannedDrainEvent) -> Result<(), IllegalPlannedDrainEvent> {
+        let mut applied = Ok(());
+        self.phase
+            .send_if_modified(|phase| match phase.on_event(event) {
+                Ok(next) => {
+                    *phase = next;
+                    true
+                }
+                Err(refused) => {
+                    applied = Err(refused);
+                    false
+                }
+            });
+        applied
     }
 
-    fn deadline(&self) -> Option<Instant> {
-        self.deadline.get().copied()
-    }
-
+    /// Close the admission boundary.  Closing it again changes nothing.
     fn close_admission(&self) {
-        self.admission_closed.store(true, Ordering::Release);
+        let _ = self.on_event(PlannedDrainEvent::CloseAdmission);
+    }
+
+    /// Begin the drain with its shared absolute deadline.  Refused unless
+    /// admission is closed and no drain has begun.
+    fn begin_drain(&self, deadline: Instant) {
+        let _ = self.on_event(PlannedDrainEvent::BeginDrain(deadline));
+    }
+
+    fn phase(&self) -> PlannedDrainPhase {
+        *self.phase.borrow()
+    }
+
+    fn admission_closed(&self) -> bool {
+        self.phase() != PlannedDrainPhase::Serving
     }
 
     fn begin_admission(&self) -> bool {
@@ -3014,7 +3735,31 @@ impl PlannedDrainSignal {
         // that passes it before close_admission is already admitted and may
         // finish after GOAWAY; a resolver/policy path that reaches it after
         // the boundary is rejected before handler dispatch.
-        !self.admission_closed.load(Ordering::Acquire)
+        !self.admission_closed()
+    }
+
+    /// The shared drain deadline, once the drain has begun.
+    fn draining_deadline(&self) -> Option<Instant> {
+        match self.phase() {
+            PlannedDrainPhase::Draining(deadline) => Some(deadline),
+            PlannedDrainPhase::Serving | PlannedDrainPhase::AdmissionClosed => None,
+        }
+    }
+
+    fn is_draining(&self) -> bool {
+        self.draining_deadline().is_some()
+    }
+
+    /// Resolve once the drain has begun.
+    async fn draining(&self) {
+        let mut phase = self.phase.subscribe();
+        if phase
+            .wait_for(|phase| matches!(phase, PlannedDrainPhase::Draining(_)))
+            .await
+            .is_err()
+        {
+            std::future::pending::<()>().await;
+        }
     }
 }
 
@@ -3030,6 +3775,8 @@ where
     policy: Arc<P>,
     handler: Arc<H>,
     diagnostics: Arc<PeerServerDiagnostics>,
+    /// The free list of diagnostics cells, owned by the listener supervisor.
+    diagnostics_slots: mpsc::Receiver<usize>,
 }
 
 /// A bounded snapshot of one authenticated incoming peer connection.
@@ -3108,6 +3855,329 @@ pub struct PeerServerStats {
     pub connections: Vec<PeerServerConnectionStats>,
 }
 
+/// How a planned GOAWAY drain of one incoming peer connection was cut short.
+/// In every case this side closed QUIC before the drain completed in order.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DrainAbort {
+    /// Writing GOAWAY failed with an HTTP/3 error.
+    GoAwayFailed,
+    /// Writing GOAWAY did not finish before the shared deadline.
+    GoAwayDeadline,
+    /// A pin revocation or connection-local emergency arrived while waiting
+    /// for the HTTP/3 completion boundary.
+    EmergencyAwaitingH3,
+    /// HTTP/3 failed while waiting for its completion boundary.
+    H3Failed,
+    /// The shared deadline passed while waiting for the HTTP/3 completion
+    /// boundary; `streams_outstanding` is whether admitted streams were
+    /// still running.
+    DeadlineAwaitingH3 { streams_outstanding: bool },
+    /// An emergency arrived while joining admitted streams.
+    EmergencyAwaitingStreams,
+    /// The shared deadline passed while joining admitted streams.
+    DeadlineAwaitingStreams,
+}
+
+impl DrainAbort {
+    fn goaway_sent(self) -> bool {
+        !matches!(self, Self::GoAwayFailed | Self::GoAwayDeadline)
+    }
+
+    /// Whether QUIC was closed because the drain ran out of its budget.
+    fn forced_connection_close(self) -> bool {
+        matches!(
+            self,
+            Self::GoAwayDeadline
+                | Self::DeadlineAwaitingH3 { .. }
+                | Self::EmergencyAwaitingStreams
+                | Self::DeadlineAwaitingStreams
+        )
+    }
+
+    /// Whether an admitted stream was cancelled by that close.
+    fn forced_stream_cancellation(self) -> bool {
+        matches!(
+            self,
+            Self::DeadlineAwaitingH3 {
+                streams_outstanding: true
+            } | Self::EmergencyAwaitingStreams
+                | Self::DeadlineAwaitingStreams
+        )
+    }
+}
+
+/// The in-order steps of a planned GOAWAY drain.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PlannedDrainStep {
+    /// The listener's drain reached this connection; GOAWAY is not written.
+    Requested,
+    /// GOAWAY is written; HTTP/3 is driven to its completion boundary.
+    GoAwaySent,
+    /// HTTP/3 reported completion; admitted streams are being joined.
+    H3Complete,
+    /// Every admitted stream returned before the deadline.
+    StreamsReturned,
+}
+
+/// Which way a finished connection left serving.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DrainRoute {
+    /// The planned drain completed in order.
+    Planned,
+    /// The planned drain was cut short.
+    Aborted(DrainAbort),
+    /// The emergency ordering: process cancellation, pin revocation, a
+    /// connection-local failure, or the peer closing first.
+    Emergency { planned_deadline_published: bool },
+}
+
+/// The shutdown of one incoming peer connection.
+///
+/// ```text
+/// Serving -> Planned(Requested -> GoAwaySent -> H3Complete -> StreamsReturned) -> Finished
+///         |          \-> Aborted(cause) -------------------------------------/
+///         \-> Emergency -----------------------------------------------------/
+/// ```
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PeerConnectionDrain {
+    /// Accepting and serving request streams.
+    Serving,
+    /// A planned GOAWAY drain, in order so far.
+    Planned(PlannedDrainStep),
+    /// The planned drain was cut short and QUIC is closed.
+    Aborted(DrainAbort),
+    /// The emergency ordering.  `planned_deadline_published` is whether the
+    /// listener had begun its planned drain, in which case this connection
+    /// shares that deadline and reports how its cleanup went.
+    Emergency { planned_deadline_published: bool },
+    /// Stream tasks are joined (or abandoned at the deadline): terminal.
+    Finished {
+        route: DrainRoute,
+        streams: DrainOutcome,
+        pin_watcher_joined: bool,
+    },
+}
+
+/// What can move a [`PeerConnectionDrain`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DrainEvent {
+    /// The listener's planned drain was observed while serving.
+    PlannedRequested,
+    /// Serving ended any other way.
+    EmergencyRequested {
+        planned_deadline_published: bool,
+    },
+    GoAwaySent,
+    GoAwayFailed,
+    GoAwayDeadline,
+    H3Complete,
+    H3Failed,
+    /// Connection-local cancellation during a planned drain.
+    Emergency,
+    /// The shared drain deadline passed during a planned drain.
+    Deadline {
+        streams_outstanding: bool,
+    },
+    StreamsReturned,
+    /// The final bounded join of the stream tasks ended.
+    TasksJoined(DrainOutcome),
+    /// The pin watcher did not join before the deadline.
+    PinWatcherAbandoned,
+}
+
+/// An event its connection drain state has no transition for.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct IllegalDrainEvent;
+
+/// The four drain facts [`PeerServerConnectionStats`] exposes.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct DrainReport {
+    planned_goaway_sent: bool,
+    forced_stream_cancellation: bool,
+    forced_connection_close: bool,
+    drain_join_incomplete: bool,
+}
+
+impl PeerConnectionDrain {
+    /// The only place a connection's drain state changes.
+    fn on_event(self, event: DrainEvent) -> Result<Self, IllegalDrainEvent> {
+        use DrainEvent as Event;
+        use PlannedDrainStep as Step;
+        let next = match (self, event) {
+            (Self::Serving, Event::PlannedRequested) => Self::Planned(Step::Requested),
+            (
+                Self::Serving,
+                Event::EmergencyRequested {
+                    planned_deadline_published,
+                },
+            ) => Self::Emergency {
+                planned_deadline_published,
+            },
+
+            (Self::Planned(Step::Requested), Event::GoAwaySent) => Self::Planned(Step::GoAwaySent),
+            (Self::Planned(Step::Requested), Event::GoAwayFailed) => {
+                Self::Aborted(DrainAbort::GoAwayFailed)
+            }
+            (Self::Planned(Step::Requested), Event::GoAwayDeadline) => {
+                Self::Aborted(DrainAbort::GoAwayDeadline)
+            }
+
+            (Self::Planned(Step::GoAwaySent), Event::H3Complete) => Self::Planned(Step::H3Complete),
+            (Self::Planned(Step::GoAwaySent), Event::H3Failed) => {
+                Self::Aborted(DrainAbort::H3Failed)
+            }
+            (Self::Planned(Step::GoAwaySent), Event::Emergency) => {
+                Self::Aborted(DrainAbort::EmergencyAwaitingH3)
+            }
+            (
+                Self::Planned(Step::GoAwaySent),
+                Event::Deadline {
+                    streams_outstanding,
+                },
+            ) => Self::Aborted(DrainAbort::DeadlineAwaitingH3 {
+                streams_outstanding,
+            }),
+
+            (Self::Planned(Step::H3Complete), Event::StreamsReturned) => {
+                Self::Planned(Step::StreamsReturned)
+            }
+            (Self::Planned(Step::H3Complete), Event::Emergency) => {
+                Self::Aborted(DrainAbort::EmergencyAwaitingStreams)
+            }
+            (Self::Planned(Step::H3Complete), Event::Deadline { .. }) => {
+                Self::Aborted(DrainAbort::DeadlineAwaitingStreams)
+            }
+
+            (Self::Planned(Step::StreamsReturned), Event::TasksJoined(streams)) => Self::Finished {
+                route: DrainRoute::Planned,
+                streams,
+                pin_watcher_joined: true,
+            },
+            (Self::Aborted(cause), Event::TasksJoined(streams)) => Self::Finished {
+                route: DrainRoute::Aborted(cause),
+                streams,
+                pin_watcher_joined: true,
+            },
+            (
+                Self::Emergency {
+                    planned_deadline_published,
+                },
+                Event::TasksJoined(streams),
+            ) => Self::Finished {
+                route: DrainRoute::Emergency {
+                    planned_deadline_published,
+                },
+                streams,
+                pin_watcher_joined: true,
+            },
+
+            (
+                Self::Finished {
+                    route,
+                    streams,
+                    pin_watcher_joined: true,
+                },
+                Event::PinWatcherAbandoned,
+            ) => Self::Finished {
+                route,
+                streams,
+                pin_watcher_joined: false,
+            },
+
+            _ => return Err(IllegalDrainEvent),
+        };
+        Ok(next)
+    }
+
+    /// What the diagnostics report in this state.
+    ///
+    /// A written GOAWAY is reported as soon as it is written.  The forced
+    /// and incomplete facts are reported once the stream tasks are joined,
+    /// and only for a connection that took part in a planned drain.
+    fn report(self) -> DrainReport {
+        match self {
+            Self::Serving | Self::Emergency { .. } | Self::Planned(PlannedDrainStep::Requested) => {
+                DrainReport::default()
+            }
+            Self::Planned(_) => DrainReport {
+                planned_goaway_sent: true,
+                ..DrainReport::default()
+            },
+            Self::Aborted(cause) => DrainReport {
+                planned_goaway_sent: cause.goaway_sent(),
+                ..DrainReport::default()
+            },
+            Self::Finished {
+                route:
+                    DrainRoute::Emergency {
+                        planned_deadline_published: false,
+                    },
+                ..
+            } => DrainReport::default(),
+            Self::Finished {
+                route,
+                streams,
+                pin_watcher_joined,
+            } => {
+                let (planned_goaway_sent, forced_close, forced_cancellation) = match route {
+                    DrainRoute::Planned => (true, false, false),
+                    DrainRoute::Aborted(cause) => (
+                        cause.goaway_sent(),
+                        cause.forced_connection_close(),
+                        cause.forced_stream_cancellation(),
+                    ),
+                    DrainRoute::Emergency { .. } => (false, false, false),
+                };
+                DrainReport {
+                    planned_goaway_sent,
+                    forced_stream_cancellation: forced_cancellation || streams.forced(),
+                    forced_connection_close: forced_close || streams.forced(),
+                    drain_join_incomplete: streams.incomplete() || !pin_watcher_joined,
+                }
+            }
+        }
+    }
+}
+
+/// One incoming connection's drain state, published to its diagnostics.
+///
+/// The connection task is the only writer.
+struct ConnectionDrain {
+    state: PeerConnectionDrain,
+    diagnostics: Option<Arc<PeerServerConnectionDiagnostics>>,
+}
+
+impl ConnectionDrain {
+    fn new(diagnostics: Option<Arc<PeerServerConnectionDiagnostics>>) -> Self {
+        Self {
+            state: PeerConnectionDrain::Serving,
+            diagnostics,
+        }
+    }
+
+    fn state(&self) -> PeerConnectionDrain {
+        self.state
+    }
+
+    fn on_event(&mut self, event: DrainEvent) {
+        match self.state.on_event(event) {
+            Ok(next) => {
+                self.state = next;
+                if let Some(diagnostics) = &self.diagnostics {
+                    diagnostics.drain.send_replace(next);
+                }
+            }
+            Err(IllegalDrainEvent) => {
+                tracing::warn!(
+                    state = ?self.state,
+                    ?event,
+                    "peer connection drain refused an out-of-order event"
+                );
+            }
+        }
+    }
+}
+
 struct PeerServerConnectionDiagnostics {
     peer_node_id: String,
     observed_server_name: Option<String>,
@@ -3121,42 +4191,76 @@ struct PeerServerConnectionDiagnostics {
     completed_streams: AtomicU64,
     cancelled_streams: AtomicU64,
     error_streams: AtomicU64,
-    planned_goaway_sent: AtomicBool,
-    forced_stream_cancellation: AtomicBool,
-    forced_connection_close: AtomicBool,
-    drain_join_incomplete: AtomicBool,
+    /// The connection's drain state, published by its own task.
+    drain: watch::Sender<PeerConnectionDrain>,
+    /// Set once a later registration found this connection already closed:
+    /// the entry stops being reported while its task finishes.
+    superseded: AtomicBool,
 }
 
 /// In-process, bounded target-side peer diagnostics.
 ///
 /// This is intentionally a library-owned observation point instead of an
-/// unauthenticated endpoint.  At most `max_connections` entries are retained;
-/// completed connection entries are removed when a replacement is registered.
+/// unauthenticated endpoint.  At most `max_connections` entries are retained:
+/// there is one cell per connection the listener can serve at once, and a
+/// closed connection's entry stops being reported when a replacement is
+/// registered.
+///
+/// Each cell is written only by the connection task that holds its
+/// [`DiagnosticsSlot`], so every cell has one writer at a time and
+/// [`Self::snapshot`] samples them without waiting.
 pub struct PeerServerDiagnostics {
-    max_connections: usize,
     next_connection_id: AtomicUsize,
-    connections: StdMutex<HashMap<usize, Arc<PeerServerConnectionDiagnostics>>>,
+    slots: Box<[watch::Sender<Option<Arc<PeerServerConnectionDiagnostics>>>]>,
+    /// Returns a released cell's index to the listener, which hands indices
+    /// out.  It holds exactly the indices not leased, so it never overflows.
+    free_slots: mpsc::Sender<usize>,
+}
+
+/// The lease of one diagnostics cell, held by one connection task.  Dropping
+/// it clears the cell and returns its index to the listener.
+struct DiagnosticsSlot {
+    diagnostics: Arc<PeerServerDiagnostics>,
+    index: usize,
+}
+
+impl Drop for DiagnosticsSlot {
+    fn drop(&mut self) {
+        if let Some(cell) = self.diagnostics.slots.get(self.index) {
+            cell.send_replace(None);
+        }
+        let _ = self.diagnostics.free_slots.try_send(self.index);
+    }
 }
 
 impl PeerServerDiagnostics {
-    fn new(max_connections: usize) -> Arc<Self> {
-        Arc::new(Self {
-            max_connections,
+    /// The diagnostics and the free list of its cells, which the listener
+    /// supervisor owns.
+    fn new(max_connections: usize) -> (Arc<Self>, mpsc::Receiver<usize>) {
+        let (free_slots, free) = mpsc::channel(max_connections.max(1));
+        for index in 0..max_connections {
+            let _ = free_slots.try_send(index);
+        }
+        let diagnostics = Arc::new(Self {
             next_connection_id: AtomicUsize::new(1),
-            connections: StdMutex::new(HashMap::new()),
-        })
+            slots: (0..max_connections)
+                .map(|_| watch::Sender::new(None))
+                .collect(),
+            free_slots,
+        });
+        (diagnostics, free)
     }
 
     /// Return a bounded snapshot without exposing request payloads.
     pub fn snapshot(&self) -> PeerServerStats {
-        let connections = match self.connections.lock() {
-            Ok(connections) => connections,
-            Err(_) => return PeerServerStats::default(),
-        };
-        let connections = connections
-            .values()
+        let connections = self
+            .slots
+            .iter()
+            .filter_map(|cell| cell.borrow().clone())
+            .filter(|connection| !connection.superseded.load(Ordering::Acquire))
             .map(|connection| {
                 let stats = connection.connection.stats();
+                let drain = connection.drain.borrow().report();
                 PeerServerConnectionStats {
                     peer_node_id: connection.peer_node_id.clone(),
                     observed_server_name: connection.observed_server_name.clone(),
@@ -3177,31 +4281,34 @@ impl PeerServerDiagnostics {
                     frame_rx_reset_stream: stats.frame_rx.reset_stream,
                     frame_tx_stop_sending: stats.frame_tx.stop_sending,
                     frame_rx_stop_sending: stats.frame_rx.stop_sending,
-                    planned_goaway_sent: connection.planned_goaway_sent.load(Ordering::Acquire),
-                    forced_stream_cancellation: connection
-                        .forced_stream_cancellation
-                        .load(Ordering::Acquire),
-                    forced_connection_close: connection
-                        .forced_connection_close
-                        .load(Ordering::Acquire),
-                    drain_join_incomplete: connection.drain_join_incomplete.load(Ordering::Acquire),
+                    planned_goaway_sent: drain.planned_goaway_sent,
+                    forced_stream_cancellation: drain.forced_stream_cancellation,
+                    forced_connection_close: drain.forced_connection_close,
+                    drain_join_incomplete: drain.drain_join_incomplete,
                 }
             })
             .collect();
         PeerServerStats { connections }
     }
 
+    /// Publish one connection in the cell `slot` leases.
     fn register(
         &self,
+        slot: &DiagnosticsSlot,
         peer_node_id: &str,
         connection: &quinn::Connection,
         stream_permits: Arc<Semaphore>,
         max_stream_permits: usize,
     ) -> Option<Arc<PeerServerConnectionDiagnostics>> {
-        let mut connections = self.connections.lock().ok()?;
-        connections.retain(|_, connection| connection.connection.close_reason().is_none());
-        if connections.len() >= self.max_connections {
-            return None;
+        let cell = self.slots.get(slot.index)?;
+        // Completed connection entries stop being reported when a
+        // replacement is registered.
+        for other in &self.slots {
+            if let Some(entry) = other.borrow().as_ref()
+                && entry.connection.close_reason().is_some()
+            {
+                entry.superseded.store(true, Ordering::Release);
+            }
         }
         let observation = Arc::new(PeerServerConnectionDiagnostics {
             peer_node_id: peer_node_id.to_owned(),
@@ -3219,19 +4326,11 @@ impl PeerServerDiagnostics {
             completed_streams: AtomicU64::new(0),
             cancelled_streams: AtomicU64::new(0),
             error_streams: AtomicU64::new(0),
-            planned_goaway_sent: AtomicBool::new(false),
-            forced_stream_cancellation: AtomicBool::new(false),
-            forced_connection_close: AtomicBool::new(false),
-            drain_join_incomplete: AtomicBool::new(false),
+            drain: watch::Sender::new(PeerConnectionDrain::Serving),
+            superseded: AtomicBool::new(false),
         });
-        connections.insert(observation.connection_id, observation.clone());
+        cell.send_replace(Some(observation.clone()));
         Some(observation)
-    }
-
-    fn unregister(&self, connection_id: usize) {
-        if let Ok(mut connections) = self.connections.lock() {
-            connections.remove(&connection_id);
-        }
     }
 }
 
@@ -3247,17 +4346,6 @@ fn observed_server_name(connection: &quinn::Connection) -> Option<String> {
         .downcast::<quinn::crypto::rustls::HandshakeData>()
         .ok()?
         .server_name
-}
-
-struct PeerServerDiagnosticsGuard {
-    diagnostics: Arc<PeerServerDiagnostics>,
-    connection_id: usize,
-}
-
-impl Drop for PeerServerDiagnosticsGuard {
-    fn drop(&mut self) {
-        self.diagnostics.unregister(self.connection_id);
-    }
 }
 
 #[derive(Clone, Copy)]
@@ -3370,14 +4458,15 @@ where
         handler: H,
     ) -> Result<Self, PeerTransportError> {
         limits.validate()?;
-        let max_connections = limits.max_connections;
+        let (diagnostics, diagnostics_slots) = PeerServerDiagnostics::new(limits.max_connections);
         Ok(Self {
             endpoint,
             pin_provider,
             limits,
             policy: Arc::new(policy),
             handler: Arc::new(handler),
-            diagnostics: PeerServerDiagnostics::new(max_connections),
+            diagnostics,
+            diagnostics_slots,
         })
     }
 
@@ -3422,6 +4511,7 @@ where
             self.policy,
             self.handler,
             self.diagnostics,
+            self.diagnostics_slots,
             emergency,
             PeerShutdownMode::PlannedDrain,
             Some(planned),
@@ -3441,6 +4531,7 @@ where
             self.policy,
             self.handler,
             self.diagnostics,
+            self.diagnostics_slots,
             cancel,
             mode,
             None,
@@ -3475,6 +4566,7 @@ async fn serve_peer_inner<P, H>(
     policy: Arc<P>,
     handler: Arc<H>,
     diagnostics: Arc<PeerServerDiagnostics>,
+    mut diagnostics_slots: mpsc::Receiver<usize>,
     cancel: CancellationToken,
     mode: PeerShutdownMode,
     planned_cancel: Option<CancellationToken>,
@@ -3525,7 +4617,17 @@ where
                 let limits = limits.clone();
                 let policy = policy.clone();
                 let handler = handler.clone();
-                let diagnostics = diagnostics.clone();
+                // A connection permit and a diagnostics cell are released
+                // together, the cell first, so a cell is free whenever a
+                // permit is.  A connection without one is served unobserved.
+                let diagnostics_slot =
+                    diagnostics_slots
+                        .try_recv()
+                        .ok()
+                        .map(|index| DiagnosticsSlot {
+                            diagnostics: diagnostics.clone(),
+                            index,
+                        });
                 // In planned mode the caller cancellation is the drain
                 // request itself.  Keep established connection/stream
                 // cancellation independent so admitted handlers survive
@@ -3547,6 +4649,7 @@ where
                 let planned = planned.clone();
                 tasks.spawn(async move {
                     let _permit = permit;
+                    let diagnostics_slot = diagnostics_slot;
                     let handshake_cancel = connection_cancel.clone();
                     let handshake_planned = planned.clone();
                     let connection = tokio::select! {
@@ -3554,7 +4657,7 @@ where
                         _ = handshake_cancel.cancelled() => {
                             return Ok(())
                         }
-                        _ = handshake_planned.token.cancelled(), if mode == PeerShutdownMode::PlannedDrain => {
+                        _ = handshake_planned.draining(), if mode == PeerShutdownMode::PlannedDrain => {
                             return Ok(())
                         }
                         result = timeout(limits.handshake_timeout, incoming) => {
@@ -3569,7 +4672,7 @@ where
                         &limits,
                         policy,
                         handler,
-                        diagnostics,
+                        diagnostics_slot,
                         connection_cancel,
                         mode,
                         planned,
@@ -3610,8 +4713,7 @@ where
             // connections can send GOAWAY and drain independently.
             endpoint.set_server_config(None);
             planned.close_admission();
-            planned.set_deadline(deadline);
-            planned.token.cancel();
+            planned.begin_drain(deadline);
             let _ = drain_peer_tasks_with_grace(
                 &mut tasks,
                 deadline,
@@ -3641,7 +4743,7 @@ async fn serve_incoming_connection<P, H>(
     limits: &PeerTransportLimits,
     policy: Arc<P>,
     handler: Arc<H>,
-    diagnostics: Arc<PeerServerDiagnostics>,
+    diagnostics_slot: Option<DiagnosticsSlot>,
     cancel: CancellationToken,
     mode: PeerShutdownMode,
     planned: PlannedDrainSignal,
@@ -3666,24 +4768,22 @@ where
         .map_err(|error| PeerTransportError::H3(error.to_string()))?;
     let pin_watcher = spawn_pin_watcher(&identity, pin_provider, &connection, cancel.clone());
     let stream_permits = Arc::new(Semaphore::new(limits.max_streams_per_connection));
-    let connection_diagnostics = diagnostics.register(
-        identity.role_id(),
-        &connection,
-        stream_permits.clone(),
-        limits.max_streams_per_connection,
-    );
-    let _diagnostics_guard =
-        connection_diagnostics
-            .as_ref()
-            .map(|observation| PeerServerDiagnosticsGuard {
-                diagnostics: diagnostics.clone(),
-                connection_id: observation.connection_id,
-            });
+    // The cell lease is held to the end of this connection: dropping it
+    // removes the entry registered here.
+    let connection_diagnostics = diagnostics_slot.as_ref().and_then(|slot| {
+        slot.diagnostics.register(
+            slot,
+            identity.role_id(),
+            &connection,
+            stream_permits.clone(),
+            limits.max_streams_per_connection,
+        )
+    });
     let connection_bytes = Arc::new(AtomicUsize::new(0));
     let mut stream_tasks = JoinSet::new();
     let stream_cancel = cancel.child_token();
     let mut connection_error = None;
-    let mut planned_requested = false;
+    let mut drain = ConnectionDrain::new(connection_diagnostics.clone());
 
     loop {
         tokio::select! {
@@ -3696,8 +4796,8 @@ where
                 // close path.
                 break;
             }
-            _ = planned.token.cancelled(), if mode == PeerShutdownMode::PlannedDrain => {
-                planned_requested = true;
+            _ = planned.draining(), if mode == PeerShutdownMode::PlannedDrain => {
+                drain.on_event(DrainEvent::PlannedRequested);
                 break;
             }
             result = h3_connection.accept() => {
@@ -3765,18 +4865,20 @@ where
         }
     }
 
-    let planned_deadline_published =
-        mode == PeerShutdownMode::PlannedDrain && planned.token.is_cancelled();
-    let deadline = if planned_requested || planned_deadline_published {
-        planned.deadline().ok_or(PeerTransportError::Timeout)?
-    } else {
-        Instant::now() + limits.drain_timeout
+    // Once the listener has begun its planned drain, every connection task
+    // -- including one leaving by the emergency ordering -- shares that
+    // drain's absolute deadline.
+    let planned_deadline = match mode {
+        PeerShutdownMode::PlannedDrain => planned.draining_deadline(),
+        PeerShutdownMode::Emergency => None,
     };
-    if planned_requested {
-        let mut forced_stream_cancellation = false;
-        let mut forced_connection_close = false;
-        let mut drain_join_incomplete = false;
-        let mut connection_closed = false;
+    if drain.state() == PeerConnectionDrain::Serving {
+        drain.on_event(DrainEvent::EmergencyRequested {
+            planned_deadline_published: planned_deadline.is_some(),
+        });
+    }
+    let deadline = planned_deadline.unwrap_or_else(|| Instant::now() + limits.drain_timeout);
+    if matches!(drain.state(), PeerConnectionDrain::Planned(_)) {
         let drain_wait_deadline = {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining > FORCED_JOIN_GRACE {
@@ -3788,143 +4890,119 @@ where
         // Send GOAWAY while QUIC is still open.  The accepted stream tasks
         // remain live while the H3 connection is driven to its post-GOAWAY
         // completion boundary.
-        let goaway_sent = match timeout_at(drain_wait_deadline, h3_connection.shutdown(0)).await {
-            Ok(Ok(())) => true,
+        match timeout_at(drain_wait_deadline, h3_connection.shutdown(0)).await {
+            Ok(Ok(())) => drain.on_event(DrainEvent::GoAwaySent),
             Ok(Err(error)) => {
                 connection_error = Some(PeerTransportError::H3(error.to_string()));
-                false
+                connection.close(quinn::VarInt::from_u32(0), b"peer planned drain failure");
+                drain.on_event(DrainEvent::GoAwayFailed);
             }
             Err(_) => {
                 connection_error = Some(PeerTransportError::Timeout);
-                forced_connection_close = true;
-                false
+                connection.close(quinn::VarInt::from_u32(0), b"peer planned drain failure");
+                drain.on_event(DrainEvent::GoAwayDeadline);
             }
-        };
-        if goaway_sent {
-            if let Some(connection_diagnostics) = &connection_diagnostics {
-                connection_diagnostics
-                    .planned_goaway_sent
-                    .store(true, Ordering::Release);
-            }
-        } else {
-            connection.close(quinn::VarInt::from_u32(0), b"peer planned drain failure");
-            connection_closed = true;
         }
-        if goaway_sent {
-            let mut h3_complete = false;
-            while !h3_complete {
-                tokio::select! {
-                    biased;
-                    _ = cancel.cancelled() => {
-                        // A pin revocation or connection-local emergency
-                        // cancellation wins over a planned drain already in
-                        // progress. The watcher has already closed QUIC;
-                        // leave the planned loop immediately and join below.
-                        connection_error.get_or_insert(PeerTransportError::Cancelled);
-                        connection.close(quinn::VarInt::from_u32(0), b"peer emergency during drain");
-                        connection_closed = true;
-                        break;
-                    }
-                    _ = sleep_until(drain_wait_deadline) => {
-                        connection_error.get_or_insert(PeerTransportError::Timeout);
-                        forced_connection_close = true;
-                        forced_stream_cancellation = !stream_tasks.is_empty();
-                        connection.close(quinn::VarInt::from_u32(0), b"peer planned drain deadline");
-                        connection_closed = true;
-                        break;
-                    }
-                    result = h3_connection.accept() => match result {
-                        Ok(Some(resolver)) => {
-                            // h3 rejects streams above the GOAWAY boundary
-                            // before returning a resolver. If a resolver does
-                            // surface here, consume and reset it with
-                            // H3_REQUEST_REJECTED ("not processed") without
-                            // dispatching; it is a bounded late-admission
-                            // observation, not an application success.
-                            if let Ok(Ok((_request, mut stream))) =
-                                timeout_at(
-                                    drain_wait_deadline,
-                                    resolver.resolve_request_with_rejection_on_cancel(
-                                        h3::error::Code::H3_REQUEST_REJECTED,
-                                    ),
-                                ).await
-                            {
-                                stream.stop_sending(h3::error::Code::H3_REQUEST_REJECTED);
-                                stream.stop_stream(h3::error::Code::H3_REQUEST_REJECTED);
-                            }
-                        }
-                        Ok(None) => h3_complete = true,
-                        Err(error) => {
-                            connection_error = Some(PeerTransportError::H3(error.to_string()));
-                            connection.close(quinn::VarInt::from_u32(0), b"peer planned H3 error");
-                            connection_closed = true;
-                            break;
-                        }
-                    },
-                    Some(result) = stream_tasks.join_next() => match result {
-                        Ok(Ok(())) => {}
-                        // A forwarded stream ending with an error is a
-                        // stream-local lifecycle event, exactly as in normal
-                        // serving.  Peers tearing down around GOAWAY reset
-                        // their streams (H3_REQUEST_CANCELLED/REJECTED); that
-                        // is the expected drain outcome, not a listener
-                        // failure.  Only a task panic or the forced-deadline
-                        // path above fails the drain.
-                        Ok(Err(error)) => {
-                            tracing::debug!(
-                                ?error,
-                                "peer stream closed during planned drain"
-                            );
-                        }
-                        Err(error) => {
-                            connection_error = Some(PeerTransportError::Task(error));
-                        }
-                    },
+        while drain.state() == PeerConnectionDrain::Planned(PlannedDrainStep::GoAwaySent) {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => {
+                    // A pin revocation or connection-local emergency
+                    // cancellation wins over a planned drain already in
+                    // progress. The watcher has already closed QUIC;
+                    // leave the planned loop immediately and join below.
+                    connection_error.get_or_insert(PeerTransportError::Cancelled);
+                    connection.close(quinn::VarInt::from_u32(0), b"peer emergency during drain");
+                    drain.on_event(DrainEvent::Emergency);
                 }
-            }
-        }
-        if goaway_sent && !connection_closed && !forced_connection_close {
-            while !stream_tasks.is_empty() {
-                tokio::select! {
-                    biased;
-                    _ = cancel.cancelled() => {
-                        connection_error.get_or_insert(PeerTransportError::Cancelled);
-                        connection.close(quinn::VarInt::from_u32(0), b"peer emergency during drain");
-                        forced_connection_close = true;
-                        forced_stream_cancellation = true;
-                        connection_closed = true;
-                        break;
-                    }
-                    _ = sleep_until(drain_wait_deadline) => {
-                        connection_error.get_or_insert(PeerTransportError::Timeout);
-                        forced_connection_close = true;
-                        forced_stream_cancellation = true;
-                        connection.close(quinn::VarInt::from_u32(0), b"peer planned drain deadline");
-                        connection_closed = true;
-                        break;
-                    }
-                    Some(result) = stream_tasks.join_next() => match result {
-                        Ok(Ok(())) => {}
-                        // A forwarded stream's own error is stream-local, as in
-                        // normal serving; the drain joins it rather than
-                        // treating an expected GOAWAY-induced reset as a
-                        // listener failure.
-                        Ok(Err(error)) => {
-                            tracing::debug!(
-                                ?error,
-                                "peer stream closed during planned drain"
-                            );
-                        }
-                        Err(error) => {
-                            connection_error = Some(PeerTransportError::Task(error));
-                        }
-                    },
+                _ = sleep_until(drain_wait_deadline) => {
+                    connection_error.get_or_insert(PeerTransportError::Timeout);
+                    let streams_outstanding = !stream_tasks.is_empty();
+                    connection.close(quinn::VarInt::from_u32(0), b"peer planned drain deadline");
+                    drain.on_event(DrainEvent::Deadline { streams_outstanding });
                 }
+                result = h3_connection.accept() => match result {
+                    Ok(Some(resolver)) => {
+                        // h3 rejects streams above the GOAWAY boundary
+                        // before returning a resolver. If a resolver does
+                        // surface here, consume and reset it with
+                        // H3_REQUEST_REJECTED ("not processed") without
+                        // dispatching; it is a bounded late-admission
+                        // observation, not an application success.
+                        if let Ok(Ok((_request, mut stream))) =
+                            timeout_at(
+                                drain_wait_deadline,
+                                resolver.resolve_request_with_rejection_on_cancel(
+                                    h3::error::Code::H3_REQUEST_REJECTED,
+                                ),
+                            ).await
+                        {
+                            stream.stop_sending(h3::error::Code::H3_REQUEST_REJECTED);
+                            stream.stop_stream(h3::error::Code::H3_REQUEST_REJECTED);
+                        }
+                    }
+                    Ok(None) => drain.on_event(DrainEvent::H3Complete),
+                    Err(error) => {
+                        connection_error = Some(PeerTransportError::H3(error.to_string()));
+                        connection.close(quinn::VarInt::from_u32(0), b"peer planned H3 error");
+                        drain.on_event(DrainEvent::H3Failed);
+                    }
+                },
+                Some(result) = stream_tasks.join_next() => match result {
+                    Ok(Ok(())) => {}
+                    // A forwarded stream ending with an error is a
+                    // stream-local lifecycle event, exactly as in normal
+                    // serving.  Peers tearing down around GOAWAY reset
+                    // their streams (H3_REQUEST_CANCELLED/REJECTED); that
+                    // is the expected drain outcome, not a listener
+                    // failure.  Only a task panic or the forced-deadline
+                    // path above fails the drain.
+                    Ok(Err(error)) => {
+                        tracing::debug!(
+                            ?error,
+                            "peer stream closed during planned drain"
+                        );
+                    }
+                    Err(error) => {
+                        connection_error = Some(PeerTransportError::Task(error));
+                    }
+                },
             }
         }
-        if forced_connection_close && !connection_closed {
-            connection.close(quinn::VarInt::from_u32(0), b"peer planned drain deadline");
-            connection_closed = true;
+        while drain.state() == PeerConnectionDrain::Planned(PlannedDrainStep::H3Complete) {
+            if stream_tasks.is_empty() {
+                drain.on_event(DrainEvent::StreamsReturned);
+                break;
+            }
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => {
+                    connection_error.get_or_insert(PeerTransportError::Cancelled);
+                    connection.close(quinn::VarInt::from_u32(0), b"peer emergency during drain");
+                    drain.on_event(DrainEvent::Emergency);
+                }
+                _ = sleep_until(drain_wait_deadline) => {
+                    connection_error.get_or_insert(PeerTransportError::Timeout);
+                    connection.close(quinn::VarInt::from_u32(0), b"peer planned drain deadline");
+                    drain.on_event(DrainEvent::Deadline { streams_outstanding: true });
+                }
+                Some(result) = stream_tasks.join_next() => match result {
+                    Ok(Ok(())) => {}
+                    // A forwarded stream's own error is stream-local, as in
+                    // normal serving; the drain joins it rather than
+                    // treating an expected GOAWAY-induced reset as a
+                    // listener failure.
+                    Ok(Err(error)) => {
+                        tracing::debug!(
+                            ?error,
+                            "peer stream closed during planned drain"
+                        );
+                    }
+                    Err(error) => {
+                        connection_error = Some(PeerTransportError::Task(error));
+                    }
+                },
+            }
         }
         stream_cancel.cancel();
         // Join any stragglers.  Stream-handler errors here are stream-local and
@@ -3938,23 +5016,13 @@ where
             "peer-streams",
         )
         .await;
-        forced_stream_cancellation |= stream_drain.forced;
-        drain_join_incomplete |= stream_drain.incomplete;
-        forced_connection_close |= stream_drain.forced || stream_drain.incomplete;
-        if let Some(connection_diagnostics) = &connection_diagnostics {
-            connection_diagnostics
-                .forced_stream_cancellation
-                .store(forced_stream_cancellation, Ordering::Release);
-            connection_diagnostics
-                .forced_connection_close
-                .store(forced_connection_close, Ordering::Release);
-            connection_diagnostics
-                .drain_join_incomplete
-                .store(drain_join_incomplete, Ordering::Release);
-        }
-        // This is the terminal action after GOAWAY/accepted-stream draining,
-        // or the explicit forced-close action at the shared deadline.
-        if !connection_closed {
+        // This is the terminal action after GOAWAY/accepted-stream draining.
+        // A drain that was cut short has already closed QUIC, with the
+        // reason for it.
+        let completed_in_order =
+            drain.state() == PeerConnectionDrain::Planned(PlannedDrainStep::StreamsReturned);
+        drain.on_event(DrainEvent::TasksJoined(stream_drain));
+        if completed_in_order {
             connection.close(
                 quinn::VarInt::from_u64(h3::error::Code::H3_NO_ERROR.value())
                     .expect("H3_NO_ERROR fits a QUIC application close code"),
@@ -3979,27 +5047,15 @@ where
         let stream_drain = drain_peer_tasks_without_recording_task_errors(
             &mut stream_tasks,
             deadline,
-            cancel.is_cancelled() && !planned_deadline_published,
+            cancel.is_cancelled() && planned_deadline.is_none(),
             &mut connection_error,
             "peer-streams",
         )
         .await;
-        if planned_deadline_published && let Some(connection_diagnostics) = &connection_diagnostics
-        {
-            connection_diagnostics
-                .forced_stream_cancellation
-                .store(stream_drain.forced, Ordering::Release);
-            connection_diagnostics.forced_connection_close.store(
-                stream_drain.forced || stream_drain.incomplete,
-                Ordering::Release,
-            );
-            connection_diagnostics
-                .drain_join_incomplete
-                .store(stream_drain.incomplete, Ordering::Release);
-        }
+        drain.on_event(DrainEvent::TasksJoined(stream_drain));
     }
     cancel.cancel();
-    let pin_watcher_result = if planned_requested || planned_deadline_published {
+    let pin_watcher_result = if planned_deadline.is_some() {
         join_handle_until_bounded(pin_watcher, deadline).await
     } else {
         join_handle_until(pin_watcher, deadline).await
@@ -4011,13 +5067,7 @@ where
         None => {
             tracing::warn!("peer pin watcher exceeded drain timeout");
             connection_error.get_or_insert(PeerTransportError::Timeout);
-            if (planned_requested || planned_deadline_published)
-                && let Some(connection_diagnostics) = &connection_diagnostics
-            {
-                connection_diagnostics
-                    .drain_join_incomplete
-                    .store(true, Ordering::Release);
-            }
+            drain.on_event(DrainEvent::PinWatcherAbandoned);
         }
         Some(Ok(())) => {}
     }
@@ -4046,7 +5096,6 @@ where
     H: PeerRequestHandler,
 {
     let mut diagnostics = PeerServerRequestDiagnosticsGuard::new(diagnostics);
-    let planned_token = planned.token.clone();
     let result = async {
         if !pin_provider.snapshot().contains(identity.spki_sha256()) {
             resolver.reject(h3::error::Code::H3_REQUEST_CANCELLED);
@@ -4058,7 +5107,7 @@ where
         let (request, stream) = tokio::select! {
             biased;
             _ = cancel.cancelled() => return Ok(()),
-            _ = planned.token.cancelled() => return Ok(()),
+            _ = planned.draining() => return Ok(()),
             result = timeout(
                 limits.idle_timeout,
                 resolver.resolve_request_with_rejection_on_cancel(
@@ -4070,7 +5119,7 @@ where
                     .map_err(|error| PeerTransportError::H3(error.to_string()))?
             }
         };
-        if planned.admission_closed.load(Ordering::Acquire) {
+        if planned.admission_closed() {
             // A planned drain closed admission before this stream was
             // dispatched.  Reset with H3_REQUEST_REJECTED ("not processed")
             // so the caller classifies it as a pre-dispatch GoAway rather than
@@ -4114,10 +5163,7 @@ where
         }
     }
     .await;
-    diagnostics.finish(
-        cancel.is_cancelled() || planned_token.is_cancelled(),
-        &result,
-    );
+    diagnostics.finish(cancel.is_cancelled() || planned.is_draining(), &result);
     result
 }
 
@@ -4355,20 +5401,115 @@ mod tests {
         assert!(shared.snapshot().is_empty());
     }
 
-    #[test]
-    fn dial_pool_retires_stale_markers_before_enforcing_saturation() {
+    fn dial_pool(max_destinations: usize) -> PeerPool {
+        PeerPool::new(
+            PeerTransportLimits {
+                max_destinations,
+                ..PeerTransportLimits::default()
+            },
+            CancellationToken::new(),
+            watch::Sender::new(Vec::new()),
+        )
+    }
+
+    fn checkout(
+        pool: &mut PeerPool,
+        destination: &PeerDestination,
+    ) -> oneshot::Receiver<Result<Checkout, PeerTransportError>> {
+        let (reply, answer) = oneshot::channel();
+        pool.handle(PoolCommand::Checkout {
+            destination: destination.clone(),
+            pins: SharedPeerPins::empty().snapshot(),
+            local_identity: None,
+            reply,
+        });
+        answer
+    }
+
+    /// The dial turn a checkout was answered with, when it was.
+    fn granted_turn(
+        answer: &mut oneshot::Receiver<Result<Checkout, PeerTransportError>>,
+    ) -> Option<DialTurn> {
+        match answer.try_recv() {
+            Ok(Ok(Checkout::Dial { previous, turn, .. })) => {
+                assert!(previous.is_none());
+                Some(turn)
+            }
+            Ok(Ok(Checkout::Reuse(_))) => panic!("nothing is pooled in this fixture"),
+            Ok(Err(error)) => panic!("checkout refused: {error:?}"),
+            Err(_) => None,
+        }
+    }
+
+    /// Let the pool observe one ended dial turn, as its task does.
+    async fn observe_ended_turn(pool: &mut PeerPool) {
+        let (destination, outcome) = timeout(Duration::from_secs(5), pool.turn_ended())
+            .await
+            .expect("a dial turn ended");
+        pool.finish_turn(destination, outcome);
+    }
+
+    #[tokio::test]
+    async fn dial_pool_releases_an_abandoned_turn_before_enforcing_saturation() {
         let destination = PeerDestination::new("127.0.0.1:1".parse().unwrap(), "peer.test");
         let other = PeerDestination::new("127.0.0.1:2".parse().unwrap(), "peer.test");
-        let mut locks = HashMap::new();
-        let retired = acquire_dial_entry(&mut locks, &destination, 1).unwrap();
-        retired.retired.store(true, Ordering::Release);
-
-        let replacement = acquire_dial_entry(&mut locks, &destination, 1).unwrap();
-        assert!(!Arc::ptr_eq(&retired, &replacement));
+        let mut pool = dial_pool(1);
+        let mut first = checkout(&mut pool, &destination);
+        let abandoned = granted_turn(&mut first).expect("the first checkout dials");
+        // The destination being dialed is accounted against the pool bound.
         assert!(matches!(
-            acquire_dial_entry(&mut locks, &other, 1),
-            Err(PeerTransportError::Capacity)
+            checkout(&mut pool, &other).try_recv(),
+            Ok(Err(PeerTransportError::Capacity))
         ));
+
+        // A creator that is cancelled mid-dial drops its turn.  The pool
+        // retires that slot, so the same destination dials afresh ...
+        drop(abandoned);
+        observe_ended_turn(&mut pool).await;
+        assert!(pool.dials.is_empty());
+        let mut replacement = checkout(&mut pool, &destination);
+        let replacement_turn = granted_turn(&mut replacement).expect("a fresh dial turn");
+        // ... while other destinations remain bounded by the live one.
+        assert!(matches!(
+            checkout(&mut pool, &other).try_recv(),
+            Ok(Err(PeerTransportError::Capacity))
+        ));
+        drop(replacement_turn);
+        observe_ended_turn(&mut pool).await;
+        let mut admitted = checkout(&mut pool, &other);
+        assert!(granted_turn(&mut admitted).is_some());
+    }
+
+    #[tokio::test]
+    async fn dial_pool_grants_one_turn_per_destination_in_arrival_order() {
+        let destination = PeerDestination::new("127.0.0.1:1".parse().unwrap(), "peer.test");
+        let mut pool = dial_pool(4);
+        let mut first = checkout(&mut pool, &destination);
+        let mut second = checkout(&mut pool, &destination);
+        let third = checkout(&mut pool, &destination);
+        let mut fourth = checkout(&mut pool, &destination);
+        let first_turn = granted_turn(&mut first).expect("the first checkout dials");
+        // At most one dial per destination: the others wait for it.
+        assert!(granted_turn(&mut second).is_none());
+        assert!(granted_turn(&mut fourth).is_none());
+        assert_eq!(pool.dials.len(), 1);
+
+        // The first dial fails: the next waiter, and only it, dials.
+        drop(first_turn);
+        observe_ended_turn(&mut pool).await;
+        let second_turn = granted_turn(&mut second).expect("the second checkout dials next");
+        assert!(granted_turn(&mut fourth).is_none());
+
+        // A waiter that stopped waiting is passed over.
+        drop(third);
+        drop(second_turn);
+        observe_ended_turn(&mut pool).await;
+        let fourth_turn = granted_turn(&mut fourth).expect("the fourth checkout dials last");
+
+        // The last turn fails with nobody waiting: the slot is released.
+        drop(fourth_turn);
+        observe_ended_turn(&mut pool).await;
+        assert!(pool.dials.is_empty());
     }
 
     #[tokio::test]
@@ -4406,44 +5547,94 @@ mod tests {
 
     #[tokio::test]
     async fn cancelled_dial_creator_releases_its_pool_marker() {
-        let state = Arc::new(PeerPoolState {
-            connections: Mutex::new(HashMap::new()),
-            dial_locks: Mutex::new(HashMap::new()),
-            draining: StdMutex::new(Vec::new()),
-        });
+        let mut pool = dial_pool(4);
         let destination = PeerDestination::new("127.0.0.1:1".parse().unwrap(), "peer.test");
-        let entry = Arc::new(DialEntry::new());
-        entry.users.fetch_add(1, Ordering::AcqRel);
-        state
-            .dial_locks
-            .lock()
-            .await
-            .insert(destination.clone(), entry.clone());
-        DialLease {
-            state: state.clone(),
-            destination: destination.clone(),
-            entry,
-            released: false,
-        }
-        .release(false)
-        .await;
-        assert!(state.dial_locks.lock().await.is_empty());
+        // A creator whose dial fails releases its turn by dropping it.
+        let mut failed = checkout(&mut pool, &destination);
+        drop(granted_turn(&mut failed).expect("a dial turn"));
+        observe_ended_turn(&mut pool).await;
+        assert!(pool.dials.is_empty());
 
+        // A creator that is cancelled while it holds the turn never takes
+        // its answer: the turn inside the unread answer is dropped with it.
         let dropped_destination = PeerDestination::new("127.0.0.1:2".parse().unwrap(), "peer.test");
-        let dropped_entry = Arc::new(DialEntry::new());
-        dropped_entry.users.fetch_add(1, Ordering::AcqRel);
-        state
-            .dial_locks
-            .lock()
-            .await
-            .insert(dropped_destination.clone(), dropped_entry.clone());
-        drop(DialLease {
-            state,
+        drop(checkout(&mut pool, &dropped_destination));
+        assert_eq!(pool.dials.len(), 1);
+        observe_ended_turn(&mut pool).await;
+        assert!(pool.dials.is_empty());
+
+        // A creator cancelled before the pool answered is never given one.
+        let (reply, answer) = oneshot::channel();
+        drop(answer);
+        pool.handle(PoolCommand::Checkout {
             destination: dropped_destination,
-            entry: dropped_entry.clone(),
-            released: false,
+            pins: SharedPeerPins::empty().snapshot(),
+            local_identity: None,
+            reply,
         });
-        assert!(dropped_entry.retired.load(Ordering::Acquire));
+        assert!(pool.dials.is_empty());
+    }
+
+    #[tokio::test]
+    async fn connection_supervisor_joins_once_and_answers_later_requests_at_once() {
+        let (joins, requests) = mpsc::channel(CONNECTION_JOIN_QUEUE);
+        let (finish_driver, driver_may_finish) = oneshot::channel::<()>();
+        let driver = tokio::spawn(async move {
+            let _ = driver_may_finish.await;
+            Err(PeerTransportError::PolicyRejected)
+        });
+        let pin_watcher = tokio::spawn(async {});
+        tokio::spawn(supervise_client_connection(requests, driver, pin_watcher));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let (reply, mut first) = oneshot::channel();
+        assert!(joins.send(JoinRequest { deadline, reply }).await.is_ok());
+        // A second caller is answered while the first is still joining.
+        let (reply, second) = oneshot::channel();
+        assert!(joins.send(JoinRequest { deadline, reply }).await.is_ok());
+        assert!(matches!(
+            timeout(Duration::from_secs(5), second).await,
+            Ok(Ok(Ok(())))
+        ));
+        assert!(first.try_recv().is_err());
+
+        // The first caller, and only it, gets the driver's own result.
+        finish_driver.send(()).unwrap();
+        assert!(matches!(
+            timeout(Duration::from_secs(5), first).await,
+            Ok(Ok(Err(PeerTransportError::PolicyRejected)))
+        ));
+        let (reply, third) = oneshot::channel();
+        assert!(joins.send(JoinRequest { deadline, reply }).await.is_ok());
+        assert!(matches!(
+            timeout(Duration::from_secs(5), third).await,
+            Ok(Ok(Ok(())))
+        ));
+    }
+
+    #[tokio::test]
+    async fn connection_supervisor_aborts_unjoined_tasks_when_the_connection_is_dropped() {
+        let (joins, requests) = mpsc::channel::<JoinRequest>(CONNECTION_JOIN_QUEUE);
+        let (driver_alive, driver_gone) = oneshot::channel::<()>();
+        let (watcher_alive, watcher_gone) = oneshot::channel::<()>();
+        let driver = tokio::spawn(async move {
+            let _alive = driver_alive;
+            std::future::pending::<Result<(), PeerTransportError>>().await
+        });
+        let pin_watcher = tokio::spawn(async move {
+            let _alive = watcher_alive;
+            std::future::pending::<()>().await
+        });
+        tokio::spawn(supervise_client_connection(requests, driver, pin_watcher));
+
+        drop(joins);
+        assert!(matches!(
+            timeout(Duration::from_secs(5), driver_gone).await,
+            Ok(Err(_))
+        ));
+        assert!(matches!(
+            timeout(Duration::from_secs(5), watcher_gone).await,
+            Ok(Err(_))
+        ));
     }
 
     #[tokio::test]
@@ -4476,5 +5667,325 @@ mod tests {
 
         assert!(preadmitted);
         assert!(!planned.begin_admission());
+    }
+
+    #[test]
+    fn planned_drain_phase_transition_table() {
+        use PlannedDrainEvent::{BeginDrain, CloseAdmission};
+        use PlannedDrainPhase::{AdmissionClosed, Draining, Serving};
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let later = deadline + Duration::from_secs(1);
+        assert_eq!(Serving.on_event(CloseAdmission), Ok(AdmissionClosed));
+        assert_eq!(
+            AdmissionClosed.on_event(BeginDrain(deadline)),
+            Ok(Draining(deadline))
+        );
+        // The drain cannot begin before admission is closed, admission
+        // cannot close twice, and a begun drain keeps its deadline.
+        for (phase, event) in [
+            (Serving, BeginDrain(deadline)),
+            (AdmissionClosed, CloseAdmission),
+            (Draining(deadline), CloseAdmission),
+            (Draining(deadline), BeginDrain(later)),
+        ] {
+            assert_eq!(phase.on_event(event), Err(IllegalPlannedDrainEvent));
+        }
+    }
+
+    #[tokio::test]
+    async fn planned_drain_signal_publishes_the_deadline_with_the_drain() {
+        let planned = PlannedDrainSignal::new();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        assert_eq!(planned.draining_deadline(), None);
+        assert_eq!(
+            planned.on_event(PlannedDrainEvent::BeginDrain(deadline)),
+            Err(IllegalPlannedDrainEvent)
+        );
+        assert!(planned.begin_admission() && !planned.is_draining());
+
+        let observer = planned.clone();
+        let observed = tokio::spawn(async move {
+            observer.draining().await;
+            observer.draining_deadline()
+        });
+        planned.close_admission();
+        assert!(planned.admission_closed() && !planned.is_draining());
+        planned.begin_drain(deadline);
+        // Whoever observes the drain reads its deadline with it.
+        assert_eq!(observed.await.unwrap(), Some(deadline));
+        planned.begin_drain(deadline + Duration::from_secs(1));
+        assert_eq!(planned.draining_deadline(), Some(deadline));
+    }
+
+    #[test]
+    fn client_connection_phase_transition_table() {
+        use ClientConnectionEvent::{IdentityRetired, RemoteGoAway, Shutdown};
+        use ClientConnectionPhase::{Closed, Live};
+        let closed = |cause, remote_goaway| Closed {
+            cause,
+            remote_goaway,
+        };
+        let goaway = ClientConnectionPhase::RemoteGoAway;
+        let shutdown = LocalCloseCause::Shutdown;
+        let retired = LocalCloseCause::IdentityRetired;
+        for (phase, event, next) in [
+            (Live, RemoteGoAway, Some(goaway)),
+            (Live, Shutdown, Some(closed(shutdown, false))),
+            (Live, IdentityRetired, Some(closed(retired, false))),
+            (goaway, RemoteGoAway, None),
+            (goaway, Shutdown, Some(closed(shutdown, true))),
+            (goaway, IdentityRetired, Some(closed(retired, true))),
+            (
+                closed(shutdown, false),
+                RemoteGoAway,
+                Some(closed(shutdown, true)),
+            ),
+            (closed(shutdown, true), RemoteGoAway, None),
+            (closed(shutdown, false), Shutdown, None),
+            (
+                closed(shutdown, true),
+                IdentityRetired,
+                Some(closed(retired, true)),
+            ),
+            (
+                closed(retired, false),
+                RemoteGoAway,
+                Some(closed(retired, true)),
+            ),
+            // A shutdown never demotes a retirement, and nothing reopens.
+            (closed(retired, false), Shutdown, None),
+            (closed(retired, true), IdentityRetired, None),
+        ] {
+            assert_eq!(phase.on_event(event), next, "{phase:?} + {event:?}");
+        }
+        assert!(!Live.remote_goaway() && !Live.identity_retired());
+        assert!(goaway.remote_goaway() && !goaway.identity_retired());
+        assert!(closed(shutdown, true).remote_goaway());
+        assert!(!closed(shutdown, true).identity_retired());
+        assert!(closed(retired, false).identity_retired());
+        assert!(!closed(retired, false).remote_goaway());
+
+        let published = watch::Sender::new(Live);
+        assert!(publish_client_connection_event(&published, RemoteGoAway));
+        assert!(!publish_client_connection_event(&published, RemoteGoAway));
+        assert!(publish_client_connection_event(&published, IdentityRetired));
+        assert_eq!(*published.borrow(), closed(retired, true));
+    }
+
+    fn drained(events: &[DrainEvent]) -> PeerConnectionDrain {
+        events
+            .iter()
+            .fold(PeerConnectionDrain::Serving, |state, event| {
+                state
+                    .on_event(*event)
+                    .unwrap_or_else(|_| panic!("{state:?} refused {event:?}"))
+            })
+    }
+
+    fn report(goaway: bool, streams: bool, close: bool, incomplete: bool) -> DrainReport {
+        DrainReport {
+            planned_goaway_sent: goaway,
+            forced_stream_cancellation: streams,
+            forced_connection_close: close,
+            drain_join_incomplete: incomplete,
+        }
+    }
+
+    #[test]
+    fn peer_connection_drain_reports_each_route() {
+        use DrainEvent as Event;
+        use DrainOutcome::{Forced, Incomplete, Joined};
+        let planned = [Event::PlannedRequested, Event::GoAwaySent];
+        // The planned drain in order: GOAWAY is reported as soon as it is
+        // written, and nothing is forced.
+        assert_eq!(
+            drained(&[Event::PlannedRequested]).report(),
+            DrainReport::default()
+        );
+        assert_eq!(
+            drained(&planned).report(),
+            report(true, false, false, false)
+        );
+        let clean = [
+            Event::PlannedRequested,
+            Event::GoAwaySent,
+            Event::H3Complete,
+            Event::StreamsReturned,
+            Event::TasksJoined(Joined),
+        ];
+        assert_eq!(drained(&clean).report(), report(true, false, false, false));
+        assert_eq!(
+            drained(&clean)
+                .on_event(Event::PinWatcherAbandoned)
+                .unwrap()
+                .report(),
+            report(true, false, false, true)
+        );
+
+        // Cut short: what was forced is reported once the tasks are joined.
+        for (cut, joined, expected) in [
+            (
+                Event::GoAwayFailed,
+                Joined,
+                report(false, false, false, false),
+            ),
+            (
+                Event::GoAwayFailed,
+                Forced,
+                report(false, true, true, false),
+            ),
+            (
+                Event::GoAwayDeadline,
+                Joined,
+                report(false, false, true, false),
+            ),
+            (
+                Event::GoAwayDeadline,
+                Incomplete,
+                report(false, true, true, true),
+            ),
+        ] {
+            let aborted = drained(&[Event::PlannedRequested, cut]);
+            assert_eq!(aborted.report(), DrainReport::default());
+            assert_eq!(
+                aborted
+                    .on_event(Event::TasksJoined(joined))
+                    .unwrap()
+                    .report(),
+                expected,
+                "{cut:?} then {joined:?}"
+            );
+        }
+        for (cut, joined, expected) in [
+            (Event::H3Failed, Joined, report(true, false, false, false)),
+            (Event::Emergency, Joined, report(true, false, false, false)),
+            (Event::Emergency, Forced, report(true, true, true, false)),
+            (
+                Event::Deadline {
+                    streams_outstanding: false,
+                },
+                Joined,
+                report(true, false, true, false),
+            ),
+            (
+                Event::Deadline {
+                    streams_outstanding: true,
+                },
+                Joined,
+                report(true, true, true, false),
+            ),
+        ] {
+            let aborted = drained(&[Event::PlannedRequested, Event::GoAwaySent, cut]);
+            assert_eq!(aborted.report(), report(true, false, false, false));
+            assert_eq!(
+                aborted
+                    .on_event(Event::TasksJoined(joined))
+                    .unwrap()
+                    .report(),
+                expected,
+                "{cut:?} then {joined:?}"
+            );
+        }
+        for cut in [
+            Event::Emergency,
+            Event::Deadline {
+                streams_outstanding: false,
+            },
+        ] {
+            let aborted = drained(&[
+                Event::PlannedRequested,
+                Event::GoAwaySent,
+                Event::H3Complete,
+                cut,
+                Event::TasksJoined(Joined),
+            ]);
+            assert_eq!(aborted.report(), report(true, true, true, false), "{cut:?}");
+        }
+
+        // The emergency ordering reports its cleanup only when the listener
+        // had begun a planned drain.
+        for (published, joined, abandoned, expected) in [
+            (false, Incomplete, true, DrainReport::default()),
+            (true, Joined, false, DrainReport::default()),
+            (true, Forced, false, report(false, true, true, false)),
+            (true, Incomplete, false, report(false, true, true, true)),
+            (true, Joined, true, report(false, false, false, true)),
+        ] {
+            let mut state = drained(&[
+                Event::EmergencyRequested {
+                    planned_deadline_published: published,
+                },
+                Event::TasksJoined(joined),
+            ]);
+            if abandoned {
+                state = state.on_event(Event::PinWatcherAbandoned).unwrap();
+            }
+            assert_eq!(
+                state.report(),
+                expected,
+                "{published} {joined:?} {abandoned}"
+            );
+        }
+    }
+
+    #[test]
+    fn peer_connection_drain_refuses_out_of_order_events() {
+        use DrainEvent as Event;
+        use DrainOutcome::Joined;
+        let serving = PeerConnectionDrain::Serving;
+        let requested = drained(&[Event::PlannedRequested]);
+        let goaway_sent = drained(&[Event::PlannedRequested, Event::GoAwaySent]);
+        let h3_complete = drained(&[
+            Event::PlannedRequested,
+            Event::GoAwaySent,
+            Event::H3Complete,
+        ]);
+        let emergency = drained(&[Event::EmergencyRequested {
+            planned_deadline_published: true,
+        }]);
+        let finished = drained(&[
+            Event::EmergencyRequested {
+                planned_deadline_published: true,
+            },
+            Event::TasksJoined(Joined),
+        ]);
+        for (state, event) in [
+            // Nothing drains before serving ends, and serving ends once.
+            (serving, Event::GoAwaySent),
+            (serving, Event::TasksJoined(Joined)),
+            (requested, Event::PlannedRequested),
+            // GOAWAY comes before the HTTP/3 boundary, which comes before
+            // the streams are joined.
+            (requested, Event::H3Complete),
+            (requested, Event::StreamsReturned),
+            (requested, Event::TasksJoined(Joined)),
+            (goaway_sent, Event::GoAwaySent),
+            (goaway_sent, Event::StreamsReturned),
+            (goaway_sent, Event::TasksJoined(Joined)),
+            (h3_complete, Event::H3Complete),
+            (h3_complete, Event::H3Failed),
+            (h3_complete, Event::TasksJoined(Joined)),
+            // The emergency ordering has no planned steps.
+            (emergency, Event::GoAwaySent),
+            (emergency, Event::PlannedRequested),
+            (emergency, Event::PinWatcherAbandoned),
+            // A finished connection only records an abandoned pin watcher,
+            // and only once.
+            (finished, Event::TasksJoined(Joined)),
+            (finished, Event::Emergency),
+            (
+                finished.on_event(Event::PinWatcherAbandoned).unwrap(),
+                Event::PinWatcherAbandoned,
+            ),
+        ] {
+            assert_eq!(
+                state.on_event(event),
+                Err(IllegalDrainEvent),
+                "{state:?} + {event:?}"
+            );
+        }
+        assert!(!DrainOutcome::Joined.forced() && !DrainOutcome::Joined.incomplete());
+        assert!(DrainOutcome::Forced.forced() && !DrainOutcome::Forced.incomplete());
+        assert!(DrainOutcome::Incomplete.forced() && DrainOutcome::Incomplete.incomplete());
     }
 }

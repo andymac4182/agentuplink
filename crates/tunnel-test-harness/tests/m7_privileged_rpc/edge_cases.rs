@@ -36,7 +36,7 @@ use std::{
 use chrono::{Duration as ChronoDuration, Utc};
 use http::StatusCode;
 use tokio::{
-    sync::{Mutex, Notify, oneshot},
+    sync::{Notify, mpsc, oneshot, watch},
     task::JoinHandle,
     time::{sleep_until, timeout, timeout_at},
 };
@@ -123,9 +123,15 @@ struct WorkerEntry {
 /// explicit join.  The registry is deliberately independent from the HTTP/3
 /// response lifetime: a partial response cannot drop a worker or silently
 /// convert a possible backend effect into success.
+///
+/// One owner task holds the handles. Admission (the shutdown fence, the
+/// capacity bound, the id and the dispatch itself) is a single step of that
+/// task, so a request arriving after shutdown cannot dispatch a worker that
+/// merely exits on the already-cancelled token.
 #[derive(Clone)]
 struct WorkerRegistry {
-    entries: Arc<Mutex<BTreeMap<u64, WorkerEntry>>>,
+    commands: mpsc::Sender<WorkerCommand>,
+    /// The next worker id; only the owner task allocates from it.
     next_id: Arc<AtomicU64>,
     cancellation: CancellationToken,
     active: Arc<AtomicUsize>,
@@ -142,13 +148,91 @@ struct WorkerTicket {
     receipt: oneshot::Receiver<VerifiedReceipt>,
 }
 
+type WorkerFuture = std::pin::Pin<Box<dyn std::future::Future<Output = WorkerExit> + Send>>;
+
+enum WorkerCommand {
+    /// Admit and dispatch one worker, or refuse it without running it.
+    Admit {
+        worker: WorkerFuture,
+        admitted: oneshot::Sender<Result<u64, WorkerRegistryError>>,
+    },
+    /// Hand one retained handle to the caller that will join it.
+    Take {
+        id: u64,
+        entry: oneshot::Sender<Option<WorkerEntry>>,
+    },
+    /// Put back a handle whose bounded join timed out.
+    Retain { id: u64, entry: WorkerEntry },
+    /// The ids of every retained handle, in id order.
+    Ids { ids: oneshot::Sender<Vec<u64>> },
+}
+
+/// Every command is one short step, and at most `MAX_ACTIVE_WORKERS` requests
+/// plus the scenario's own joins talk to the owner at once; a full queue
+/// makes the sender wait its turn.
+const WORKER_COMMAND_QUEUE: usize = 2 * MAX_ACTIVE_WORKERS;
+
+async fn run_worker_registry(
+    mut commands: mpsc::Receiver<WorkerCommand>,
+    cancellation: CancellationToken,
+    next_id: Arc<AtomicU64>,
+    active: Arc<AtomicUsize>,
+) {
+    let mut entries = BTreeMap::new();
+    while let Some(command) = commands.recv().await {
+        match command {
+            WorkerCommand::Admit { worker, admitted } => {
+                // Cancellation is the admission fence.  It is checked in the
+                // same step that dispatches, before allocating an id or
+                // touching any lifecycle counters.
+                let outcome = if cancellation.is_cancelled() {
+                    Err(WorkerRegistryError::Shutdown)
+                } else if entries.len() >= MAX_ACTIVE_WORKERS {
+                    Err(WorkerRegistryError::AtCapacity)
+                } else {
+                    let id = next_id.fetch_add(1, Ordering::AcqRel);
+                    active.fetch_add(1, Ordering::AcqRel);
+                    let handle = tokio::spawn(worker);
+                    entries.insert(id, WorkerEntry { handle });
+                    Ok(id)
+                };
+                let _ = admitted.send(outcome);
+            }
+            WorkerCommand::Take { id, entry } => {
+                if let Some(taken) = entries.remove(&id)
+                    && let Err(Some(unclaimed)) = entry.send(Some(taken))
+                {
+                    // The caller went away; keep the handle retained.
+                    entries.insert(id, unclaimed);
+                }
+            }
+            WorkerCommand::Retain { id, entry } => {
+                entries.insert(id, entry);
+            }
+            WorkerCommand::Ids { ids } => {
+                let _ = ids.send(entries.keys().copied().collect());
+            }
+        }
+    }
+}
+
 impl WorkerRegistry {
     fn new() -> Self {
+        let (commands, queue) = mpsc::channel(WORKER_COMMAND_QUEUE);
+        let cancellation = CancellationToken::new();
+        let next_id = Arc::new(AtomicU64::new(1));
+        let active = Arc::new(AtomicUsize::new(0));
+        tokio::spawn(run_worker_registry(
+            queue,
+            cancellation.clone(),
+            Arc::clone(&next_id),
+            Arc::clone(&active),
+        ));
         Self {
-            entries: Arc::new(Mutex::new(BTreeMap::new())),
-            next_id: Arc::new(AtomicU64::new(1)),
-            cancellation: CancellationToken::new(),
-            active: Arc::new(AtomicUsize::new(0)),
+            commands,
+            next_id,
+            cancellation,
+            active,
             effects: Arc::new(AtomicUsize::new(0)),
             receipts: Arc::new(AtomicUsize::new(0)),
             coverage: Arc::new(AtomicUsize::new(0)),
@@ -165,18 +249,6 @@ impl WorkerRegistry {
         disposition: WorkerDisposition,
         deadline: Instant,
     ) -> Result<WorkerTicket, WorkerRegistryError> {
-        let mut entries = self.entries.lock().await;
-        // Cancellation is the admission fence.  Check it while retaining the
-        // entries lock, before allocating an id or touching any lifecycle
-        // counters, so a request arriving after shutdown cannot dispatch a
-        // worker that merely exits on the already-cancelled token.
-        if self.cancellation.is_cancelled() {
-            return Err(WorkerRegistryError::Shutdown);
-        }
-        if entries.len() >= MAX_ACTIVE_WORKERS {
-            return Err(WorkerRegistryError::AtCapacity);
-        }
-        let id = self.next_id.fetch_add(1, Ordering::AcqRel);
         let (receipt_tx, receipt_rx) = oneshot::channel();
         let cancellation = self.cancellation.clone();
         let active = Arc::clone(&self.active);
@@ -186,8 +258,7 @@ impl WorkerRegistry {
         let deadline_cancels = Arc::clone(&self.deadline_cancels);
         let shutdown_cancels = Arc::clone(&self.shutdown_cancels);
         let events = Arc::clone(&self.events);
-        active.fetch_add(1, Ordering::AcqRel);
-        let handle = tokio::spawn(async move {
+        let worker: WorkerFuture = Box::pin(async move {
             // The synthetic effect begins at dispatch.  It is intentionally
             // before the response terminal, so partial transport failure can
             // leave effect=1 and application success=0.
@@ -225,15 +296,48 @@ impl WorkerRegistry {
                 }
             }
         });
-        entries.insert(id, WorkerEntry { handle });
+        let (admitted, outcome) = oneshot::channel();
+        self.commands
+            .send(WorkerCommand::Admit { worker, admitted })
+            .await
+            .map_err(|_| WorkerRegistryError::Shutdown)?;
+        let id = outcome.await.map_err(|_| WorkerRegistryError::Shutdown)??;
         Ok(WorkerTicket {
             id,
             receipt: receipt_rx,
         })
     }
 
+    /// Take one retained handle out of the registry.
+    async fn take(&self, id: u64) -> Option<WorkerEntry> {
+        let (entry, taken) = oneshot::channel();
+        self.commands
+            .send(WorkerCommand::Take { id, entry })
+            .await
+            .ok()?;
+        taken.await.ok().flatten()
+    }
+
+    /// The ids of every handle the registry still retains.
+    async fn retained_ids(&self) -> Vec<u64> {
+        let (ids, retained) = oneshot::channel();
+        if self
+            .commands
+            .send(WorkerCommand::Ids { ids })
+            .await
+            .is_err()
+        {
+            return Vec::new();
+        }
+        retained.await.unwrap_or_default()
+    }
+
+    async fn retained_count(&self) -> usize {
+        self.retained_ids().await.len()
+    }
+
     async fn join(&self, id: u64) -> Result<WorkerExit, WorkerRegistryError> {
-        let Some(entry) = self.entries.lock().await.remove(&id) else {
+        let Some(entry) = self.take(id).await else {
             return Err(WorkerRegistryError::MissingHandle);
         };
         let exit = entry
@@ -245,15 +349,9 @@ impl WorkerRegistry {
 
     async fn cancel_and_join(&self, deadline: Instant) -> Result<(), WorkerRegistryError> {
         self.cancellation.cancel();
-        let ids = self
-            .entries
-            .lock()
-            .await
-            .keys()
-            .copied()
-            .collect::<Vec<_>>();
+        let ids = self.retained_ids().await;
         for id in ids {
-            let Some(entry) = self.entries.lock().await.remove(&id) else {
+            let Some(entry) = self.take(id).await else {
                 continue;
             };
             let mut handle = entry.handle;
@@ -262,7 +360,13 @@ impl WorkerRegistry {
                 // Preserve the handle for a later bounded drain; dropping a
                 // timed-out JoinHandle would violate the retain-and-join
                 // contract and could leave an adapter task running.
-                self.entries.lock().await.insert(id, WorkerEntry { handle });
+                let _ = self
+                    .commands
+                    .send(WorkerCommand::Retain {
+                        id,
+                        entry: WorkerEntry { handle },
+                    })
+                    .await;
                 return Err(WorkerRegistryError::JoinTimedOut);
             };
             joined.map_err(|_| WorkerRegistryError::JoinFailed)?;
@@ -271,7 +375,7 @@ impl WorkerRegistry {
     }
 
     async fn wait_for_empty(&self) {
-        while !self.entries.lock().await.is_empty() {
+        while self.retained_count().await != 0 {
             self.events.notified().await;
         }
     }
@@ -410,6 +514,98 @@ impl SyntheticAdapterAuthority {
     }
 }
 
+enum ScopedOperationCommand {
+    /// Reserve `key` unless it is already reserved or bound.
+    Reserve {
+        key: ScopedOperationKey,
+        reserved: oneshot::Sender<bool>,
+    },
+    /// Give back a reservation whose worker was never dispatched.
+    Release { key: ScopedOperationKey },
+    /// Record the worker dispatched for a reserved key.
+    Bind {
+        key: ScopedOperationKey,
+        worker: u64,
+    },
+    Snapshot {
+        operations: oneshot::Sender<BTreeMap<ScopedOperationKey, u64>>,
+    },
+}
+
+/// Handle to the task that owns the scoped operation table.
+///
+/// "Is this key taken" and "take it" are one step of that task, so two
+/// requests for the same key can never both dispatch a worker. The queue is
+/// sized like the worker registry's; a full queue makes the sender wait.
+#[derive(Clone)]
+struct ScopedOperations {
+    commands: mpsc::Sender<ScopedOperationCommand>,
+}
+
+impl ScopedOperations {
+    fn spawn() -> Self {
+        let (commands, mut queue) = mpsc::channel(WORKER_COMMAND_QUEUE);
+        tokio::spawn(async move {
+            let mut operations = BTreeMap::new();
+            while let Some(command) = queue.recv().await {
+                match command {
+                    ScopedOperationCommand::Reserve { key, reserved } => {
+                        let free = !operations.contains_key(&key);
+                        if free {
+                            operations.insert(key, u64::MAX);
+                        }
+                        let _ = reserved.send(free);
+                    }
+                    ScopedOperationCommand::Release { key } => {
+                        operations.remove(&key);
+                    }
+                    ScopedOperationCommand::Bind { key, worker } => {
+                        operations.insert(key, worker);
+                    }
+                    ScopedOperationCommand::Snapshot {
+                        operations: snapshot,
+                    } => {
+                        let _ = snapshot.send(operations.clone());
+                    }
+                }
+            }
+        });
+        Self { commands }
+    }
+
+    async fn reserve(&self, key: ScopedOperationKey) -> Result<bool, PeerRuntimeError> {
+        let (reserved, outcome) = oneshot::channel();
+        self.commands
+            .send(ScopedOperationCommand::Reserve { key, reserved })
+            .await
+            .map_err(|_| PeerRuntimeError::Closed)?;
+        outcome.await.map_err(|_| PeerRuntimeError::Closed)
+    }
+
+    async fn release(&self, key: ScopedOperationKey) {
+        let _ = self
+            .commands
+            .send(ScopedOperationCommand::Release { key })
+            .await;
+    }
+
+    async fn bind(&self, key: ScopedOperationKey, worker: u64) {
+        let _ = self
+            .commands
+            .send(ScopedOperationCommand::Bind { key, worker })
+            .await;
+    }
+
+    async fn snapshot(&self) -> BTreeMap<ScopedOperationKey, u64> {
+        let (operations, snapshot) = oneshot::channel();
+        self.commands
+            .send(ScopedOperationCommand::Snapshot { operations })
+            .await
+            .expect("scoped operation owner");
+        snapshot.await.expect("scoped operation owner")
+    }
+}
+
 #[derive(Clone)]
 struct SignedAuthorityChange {
     membership: VerifiedMembership,
@@ -421,9 +617,12 @@ struct SignedAuthorityChange {
 /// production peer handler and keys every record by route namespace.
 #[derive(Clone)]
 struct ScopedManager {
-    authority: Arc<Mutex<SyntheticAdapterAuthority>>,
+    /// The current signed authority. The scenario is its only writer: it
+    /// applies one signed change at a time and request handlers sample
+    /// whichever authority is current.
+    authority: Arc<watch::Sender<SyntheticAdapterAuthority>>,
     registry: WorkerRegistry,
-    scoped_operations: Arc<Mutex<BTreeMap<ScopedOperationKey, u64>>>,
+    scoped_operations: ScopedOperations,
     privileged_release: CancellationToken,
     seen_customer: Arc<AtomicUsize>,
     seen_privileged: Arc<AtomicUsize>,
@@ -453,9 +652,9 @@ impl ScopedManager {
 
     fn with_authority(authority: SyntheticAdapterAuthority) -> Self {
         Self {
-            authority: Arc::new(Mutex::new(authority)),
+            authority: Arc::new(watch::Sender::new(authority)),
             registry: WorkerRegistry::new(),
-            scoped_operations: Arc::new(Mutex::new(BTreeMap::new())),
+            scoped_operations: ScopedOperations::spawn(),
             privileged_release: CancellationToken::new(),
             seen_customer: Arc::new(AtomicUsize::new(0)),
             seen_privileged: Arc::new(AtomicUsize::new(0)),
@@ -474,30 +673,35 @@ impl ScopedManager {
         change: SignedAuthorityChange,
     ) -> Result<(), SyntheticAdapterBoundaryError> {
         let now = Utc::now();
-        let service = self.authority.lock().await.service;
+        let service = self.authority.borrow().service;
         let next = SyntheticAdapterAuthority::from_verified_membership(
             &change.membership,
             change.owner,
             service,
             now,
         )?;
-        let mut current = self.authority.lock().await;
-        if next.owner.token.deployment_incarnation != current.owner.token.deployment_incarnation
-            || next.owner.token.tenant_id != current.owner.token.tenant_id
-            || next.owner.token.device_id != current.owner.token.device_id
-            || next.owner.token.node_id != current.owner.token.node_id
-            || next.owner.token.boot_id != current.owner.token.boot_id
-            || next.owner.token.epoch <= current.owner.token.epoch
-        {
+        let applied = self.authority.send_if_modified(|current| {
+            if next.owner.token.deployment_incarnation != current.owner.token.deployment_incarnation
+                || next.owner.token.tenant_id != current.owner.token.tenant_id
+                || next.owner.token.device_id != current.owner.token.device_id
+                || next.owner.token.node_id != current.owner.token.node_id
+                || next.owner.token.boot_id != current.owner.token.boot_id
+                || next.owner.token.epoch <= current.owner.token.epoch
+            {
+                return false;
+            }
+            *current = next;
+            true
+        });
+        if !applied {
             return Err(SyntheticAdapterBoundaryError::MembershipOwnerMismatch);
         }
-        *current = next;
         self.events.notify_one();
         Ok(())
     }
 
     async fn authority_snapshot(&self) -> SyntheticAdapterAuthority {
-        self.authority.lock().await.clone()
+        self.authority.borrow().clone()
     }
 
     fn classify(&self, envelope: &RequestEnvelope) -> Option<StreamNamespace> {
@@ -549,7 +753,7 @@ impl ScopedManager {
         let envelope = request.envelope().clone();
         let binding = request.binding().clone();
         let (mut send, mut recv) = request.split();
-        let authority = self.authority.lock().await.clone();
+        let authority = self.authority.borrow().clone();
         let namespace = self.classify(&envelope);
         let Some(namespace) = namespace else {
             self.cross_namespace_rejections
@@ -594,20 +798,15 @@ impl ScopedManager {
             StreamNamespace::Privileged => WorkerDisposition::CompleteAfterReceipt,
         };
         let key = ScopedOperationKey::new(namespace, SHARED_APPLICATION_ID);
-        {
-            let mut scoped_operations = self.scoped_operations.lock().await;
-            if scoped_operations.contains_key(&key) {
-                self.cross_namespace_rejections
-                    .fetch_add(1, Ordering::AcqRel);
-                drop(scoped_operations);
-                return self
-                    .reject(&mut send, &mut recv, StatusCode::BAD_REQUEST)
-                    .await;
-            }
-            // Reserve the scoped key before spawning.  A duplicate request
-            // must not cause a backend effect merely to discover a namespace
-            // collision after dispatch.
-            scoped_operations.insert(key.clone(), u64::MAX);
+        // Reserve the scoped key before spawning.  A duplicate request
+        // must not cause a backend effect merely to discover a namespace
+        // collision after dispatch.
+        if !self.scoped_operations.reserve(key.clone()).await? {
+            self.cross_namespace_rejections
+                .fetch_add(1, Ordering::AcqRel);
+            return self
+                .reject(&mut send, &mut recv, StatusCode::BAD_REQUEST)
+                .await;
         }
         let ticket = self
             .registry
@@ -616,11 +815,11 @@ impl ScopedManager {
         let ticket = match ticket {
             Ok(ticket) => ticket,
             Err(_) => {
-                self.scoped_operations.lock().await.remove(&key);
+                self.scoped_operations.release(key).await;
                 return Err(PeerRuntimeError::Closed);
             }
         };
-        self.scoped_operations.lock().await.insert(key, ticket.id);
+        self.scoped_operations.bind(key, ticket.id).await;
         match namespace {
             StreamNamespace::Customer => {
                 self.seen_customer.fetch_add(1, Ordering::AcqRel);
@@ -709,11 +908,50 @@ impl PeerIngressHandler for ScopedManager {
 /// request receives that pending terminal marker, tagged with the first
 /// request id, so the caller must reject it as a late terminal from another
 /// operation rather than treating it as its own completion.
+/// A request that parks its id here, or the parked id it collects instead.
+type TerminalExchange = (String, oneshot::Sender<Option<String>>);
+
+/// Handle to the task that owns the one pending late-terminal marker.
+///
+/// A request either collects the marker an earlier request parked, or parks
+/// its own id when there is none; the owner task decides that in one step.
+/// The queue only ever holds the scenario's few sequential requests.
+#[derive(Clone)]
+struct PendingTerminal {
+    exchanges: mpsc::Sender<TerminalExchange>,
+}
+
+impl PendingTerminal {
+    fn spawn() -> Self {
+        let (exchanges, mut queue) = mpsc::channel::<TerminalExchange>(MAX_ACTIVE_WORKERS);
+        tokio::spawn(async move {
+            let mut pending: Option<String> = None;
+            while let Some((request_id, previous)) = queue.recv().await {
+                let parked = pending.take();
+                if parked.is_none() {
+                    pending = Some(request_id);
+                }
+                let _ = previous.send(parked);
+            }
+        });
+        Self { exchanges }
+    }
+
+    async fn take_or_park(&self, request_id: String) -> Result<Option<String>, PeerRuntimeError> {
+        let (previous, parked) = oneshot::channel();
+        self.exchanges
+            .send((request_id, previous))
+            .await
+            .map_err(|_| PeerRuntimeError::Closed)?;
+        parked.await.map_err(|_| PeerRuntimeError::Closed)
+    }
+}
+
 #[derive(Clone)]
 struct LateTerminalManager {
     expected_owner: OwnerToken,
     expected_service: uuid::Uuid,
-    pending_request_id: Arc<Mutex<Option<String>>>,
+    pending_terminal: PendingTerminal,
     dispatches: Arc<AtomicUsize>,
     terminal_attempts: Arc<AtomicUsize>,
 }
@@ -723,7 +961,7 @@ impl LateTerminalManager {
         Self {
             expected_owner: owner,
             expected_service: service,
-            pending_request_id: Arc::new(Mutex::new(None)),
+            pending_terminal: PendingTerminal::spawn(),
             dispatches: Arc::new(AtomicUsize::new(0)),
             terminal_attempts: Arc::new(AtomicUsize::new(0)),
         }
@@ -757,14 +995,7 @@ impl LateTerminalManager {
         }
 
         self.dispatches.fetch_add(1, Ordering::AcqRel);
-        let late_request_id = {
-            let mut pending = self.pending_request_id.lock().await;
-            let previous = pending.take();
-            if previous.is_none() {
-                *pending = Some(request_id);
-            }
-            previous
-        };
+        let late_request_id = self.pending_terminal.take_or_park(request_id).await?;
 
         send.respond(StatusCode::OK).await?;
         send.send_message(PeerRecordKind::ConsumerChunk, b"late-terminal-accepted")
@@ -1488,7 +1719,7 @@ mod tests {
             manager.cross_namespace_rejections.load(Ordering::Acquire),
             0
         );
-        let scoped_operations = manager.scoped_operations.lock().await;
+        let scoped_operations = manager.scoped_operations.snapshot().await;
         assert_eq!(scoped_operations.len(), 2);
         assert!(scoped_operations.contains_key(&ScopedOperationKey::new(
             StreamNamespace::Customer,
@@ -1498,7 +1729,6 @@ mod tests {
             StreamNamespace::Privileged,
             SHARED_APPLICATION_ID,
         )));
-        drop(scoped_operations);
         assert_eq!(manager.registry.effects.load(Ordering::Acquire), 2);
         assert_eq!(manager.registry.receipts.load(Ordering::Acquire), 1);
         assert_eq!(
@@ -1593,7 +1823,7 @@ mod tests {
         manager.registry.wait_for_effect(1).await;
         assert_eq!(manager.registry.active(), 1);
         assert_eq!(manager.registry.deadline_cancels.load(Ordering::Acquire), 0);
-        assert_eq!(manager.registry.entries.lock().await.len(), 1);
+        assert_eq!(manager.registry.retained_count().await, 1);
 
         let terminal = response.recv_message().await;
         assert!(
@@ -1622,7 +1852,7 @@ mod tests {
         assert_eq!(manager.registry.receipts.load(Ordering::Acquire), 0);
         assert_eq!(manager.registry.coverage.load(Ordering::Acquire), 0);
         manager.registry.wait_for_empty().await;
-        assert_eq!(manager.registry.entries.lock().await.len(), 0);
+        assert_eq!(manager.registry.retained_count().await, 0);
         super::super::shutdown_rpc_fixture(fixture).await;
     }
 
@@ -1660,7 +1890,7 @@ mod tests {
             .expect("existing worker must be cancelled and joined");
         assert_eq!(manager.registry.shutdown_cancels.load(Ordering::Acquire), 1);
         assert_eq!(manager.registry.active(), 0);
-        assert_eq!(manager.registry.entries.lock().await.len(), 0);
+        assert_eq!(manager.registry.retained_count().await, 0);
 
         let first_terminal = timeout(super::super::RESPONSE_TIMEOUT, first.recv_message()).await;
         assert!(
@@ -1695,7 +1925,7 @@ mod tests {
             .shutdown_workers(Instant::now() + WORKER_JOIN_BOUND)
             .await
             .is_ok();
-        let entries_empty = manager.registry.entries.lock().await.is_empty();
+        let entries_empty = manager.registry.retained_count().await == 0;
 
         // The fixture production patch classifies the admission failure as
         // WorkerRegistryError::Shutdown.  It is observable here through the

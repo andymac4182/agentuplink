@@ -15,7 +15,7 @@ use std::{
     future::pending,
     net::SocketAddr,
     sync::{
-        Arc, Mutex,
+        Arc,
         atomic::{AtomicUsize, Ordering},
     },
     time::Duration,
@@ -67,8 +67,10 @@ const CASE_TIMEOUT: Duration = Duration::from_secs(4);
 #[derive(Clone)]
 struct AdmissionProvider {
     bindings: Arc<HashMap<(String, String), VerifiedPeerBinding>>,
-    tokens: Arc<Mutex<HashMap<(String, String), CancellationToken>>>,
-    lookups: Arc<Mutex<HashMap<(String, String), usize>>>,
+    /// One token and one lookup counter per verified identity, fixed when
+    /// the provider is built.
+    tokens: Arc<HashMap<(String, String), CancellationToken>>,
+    lookups: Arc<HashMap<(String, String), AtomicUsize>>,
 }
 
 impl AdmissionProvider {
@@ -78,17 +80,20 @@ impl AdmissionProvider {
             .cloned()
             .map(|key| (key, CancellationToken::new()))
             .collect();
+        let lookups = bindings
+            .keys()
+            .cloned()
+            .map(|key| (key, AtomicUsize::new(0)))
+            .collect();
         Self {
             bindings: Arc::new(bindings),
-            tokens: Arc::new(Mutex::new(tokens)),
-            lookups: Arc::new(Mutex::new(HashMap::new())),
+            tokens: Arc::new(tokens),
+            lookups: Arc::new(lookups),
         }
     }
 
     fn token(&self, node_id: &str, boot_id: &str) -> CancellationToken {
         self.tokens
-            .lock()
-            .expect("admission token mutex")
             .get(&(node_id.to_owned(), boot_id.to_owned()))
             .cloned()
             .expect("admission token for verified identity")
@@ -96,18 +101,16 @@ impl AdmissionProvider {
 
     fn lookup_count(&self, node_id: &str, boot_id: &str) -> usize {
         self.lookups
-            .lock()
-            .expect("admission lookup mutex")
             .get(&(node_id.to_owned(), boot_id.to_owned()))
-            .copied()
-            .unwrap_or(0)
+            .map_or(0, |lookups| lookups.load(Ordering::SeqCst))
     }
 
     fn record_lookup(&self, node_id: &str, boot_id: &str) {
-        let mut lookups = self.lookups.lock().expect("admission lookup mutex");
-        *lookups
-            .entry((node_id.to_owned(), boot_id.to_owned()))
-            .or_default() += 1;
+        // Only a verified identity is ever asked about; any other lookup
+        // fails in the provider and has no counter to read.
+        if let Some(lookups) = self.lookups.get(&(node_id.to_owned(), boot_id.to_owned())) {
+            lookups.fetch_add(1, Ordering::SeqCst);
+        }
     }
 }
 
@@ -159,12 +162,7 @@ impl PeerBindingProvider for AdmissionProvider {
         let key = (node_id.to_owned(), boot_id.to_owned());
         let expected_spki = spki_sha256.to_owned();
         let binding = self.bindings.get(&key).cloned();
-        let token = self
-            .tokens
-            .lock()
-            .expect("admission token mutex")
-            .get(&key)
-            .cloned();
+        let token = self.tokens.get(&key).cloned();
         self.record_lookup(node_id, boot_id);
         Box::pin(async move {
             let binding = binding

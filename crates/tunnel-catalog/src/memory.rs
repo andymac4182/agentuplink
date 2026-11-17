@@ -9,13 +9,43 @@ use crate::{
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
-use std::{collections::HashMap, sync::Arc};
-use tokio::sync::Mutex;
+use std::{
+    collections::HashMap,
+    sync::{Arc, OnceLock},
+};
+use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
+/// Bound of the owning actor's command queue. Operations never wait on
+/// anything, so the queue only absorbs bursts; a caller that finds it full
+/// waits for room (backpressure) and nothing is dropped.
+const COMMAND_QUEUE_BOUND: usize = 64;
+
+/// The owning actor is not running: the runtime that first used the catalog
+/// has shut down, or an operation panicked.
+const ACTOR_GONE: CatalogError = CatalogError::Conflict("memory catalog actor is not running");
+
+/// One whole catalog operation. The actor runs each to completion before the
+/// next, which is what makes it atomic across every key it touches -- the
+/// guarantee the Redis catalog gets from one Lua script.
+type Command = Box<dyn FnOnce(&mut State) + Send>;
+
+/// The in-memory catalog double.
+///
+/// Its state has a single owner: an actor task, started by the first
+/// operation on the runtime that operation runs on, and shared by every
+/// clone. The catalog must not outlive that runtime; afterwards every
+/// operation fails closed.
 #[derive(Clone, Default)]
 pub struct MemoryCatalog {
-    state: Arc<Mutex<State>>,
+    actor: Arc<OnceLock<mpsc::Sender<Command>>>,
+}
+
+async fn run_catalog(mut commands: mpsc::Receiver<Command>) {
+    let mut state = State::default();
+    while let Some(command) = commands.recv().await {
+        command(&mut state);
+    }
 }
 
 #[derive(Clone, Default)]
@@ -62,12 +92,23 @@ impl MemoryCatalog {
         if records.len() > MAX_SIGNED_MEMBERSHIP_RECORDS {
             return Err(CatalogError::InvalidInput("signed membership count"));
         }
-        self.state.lock().await.signed_memberships = records;
-        Ok(())
+        self.with_state(move |state| {
+            state.signed_memberships = records;
+            Ok(())
+        })
+        .await
     }
 
+    /// Panics if the catalog's actor is gone (the catalog outlived the
+    /// runtime it was first used on): an empty fixture would read as an
+    /// empty catalog.
     pub async fn snapshot_fixture(&self) -> CatalogFixture {
-        let state = self.state.lock().await;
+        self.with_state(|state| Ok(Self::fixture_of(state)))
+            .await
+            .expect("in-memory catalog actor is running")
+    }
+
+    fn fixture_of(state: &State) -> CatalogFixture {
         CatalogFixture {
             tenants: state.tenants.values().cloned().collect(),
             users: state.users.values().cloned().collect(),
@@ -89,10 +130,7 @@ impl MemoryCatalog {
         }
     }
 
-    async fn validate_and_apply(
-        state: &mut State,
-        fixture: &CatalogFixture,
-    ) -> Result<(), CatalogError> {
+    fn validate_and_apply(state: &mut State, fixture: &CatalogFixture) -> Result<(), CatalogError> {
         for tenant in &fixture.tenants {
             state.tenants.insert(tenant.tenant_id, tenant.clone());
         }
@@ -217,34 +255,11 @@ impl MemoryCatalog {
         Ok(())
     }
 
-    async fn with_state<F, T>(&self, operation: F) -> Result<T, CatalogError>
-    where
-        F: FnOnce(&mut State) -> Result<T, CatalogError>,
-    {
-        let mut state = self.state.lock().await;
-        operation(&mut state)
-    }
-}
-
-/// Task row M6-C63: a successful owner claim or renewal is the device being
-/// seen at `now`, as the Redis catalog's claim and renew scripts record it.
-fn mark_seen(state: &mut State, key: (Uuid, Uuid), now: DateTime<Utc>) {
-    if let Some(device) = state.devices.get_mut(&key) {
-        device.last_seen_at = Some(now);
-    }
-}
-
-#[async_trait]
-impl Catalog for MemoryCatalog {
-    async fn resolve_device(
-        &self,
+    fn resolve_device_in(
+        state: &State,
         spki_fingerprint: &str,
         at: DateTime<Utc>,
     ) -> Result<Option<DeviceIdentity>, CatalogError> {
-        if !valid_fingerprint(spki_fingerprint) {
-            return Ok(None);
-        }
-        let state = self.state.lock().await;
         for credential in state.credentials.values() {
             if credential.spki_fingerprint != spki_fingerprint
                 || !credential.active
@@ -295,20 +310,12 @@ impl Catalog for MemoryCatalog {
         Ok(None)
     }
 
-    async fn resolve_consumer(
-        &self,
-        issuer: &str,
-        subject: &str,
+    fn resolve_consumer_in(
+        state: &State,
+        key: &(String, String),
         tenant_id: Option<Uuid>,
     ) -> Result<Option<AuthenticatedConsumer>, CatalogError> {
-        if !valid_principal_identity(issuer, subject) {
-            return Ok(None);
-        }
-        let state = self.state.lock().await;
-        let Some(identity) = state
-            .identities
-            .get(&(issuer.to_owned(), subject.to_owned()))
-        else {
+        let Some(identity) = state.identities.get(key) else {
             return Ok(None);
         };
         let memberships = state
@@ -336,19 +343,15 @@ impl Catalog for MemoryCatalog {
         }
     }
 
-    async fn authorize(
-        &self,
+    fn authorize_in(
+        state: &State,
         principal: &AuthenticatedConsumer,
         device_id: Uuid,
         service_id: Uuid,
         read_started_at: DateTime<Utc>,
         at: DateTime<Utc>,
     ) -> Result<Option<GrantSnapshot>, CatalogError> {
-        if read_started_at > at {
-            return Err(CatalogError::InvalidInput("authorization read start"));
-        }
-        let state = self.state.lock().await;
-        if !active_membership(&state, principal.tenant_id, principal.principal_id) {
+        if !active_membership(state, principal.tenant_id, principal.principal_id) {
             return Ok(None);
         }
         let Some(device) = state.devices.get(&(principal.tenant_id, device_id)) else {
@@ -397,14 +400,13 @@ impl Catalog for MemoryCatalog {
         }))
     }
 
-    async fn list_devices_filtered(
-        &self,
+    fn list_devices_in(
+        state: &State,
         principal: &AuthenticatedConsumer,
         filter: &DeviceListFilter,
         at: DateTime<Utc>,
     ) -> Result<Vec<DeviceSummary>, CatalogError> {
-        let state = self.state.lock().await;
-        if !active_membership(&state, principal.tenant_id, principal.principal_id) {
+        if !active_membership(state, principal.tenant_id, principal.principal_id) {
             return Ok(Vec::new());
         }
         let mut result = Vec::new();
@@ -456,6 +458,102 @@ impl Catalog for MemoryCatalog {
         Ok(result)
     }
 
+    /// Run `operation` on the actor, alone, and return its result.
+    async fn with_state<F, T>(&self, operation: F) -> Result<T, CatalogError>
+    where
+        F: FnOnce(&mut State) -> Result<T, CatalogError> + Send + 'static,
+        T: Send + 'static,
+    {
+        let actor = self.actor.get_or_init(|| {
+            let (actor, commands) = mpsc::channel(COMMAND_QUEUE_BOUND);
+            tokio::spawn(run_catalog(commands));
+            actor
+        });
+        let (reply, outcome) = oneshot::channel();
+        actor
+            .send(Box::new(move |state| {
+                let _ = reply.send(operation(state));
+            }))
+            .await
+            .map_err(|_| ACTOR_GONE)?;
+        outcome.await.map_err(|_| ACTOR_GONE)?
+    }
+}
+
+/// Task row M6-C63: a successful owner claim or renewal is the device being
+/// seen at `now`, as the Redis catalog's claim and renew scripts record it.
+fn mark_seen(state: &mut State, key: (Uuid, Uuid), now: DateTime<Utc>) {
+    if let Some(device) = state.devices.get_mut(&key) {
+        device.last_seen_at = Some(now);
+    }
+}
+
+#[async_trait]
+impl Catalog for MemoryCatalog {
+    async fn resolve_device(
+        &self,
+        spki_fingerprint: &str,
+        at: DateTime<Utc>,
+    ) -> Result<Option<DeviceIdentity>, CatalogError> {
+        if !valid_fingerprint(spki_fingerprint) {
+            return Ok(None);
+        }
+        let spki_fingerprint = spki_fingerprint.to_owned();
+        self.with_state(move |state| Self::resolve_device_in(state, &spki_fingerprint, at))
+            .await
+    }
+
+    async fn resolve_consumer(
+        &self,
+        issuer: &str,
+        subject: &str,
+        tenant_id: Option<Uuid>,
+    ) -> Result<Option<AuthenticatedConsumer>, CatalogError> {
+        if !valid_principal_identity(issuer, subject) {
+            return Ok(None);
+        }
+        let key = (issuer.to_owned(), subject.to_owned());
+        self.with_state(move |state| Self::resolve_consumer_in(state, &key, tenant_id))
+            .await
+    }
+
+    async fn authorize(
+        &self,
+        principal: &AuthenticatedConsumer,
+        device_id: Uuid,
+        service_id: Uuid,
+        read_started_at: DateTime<Utc>,
+        at: DateTime<Utc>,
+    ) -> Result<Option<GrantSnapshot>, CatalogError> {
+        if read_started_at > at {
+            return Err(CatalogError::InvalidInput("authorization read start"));
+        }
+        let principal = principal.clone();
+        self.with_state(move |state| {
+            Self::authorize_in(
+                state,
+                &principal,
+                device_id,
+                service_id,
+                read_started_at,
+                at,
+            )
+        })
+        .await
+    }
+
+    async fn list_devices_filtered(
+        &self,
+        principal: &AuthenticatedConsumer,
+        filter: &DeviceListFilter,
+        at: DateTime<Utc>,
+    ) -> Result<Vec<DeviceSummary>, CatalogError> {
+        let principal = principal.clone();
+        let filter = filter.clone();
+        self.with_state(move |state| Self::list_devices_in(state, &principal, &filter, at))
+            .await
+    }
+
     async fn upsert_grant(&self, spec: &GrantSpec) -> Result<GrantSnapshot, CatalogError> {
         let now = Utc::now();
         if spec.expires_at.is_some_and(|expiry| expiry <= now) {
@@ -467,7 +565,8 @@ impl Catalog for MemoryCatalog {
             spec.device_id,
             spec.service_id,
         );
-        self.with_state(|state| {
+        let spec = spec.clone();
+        self.with_state(move |state| {
             if !active_membership(state, spec.tenant_id, spec.principal_id)
                 || !state
                     .devices
@@ -518,7 +617,7 @@ impl Catalog for MemoryCatalog {
         service_id: Uuid,
         _at: DateTime<Utc>,
     ) -> Result<u64, CatalogError> {
-        self.with_state(|state| {
+        self.with_state(move |state| {
             let key = (tenant_id, principal_id, device_id, service_id);
             let Some(grant) = state.grants.get_mut(&key) else {
                 return Err(CatalogError::NotFound);
@@ -539,7 +638,7 @@ impl Catalog for MemoryCatalog {
         device_id: Uuid,
         at: DateTime<Utc>,
     ) -> Result<u64, CatalogError> {
-        self.with_state(|state| {
+        self.with_state(move |state| {
             let key = (tenant_id, device_id);
             if !state.devices.contains_key(&key) {
                 return Err(CatalogError::NotFound);
@@ -603,7 +702,7 @@ impl Catalog for MemoryCatalog {
         credential_id: Uuid,
         at: DateTime<Utc>,
     ) -> Result<u64, CatalogError> {
-        self.with_state(|state| {
+        self.with_state(move |state| {
             let key = (tenant_id, device_id, credential_id);
             if !state
                 .credentials
@@ -633,10 +732,16 @@ impl Catalog for MemoryCatalog {
     }
 
     async fn seed_fixture(&self, fixture: &CatalogFixture) -> Result<(), CatalogError> {
-        let mut state = self.state.lock().await.clone();
-        Self::validate_and_apply(&mut state, fixture).await?;
-        *self.state.lock().await = state;
-        Ok(())
+        let fixture = fixture.clone();
+        // Applied to a copy and committed only when the whole fixture is
+        // valid, in one operation: a refused seed changes nothing.
+        self.with_state(move |state| {
+            let mut seeded = state.clone();
+            Self::validate_and_apply(&mut seeded, &fixture)?;
+            *state = seeded;
+            Ok(())
+        })
+        .await
     }
 
     async fn claim_owner(&self, request: &OwnerClaimRequest) -> Result<OwnerClaim, CatalogError> {
@@ -649,7 +754,8 @@ impl Catalog for MemoryCatalog {
         {
             return Err(CatalogError::InvalidOwner);
         }
-        self.with_state(|state| {
+        let request = request.clone();
+        self.with_state(move |state| {
             if !state
                 .devices
                 .get(&(request.tenant_id, request.device_id))
@@ -705,7 +811,8 @@ impl Catalog for MemoryCatalog {
         if lease_expires_at <= now {
             return Err(CatalogError::InvalidOwner);
         }
-        self.with_state(|state| {
+        let token = token.clone();
+        self.with_state(move |state| {
             if !state
                 .devices
                 .get(&(token.tenant_id, token.device_id))
@@ -716,7 +823,7 @@ impl Catalog for MemoryCatalog {
             let Some(claim) = state.owners.get_mut(&(token.tenant_id, token.device_id)) else {
                 return Ok(false);
             };
-            if claim.token != *token || claim.lease_expires_at <= now {
+            if claim.token != token || claim.lease_expires_at <= now {
                 return Ok(false);
             }
             claim.lease_expires_at = lease_expires_at;
@@ -727,14 +834,15 @@ impl Catalog for MemoryCatalog {
     }
 
     async fn release_owner(&self, token: &OwnerToken) -> Result<bool, CatalogError> {
-        self.with_state(|state| {
+        let token = token.clone();
+        self.with_state(move |state| {
             let key = (token.tenant_id, token.device_id);
             // As in Redis, an owner past its lease cannot release (M7-C114).
             let now = Utc::now();
             if state
                 .owners
                 .get(&key)
-                .is_some_and(|claim| claim.token == *token && claim.lease_expires_at > now)
+                .is_some_and(|claim| claim.token == token && claim.lease_expires_at > now)
             {
                 state.owners.remove(&key);
                 return Ok(true);
@@ -750,7 +858,7 @@ impl Catalog for MemoryCatalog {
         device_id: Uuid,
         at: DateTime<Utc>,
     ) -> Result<Option<OwnerClaim>, CatalogError> {
-        self.with_state(|state| {
+        self.with_state(move |state| {
             let key = (tenant_id, device_id);
             if !state.devices.get(&key).is_some_and(|device| device.active) {
                 return Ok(None);
@@ -774,7 +882,8 @@ impl Catalog for MemoryCatalog {
         let now = Utc::now();
         cluster::validate_ticket_issue(request, &request.owner.deployment_incarnation, now)?;
         let key = (request.tenant_id, request.device_id);
-        self.with_state(|state| {
+        let request = request.clone();
+        self.with_state(move |state| {
             let Some(current) = state.owners.get(&key) else {
                 return Err(CatalogError::InvalidOwner);
             };
@@ -828,7 +937,7 @@ impl Catalog for MemoryCatalog {
             &request.ticket,
         )?;
         let digest = cluster::ticket_digest(&request.ticket);
-        self.with_state(|state| {
+        self.with_state(move |state| {
             let Some(ticket) = state.attachment_tickets.get(&digest) else {
                 return Err(CatalogError::Unauthorized);
             };
@@ -848,11 +957,13 @@ impl Catalog for MemoryCatalog {
     }
 
     async fn read_signed_membership(&self) -> Result<Option<SignedMembershipRecord>, CatalogError> {
-        Ok(self.state.lock().await.signed_memberships.first().cloned())
+        self.with_state(|state| Ok(state.signed_memberships.first().cloned()))
+            .await
     }
 
     async fn read_signed_memberships(&self) -> Result<Vec<SignedMembershipRecord>, CatalogError> {
-        Ok(self.state.lock().await.signed_memberships.clone())
+        self.with_state(|state| Ok(state.signed_memberships.clone()))
+            .await
     }
 }
 

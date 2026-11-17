@@ -46,8 +46,8 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
     sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     thread,
     time::{Duration, Instant},
@@ -150,7 +150,7 @@ impl Pki {
 struct SilentRelay {
     port: u16,
     stop: Arc<AtomicBool>,
-    accepted: Arc<Mutex<Vec<TcpStream>>>,
+    accepted: Arc<AtomicUsize>,
     tls_completed: Arc<AtomicBool>,
     thread: Option<thread::JoinHandle<()>>,
 }
@@ -163,7 +163,7 @@ impl SilentRelay {
             .expect("make silent relay pollable");
         let port = listener.local_addr().expect("silent relay address").port();
         let stop = Arc::new(AtomicBool::new(false));
-        let accepted = Arc::new(Mutex::new(Vec::new()));
+        let accepted = Arc::new(AtomicUsize::new(0));
         let tls_completed = Arc::new(AtomicBool::new(false));
         let server_config = match phase {
             Phase::TlsHandshake => None,
@@ -174,6 +174,9 @@ impl SilentRelay {
             let accepted = Arc::clone(&accepted);
             let tls_completed = Arc::clone(&tls_completed);
             thread::spawn(move || {
+                // The thread owns every accepted socket and keeps it open
+                // until the relay is dropped, which stops and joins it.
+                let mut held: Vec<TcpStream> = Vec::new();
                 while !stop.load(Ordering::Acquire) {
                     match listener.accept() {
                         Ok((stream, _)) => {
@@ -192,7 +195,8 @@ impl SilentRelay {
                                     }
                                 }
                             };
-                            accepted.lock().expect("silent relay sockets").push(stream);
+                            held.push(stream);
+                            accepted.store(held.len(), Ordering::Release);
                         }
                         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                             thread::sleep(Duration::from_millis(5));
@@ -216,7 +220,7 @@ impl SilentRelay {
     }
 
     fn accepted(&self) -> usize {
-        self.accepted.lock().expect("silent relay sockets").len()
+        self.accepted.load(Ordering::Acquire)
     }
 }
 

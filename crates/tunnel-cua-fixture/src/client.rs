@@ -29,7 +29,8 @@
 //! check that claim rather than taking this module's word for it.
 
 use std::collections::BTreeSet;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use serde_json::{Value, json};
@@ -37,11 +38,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use tunnel_cua::capability::{CallerGrant, LocalConfiguration, UpstreamSupport};
-use tunnel_cua::capture::{Captures, PointSpace};
+use tunnel_cua::capture::PointSpace;
 use tunnel_cua::endpoint::BackendEndpoint;
-use tunnel_cua::lease::{
-    GrantRevision, InputLeases, LeaseGrant, LeaseRefusal, SessionId, TargetSession,
-};
+use tunnel_cua::lease::{GrantRevision, LeaseGrant, LeaseRefusal, SessionId, TargetSession};
 use tunnel_cua::operation::Operation;
 use tunnel_cua::outcome::{
     Completion, Dispatch, NotDispatched, UnknownReason, classify_backend_response,
@@ -50,11 +49,14 @@ use tunnel_cua::plan::{Planned, SessionContext, discovery_payload, plan};
 use tunnel_cua::schema::Request;
 
 use crate::CMD_PATH;
+use crate::registries::{CaptureRecord, PlanRequest, Registries};
 
 /// Everything the dispatcher needs that is not the request.
 pub struct Dispatcher {
     endpoint: BackendEndpoint,
-    permitted: BTreeSet<Operation>,
+    /// Shared so a plan request can carry the set to the registries' owner
+    /// without copying it. Never changed after construction.
+    permitted: Arc<BTreeSet<Operation>>,
     deadline: Duration,
     /// The supervisor's lifecycle epoch, if this dispatcher was given one.
     ///
@@ -76,7 +78,7 @@ impl Dispatcher {
     pub fn new(endpoint: BackendEndpoint, permitted: BTreeSet<Operation>) -> Self {
         Self {
             endpoint,
-            permitted,
+            permitted: Arc::new(permitted),
             deadline: DEFAULT_DEADLINE,
             epoch: tunnel_cua_export::supervisor::LifecycleEpochHandle::detached(),
         }
@@ -125,7 +127,7 @@ impl Dispatcher {
 
     /// The negotiated set this dispatcher was built with.
     #[must_use]
-    pub const fn permitted(&self) -> &BTreeSet<Operation> {
+    pub fn permitted(&self) -> &BTreeSet<Operation> {
         &self.permitted
     }
 
@@ -486,17 +488,45 @@ pub fn operation_of(request: &Request) -> Operation {
 /// the **device**, not of a session: a lease that was per-session could not
 /// exclude anybody, and a capture registry that was per-session could not
 /// notice that another session's capture superseded yours.
-#[derive(Debug, Default)]
+///
+/// **Neither registry is reachable from here.** Both are owned by one task
+/// (`crate::registries`), and every accessor below is a request to it. That
+/// task applies one request at a time, whole, in the order they were made,
+/// which is what keeps the two registries consistent with each other and
+/// what puts an invalidation into effect ahead of every plan not yet made. The
+/// accessors are `async` for that reason; none of them does I/O.
+#[derive(Debug)]
 pub struct DeviceState {
-    leases: Mutex<InputLeases>,
-    captures: Mutex<Captures>,
+    registries: Registries,
     /// The display scale this device has been **told**, as a percentage, or
     /// `None`. There is no default (M5-C14).
-    declared_scale_percent: Mutex<Option<u32>>,
+    ///
+    /// One independent word: [`SCALE_UNDECLARED`], or the percentage.
+    declared_scale_percent: AtomicU64,
     /// The display's size in input point space, if an operator declared one
     /// (M5-C19 option (b)). When set, each capture's scale is **derived**
     /// from it rather than read from [`DeviceState::declare_scale_percent`].
-    declared_point_space: Mutex<Option<PointSpace>>,
+    ///
+    /// One independent word: [`POINT_SPACE_UNDECLARED`], or the width in the
+    /// high half and the height in the low half. Both dimensions are stored
+    /// and read as that one word, so a reader never sees the width of one
+    /// declaration with the height of another.
+    declared_point_space: AtomicU64,
+}
+
+/// No scale declared. Outside the range of any `u32` percentage.
+const SCALE_UNDECLARED: u64 = u64::MAX;
+/// No point space declared. A declared one never has a zero dimension.
+const POINT_SPACE_UNDECLARED: u64 = 0;
+
+impl Default for DeviceState {
+    fn default() -> Self {
+        Self {
+            registries: Registries::default(),
+            declared_scale_percent: AtomicU64::new(SCALE_UNDECLARED),
+            declared_point_space: AtomicU64::new(POINT_SPACE_UNDECLARED),
+        }
+    }
 }
 
 impl DeviceState {
@@ -507,12 +537,8 @@ impl DeviceState {
 
     /// Which session holds the input lease for a target, if any. For tests
     /// that need to read the registry rather than infer it from a refusal.
-    #[must_use]
-    pub fn holder(&self, target: &TargetSession) -> Option<SessionId> {
-        self.leases
-            .lock()
-            .expect("the lease mutex is never poisoned by fixture code")
-            .holder(target)
+    pub async fn holder(&self, target: &TargetSession) -> Option<SessionId> {
+        self.registries.holder(target).await
     }
 
     /// Declare the display scale of the captures this device will record, as
@@ -530,10 +556,10 @@ impl DeviceState {
     /// `docs/tasks.md` M5-C14: only a probe of a real backend (M5-C02) can say
     /// whether any server output could replace it.
     pub fn declare_scale_percent(&self, percent: Option<u32>) {
-        *self
-            .declared_scale_percent
-            .lock()
-            .expect("the scale mutex is never poisoned by fixture code") = percent;
+        self.declared_scale_percent.store(
+            percent.map_or(SCALE_UNDECLARED, u64::from),
+            Ordering::SeqCst,
+        );
     }
 
     /// Declare the target display's size in input point space, or clear it.
@@ -548,25 +574,37 @@ impl DeviceState {
     /// declared percentage. Like the percentage, it applies to captures
     /// recorded after the call.
     pub fn declare_point_space(&self, space: Option<PointSpace>) {
-        *self
-            .declared_point_space
-            .lock()
-            .expect("the scale mutex is never poisoned by fixture code") = space;
+        let word = space.map_or(POINT_SPACE_UNDECLARED, |space| {
+            (u64::from(space.width()) << 32) | u64::from(space.height())
+        });
+        self.declared_point_space.store(word, Ordering::SeqCst);
+    }
+
+    fn declared_scale_percent(&self) -> Option<u32> {
+        u32::try_from(self.declared_scale_percent.load(Ordering::SeqCst)).ok()
+    }
+
+    fn declared_point_space(&self) -> Option<PointSpace> {
+        let word = self.declared_point_space.load(Ordering::SeqCst);
+        if word == POINT_SPACE_UNDECLARED {
+            return None;
+        }
+        let width = u32::try_from(word >> 32).ok()?;
+        let height = u32::try_from(word & u64::from(u32::MAX)).ok()?;
+        // Only a `PointSpace` that already passed `new` is ever stored.
+        PointSpace::new(width, height).ok()
     }
 
     /// Drop the leases of a session whose grant revision has advanced.
     ///
     /// **The M3-16 mechanism, with no production caller.** See
     /// `tunnel_cua::lease` and `docs/tasks.md` M5-C05.
-    pub fn reconcile_grant(
+    pub async fn reconcile_grant(
         &self,
         session: SessionId,
         revision: GrantRevision,
     ) -> Vec<TargetSession> {
-        self.leases
-            .lock()
-            .expect("the lease mutex is never poisoned by fixture code")
-            .reconcile_grant(session, revision)
+        self.registries.reconcile_grant(session, revision).await
     }
 
     /// End a device-side session: drop every input lease it holds, whatever
@@ -581,23 +619,16 @@ impl DeviceState {
     /// addition and is queued as an owner decision, so this has no production
     /// caller -- but the effect is pinned here, so the decision is about the
     /// delivery and not about what a device does on receipt.
-    pub fn end_session(&self, session: SessionId) -> Vec<TargetSession> {
-        self.leases
-            .lock()
-            .expect("the lease mutex is never poisoned by fixture code")
-            .release_all_for_session(session)
+    pub async fn end_session(&self, session: SessionId) -> Vec<TargetSession> {
+        self.registries.end_session(session).await
     }
 
     /// How many capture identities this device is holding.
     ///
     /// For a test that must read the registry rather than infer its size from
     /// a refusal.
-    #[must_use]
-    pub fn capture_count(&self) -> usize {
-        self.captures
-            .lock()
-            .expect("the capture mutex is never poisoned by fixture code")
-            .len()
+    pub async fn capture_count(&self) -> usize {
+        self.registries.capture_count().await
     }
 }
 
@@ -610,23 +641,22 @@ impl DeviceState {
 /// this trait that keeps a lease, and
 /// [`tunnel_cua_export::Supervisor::restart`] takes it as a required argument,
 /// so a restart cannot happen without one.
+///
+/// **Ordering.** No input can be planned between the invalidation being
+/// requested and it being applied. The request is recorded synchronously by
+/// the first poll of the returned future; plans are computed only by the
+/// registries' owner, which honours an outstanding request -- emptying both
+/// registries -- before it applies any command at all. Once requested it is
+/// applied even if the caller stops waiting, and the future resolves after it
+/// has taken effect. `crate::registries` has the full argument, and
+/// `an_invalidation_takes_effect_before_any_plan_not_yet_computed` drives it
+/// with a full queue and a caller that gives up.
 impl tunnel_cua_export::supervisor::InputAuthority for DeviceState {
-    fn invalidate(
+    async fn invalidate(
         &self,
         generation: tunnel_cua::supervision::BackendGeneration,
     ) -> tunnel_cua::supervision::Invalidation {
-        // Both locks, in the same order everything else in this file takes
-        // them, and released before the call returns. Nothing is dispatched
-        // while they are held.
-        let mut leases = self
-            .leases
-            .lock()
-            .expect("the lease mutex is never poisoned by fixture code");
-        let mut captures = self
-            .captures
-            .lock()
-            .expect("the capture mutex is never poisoned by fixture code");
-        tunnel_cua::supervision::invalidate(&mut leases, &mut captures, generation)
+        self.registries.invalidate(generation).await
     }
 }
 
@@ -680,24 +710,19 @@ impl SessionFacade {
     ///
     /// # Errors
     /// [`LeaseRefusal::HeldByAnotherSession`].
-    pub fn acquire_input_lease(&self) -> Result<LeaseGrant, LeaseRefusal> {
+    pub async fn acquire_input_lease(&self) -> Result<LeaseGrant, LeaseRefusal> {
         self.state
-            .leases
-            .lock()
-            .expect("the lease mutex is never poisoned by fixture code")
+            .registries
             .acquire(&self.target, self.session, self.grant_revision)
+            .await
     }
 
     /// Release a lease this session holds.
     ///
     /// # Errors
     /// Any [`LeaseRefusal`].
-    pub fn release_input_lease(&self, grant: &LeaseGrant) -> Result<(), LeaseRefusal> {
-        self.state
-            .leases
-            .lock()
-            .expect("the lease mutex is never poisoned by fixture code")
-            .release(grant)
+    pub async fn release_input_lease(&self, grant: &LeaseGrant) -> Result<(), LeaseRefusal> {
+        self.state.registries.release(grant).await
     }
 
     /// The carrier rotated underneath this session.
@@ -731,10 +756,14 @@ impl SessionFacade {
     /// it had authorized became a lock with no key, held on behalf of a
     /// consumer the relay had already fenced.
     ///
-    /// The reconcile now happens **under the same lease lock, in the same
-    /// call** that records the revision, so there is no window in which the
+    /// The reconcile is now **requested in the same step** that records the
+    /// revision -- the revision is recorded at the instant the reconcile is
+    /// queued for the registries' owner, with no await between the two, and
+    /// this session cannot plan in between because it is borrowed mutably
+    /// until the owner has answered. So there is no window in which the
     /// device knows a holding is superseded and still honours it for
-    /// exclusion. A superseded holder's next input is refused with
+    /// exclusion, and a caller that stops waiting leaves either neither done
+    /// or both. A superseded holder's next input is refused with
     /// [`LeaseRefusal::NotHeld`] rather than `GrantRevoked`, because there is
     /// no holding left to be revoked -- and nothing is dispatched either way.
     ///
@@ -763,17 +792,15 @@ impl SessionFacade {
     ///
     /// Nothing calls this in production yet, because nothing tells a device
     /// that a grant moved. See `docs/tasks.md` M5-C05.
-    pub fn note_grant_revision(&mut self, revision: GrantRevision) -> Vec<TargetSession> {
-        let mut leases = self
-            .state
-            .leases
-            .lock()
-            .expect("the lease mutex is never poisoned by fixture code");
+    pub async fn note_grant_revision(&mut self, revision: GrantRevision) -> Vec<TargetSession> {
         if revision <= self.grant_revision {
             return Vec::new();
         }
-        self.grant_revision = revision;
-        leases.reconcile_grant(self.session, revision)
+        let recorded = &mut self.grant_revision;
+        self.state
+            .registries
+            .reconcile_grant_with(self.session, revision, || *recorded = revision)
+            .await
     }
 
     #[must_use]
@@ -790,40 +817,31 @@ impl SessionFacade {
 
     /// Validate and dispatch one `computer.v1` request for this session.
     ///
-    /// The locks are held **only** across [`plan`], which is pure and cannot
-    /// block, and are dropped before anything is sent. A lock held across the
-    /// exchange would make the lease a mutex over the network rather than over
-    /// input.
+    /// The registries' owner is asked **only** for the [`plan`], which is
+    /// pure and cannot block, and has answered before anything is sent. An
+    /// owner busy across the exchange would make the lease exclusion over the
+    /// network rather than over input.
     pub async fn handle(&self, body: &[u8], limit: u64) -> Dispatch {
-        let (planned, dispatch) = self
-            .dispatcher
-            .dispatch_planned(self.plan(body, limit))
-            .await;
+        let planned = self.plan(body, limit).await;
+        let (planned, dispatch) = self.dispatcher.dispatch_planned(planned).await;
         self.issue_capture_identity(planned.as_ref(), dispatch)
+            .await
     }
 
-    /// Run the pure planner under the device's locks, and drop them.
-    fn plan(&self, body: &[u8], limit: u64) -> Result<Planned, Dispatch> {
-        {
-            let leases = self
-                .state
-                .leases
-                .lock()
-                .expect("the lease mutex is never poisoned by fixture code");
-            let captures = self
-                .state
-                .captures
-                .lock()
-                .expect("the capture mutex is never poisoned by fixture code");
-            let context = SessionContext {
+    /// Have the registries' owner run the pure planner against both
+    /// registries as they stand when it reaches this request.
+    async fn plan(&self, body: &[u8], limit: u64) -> Result<Planned, Dispatch> {
+        self.state
+            .registries
+            .plan(PlanRequest {
+                body: body.to_vec(),
+                limit,
+                permitted: Arc::clone(&self.dispatcher.permitted),
                 session: self.session,
-                target: &self.target,
+                target: self.target.clone(),
                 grant_revision: self.grant_revision,
-                leases: &leases,
-                captures: &captures,
-            };
-            plan(body, limit, self.dispatcher.permitted(), &context)
-        }
+            })
+            .await
     }
 
     /// [`SessionFacade::handle`], abandoned if `cancel` completes first
@@ -846,12 +864,13 @@ impl SessionFacade {
         limit: u64,
         cancel: impl core::future::Future<Output = ()>,
     ) -> Dispatch {
-        let planned = self.plan(body, limit);
+        let planned = self.plan(body, limit).await;
         let (planned, dispatch) = self
             .dispatcher
             .dispatch_planned_until(planned, cancel)
             .await;
         self.issue_capture_identity(planned.as_ref(), dispatch)
+            .await
     }
 
     /// Record a successful capture and hand its identity back to the consumer.
@@ -859,7 +878,11 @@ impl SessionFacade {
     /// **Only on [`Completion::Ok`].** A capture that failed, or whose outcome
     /// is unknown, issues no identity: there is no image the consumer could
     /// have looked at, so there is nothing for a later click to refer to.
-    fn issue_capture_identity(&self, planned: Option<&Planned>, dispatch: Dispatch) -> Dispatch {
+    async fn issue_capture_identity(
+        &self,
+        planned: Option<&Planned>,
+        dispatch: Dispatch,
+    ) -> Dispatch {
         let Some(Planned::Dispatch {
             operation: Operation::Capture,
             payload,
@@ -903,32 +926,24 @@ impl SessionFacade {
         // ([`DeviceState::declare_scale_percent`]) or nothing, and with nothing
         // every coordinate on this capture is refused with
         // `CaptureRefusal::ScaleUndeclared`.
-        let point_space = *self
-            .state
-            .declared_point_space
-            .lock()
-            .expect("the scale mutex is never poisoned by fixture code");
-        let declared = match point_space {
+        let declared = match self.state.declared_point_space() {
             // M5-C19 option (b): the ratio is derived per capture, and a
             // capture the declaration contradicts gets no scale at all.
             Some(space) => space.scale_percent_for(width, height).ok(),
-            None => *self
-                .state
-                .declared_scale_percent
-                .lock()
-                .expect("the scale mutex is never poisoned by fixture code"),
+            None => self.state.declared_scale_percent(),
         };
-        let mut captures = self
+        let recorded = self
             .state
-            .captures
-            .lock()
-            .expect("the capture mutex is never poisoned by fixture code");
-        let recorded = match declared {
-            Some(percent) => captures.record(&self.target, display, width, height, percent),
-            None => captures.record_undeclared_scale(&self.target, display, width, height),
-        };
-        drop(captures);
-        let Ok(identity) = recorded else {
+            .registries
+            .record(CaptureRecord {
+                target: self.target.clone(),
+                display,
+                width,
+                height,
+                scale_percent: declared,
+            })
+            .await;
+        let Some(identity) = recorded else {
             return dispatch;
         };
 
@@ -943,7 +958,135 @@ impl SessionFacade {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_response;
+    use core::future::Future;
+    use core::pin::Pin;
+    use core::task::Poll;
+    use std::collections::BTreeSet;
+
+    use serde_json::json;
+    use tunnel_cua::endpoint::BackendEndpoint;
+    use tunnel_cua::lease::{LeaseRefusal, SessionId, TargetSession};
+    use tunnel_cua::operation::Operation;
+    use tunnel_cua::outcome::{Dispatch, InputRefusal, NotDispatched};
+    use tunnel_cua::supervision::BackendGeneration;
+    use tunnel_cua_export::supervisor::InputAuthority;
+
+    use super::{DeviceState, Dispatcher, SessionFacade, parse_response, request_body};
+    use crate::registries::QUEUE;
+
+    const LIMIT: u64 = tunnel_cua::DEFAULT_REQUEST_BODY_LIMIT;
+
+    /// Poll a future exactly once, without yielding to the runtime, and say
+    /// whether it is still pending.
+    async fn poll_once<T>(future: &mut Pin<Box<dyn Future<Output = T> + '_>>) -> bool {
+        core::future::poll_fn(|context| Poll::Ready(future.as_mut().poll(context).is_pending()))
+            .await
+    }
+
+    /// A loopback endpoint nothing is listening on, so an operation that
+    /// passes planning is reported `NotReached` and one that planning refuses
+    /// is reported as refused: the two cannot be confused.
+    async fn dead_endpoint() -> BackendEndpoint {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("loopback");
+        let address = listener.local_addr().expect("bound");
+        drop(listener);
+        BackendEndpoint::new(address).expect("loopback")
+    }
+
+    fn lease_not_held() -> Dispatch {
+        Dispatch::NotDispatched(NotDispatched::InputAuthority(InputRefusal::Lease(
+            LeaseRefusal::NotHeld,
+        )))
+    }
+
+    /// The computer-use ordering: once an invalidation has been requested, no
+    /// input operation is planned against the authority it revokes.
+    ///
+    /// Single-threaded on purpose, so the registries' owner runs only when
+    /// this test yields and every interleaving below is the one written.
+    #[tokio::test]
+    async fn an_invalidation_takes_effect_before_any_plan_not_yet_computed() {
+        let state = DeviceState::new();
+        let target = TargetSession::new("console:1");
+        let facade = SessionFacade::new(
+            std::sync::Arc::clone(&state),
+            Dispatcher::new(dead_endpoint().await, BTreeSet::from(Operation::ALL)),
+            SessionId::new(1),
+            target.clone(),
+        );
+        let key = request_body("press_key", json!({"key": "a"}));
+        facade.acquire_input_lease().await.expect("an idle target");
+        // The control: holding the lease, the key press passes planning.
+        assert_eq!(
+            facade.handle(&key, LIMIT).await,
+            Dispatch::NotDispatched(NotDispatched::NotReached)
+        );
+
+        // Fill the owner's queue with key presses it has not looked at yet.
+        let mut queued: Vec<Pin<Box<dyn Future<Output = Dispatch> + '_>>> = Vec::new();
+        for _ in 0..QUEUE {
+            let mut press: Pin<Box<dyn Future<Output = Dispatch> + '_>> =
+                Box::pin(facade.handle(&key, LIMIT));
+            assert!(poll_once(&mut press).await);
+            queued.push(press);
+        }
+        assert_eq!(state.registries.room(), 0, "the queue is full");
+
+        // Request the invalidation. Its command cannot be queued: there is no
+        // room. Then ask for one more key press, behind it.
+        let mut invalidation: Pin<Box<dyn Future<Output = _> + '_>> =
+            Box::pin(state.invalidate(BackendGeneration::INITIAL));
+        assert!(poll_once(&mut invalidation).await);
+        let mut later: Pin<Box<dyn Future<Output = Dispatch> + '_>> =
+            Box::pin(facade.handle(&key, LIMIT));
+        assert!(poll_once(&mut later).await);
+
+        // The caller gives up before its command was ever queued. The request
+        // was made, so it must still take effect.
+        drop(invalidation);
+
+        // Every key press the owner had not yet planned is refused -- those
+        // queued ahead of the request as much as the one behind it.
+        for press in queued {
+            assert_eq!(press.await, lease_not_held());
+        }
+        assert_eq!(later.await, lease_not_held());
+        assert_eq!(state.holder(&target).await, None);
+        assert_eq!(facade.handle(&key, LIMIT).await, lease_not_held());
+
+        // What the abandoned request freed is reported by the next one.
+        let reported = state.invalidate(BackendGeneration::INITIAL).await;
+        assert_eq!(reported.leases_released, vec![target]);
+    }
+
+    /// The plain case: an invalidation that was awaited has been applied.
+    #[tokio::test]
+    async fn an_awaited_invalidation_has_dropped_the_lease_and_the_captures() {
+        let state = DeviceState::new();
+        let target = TargetSession::new("console:1");
+        let facade = SessionFacade::new(
+            std::sync::Arc::clone(&state),
+            Dispatcher::new(dead_endpoint().await, BTreeSet::from(Operation::ALL)),
+            SessionId::new(1),
+            target.clone(),
+        );
+        facade.acquire_input_lease().await.expect("an idle target");
+        let freed = state.invalidate(BackendGeneration::INITIAL).await;
+        assert_eq!(freed.leases_released, vec![target.clone()]);
+        assert_eq!(state.holder(&target).await, None);
+        assert_eq!(state.capture_count().await, 0);
+        let key = request_body("press_key", json!({"key": "a"}));
+        assert_eq!(facade.handle(&key, LIMIT).await, lease_not_held());
+        // Nothing was left over for a second invalidation to report.
+        assert!(
+            !state
+                .invalidate(BackendGeneration::INITIAL)
+                .await
+                .freed_anything()
+        );
+    }
 
     /// The shape uvicorn gives the released server's `StreamingResponse`.
     #[test]

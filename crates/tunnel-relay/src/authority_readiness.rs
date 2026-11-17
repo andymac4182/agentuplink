@@ -28,7 +28,7 @@
 use std::{
     collections::BTreeMap,
     sync::{
-        Arc, Mutex, PoisonError,
+        Arc,
         atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant},
@@ -60,8 +60,61 @@ pub(crate) struct AuthorityReadiness {
     ready_until_ms: AtomicU64,
     /// Checks run, for the private metrics listener (M6-C24).
     checks: AtomicU64,
-    /// Failed checks by fixed failure class; the class set is closed.
-    failures: Mutex<BTreeMap<&'static str, u64>>,
+    /// Failed checks by fixed failure class, indexed by
+    /// [`failure_slot`]; the class set is closed, so each class has its own
+    /// independent counter.
+    failures: [AtomicU64; FAILURE_CLASSES.len()],
+}
+
+/// Every failure class a check can report, in [`failure_slot`] order.  A
+/// check that exceeds [`PROBE_DEADLINE`] is counted as
+/// [`CatalogConnectionFailure::Timeout`], whose label is `timeout`.
+const FAILURE_CLASSES: [CatalogConnectionFailure; 19] = [
+    CatalogConnectionFailure::Timeout,
+    CatalogConnectionFailure::Dns,
+    CatalogConnectionFailure::Refused,
+    CatalogConnectionFailure::Io,
+    CatalogConnectionFailure::TlsCertificate,
+    CatalogConnectionFailure::TlsAlert,
+    CatalogConnectionFailure::Tls,
+    CatalogConnectionFailure::Auth,
+    CatalogConnectionFailure::NoPerm,
+    CatalogConnectionFailure::Reply,
+    CatalogConnectionFailure::InvalidReply,
+    CatalogConnectionFailure::RunIdConflict,
+    CatalogConnectionFailure::Unbound,
+    CatalogConnectionFailure::RunChanged,
+    CatalogConnectionFailure::Unprovisioned,
+    CatalogConnectionFailure::Continuity,
+    CatalogConnectionFailure::Persistence,
+    CatalogConnectionFailure::Config,
+    CatalogConnectionFailure::Catalog,
+];
+
+/// The counter slot of a failure class.  The match is exhaustive, so a new
+/// class cannot be added without a slot.
+const fn failure_slot(class: CatalogConnectionFailure) -> usize {
+    match class {
+        CatalogConnectionFailure::Timeout => 0,
+        CatalogConnectionFailure::Dns => 1,
+        CatalogConnectionFailure::Refused => 2,
+        CatalogConnectionFailure::Io => 3,
+        CatalogConnectionFailure::TlsCertificate => 4,
+        CatalogConnectionFailure::TlsAlert => 5,
+        CatalogConnectionFailure::Tls => 6,
+        CatalogConnectionFailure::Auth => 7,
+        CatalogConnectionFailure::NoPerm => 8,
+        CatalogConnectionFailure::Reply => 9,
+        CatalogConnectionFailure::InvalidReply => 10,
+        CatalogConnectionFailure::RunIdConflict => 11,
+        CatalogConnectionFailure::Unbound => 12,
+        CatalogConnectionFailure::RunChanged => 13,
+        CatalogConnectionFailure::Unprovisioned => 14,
+        CatalogConnectionFailure::Continuity => 15,
+        CatalogConnectionFailure::Persistence => 16,
+        CatalogConnectionFailure::Config => 17,
+        CatalogConnectionFailure::Catalog => 18,
+    }
 }
 
 impl AuthorityReadiness {
@@ -73,7 +126,7 @@ impl AuthorityReadiness {
             origin: Instant::now(),
             ready_until_ms: AtomicU64::new(0),
             checks: AtomicU64::new(0),
-            failures: Mutex::new(BTreeMap::new()),
+            failures: std::array::from_fn(|_| AtomicU64::new(0)),
         };
         readiness.mark_ready();
         readiness
@@ -104,18 +157,27 @@ impl AuthorityReadiness {
         self.checks.load(Ordering::Relaxed)
     }
 
-    /// Failed checks by fixed failure class.
+    /// Failed checks by fixed failure class; a class that never failed is
+    /// absent.
     pub(crate) fn failures(&self) -> BTreeMap<&'static str, u64> {
-        self.failures
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone()
+        FAILURE_CLASSES
+            .iter()
+            .zip(&self.failures)
+            .filter_map(|(class, count)| {
+                let count = count.load(Ordering::Relaxed);
+                (count > 0).then_some((class.as_str(), count))
+            })
+            .collect()
     }
 
-    fn count_failure(&self, class: &'static str) {
-        let mut failures = self.failures.lock().unwrap_or_else(PoisonError::into_inner);
-        let count = failures.entry(class).or_insert(0);
-        *count = count.saturating_add(1);
+    /// Only the check loop counts failures, so a plain saturating update of
+    /// the one class counter loses nothing.
+    fn count_failure(&self, class: CatalogConnectionFailure) {
+        let count = &self.failures[failure_slot(class)];
+        count.store(
+            count.load(Ordering::Relaxed).saturating_add(1),
+            Ordering::Relaxed,
+        );
     }
 
     /// Start the check loop for `catalog`; it stops when `cancel` fires.
@@ -133,18 +195,18 @@ impl AuthorityReadiness {
 }
 
 /// One bounded check; `Err` carries only the fixed failure class.
-async fn check_once(catalog: &SharedCatalog) -> Result<(), &'static str> {
+async fn check_once(catalog: &SharedCatalog) -> Result<(), CatalogConnectionFailure> {
     match tokio::time::timeout(PROBE_DEADLINE, catalog.check_authority()).await {
         Ok(Ok(())) => Ok(()),
-        Ok(Err(error)) => Err(CatalogConnectionFailure::classify(&error).as_str()),
-        Err(_) => Err("timeout"),
+        Ok(Err(error)) => Err(CatalogConnectionFailure::classify(&error)),
+        Err(_) => Err(CatalogConnectionFailure::Timeout),
     }
 }
 
 async fn check_loop(catalog: SharedCatalog, state: Arc<AuthorityReadiness>) {
     let mut ticker = tokio::time::interval(PROBE_INTERVAL);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut failing: Option<&'static str> = None;
+    let mut failing: Option<CatalogConnectionFailure> = None;
     loop {
         ticker.tick().await;
         state.checks.fetch_add(1, Ordering::Relaxed);
@@ -159,7 +221,10 @@ async fn check_loop(catalog: SharedCatalog, state: Arc<AuthorityReadiness>) {
                 state.mark_unready();
                 state.count_failure(class);
                 if failing != Some(class) {
-                    tracing::warn!(class, "relay Redis authority unavailable; not ready");
+                    tracing::warn!(
+                        class = class.as_str(),
+                        "relay Redis authority unavailable; not ready"
+                    );
                     failing = Some(class);
                 }
             }

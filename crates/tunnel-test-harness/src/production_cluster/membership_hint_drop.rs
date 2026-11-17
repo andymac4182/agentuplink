@@ -490,7 +490,7 @@ impl HintDropFilter {
 /// Replace the fixture's pin-publishing invalidation callback with one that
 /// publishes nothing while armed.  This is the whole injection: no product code
 /// changes, and the runtime keeps dispatching hints exactly as before.
-fn install_hint_drop_callback(relay: &ProductionRelay, filter: &Arc<HintDropFilter>) {
+async fn install_hint_drop_callback(relay: &ProductionRelay, filter: &Arc<HintDropFilter>) {
     let membership = Arc::clone(&relay.membership);
     let pins = relay.pins.clone();
     let filter = Arc::clone(filter);
@@ -505,7 +505,8 @@ fn install_hint_drop_callback(relay: &ProductionRelay, filter: &Arc<HintDropFilt
                 tracing::warn!(?error, "hint-drop pin publication failed closed");
                 let _ = pins.replace(std::iter::empty::<tunnel_transport::SpkiSha256>());
             }
-        })));
+        })))
+        .await;
 }
 
 /// Run the bounded real Redis-backed membership hint-drop fixture.
@@ -711,7 +712,7 @@ async fn run_inner(
     // change, so no publication path is left behind for the measured window.
     let filter = Arc::new(HintDropFilter::default());
     for relay in &cluster.relays {
-        install_hint_drop_callback(relay, &filter);
+        install_hint_drop_callback(relay, &filter).await;
     }
 
     // Pin each connector's control and data sockets to its committed owner.

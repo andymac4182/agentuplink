@@ -46,7 +46,7 @@
 //! process; the waiting server polls, the test never sleeps on them.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use rmcp::model::{
@@ -61,6 +61,7 @@ use rmcp::model::{
 use rmcp::service::{RequestContext, SubscriptionContext};
 use rmcp::{ErrorData, RoleServer, ServerHandler};
 use tokio::io::AsyncWriteExt;
+use tokio::sync::{mpsc, oneshot};
 
 /// The synthetic stderr marker `crash` writes.  Tests assert it never
 /// reaches a consumer.
@@ -261,7 +262,44 @@ pub struct FixtureServer {
     /// Resource URIs a legacy (2025-11-25) client subscribed to on this
     /// server instance.  One stdio child serves one session, so this is
     /// per session there.
-    subscriptions: Arc<std::sync::Mutex<std::collections::BTreeSet<String>>>,
+    ///
+    /// The set itself is owned by one task, started the first time a request
+    /// needs it; every clone of this server holds the same queue to it.
+    subscriptions: Arc<OnceLock<mpsc::Sender<SubscriptionCommand>>>,
+}
+
+/// How many subscription commands may be queued for the owning task. A
+/// request that finds the queue full waits its turn.
+const SUBSCRIPTION_QUEUE: usize = 16;
+
+/// What a request asks the task that owns the subscription set.
+#[derive(Debug)]
+enum SubscriptionCommand {
+    Subscribe(String),
+    Unsubscribe(String),
+    /// Whether this URI is subscribed, answered on the sender.
+    Contains(String, oneshot::Sender<bool>),
+}
+
+/// Own the subscription set until every server clone has gone.
+///
+/// Commands are applied in the order they were queued, so a request that is
+/// queued after a `subscribe` has returned observes that subscription.
+async fn own_subscriptions(mut commands: mpsc::Receiver<SubscriptionCommand>) {
+    let mut subscribed = std::collections::BTreeSet::<String>::new();
+    while let Some(command) = commands.recv().await {
+        match command {
+            SubscriptionCommand::Subscribe(uri) => {
+                subscribed.insert(uri);
+            }
+            SubscriptionCommand::Unsubscribe(uri) => {
+                subscribed.remove(&uri);
+            }
+            SubscriptionCommand::Contains(uri, answer) => {
+                let _ = answer.send(subscribed.contains(&uri));
+            }
+        }
+    }
 }
 
 impl FixtureServer {
@@ -271,6 +309,32 @@ impl FixtureServer {
             marker_dir: marker_dir.map(Arc::new),
             subscriptions: Arc::default(),
         }
+    }
+
+    /// The queue to the task that owns the subscription set, starting that
+    /// task on first use. Only ever called while serving a request, so a
+    /// runtime is present.
+    fn subscriptions(&self) -> &mpsc::Sender<SubscriptionCommand> {
+        self.subscriptions.get_or_init(|| {
+            let (commands, queued) = mpsc::channel(SUBSCRIPTION_QUEUE);
+            tokio::spawn(own_subscriptions(queued));
+            commands
+        })
+    }
+
+    /// Whether a legacy client subscribed to `uri`. `false` if the owning
+    /// task has gone, which is also what an unreadable set used to answer.
+    async fn is_subscribed(&self, uri: &str) -> bool {
+        let (answer, answered) = oneshot::channel();
+        if self
+            .subscriptions()
+            .send(SubscriptionCommand::Contains(uri.to_owned(), answer))
+            .await
+            .is_err()
+        {
+            return false;
+        }
+        answered.await.unwrap_or(false)
     }
 
     async fn record(&self, name: &str, line: &str) {
@@ -1079,11 +1143,7 @@ impl ServerHandler for FixtureServer {
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or(RESOURCE_TEXT_URI)
                     .to_owned();
-                let subscribed = self
-                    .subscriptions
-                    .lock()
-                    .map(|set| set.contains(&uri))
-                    .unwrap_or(false);
+                let subscribed = self.is_subscribed(&uri).await;
                 if subscribed {
                     let _ = context
                         .peer
@@ -1180,9 +1240,10 @@ impl ServerHandler for FixtureServer {
         _context: RequestContext<RoleServer>,
     ) -> Result<(), ErrorData> {
         self.record("invocations.log", "resources/subscribe").await;
-        if let Ok(mut set) = self.subscriptions.lock() {
-            set.insert(request.uri);
-        }
+        let _ = self
+            .subscriptions()
+            .send(SubscriptionCommand::Subscribe(request.uri))
+            .await;
         Ok(())
     }
 
@@ -1194,9 +1255,10 @@ impl ServerHandler for FixtureServer {
     ) -> Result<(), ErrorData> {
         self.record("invocations.log", "resources/unsubscribe")
             .await;
-        if let Ok(mut set) = self.subscriptions.lock() {
-            set.remove(&request.uri);
-        }
+        let _ = self
+            .subscriptions()
+            .send(SubscriptionCommand::Unsubscribe(request.uri))
+            .await;
         Ok(())
     }
 
@@ -1274,5 +1336,34 @@ pub async fn serve_http(
                 .serve_connection(TokioIo::new(stream), service)
                 .await;
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FixtureServer, SubscriptionCommand};
+
+    /// The owning task applies commands in the order they were queued, and
+    /// every clone of a server reaches the same set.
+    #[tokio::test]
+    async fn subscriptions_are_shared_by_clones_and_applied_in_order() {
+        let server = FixtureServer::new(None);
+        let clone = server.clone();
+        assert!(!server.is_subscribed("fixture://a").await);
+
+        server
+            .subscriptions()
+            .send(SubscriptionCommand::Subscribe("fixture://a".to_owned()))
+            .await
+            .expect("the owning task is running");
+        assert!(clone.is_subscribed("fixture://a").await);
+        assert!(!clone.is_subscribed("fixture://b").await);
+
+        clone
+            .subscriptions()
+            .send(SubscriptionCommand::Unsubscribe("fixture://a".to_owned()))
+            .await
+            .expect("the owning task is running");
+        assert!(!server.is_subscribed("fixture://a").await);
     }
 }

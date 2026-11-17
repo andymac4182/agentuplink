@@ -38,9 +38,9 @@
 //!   the ingress in the peer RESET record, so the ingress gateway status and
 //!   execution knowledge match the device's authoritative record.
 
-use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::pin;
+use std::sync::atomic::{AtomicBool, AtomicUsize};
 
 use bytes::Bytes;
 use tokio::sync::{Notify, watch};
@@ -774,32 +774,63 @@ impl PeerRecvHalf for crate::peer_runtime::InboundPeerRecv {
     }
 }
 
+/// The hop's send credit.
+///
+/// `sent_*` are written only by the hop's writer (one write at a time) and
+/// `peer_consumed_*` only by the reader task, so each side reads its own
+/// figures exactly and the other side's as of the instant it loads them.
+/// The peer's consumption only grows, so a writer that reads it late sees a
+/// fuller window than there is and waits; it can never over-admit.
 #[derive(Debug, Default)]
 struct CreditState {
-    sent_bytes: u64,
-    sent_records: u64,
-    peer_consumed_bytes: u64,
-    peer_consumed_records: u64,
-    in_flight_high_water: usize,
-    closed: bool,
+    sent_bytes: AtomicU64,
+    sent_records: AtomicU64,
+    peer_consumed_bytes: AtomicU64,
+    peer_consumed_records: AtomicU64,
+    in_flight_high_water: AtomicUsize,
+    closed: AtomicBool,
 }
 
+impl CreditState {
+    /// Encoded bytes sent and not yet reported consumed.
+    fn in_flight_bytes(&self) -> u64 {
+        self.sent_bytes
+            .load(Ordering::Acquire)
+            .saturating_sub(self.peer_consumed_bytes.load(Ordering::Acquire))
+    }
+
+    fn in_flight_records(&self) -> u64 {
+        self.sent_records
+            .load(Ordering::Acquire)
+            .saturating_sub(self.peer_consumed_records.load(Ordering::Acquire))
+    }
+}
+
+/// The receive queue's levels.  The reader task is the only producer and the
+/// hop's [`PeerHopReader`] the only consumer; the events themselves travel in
+/// a bounded channel between the two.
+///
+/// Only the producer raises a level and only the consumer lowers it, so the
+/// producer's bound check can only ever read a level that is too high, never
+/// one that is too low: the byte and record bounds hold exactly.
 #[derive(Debug, Default)]
 struct QueueState {
-    events: VecDeque<CarrierEvent>,
-    queued_bytes: usize,
-    queued_records: usize,
-    high_water: usize,
-    consumed_bytes: u64,
-    consumed_records: u64,
+    queued_bytes: AtomicUsize,
+    queued_records: AtomicUsize,
+    /// Encoded cost of the queued DATA, as charged to the peer aggregate.
+    queued_cost: AtomicU64,
+    high_water: AtomicUsize,
 }
+
+/// Events the receive queue can hold at once: a full record window of DATA,
+/// one FIN and one terminal event (RESET or the closed marker).
+const HOP_QUEUE_EVENTS: usize = PEER_HOP_WINDOW_RECORDS + 2;
 
 /// State shared by one peer hop's writer, reader and tasks.
 struct HopShared {
-    credit: Mutex<CreditState>,
+    credit: CreditState,
     credit_changed: Notify,
-    queue: Mutex<QueueState>,
-    queue_changed: Notify,
+    queue: QueueState,
     consumed_tx: watch::Sender<(u64, u64)>,
     peer_terminal: CancellationToken,
     stop: CancellationToken,
@@ -822,43 +853,15 @@ impl Drop for HopShared {
     /// Return whatever this stream still holds of the peer aggregate: bytes
     /// sent but never reported consumed, and bytes received but never read.
     fn drop(&mut self) {
-        let credit = self
-            .credit
-            .get_mut()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let in_flight = credit.sent_bytes.saturating_sub(credit.peer_consumed_bytes);
-        self.aggregate.release_send(in_flight);
-        let queue = self
-            .queue
-            .get_mut()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let queued: u64 = queue
-            .events
-            .iter()
-            .map(|event| match event {
-                CarrierEvent::Data(data) => hop_cost(data.len()),
-                _ => 0,
-            })
-            .sum();
-        self.aggregate.release_receive(queued);
+        self.aggregate.release_send(self.credit.in_flight_bytes());
+        self.aggregate
+            .release_receive(self.queue.queued_cost.load(Ordering::Acquire));
     }
 }
 
 impl HopShared {
-    fn credit(&self) -> MutexGuard<'_, CreditState> {
-        self.credit
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
-    fn queue(&self) -> MutexGuard<'_, QueueState> {
-        self.queue
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
     fn close_credit(&self) {
-        self.credit().closed = true;
+        self.credit.closed.store(true, Ordering::Release);
         self.credit_changed.notify_waiters();
     }
 
@@ -868,7 +871,7 @@ impl HopShared {
             let notified = self.credit_changed.notified();
             let mut notified = pin!(notified);
             notified.as_mut().enable();
-            if self.credit().closed || self.stop.is_cancelled() {
+            if self.credit.closed.load(Ordering::Acquire) || self.stop.is_cancelled() {
                 return;
             }
             tokio::select! {
@@ -877,24 +880,52 @@ impl HopShared {
             }
         }
     }
+}
 
+/// The producing end of a hop's receive queue, owned by the reader task.
+struct HopQueueProducer {
+    shared: Arc<HopShared>,
+    events: mpsc::Sender<CarrierEvent>,
+}
+
+impl HopQueueProducer {
+    /// Whether one more DATA record of `len` payload bytes would exceed the
+    /// window this side granted.
+    fn over_window(&self, len: usize) -> bool {
+        let queue = &self.shared.queue;
+        queue
+            .queued_bytes
+            .load(Ordering::Acquire)
+            .saturating_add(len)
+            > PEER_HOP_WINDOW_BYTES
+            || queue.queued_records.load(Ordering::Acquire) >= PEER_HOP_WINDOW_RECORDS
+    }
+
+    /// Queue `event` for the hop's reader.
+    ///
+    /// The levels are raised before the event is offered, so the consumer
+    /// never lowers a level it has not seen raised.  The channel holds a full
+    /// window plus the two non-DATA events the reader task can produce, so an
+    /// offer only fails once the consumer is gone.  A DATA record refused
+    /// that way stays accounted, exactly as one nobody will ever read: the
+    /// window then closes on the peer, and [`HopShared`]'s drop returns the
+    /// aggregate charge.
     fn push(&self, event: CarrierEvent) {
-        {
-            let mut queue = self.queue();
-            if let CarrierEvent::Data(data) = &event {
-                queue.queued_bytes = queue.queued_bytes.saturating_add(data.len());
-                queue.queued_records = queue.queued_records.saturating_add(1);
-                queue.high_water = queue.high_water.max(queue.queued_bytes);
-                // The receive half of the coincident pair, read while the
-                // queue lock is held so the level published is the one just
-                // written.  `note_receive` reads the send side from an atomic
-                // and takes only the leaf coincident lock, so this cannot
-                // cycle with the credit lock.
-                self.live.note_receive(queue.queued_bytes);
-            }
-            queue.events.push_back(event);
+        if let CarrierEvent::Data(data) = &event {
+            let queue = &self.shared.queue;
+            let len = data.len();
+            queue.queued_records.fetch_add(1, Ordering::AcqRel);
+            queue.queued_cost.fetch_add(hop_cost(len), Ordering::AcqRel);
+            let level = queue
+                .queued_bytes
+                .fetch_add(len, Ordering::AcqRel)
+                .saturating_add(len);
+            queue.high_water.fetch_max(level, Ordering::AcqRel);
+            // The receive half of the coincident pair.  See
+            // `PeerHopWriter::data` for the other half.
+            self.shared.live.add_receive(len);
         }
-        self.queue_changed.notify_one();
+        let _ = self.events.try_send(event);
     }
 }
 
@@ -974,21 +1005,15 @@ impl CarrierWriter for PeerHopWriter {
                 let notified = shared.credit_changed.notified();
                 let mut notified = pin!(notified);
                 notified.as_mut().enable();
+                if shared.credit.closed.load(Ordering::Acquire) {
+                    return Err(CarrierClosed);
+                }
+                if shared.credit.in_flight_bytes().saturating_add(cost)
+                    <= PEER_HOP_WINDOW_BYTES as u64
+                    && shared.credit.in_flight_records().saturating_add(records)
+                        <= PEER_HOP_WINDOW_RECORDS as u64
                 {
-                    let credit = shared.credit();
-                    if credit.closed {
-                        return Err(CarrierClosed);
-                    }
-                    let in_flight = credit.sent_bytes.saturating_sub(credit.peer_consumed_bytes);
-                    let in_flight_records = credit
-                        .sent_records
-                        .saturating_sub(credit.peer_consumed_records);
-                    if in_flight.saturating_add(cost) <= PEER_HOP_WINDOW_BYTES as u64
-                        && in_flight_records.saturating_add(records)
-                            <= PEER_HOP_WINDOW_RECORDS as u64
-                    {
-                        break;
-                    }
+                    break;
                 }
                 tokio::select! {
                     () = shared.stop.cancelled() => return Err(CarrierClosed),
@@ -1013,17 +1038,38 @@ impl CarrierWriter for PeerHopWriter {
             {
                 return Err(CarrierClosed);
             }
-            {
-                let mut credit = shared.credit();
-                credit.sent_bytes = credit.sent_bytes.saturating_add(cost);
-                credit.sent_records = credit.sent_records.saturating_add(records);
-                let in_flight = credit.sent_bytes.saturating_sub(credit.peer_consumed_bytes);
-                let in_flight = usize::try_from(in_flight).unwrap_or(usize::MAX);
-                credit.in_flight_high_water = credit.in_flight_high_water.max(in_flight);
-                // The send half of the coincident pair, read while the credit
-                // lock is held.  See `HopShared::push` for the other half.
-                shared.live.note_send(in_flight);
-            }
+            // Only this writer moves `sent_*`, so a load followed by a store
+            // is the whole update.  The level read back is the true in-flight
+            // level at that instant: the peer's consumption may already have
+            // advanced, never retreated.
+            //
+            // The send half of the coincident pair rises first (see
+            // `HopQueueProducer::push` for the other half), so the reader
+            // task, which lowers it by what a credit releases out of
+            // `sent_bytes`, never lowers it by a charge it has not seen
+            // raised.
+            shared
+                .live
+                .add_send(usize::try_from(cost).unwrap_or(usize::MAX));
+            let credit = &shared.credit;
+            credit.sent_bytes.store(
+                credit
+                    .sent_bytes
+                    .load(Ordering::Acquire)
+                    .saturating_add(cost),
+                Ordering::Release,
+            );
+            credit.sent_records.store(
+                credit
+                    .sent_records
+                    .load(Ordering::Acquire)
+                    .saturating_add(records),
+                Ordering::Release,
+            );
+            let in_flight = usize::try_from(credit.in_flight_bytes()).unwrap_or(usize::MAX);
+            credit
+                .in_flight_high_water
+                .fetch_max(in_flight, Ordering::AcqRel);
             for (permit, piece) in permits.zip(pieces) {
                 permit.send(HopCommand::Record(encode_hop(&HopRecord::Data(piece))));
             }
@@ -1061,42 +1107,48 @@ impl CarrierWriter for PeerHopWriter {
 /// The credited receive side of a peer hop.
 pub(crate) struct PeerHopReader {
     shared: Arc<HopShared>,
+    /// The consuming end of the receive queue.
+    events: mpsc::Receiver<CarrierEvent>,
+    /// Encoded bytes and records this reader has consumed.  Only this reader
+    /// counts them; the hop's writer task learns them from `consumed_tx`.
+    consumed_bytes: u64,
+    consumed_records: u64,
     signal: ResetSignal,
 }
 
 impl CarrierReader for PeerHopReader {
-    fn next(&mut self) -> impl Future<Output = CarrierEvent> + Send {
-        let shared = Arc::clone(&self.shared);
-        async move {
-            loop {
-                let notified = shared.queue_changed.notified();
-                let mut notified = pin!(notified);
-                notified.as_mut().enable();
-                let popped = {
-                    let mut queue = shared.queue();
-                    let event = queue.events.pop_front();
-                    if let Some(CarrierEvent::Data(data)) = &event {
-                        shared.aggregate.release_receive(hop_cost(data.len()));
-                        queue.queued_bytes = queue.queued_bytes.saturating_sub(data.len());
-                        queue.queued_records = queue.queued_records.saturating_sub(1);
-                        queue.consumed_bytes =
-                            queue.consumed_bytes.saturating_add(hop_cost(data.len()));
-                        queue.consumed_records = queue.consumed_records.saturating_add(1);
-                        let consumed = (queue.consumed_bytes, queue.consumed_records);
-                        // Keep the live receive level truthful as the queue
-                        // drains.  A fall never latches, because the latch
-                        // only moves when the smaller half grows.
-                        shared.live.note_receive(queue.queued_bytes);
-                        shared.consumed_tx.send_replace(consumed);
-                    }
-                    event
-                };
-                if let Some(event) = popped {
-                    return event;
-                }
-                notified.await;
-            }
+    async fn next(&mut self) -> CarrierEvent {
+        // Taking an event is cancellation-safe, and nothing awaits between
+        // taking a DATA record and accounting for it.
+        let Some(event) = self.events.recv().await else {
+            // The reader task ended without a terminal event (the hop was
+            // stopped, or the stream ended after the peer's own
+            // terminal).  There is nothing more to deliver, ever.
+            return std::future::pending().await;
+        };
+        if let CarrierEvent::Data(data) = &event {
+            let shared = &self.shared;
+            let cost = hop_cost(data.len());
+            shared.aggregate.release_receive(cost);
+            shared
+                .queue
+                .queued_bytes
+                .fetch_sub(data.len(), Ordering::AcqRel);
+            shared.queue.queued_records.fetch_sub(1, Ordering::AcqRel);
+            shared.queue.queued_cost.fetch_sub(cost, Ordering::AcqRel);
+            self.consumed_bytes = self.consumed_bytes.saturating_add(cost);
+            self.consumed_records = self.consumed_records.saturating_add(1);
+            // Keep the live receive level truthful as the queue drains.
+            // A fall never latches, because the latch only moves when the
+            // smaller half grows.
+            shared.live.sub_receive(data.len());
+            // The levels fall before the consumption is reported, so the
+            // peer cannot use credit the bound check has not yet seen.
+            shared
+                .consumed_tx
+                .send_replace((self.consumed_bytes, self.consumed_records));
         }
+        event
     }
 
     fn reset_signal(&self) -> ResetSignal {
@@ -1113,7 +1165,10 @@ pub(crate) struct PeerHop {
 
 impl PeerHop {
     fn send_in_flight_high_water(&self) -> usize {
-        self.shared.credit().in_flight_high_water
+        self.shared
+            .credit
+            .in_flight_high_water
+            .load(Ordering::Acquire)
     }
 
     /// The owner's refusal of the stream's OPEN, as its peer reported it on
@@ -1132,7 +1187,7 @@ impl PeerHop {
     }
 
     fn receive_queue_high_water(&self) -> usize {
-        self.shared.queue().high_water
+        self.shared.queue.high_water.load(Ordering::Acquire)
     }
 
     /// The send/receive pair at the instant the smaller of the two was
@@ -1163,6 +1218,256 @@ impl PeerHop {
     }
 }
 
+/// How the hop's writer task leaves its send half.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HopWriterEnd {
+    /// This direction reached its own terminal (FIN or RESET): end it cleanly.
+    Finish,
+    /// It did not, or the transport failed: cancel it.
+    Cancel,
+}
+
+/// The send direction of one peer hop.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HopWriterState {
+    /// No terminal sent; the local endpoint still holds the writer.
+    Open,
+    /// FIN sent.  The local endpoint still holds the writer, so a RESET may
+    /// follow, and the peer still needs CREDIT.
+    FinSent,
+    /// FIN sent and the local endpoint released the writer.  Only CREDIT is
+    /// still owed, until the peer's own terminal.
+    FinDrained,
+    /// FIN sent, the writer released and the peer's terminal seen.
+    Completed,
+    /// RESET sent (or being sent): both directions are over.
+    ResetSent,
+    /// The hop was stopped; `after_fin` records whether FIN had been sent.
+    Stopped { after_fin: bool },
+    /// A record could not be sent.
+    Failed,
+}
+
+/// What the writer task's select may offer in a state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HopWriterPhase {
+    Live { commands_open: bool },
+    Ended(HopWriterEnd),
+}
+
+enum HopWriterEvent {
+    Command(HopCommand),
+    /// Every sender of the command channel is gone.
+    CommandsClosed,
+    /// The local reader consumed up to these totals.
+    Consumed {
+        bytes: u64,
+        records: u64,
+    },
+    /// The peer's own terminal arrived.
+    PeerTerminal,
+    Stop,
+    SendFailed,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum HopWriterEffect {
+    /// Send this encoded hop record.
+    Send(Vec<u8>),
+    Nothing,
+}
+
+/// An event its state does not accept.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct HopWriterRefused(HopWriterState);
+
+impl HopWriterState {
+    fn phase(self) -> HopWriterPhase {
+        match self {
+            Self::Open | Self::FinSent => HopWriterPhase::Live {
+                commands_open: true,
+            },
+            Self::FinDrained => HopWriterPhase::Live {
+                commands_open: false,
+            },
+            Self::Completed | Self::ResetSent | Self::Stopped { after_fin: true } => {
+                HopWriterPhase::Ended(HopWriterEnd::Finish)
+            }
+            Self::Stopped { after_fin: false } | Self::Failed => {
+                HopWriterPhase::Ended(HopWriterEnd::Cancel)
+            }
+        }
+    }
+
+    /// The only place the writer's state changes.
+    fn on_event(self, event: HopWriterEvent) -> Result<(Self, HopWriterEffect), HopWriterRefused> {
+        use HopWriterEffect::{Nothing, Send};
+        let send = |record: &HopRecord| Send(encode_hop(record));
+        Ok(match (self, event) {
+            // A stop or a failed send while the terminal RESET is in flight
+            // is the only thing a RESET state still accepts: the stop leaves
+            // the direction terminated, the failure does not.
+            (Self::ResetSent, HopWriterEvent::Stop) => (Self::ResetSent, Nothing),
+            (
+                Self::Open | Self::FinSent | Self::FinDrained | Self::ResetSent,
+                HopWriterEvent::SendFailed,
+            ) => (Self::Failed, Nothing),
+            (Self::Open, HopWriterEvent::Stop) => (Self::Stopped { after_fin: false }, Nothing),
+            (Self::FinSent | Self::FinDrained, HopWriterEvent::Stop) => {
+                (Self::Stopped { after_fin: true }, Nothing)
+            }
+            (
+                state @ (Self::Open | Self::FinSent | Self::FinDrained),
+                HopWriterEvent::Consumed { bytes, records },
+            ) => (state, send(&HopRecord::Credit { bytes, records })),
+
+            (Self::Open, HopWriterEvent::Command(HopCommand::Record(body))) => {
+                (Self::Open, Send(body))
+            }
+            (Self::Open, HopWriterEvent::Command(HopCommand::Fin)) => {
+                (Self::FinSent, send(&HopRecord::Fin))
+            }
+            // The local endpoint dropped the writer before FIN or RESET: the
+            // direction is abandoned, never completed.
+            (Self::Open, HopWriterEvent::CommandsClosed) => (
+                Self::ResetSent,
+                send(&HopRecord::Reset(ResetDetail {
+                    code: HttpErrorCode::StreamInterrupted,
+                    execution: Execution::Unknown,
+                })),
+            ),
+            // DATA after FIN is impossible from the bridge; drop it rather
+            // than violate the peer's directional grammar.  A second FIN is
+            // dropped likewise.
+            (Self::FinSent, HopWriterEvent::Command(HopCommand::Record(_) | HopCommand::Fin)) => {
+                (Self::FinSent, Nothing)
+            }
+            (Self::FinSent, HopWriterEvent::CommandsClosed) => (Self::FinDrained, Nothing),
+            (Self::Open | Self::FinSent, HopWriterEvent::Command(HopCommand::Reset(detail))) => {
+                (Self::ResetSent, send(&HopRecord::Reset(detail)))
+            }
+            (
+                state @ (Self::Open | Self::FinSent),
+                HopWriterEvent::Command(HopCommand::Pause(paused)),
+            ) => (state, send(&HopRecord::Pause(paused))),
+
+            (Self::FinDrained, HopWriterEvent::PeerTerminal) => (Self::Completed, Nothing),
+
+            // The command channel is closed in `FinDrained`, the peer's
+            // terminal is only awaited there, and an ended writer accepts
+            // nothing further.
+            (state, _) => return Err(HopWriterRefused(state)),
+        })
+    }
+}
+
+/// The receive direction of one peer hop, as the peer's records define it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HopReaderState {
+    /// Nothing but CREDIT or PAUSE seen yet.
+    Open,
+    /// The peer reported the owner's refusal of the OPEN: nothing ran, so
+    /// only a RESET may follow.
+    Refused,
+    /// DATA seen.
+    Streaming,
+    /// FIN seen; only a RESET (or CREDIT and PAUSE) may follow.
+    FinSeen,
+    /// RESET seen, the stream ended, or the peer violated the grammar.
+    Ended,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HopReaderEvent {
+    Data,
+    Refused,
+    Fin,
+    Reset,
+    /// CREDIT or PAUSE: valid in every live state and changes none.
+    Control,
+    /// The stream ended, failed, or carried a record of another kind.
+    ReceiveEnded,
+    /// A malformed record, or DATA beyond the window or the aggregate.
+    Violation,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HopReaderVerdict {
+    /// Handle the record.
+    Accept,
+    /// A RESET before the peer's FIN.
+    Reset,
+    /// A RESET after the peer's FIN.
+    ResetAfterFin,
+    /// Drop the record: it repeats what the state already holds.
+    Ignore,
+    /// The direction ended with nothing more to report.
+    Quiet,
+    /// The peer broke the grammar, or the stream ended underneath an
+    /// unfinished direction: report the direction closed.
+    Closed,
+}
+
+/// An event after the direction ended.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct HopReaderRefused(HopReaderEvent);
+
+impl HopReaderState {
+    /// The only place the reader's state changes.
+    fn on_event(self, event: HopReaderEvent) -> Result<(Self, HopReaderVerdict), HopReaderRefused> {
+        use HopReaderVerdict::{Accept, Closed, Ignore, Quiet, Reset, ResetAfterFin};
+        Ok(match (self, event) {
+            (Self::Ended, event) => return Err(HopReaderRefused(event)),
+            (state, HopReaderEvent::Control) => (state, Accept),
+            (_, HopReaderEvent::Violation) => (Self::Ended, Closed),
+
+            (Self::Open | Self::Streaming, HopReaderEvent::Data) => (Self::Streaming, Accept),
+            (Self::Refused | Self::FinSeen, HopReaderEvent::Data) => (Self::Ended, Closed),
+
+            (Self::Open, HopReaderEvent::Refused) => (Self::Refused, Accept),
+            // The refusal is set once; a repeat changes nothing.
+            (Self::Refused, HopReaderEvent::Refused) => (Self::Refused, Ignore),
+            (Self::Streaming | Self::FinSeen, HopReaderEvent::Refused) => (Self::Ended, Closed),
+
+            (Self::Open | Self::Streaming, HopReaderEvent::Fin) => (Self::FinSeen, Accept),
+            // The direction is already finished and its FIN already queued:
+            // a repeat adds nothing, and queueing each one would let a peer
+            // grow the receive queue without bound.
+            (Self::FinSeen, HopReaderEvent::Fin) => (Self::FinSeen, Ignore),
+            (Self::Refused, HopReaderEvent::Fin) => (Self::Ended, Closed),
+
+            (Self::FinSeen, HopReaderEvent::Reset) => (Self::Ended, ResetAfterFin),
+            (Self::Open | Self::Refused | Self::Streaming, HopReaderEvent::Reset) => {
+                (Self::Ended, Reset)
+            }
+
+            // After the peer's own terminal a stream end is expected;
+            // anywhere else the direction closed underneath it.
+            (Self::FinSeen, HopReaderEvent::ReceiveEnded) => (Self::Ended, Quiet),
+            (Self::Open | Self::Refused | Self::Streaming, HopReaderEvent::ReceiveEnded) => {
+                (Self::Ended, Closed)
+            }
+        })
+    }
+
+    /// Apply one event in place; `None` if the direction had already ended.
+    fn step(&mut self, event: HopReaderEvent) -> Option<HopReaderVerdict> {
+        match self.on_event(event) {
+            Ok((next, verdict)) => {
+                *self = next;
+                Some(verdict)
+            }
+            Err(refused) => {
+                tracing::debug!(
+                    refused = ?refused,
+                    phase = "http_forward_peer_hop_reader_state"
+                );
+                None
+            }
+        }
+    }
+}
+
 /// Start one credited peer hop over an established request stream.
 pub(crate) fn spawn_peer_hop<S: PeerSendHalf, R: PeerRecvHalf>(
     mut send: S,
@@ -1172,10 +1477,9 @@ pub(crate) fn spawn_peer_hop<S: PeerSendHalf, R: PeerRecvHalf>(
 ) -> (PeerHopWriter, PeerHopReader, PeerHop) {
     let (consumed_tx, mut consumed_rx) = watch::channel((0u64, 0u64));
     let shared = Arc::new(HopShared {
-        credit: Mutex::new(CreditState::default()),
+        credit: CreditState::default(),
         credit_changed: Notify::new(),
-        queue: Mutex::new(QueueState::default()),
-        queue_changed: Notify::new(),
+        queue: QueueState::default(),
         consumed_tx,
         peer_terminal: CancellationToken::new(),
         stop: CancellationToken::new(),
@@ -1187,97 +1491,92 @@ pub(crate) fn spawn_peer_hop<S: PeerSendHalf, R: PeerRecvHalf>(
     let (notifier, signal): (ResetNotifier, ResetSignal) = reset_signal_pair();
     let (commands, mut command_rx) = mpsc::channel::<HopCommand>(4);
 
+    let (events, queued_events) = mpsc::channel::<CarrierEvent>(HOP_QUEUE_EVENTS);
+
     let writer_shared = Arc::clone(&shared);
     let writer_task = tokio::spawn(async move {
         let shared = writer_shared;
-        let mut fin_sent = false;
-        let mut reset_sent = false;
-        let mut commands_closed = false;
-        let mut failed = false;
-        loop {
-            // A RESET ends both directions.  After FIN the writer stays open
-            // for a later RESET until the local endpoint releases it, and
-            // until the peer's own terminal ends the need for CREDIT.
-            if reset_sent || (fin_sent && commands_closed && shared.peer_terminal.is_cancelled()) {
-                break;
-            }
-            enum Step {
-                Command(Option<HopCommand>),
-                Credit,
-                PeerTerminal,
-                Stop,
-            }
-            let step = tokio::select! {
-                biased;
-                () = shared.stop.cancelled() => Step::Stop,
-                command = command_rx.recv(), if !commands_closed => Step::Command(command),
-                changed = consumed_rx.changed(), if !shared.peer_terminal.is_cancelled() => {
-                    if changed.is_err() { Step::Stop } else { Step::Credit }
-                }
-                () = shared.peer_terminal.cancelled(), if commands_closed => Step::PeerTerminal,
+        let mut state = HopWriterState::Open;
+        // A RESET ends both directions.  After FIN the writer stays open for
+        // a later RESET until the local endpoint releases it, and until the
+        // peer's own terminal ends the need for CREDIT.
+        let end = loop {
+            let commands_open = match state.phase() {
+                HopWriterPhase::Ended(end) => break end,
+                HopWriterPhase::Live { commands_open } => commands_open,
             };
-            let body = match step {
-                Step::Stop => break,
-                Step::PeerTerminal => continue,
-                Step::Credit => {
-                    let (bytes, records) = *consumed_rx.borrow_and_update();
-                    encode_hop(&HopRecord::Credit { bytes, records })
-                }
-                Step::Command(None) => {
-                    commands_closed = true;
-                    if fin_sent {
-                        continue;
+            let event = tokio::select! {
+                biased;
+                () = shared.stop.cancelled() => HopWriterEvent::Stop,
+                command = command_rx.recv(), if commands_open => match command {
+                    Some(command) => HopWriterEvent::Command(command),
+                    None => HopWriterEvent::CommandsClosed,
+                },
+                changed = consumed_rx.changed(), if !shared.peer_terminal.is_cancelled() => {
+                    if changed.is_err() {
+                        HopWriterEvent::Stop
+                    } else {
+                        let (bytes, records) = *consumed_rx.borrow_and_update();
+                        HopWriterEvent::Consumed { bytes, records }
                     }
-                    // The local endpoint dropped the writer before FIN or
-                    // RESET: the direction is abandoned, never completed.
-                    reset_sent = true;
-                    encode_hop(&HopRecord::Reset(ResetDetail {
-                        code: HttpErrorCode::StreamInterrupted,
-                        execution: Execution::Unknown,
-                    }))
                 }
-                // DATA after FIN is impossible from the bridge; drop it
-                // rather than violate the peer's directional grammar.
-                Step::Command(Some(HopCommand::Record(_))) if fin_sent => continue,
-                Step::Command(Some(HopCommand::Record(body))) => body,
-                Step::Command(Some(HopCommand::Fin)) if fin_sent => continue,
-                Step::Command(Some(HopCommand::Fin)) => {
-                    fin_sent = true;
-                    encode_hop(&HopRecord::Fin)
+                () = shared.peer_terminal.cancelled(), if !commands_open => {
+                    HopWriterEvent::PeerTerminal
                 }
-                Step::Command(Some(HopCommand::Reset(detail))) => {
-                    reset_sent = true;
-                    encode_hop(&HopRecord::Reset(detail))
+            };
+            let body = match state.on_event(event) {
+                Ok((next, effect)) => {
+                    state = next;
+                    match effect {
+                        HopWriterEffect::Send(body) => body,
+                        HopWriterEffect::Nothing => continue,
+                    }
                 }
-                Step::Command(Some(HopCommand::Pause(paused))) => {
-                    encode_hop(&HopRecord::Pause(paused))
+                Err(refused) => {
+                    // The select above only offers the events its state
+                    // accepts, so this is a defect, not a peer's doing.
+                    tracing::debug!(
+                        refused = ?refused,
+                        phase = "http_forward_peer_hop_writer_state"
+                    );
+                    break HopWriterEnd::Cancel;
                 }
             };
             let sent = tokio::select! {
                 biased;
-                () = shared.stop.cancelled() => break,
-                sent = send.send_record(&body) => sent,
+                () = shared.stop.cancelled() => Err(None),
+                sent = send.send_record(&body) => sent.map_err(Some),
             };
-            if let Err(error) = &sent {
-                tracing::debug!(error = %error, phase = "http_forward_peer_hop_send");
-                failed = true;
-                break;
+            let after_send = match sent {
+                Ok(()) => continue,
+                Err(None) => HopWriterEvent::Stop,
+                Err(Some(error)) => {
+                    tracing::debug!(error = %error, phase = "http_forward_peer_hop_send");
+                    HopWriterEvent::SendFailed
+                }
+            };
+            match state.on_event(after_send) {
+                Ok((next, _)) => state = next,
+                Err(_) => break HopWriterEnd::Cancel,
             }
-        }
+        };
         shared.close_credit();
-        let local_terminal = fin_sent || reset_sent;
-        if failed || !local_terminal {
-            send.cancel();
-        } else {
-            let _ = tokio::time::timeout(Duration::from_secs(5), send.finish()).await;
+        match end {
+            HopWriterEnd::Cancel => send.cancel(),
+            HopWriterEnd::Finish => {
+                let _ = tokio::time::timeout(Duration::from_secs(5), send.finish()).await;
+            }
         }
     });
 
     let reader_shared = Arc::clone(&shared);
     let reader_task = tokio::spawn(async move {
         let shared = reader_shared;
-        let mut fin_seen = false;
-        let mut data_seen = false;
+        let queue = HopQueueProducer {
+            shared: Arc::clone(&shared),
+            events,
+        };
+        let mut state = HopReaderState::Open;
         loop {
             let received = tokio::select! {
                 biased;
@@ -1292,97 +1591,99 @@ pub(crate) fn spawn_peer_hop<S: PeerSendHalf, R: PeerRecvHalf>(
                         failed = other.is_err(),
                         phase = "http_forward_peer_hop_receive_end"
                     );
-                    if !shared.peer_terminal.is_cancelled() {
-                        shared.push(CarrierEvent::Closed);
+                    if state.step(HopReaderEvent::ReceiveEnded) == Some(HopReaderVerdict::Closed) {
+                        queue.push(CarrierEvent::Closed);
                     }
                     break;
                 }
             };
             let Some(decoded) = decode_hop(record.body()) else {
-                shared.push(CarrierEvent::Closed);
+                state.step(HopReaderEvent::Violation);
+                queue.push(CarrierEvent::Closed);
                 break;
             };
             drop(record);
+            let event = match &decoded {
+                HopRecord::Data(_) => HopReaderEvent::Data,
+                HopRecord::Refused(_) => HopReaderEvent::Refused,
+                HopRecord::Fin => HopReaderEvent::Fin,
+                HopRecord::Reset(_) => HopReaderEvent::Reset,
+                HopRecord::Credit { .. } | HopRecord::Pause(_) => HopReaderEvent::Control,
+            };
+            let verdict = match state.step(event) {
+                // After a recorded refusal nothing ran, so DATA is a protocol
+                // violation, and a refused stream ends with RESET, never FIN
+                // (task row M6-C213).  A refusal is only valid before any
+                // DATA or terminal: a refused OPEN ran nothing.
+                Some(HopReaderVerdict::Closed) | None => {
+                    queue.push(CarrierEvent::Closed);
+                    break;
+                }
+                Some(HopReaderVerdict::Ignore) => continue,
+                Some(verdict) => verdict,
+            };
             match decoded {
                 HopRecord::Data(data) => {
-                    // After a recorded refusal nothing ran, so DATA is a
-                    // protocol violation (task row M6-C213).
-                    if fin_seen
-                        || shared.peer_terminal.is_cancelled()
-                        || shared.open_refusal.get().is_some()
-                    {
-                        shared.push(CarrierEvent::Closed);
-                        break;
-                    }
                     // The sender may not exceed the window this side has
                     // granted; a violation is a protocol failure, not a
                     // reason to queue more.
-                    let over = {
-                        let queue = shared.queue();
-                        queue.queued_bytes.saturating_add(data.len()) > PEER_HOP_WINDOW_BYTES
-                            || queue.queued_records >= PEER_HOP_WINDOW_RECORDS
-                    };
-                    if over {
+                    if queue.over_window(data.len()) {
                         tracing::debug!(phase = "http_forward_peer_hop_window_violation");
-                        shared.push(CarrierEvent::Closed);
+                        state.step(HopReaderEvent::Violation);
+                        queue.push(CarrierEvent::Closed);
                         break;
                     }
                     // The same peer's HTTP hops together may not exceed the
                     // aggregate its own sender bound respects.
                     if !shared.aggregate.charge_receive(hop_cost(data.len())) {
                         tracing::debug!(phase = "http_forward_peer_hop_aggregate_violation");
-                        shared.push(CarrierEvent::Closed);
+                        state.step(HopReaderEvent::Violation);
+                        queue.push(CarrierEvent::Closed);
                         break;
                     }
-                    data_seen = true;
-                    shared.push(CarrierEvent::Data(data));
+                    queue.push(CarrierEvent::Data(data));
                 }
                 HopRecord::Refused(code) => {
-                    // Only before any DATA or terminal: a refused OPEN ran
-                    // nothing.  Anywhere else it is a protocol violation.
-                    if data_seen || fin_seen || shared.peer_terminal.is_cancelled() {
-                        shared.push(CarrierEvent::Closed);
-                        break;
-                    }
                     let _ = shared.open_refusal.set(code);
                 }
                 HopRecord::Fin => {
-                    // A refused stream ends with RESET, never FIN (task row
-                    // M6-C213).
-                    if shared.open_refusal.get().is_some() {
-                        shared.push(CarrierEvent::Closed);
-                        break;
-                    }
-                    fin_seen = true;
                     shared.peer_terminal.cancel();
-                    shared.push(CarrierEvent::Fin);
+                    queue.push(CarrierEvent::Fin);
                 }
                 HopRecord::Reset(detail) => {
                     notifier.notify(SignaledReset {
                         detail,
-                        after_fin: fin_seen,
+                        after_fin: verdict == HopReaderVerdict::ResetAfterFin,
                     });
                     shared.peer_terminal.cancel();
-                    shared.push(CarrierEvent::Reset(detail));
+                    queue.push(CarrierEvent::Reset(detail));
                     break;
                 }
                 HopRecord::Credit { bytes, records } => {
-                    let released = {
-                        let mut credit = shared.credit();
-                        // Consumption can never exceed what was sent.
-                        let bytes = bytes.min(credit.sent_bytes);
-                        let released = bytes.saturating_sub(credit.peer_consumed_bytes);
-                        credit.peer_consumed_bytes = credit.peer_consumed_bytes.max(bytes);
-                        credit.peer_consumed_records = credit.peer_consumed_records.max(records);
-                        // Keep the live send level truthful as the peer
-                        // reports consumption.  A fall never latches.
-                        let in_flight =
-                            credit.sent_bytes.saturating_sub(credit.peer_consumed_bytes);
-                        shared
-                            .live
-                            .note_send(usize::try_from(in_flight).unwrap_or(usize::MAX));
-                        released
-                    };
+                    // Only this task moves `peer_consumed_*`, so a load
+                    // followed by a store is the whole update.  The writer
+                    // charges `sent_bytes` before it sends what a credit can
+                    // name, so the clamp reads a figure that already covers
+                    // it.  Consumption can never exceed what was sent.
+                    let credit = &shared.credit;
+                    let bytes = bytes.min(credit.sent_bytes.load(Ordering::Acquire));
+                    let consumed = credit.peer_consumed_bytes.load(Ordering::Acquire);
+                    let released = bytes.saturating_sub(consumed);
+                    credit
+                        .peer_consumed_bytes
+                        .store(consumed.max(bytes), Ordering::Release);
+                    credit.peer_consumed_records.store(
+                        credit
+                            .peer_consumed_records
+                            .load(Ordering::Acquire)
+                            .max(records),
+                        Ordering::Release,
+                    );
+                    // Keep the live send level truthful as the peer reports
+                    // consumption.  A fall never latches.
+                    shared
+                        .live
+                        .sub_send(usize::try_from(released).unwrap_or(usize::MAX));
                     shared.aggregate.release_send(released);
                     shared.credit_changed.notify_waiters();
                 }
@@ -1402,6 +1703,9 @@ pub(crate) fn spawn_peer_hop<S: PeerSendHalf, R: PeerRecvHalf>(
         },
         PeerHopReader {
             shared: Arc::clone(&shared),
+            events: queued_events,
+            consumed_bytes: 0,
+            consumed_records: 0,
             signal,
         },
         PeerHop {
@@ -1803,6 +2107,7 @@ pub(crate) async fn http_forward_route(
     let Some(scope_permit) = state
         .scoped_admission
         .try_acquire(OwnerScope::new(grant.tenant_id, device_id))
+        .await
     else {
         return admission_limit_response(ADMISSION_LIMIT_RETRY_AFTER_MS);
     };
@@ -1925,6 +2230,20 @@ pub(crate) async fn http_forward_route(
                     Some(request_id.clone()),
                 ),
             );
+            // Before anything is opened on the owner: without the peer's
+            // shared aggregate the hop would be unbounded across streams, so
+            // it is refused as the peer byte budget being unavailable
+            // (`PEER_UNAVAILABLE`, `not_dispatched`).
+            let Some(aggregate) = state
+                .handle
+                .http_hop_aggregates()
+                .for_peer(&route.owner_token().node_id)
+                .await
+            else {
+                let error = PeerRuntimeError::Transport(PeerTransportError::Capacity);
+                state.handle.record_peer_fault(&fault, &error);
+                return peer_failure_response(error);
+            };
             let admission = match timeout(
                 state.limits.operation_timeout,
                 open_remote_http_admission(
@@ -1954,10 +2273,6 @@ pub(crate) async fn http_forward_route(
             };
             fault.mark(PeerOpenDiagnosticStage::Body);
             let (_, send, recv) = admission.into_parts();
-            let aggregate = state
-                .handle
-                .http_hop_aggregates()
-                .for_peer(&route.owner_token().node_id);
             let (hop_writer, hop_reader, hop) =
                 spawn_peer_hop(send, recv, exchange_deadline, aggregate);
             // Publish this hop's live pair while the exchange runs.  The
@@ -2398,6 +2713,11 @@ pub(crate) async fn handle_peer_http_stream(
     let request_id = request.envelope().request_id.clone();
     let source_node = request.envelope().source.node_id.clone();
     let admission_context = request.admission_cancellation_context();
+    // Before the stream is registered: without the peer's shared aggregate
+    // the hop would be unbounded across streams, so it is refused.
+    let Some(aggregate) = handle.http_hop_aggregates().for_peer(&source_node).await else {
+        return Err(PeerRuntimeError::Closed);
+    };
     let watch = watches_principal_sessions(&export).then(|| (consumer.clone(), grant.tenant_id));
     let registration = match handle
         .open_http_stream(
@@ -2475,7 +2795,6 @@ pub(crate) async fn handle_peer_http_stream(
         .unwrap_or_default()
         .min(tunnel_http_bridge::MAX_DEADLINE);
     let deadline = tokio::time::Instant::now() + token_remaining;
-    let aggregate = handle.http_hop_aggregates().for_peer(&source_node);
     let (hop_writer, hop_reader, hop) = spawn_peer_hop(send, recv, deadline, aggregate);
     // A refused OPEN is told to the ingress before this direction's RESET
     // (task row M6-C213).
@@ -3673,5 +3992,337 @@ mod tests {
         closed.cancel();
         assert_eq!(accepted_peer_reset(closed, reset_rx.clone()).await, None);
         assert_eq!(reset_behind_close(&reset_rx), None);
+    }
+
+    fn reset_detail() -> ResetDetail {
+        ResetDetail {
+            code: HttpErrorCode::StreamInterrupted,
+            execution: Execution::Unknown,
+        }
+    }
+
+    fn sends(record: &HopRecord) -> HopWriterEffect {
+        HopWriterEffect::Send(encode_hop(record))
+    }
+
+    /// Every legal transition of the hop writer, with the record it sends.
+    #[test]
+    fn the_hop_writer_transition_table_is_exact() {
+        use HopWriterEffect::Nothing;
+        use HopWriterState::{Completed, Failed, FinDrained, FinSent, Open, ResetSent, Stopped};
+        let record = || HopCommand::Record(vec![1, 2, 3]);
+        let credit = HopRecord::Credit {
+            bytes: 9,
+            records: 2,
+        };
+        let consumed = || HopWriterEvent::Consumed {
+            bytes: 9,
+            records: 2,
+        };
+        let interrupted = sends(&HopRecord::Reset(reset_detail()));
+        let cases: Vec<(
+            HopWriterState,
+            HopWriterEvent,
+            HopWriterState,
+            HopWriterEffect,
+        )> = vec![
+            (
+                Open,
+                HopWriterEvent::Command(record()),
+                Open,
+                HopWriterEffect::Send(vec![1, 2, 3]),
+            ),
+            (
+                Open,
+                HopWriterEvent::Command(HopCommand::Fin),
+                FinSent,
+                sends(&HopRecord::Fin),
+            ),
+            (
+                Open,
+                HopWriterEvent::Command(HopCommand::Reset(reset_detail())),
+                ResetSent,
+                sends(&HopRecord::Reset(reset_detail())),
+            ),
+            (
+                Open,
+                HopWriterEvent::Command(HopCommand::Pause(true)),
+                Open,
+                sends(&HopRecord::Pause(true)),
+            ),
+            // An abandoned direction is reset, never completed.
+            (Open, HopWriterEvent::CommandsClosed, ResetSent, interrupted),
+            (Open, consumed(), Open, sends(&credit)),
+            (
+                Open,
+                HopWriterEvent::Stop,
+                Stopped { after_fin: false },
+                Nothing,
+            ),
+            (Open, HopWriterEvent::SendFailed, Failed, Nothing),
+            // After FIN: DATA and a second FIN are dropped, RESET still goes.
+            (FinSent, HopWriterEvent::Command(record()), FinSent, Nothing),
+            (
+                FinSent,
+                HopWriterEvent::Command(HopCommand::Fin),
+                FinSent,
+                Nothing,
+            ),
+            (
+                FinSent,
+                HopWriterEvent::Command(HopCommand::Reset(reset_detail())),
+                ResetSent,
+                sends(&HopRecord::Reset(reset_detail())),
+            ),
+            (
+                FinSent,
+                HopWriterEvent::Command(HopCommand::Pause(false)),
+                FinSent,
+                sends(&HopRecord::Pause(false)),
+            ),
+            (FinSent, HopWriterEvent::CommandsClosed, FinDrained, Nothing),
+            (FinSent, consumed(), FinSent, sends(&credit)),
+            (
+                FinSent,
+                HopWriterEvent::Stop,
+                Stopped { after_fin: true },
+                Nothing,
+            ),
+            (FinSent, HopWriterEvent::SendFailed, Failed, Nothing),
+            // Released after FIN: CREDIT until the peer's terminal.
+            (FinDrained, consumed(), FinDrained, sends(&credit)),
+            (FinDrained, HopWriterEvent::PeerTerminal, Completed, Nothing),
+            (
+                FinDrained,
+                HopWriterEvent::Stop,
+                Stopped { after_fin: true },
+                Nothing,
+            ),
+            (FinDrained, HopWriterEvent::SendFailed, Failed, Nothing),
+            // The RESET in flight: a stop leaves it sent, a failure does not.
+            (ResetSent, HopWriterEvent::Stop, ResetSent, Nothing),
+            (ResetSent, HopWriterEvent::SendFailed, Failed, Nothing),
+        ];
+        for (index, (state, event, next, effect)) in cases.into_iter().enumerate() {
+            assert_eq!(state.on_event(event), Ok((next, effect)), "case {index}");
+        }
+    }
+
+    /// Events a writer state does not accept are refused and change nothing.
+    #[test]
+    fn the_hop_writer_refuses_events_its_state_cannot_receive() {
+        use HopWriterState::{Completed, Failed, FinDrained, FinSent, Open, ResetSent, Stopped};
+        let refused: Vec<(HopWriterState, HopWriterEvent)> = vec![
+            // The peer's terminal is only awaited once the writer is released.
+            (Open, HopWriterEvent::PeerTerminal),
+            (FinSent, HopWriterEvent::PeerTerminal),
+            // The command channel is closed in `FinDrained`.
+            (FinDrained, HopWriterEvent::Command(HopCommand::Fin)),
+            (
+                FinDrained,
+                HopWriterEvent::Command(HopCommand::Record(vec![1])),
+            ),
+            (
+                FinDrained,
+                HopWriterEvent::Command(HopCommand::Reset(reset_detail())),
+            ),
+            (FinDrained, HopWriterEvent::Command(HopCommand::Pause(true))),
+            (FinDrained, HopWriterEvent::CommandsClosed),
+            // Nothing follows a RESET but the end of its own send.
+            (ResetSent, HopWriterEvent::Command(HopCommand::Fin)),
+            (ResetSent, HopWriterEvent::CommandsClosed),
+            (
+                ResetSent,
+                HopWriterEvent::Consumed {
+                    bytes: 1,
+                    records: 1,
+                },
+            ),
+            (ResetSent, HopWriterEvent::PeerTerminal),
+        ];
+        for (index, (state, event)) in refused.into_iter().enumerate() {
+            assert_eq!(
+                state.on_event(event),
+                Err(HopWriterRefused(state)),
+                "case {index}"
+            );
+        }
+        // An ended writer accepts nothing at all.
+        for state in [
+            Completed,
+            Failed,
+            Stopped { after_fin: false },
+            Stopped { after_fin: true },
+        ] {
+            let events = [
+                HopWriterEvent::Command(HopCommand::Fin),
+                HopWriterEvent::CommandsClosed,
+                HopWriterEvent::Consumed {
+                    bytes: 1,
+                    records: 1,
+                },
+                HopWriterEvent::PeerTerminal,
+                HopWriterEvent::Stop,
+                HopWriterEvent::SendFailed,
+            ];
+            for event in events {
+                assert_eq!(state.on_event(event), Err(HopWriterRefused(state)));
+            }
+        }
+    }
+
+    /// The send half is finished only when this direction reached its own
+    /// terminal and the transport did not fail.
+    #[test]
+    fn the_hop_writer_finishes_only_a_terminated_direction() {
+        use HopWriterState::{Completed, Failed, FinDrained, FinSent, Open, ResetSent, Stopped};
+        let live = |commands_open| HopWriterPhase::Live { commands_open };
+        assert_eq!(Open.phase(), live(true));
+        assert_eq!(FinSent.phase(), live(true));
+        assert_eq!(FinDrained.phase(), live(false));
+        for state in [Completed, ResetSent, Stopped { after_fin: true }] {
+            assert_eq!(state.phase(), HopWriterPhase::Ended(HopWriterEnd::Finish));
+        }
+        for state in [Failed, Stopped { after_fin: false }] {
+            assert_eq!(state.phase(), HopWriterPhase::Ended(HopWriterEnd::Cancel));
+        }
+    }
+
+    /// Every transition of the hop reader.
+    #[test]
+    fn the_hop_reader_transition_table_is_exact() {
+        use HopReaderEvent as Event;
+        use HopReaderState::{Ended, FinSeen, Open, Refused, Streaming};
+        use HopReaderVerdict::{Accept, Closed, Ignore, Quiet, Reset, ResetAfterFin};
+        let cases = [
+            (Open, Event::Data, Streaming, Accept),
+            (Open, Event::Refused, Refused, Accept),
+            (Open, Event::Fin, FinSeen, Accept),
+            (Open, Event::Reset, Ended, Reset),
+            (Open, Event::Control, Open, Accept),
+            (Open, Event::ReceiveEnded, Ended, Closed),
+            (Open, Event::Violation, Ended, Closed),
+            // A refused OPEN ran nothing: only RESET may follow.
+            (Refused, Event::Data, Ended, Closed),
+            (Refused, Event::Refused, Refused, Ignore),
+            (Refused, Event::Fin, Ended, Closed),
+            (Refused, Event::Reset, Ended, Reset),
+            (Refused, Event::Control, Refused, Accept),
+            (Refused, Event::ReceiveEnded, Ended, Closed),
+            (Refused, Event::Violation, Ended, Closed),
+            // A refusal is only valid before any DATA.
+            (Streaming, Event::Data, Streaming, Accept),
+            (Streaming, Event::Refused, Ended, Closed),
+            (Streaming, Event::Fin, FinSeen, Accept),
+            (Streaming, Event::Reset, Ended, Reset),
+            (Streaming, Event::Control, Streaming, Accept),
+            (Streaming, Event::ReceiveEnded, Ended, Closed),
+            (Streaming, Event::Violation, Ended, Closed),
+            // After FIN: no DATA, no refusal; a RESET is marked as after FIN
+            // and the stream's end is expected.
+            (FinSeen, Event::Data, Ended, Closed),
+            (FinSeen, Event::Refused, Ended, Closed),
+            (FinSeen, Event::Fin, FinSeen, Ignore),
+            (FinSeen, Event::Reset, Ended, ResetAfterFin),
+            (FinSeen, Event::Control, FinSeen, Accept),
+            (FinSeen, Event::ReceiveEnded, Ended, Quiet),
+            (FinSeen, Event::Violation, Ended, Closed),
+        ];
+        for (state, event, next, verdict) in cases {
+            assert_eq!(
+                state.on_event(event),
+                Ok((next, verdict)),
+                "{state:?} {event:?}"
+            );
+        }
+        // An ended direction accepts nothing, and `step` leaves it ended.
+        for event in [
+            Event::Data,
+            Event::Refused,
+            Event::Fin,
+            Event::Reset,
+            Event::Control,
+            Event::ReceiveEnded,
+            Event::Violation,
+        ] {
+            assert_eq!(Ended.on_event(event), Err(HopReaderRefused(event)));
+            let mut state = Ended;
+            assert_eq!(state.step(event), None);
+            assert_eq!(state, Ended);
+        }
+    }
+
+    /// A peer that repeats FIN gets one FIN delivered and cannot grow the
+    /// receive queue: the repeats are dropped, and a RESET after them still
+    /// arrives marked as after FIN.
+    #[tokio::test]
+    async fn a_repeated_fin_is_delivered_once_and_never_queued_again() {
+        let (writer, mut pair) = refusal_hop_pair();
+        // Straight onto the wire: the sending writer itself drops a second
+        // FIN, so the repeats are sent as raw records.
+        for _ in 0..(HOP_QUEUE_EVENTS * 4) {
+            writer
+                .commands
+                .send(HopCommand::Record(encode_hop(&HopRecord::Fin)))
+                .await
+                .expect("raw FIN");
+        }
+        writer
+            .commands
+            .send(HopCommand::Record(encode_hop(&HopRecord::Reset(
+                reset_detail(),
+            ))))
+            .await
+            .expect("raw RESET");
+        let first = tokio::time::timeout(Duration::from_secs(2), pair.receiver_reader.next()).await;
+        assert!(matches!(first, Ok(CarrierEvent::Fin)), "{first:?}");
+        let second =
+            tokio::time::timeout(Duration::from_secs(2), pair.receiver_reader.next()).await;
+        assert!(matches!(second, Ok(CarrierEvent::Reset(_))), "{second:?}");
+    }
+
+    /// The receive queue's byte and record levels follow every push and pop,
+    /// and its high-water mark keeps the peak.
+    #[tokio::test]
+    async fn the_receive_queue_levels_follow_every_push_and_pop() {
+        let (mut writer, mut pair) = refusal_hop_pair();
+        for _ in 0..3 {
+            writer
+                .data(Bytes::from_static(b"12345"))
+                .await
+                .expect("data");
+        }
+        let shared = Arc::clone(&pair._receiver.shared);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while shared.queue.queued_records.load(Ordering::Acquire) != 3 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("three records queued");
+        assert_eq!(shared.queue.queued_bytes.load(Ordering::Acquire), 15);
+        assert_eq!(
+            shared.queue.queued_cost.load(Ordering::Acquire),
+            3 * hop_cost(5)
+        );
+        assert_eq!(pair._receiver.receive_queue_high_water(), 15);
+        assert_eq!(shared.aggregate.current().1, 3 * hop_cost(5));
+        assert!(matches!(
+            pair.receiver_reader.next().await,
+            CarrierEvent::Data(_)
+        ));
+        assert_eq!(shared.queue.queued_records.load(Ordering::Acquire), 2);
+        assert_eq!(shared.queue.queued_bytes.load(Ordering::Acquire), 10);
+        assert_eq!(
+            *shared.consumed_tx.borrow(),
+            (hop_cost(5), 1),
+            "consumption is reported per record"
+        );
+        assert_eq!(
+            pair._receiver.receive_queue_high_water(),
+            15,
+            "the peak stays"
+        );
+        assert_eq!(shared.aggregate.current().1, 2 * hop_cost(5));
     }
 }

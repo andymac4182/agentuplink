@@ -40,7 +40,7 @@
 
 mod common;
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use agent_client_protocol::schema::ProtocolVersion;
@@ -53,15 +53,21 @@ use agent_client_protocol::{Agent, ConnectionTo};
 use agent_client_protocol_http::HttpClient;
 use common::{acp_export, gateway, http2_client, sse_payloads, within};
 use serde_json::Value;
+use tokio::sync::mpsc;
 
-/// Everything the client's own handlers saw, in the order they ran.
+/// Everything the client's own handlers saw, in the order they ran: each
+/// handler sends what it saw, and the test drains both queues afterwards.
 ///
 /// Deliberately named for what it is.  Handler order is **not** wire order,
 /// and this record is only ever compared as a multiset.
-#[derive(Clone, Debug, Default)]
 struct HandlerRecord {
-    updates: Arc<Mutex<Vec<String>>>,
-    permissions: Arc<Mutex<Vec<String>>>,
+    updates: mpsc::UnboundedReceiver<String>,
+    permissions: mpsc::UnboundedReceiver<String>,
+}
+
+/// Everything queued so far, in the order it was sent.
+fn drain(queue: &mut mpsc::UnboundedReceiver<String>) -> Vec<String> {
+    core::iter::from_fn(|| queue.try_recv().ok()).collect()
 }
 
 fn update_text(notification: &SessionNotification) -> String {
@@ -80,14 +86,17 @@ fn update_text(notification: &SessionNotification) -> String {
 async fn the_pinned_client_completes_a_v1_conversation_with_a_permission_callback() {
     let workspace = tempfile::tempdir().expect("workspace");
     let export = acp_export(workspace.path());
-    let gateway = gateway(export.clone());
+    let mut gateway = gateway(export.clone());
     let endpoint = gateway.endpoint();
-    let record = HandlerRecord::default();
-
-    let updates = Arc::clone(&record.updates);
-    let permissions = Arc::clone(&record.permissions);
+    let (updates, seen_updates) = mpsc::unbounded_channel();
+    let (permissions, seen_permissions) = mpsc::unbounded_channel();
+    let mut record = HandlerRecord {
+        updates: seen_updates,
+        permissions: seen_permissions,
+    };
     let cwd = workspace.path().to_path_buf();
-    let outcome: Arc<Mutex<Option<StopReason>>> = Arc::new(Mutex::new(None));
+    // Set once, by the conversation, when the prompt's result arrives.
+    let outcome: Arc<OnceLock<StopReason>> = Arc::new(OnceLock::new());
     let seen_stop = Arc::clone(&outcome);
 
     let client = HttpClient::with_endpoint_and_client(&endpoint, http2_client())
@@ -98,10 +107,7 @@ async fn the_pinned_client_completes_a_v1_conversation_with_a_permission_callbac
             .builder()
             .on_receive_notification(
                 async move |notification: SessionNotification, _context| {
-                    updates
-                        .lock()
-                        .expect("lock")
-                        .push(update_text(&notification));
+                    let _ = updates.send(update_text(&notification));
                     Ok(())
                 },
                 agent_client_protocol::on_receive_notification!(),
@@ -118,10 +124,7 @@ async fn the_pinned_client_completes_a_v1_conversation_with_a_permission_callbac
                         })
                         .map(|option| option.option_id.clone())
                         .expect("the agent offered the permit option");
-                    permissions
-                        .lock()
-                        .expect("lock")
-                        .push(option.0.as_ref().to_owned());
+                    let _ = permissions.send(option.0.as_ref().to_owned());
                     responder.respond(RequestPermissionResponse::new(
                         RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(option)),
                     ))
@@ -152,7 +155,9 @@ async fn the_pinned_client_completes_a_v1_conversation_with_a_permission_callbac
                     ))
                     .block_task()
                     .await?;
-                *seen_stop.lock().expect("lock") = Some(prompt.stop_reason);
+                seen_stop
+                    .set(prompt.stop_reason)
+                    .expect("the conversation records one stop reason");
                 Ok(())
             }),
     )
@@ -164,7 +169,7 @@ async fn the_pinned_client_completes_a_v1_conversation_with_a_permission_callbac
     // `stopReason` is read from the message the client received, which the
     // bridge put on the session GET.  No status says a turn finished.
     assert_eq!(
-        *outcome.lock().expect("lock"),
+        outcome.get().copied(),
         Some(StopReason::EndTurn),
         "the turn ended with end_turn, read off the wire"
     );
@@ -188,11 +193,11 @@ async fn the_pinned_client_completes_a_v1_conversation_with_a_permission_callbac
     // The client's handlers saw one permission and the agent's chunks.  This
     // is a multiset claim on purpose: handler order is the SDK's business.
     assert_eq!(
-        record.permissions.lock().expect("lock").len(),
+        drain(&mut record.permissions).len(),
         1,
         "exactly one permission reached the host"
     );
-    let mut handler_updates = record.updates.lock().expect("lock").clone();
+    let mut handler_updates = drain(&mut record.updates);
     handler_updates.sort();
     assert!(
         handler_updates
@@ -280,7 +285,8 @@ async fn the_pinned_clients_own_delete_ends_the_child() {
     let gateway = gateway(export.clone());
     let endpoint = gateway.endpoint();
     let cwd = workspace.path().to_path_buf();
-    let pids: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
+    // Set once, by the conversation, right after `initialize`.
+    let pids: Arc<OnceLock<Vec<u32>>> = Arc::new(OnceLock::new());
     let observed = Arc::clone(&pids);
     let live = export.clone();
 
@@ -297,7 +303,9 @@ async fn the_pinned_clients_own_delete_ends_the_child() {
                     .send_request(InitializeRequest::new(ProtocolVersion::V1))
                     .block_task()
                     .await?;
-                *observed.lock().expect("lock") = live.child_pids();
+                observed
+                    .set(live.child_pids())
+                    .expect("the conversation observes the children once");
                 let session = connection
                     .send_request(NewSessionRequest::new(cwd))
                     .block_task()
@@ -317,9 +325,8 @@ async fn the_pinned_clients_own_delete_ends_the_child() {
     .expect("conversation");
 
     let pid = pids
-        .lock()
-        .expect("lock")
-        .first()
+        .get()
+        .and_then(|observed| observed.first())
         .copied()
         .expect("a child");
     for _ in 0..400 {

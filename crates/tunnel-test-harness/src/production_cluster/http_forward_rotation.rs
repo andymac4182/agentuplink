@@ -32,16 +32,16 @@
 //!
 //! All payloads, credentials and headers are synthetic.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use http_body_util::{BodyExt, StreamBody};
 use hyper::body::Frame;
 use sha2::{Digest, Sha256};
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::time::{sleep, timeout};
 use tunnel_client::http_forward::{
     DeviceHttpDiagnostics, DeviceHttpExchangeRecord, HttpExport, HttpHandler, HttpHandlerError,
@@ -60,6 +60,7 @@ use tunnel_relay::{
 
 use crate::http_relay_hold::HttpRelayHold;
 
+use super::append_log::AppendLog;
 use super::http_forward_real_path::{
     ConsumerStream, connect_consumer, empty_stream, full_body, handler_body, request,
     synthetic_chunk,
@@ -587,12 +588,28 @@ fn sse_bytes() -> Vec<u8> {
     SSE_EVENTS.iter().flat_map(|event| event.concat()).collect()
 }
 
-#[derive(Default)]
+/// How many `/sse` slot commands may wait.  The gate arms the slot once per
+/// case and one handler invocation takes it, so the queue holds at most two;
+/// a full queue makes the sender wait.
+const SSE_SLOT_QUEUE: usize = 4;
+
+/// The `/sse` case's event source, handed from the gate to the handler.
+enum SseSlotCommand {
+    /// The gate's event receiver for the next `/sse` request.
+    Arm(mpsc::Receiver<Bytes>),
+    /// The handler takes the receiver; `None` when the slot was not armed.
+    Take(oneshot::Sender<Option<mpsc::Receiver<Bytes>>>),
+}
+
 struct GateHandlerState {
-    invocations: Mutex<BTreeMap<String, usize>>,
+    /// The path of every handler invocation, in arrival order.
+    invocations: AppendLog<String>,
     invoked: Notify,
-    sse_events: Mutex<Option<mpsc::Receiver<Bytes>>>,
-    cancelled: Mutex<Option<Instant>>,
+    /// The task that owns the armed `/sse` event receiver until a handler
+    /// takes it.  Commands are applied in the order they were sent, so a
+    /// slot armed before the request is sent is armed when the handler asks.
+    sse_slot: mpsc::Sender<SseSlotCommand>,
+    cancelled: AtomicBool,
     cancelled_notify: Notify,
     effect_hit: Notify,
     effect_release: Notify,
@@ -600,21 +617,42 @@ struct GateHandlerState {
 }
 
 impl GateHandlerState {
+    /// Must be called inside the runtime: it starts the slot's owning task,
+    /// which ends when this state is dropped.
+    fn new() -> Self {
+        let (sse_slot, mut commands) = mpsc::channel(SSE_SLOT_QUEUE);
+        tokio::spawn(async move {
+            let mut armed: Option<mpsc::Receiver<Bytes>> = None;
+            while let Some(command) = commands.recv().await {
+                match command {
+                    SseSlotCommand::Arm(events) => armed = Some(events),
+                    SseSlotCommand::Take(reply) => {
+                        let _ = reply.send(armed.take());
+                    }
+                }
+            }
+        });
+        Self {
+            invocations: AppendLog::default(),
+            invoked: Notify::new(),
+            sse_slot,
+            cancelled: AtomicBool::new(false),
+            cancelled_notify: Notify::new(),
+            effect_hit: Notify::new(),
+            effect_release: Notify::new(),
+            second_event: Notify::new(),
+        }
+    }
+
     fn count(&self, path: &str) -> usize {
         self.invocations
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(path)
-            .copied()
-            .unwrap_or(0)
+            .iter()
+            .filter(|invoked| invoked.as_str() == path)
+            .count()
     }
 
     fn total(&self) -> usize {
-        self.invocations
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .values()
-            .sum()
+        self.invocations.iter().count()
     }
 
     async fn wait_invoked(&self, path: &str) -> Result<()> {
@@ -670,12 +708,7 @@ fn gate_handler(state: Arc<GateHandlerState>) -> Arc<dyn HttpHandler> {
             let state = Arc::clone(&state);
             Box::pin(async move {
                 let path = request.uri().path().to_owned();
-                *state
-                    .invocations
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .entry(path.clone())
-                    .or_default() += 1;
+                state.invocations.push(path.clone());
                 state.invoked.notify_waiters();
                 let cancellation = request.extensions().get::<HandlerCancellation>().cloned();
                 match path.as_str() {
@@ -713,12 +746,13 @@ fn gate_handler(state: Arc<GateHandlerState>) -> Arc<dyn HttpHandler> {
                         response_with("application/octet-stream", handler_body(rx))
                     }
                     "/sse" => {
-                        let events = state
-                            .sse_events
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .take()
-                            .ok_or(HttpHandlerError)?;
+                        let (reply, taken) = oneshot::channel();
+                        state
+                            .sse_slot
+                            .send(SseSlotCommand::Take(reply))
+                            .await
+                            .map_err(|_| HttpHandlerError)?;
+                        let events = taken.await.ok().flatten().ok_or(HttpHandlerError)?;
                         response_with("text/event-stream", handler_body(events))
                     }
                     "/cancel-race" => {
@@ -737,11 +771,7 @@ fn gate_handler(state: Arc<GateHandlerState>) -> Arc<dyn HttpHandler> {
                                         token.cancelled().await;
                                     }
                                 }
-                                *state
-                                    .cancelled
-                                    .lock()
-                                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                                    Some(Instant::now());
+                                state.cancelled.store(true, Ordering::SeqCst);
                                 state.cancelled_notify.notify_waiters();
                             }
                             drop(tx);
@@ -1434,11 +1464,11 @@ impl Gate<'_> {
         let name = "sse";
         let path = "/sse";
         let (events_tx, events_rx) = mpsc::channel::<Bytes>(4);
-        *self
-            .state
-            .sse_events
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(events_rx);
+        self.state
+            .sse_slot
+            .send(SseSlotCommand::Arm(events_rx))
+            .await
+            .map_err(|_| HarnessError::Process("sse: event slot task ended".into()))?;
         let response = self
             .send_request(
                 "GET",
@@ -1657,13 +1687,7 @@ impl Gate<'_> {
                     let cancelled = self.state.cancelled_notify.notified();
                     tokio::pin!(cancelled);
                     cancelled.as_mut().enable();
-                    if self
-                        .state
-                        .cancelled
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .is_some()
-                    {
+                    if self.state.cancelled.load(Ordering::SeqCst) {
                         return;
                     }
                     cancelled.await;
@@ -2215,7 +2239,7 @@ async fn run(
         .config
         .validate()
         .map_err(|error| HarnessError::InvalidInput(format!("device config: {error}")))?;
-    let state = Arc::new(GateHandlerState::default());
+    let state = Arc::new(GateHandlerState::new());
     let handlers = HttpHandlers::new().with_export(
         http_service.to_string(),
         HttpExport {

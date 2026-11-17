@@ -33,7 +33,7 @@ use axum::http::{Request, Response, StatusCode};
 use chrono::{DateTime, TimeZone, Utc};
 use futures_util::stream::{self, StreamExt};
 use tokio::{
-    sync::Mutex,
+    sync::{mpsc, oneshot},
     time::{Instant as TokioInstant, timeout_at},
 };
 use tokio_util::sync::CancellationToken;
@@ -60,6 +60,7 @@ use self::peer_readiness::{
     MAX_CONCURRENT_PEER_PROBES, PEER_PROBE_TIMEOUT, PeerListenerState, PeerProbeState,
     PeerReadiness, PeerReadinessError, PeerRouteTarget,
 };
+use crate::owner_task::OwnerTask;
 use crate::{
     http::{PeerAdmissionBarrier, PeerAdmissionScope},
     membership_runtime::PeerAdmissionCancellation,
@@ -128,6 +129,7 @@ impl PeerBindingProvider for crate::MembershipRuntime {
             let identity =
                 crate::membership_runtime::PeerIdentity::new(node_id, boot_id, spki_sha256);
             self.admit_peer(identity)
+                .await
                 .map(|admission| Some(admission.cancellation()))
                 .map_err(|error| PeerRuntimeError::Membership(error.to_string()))
         })
@@ -558,6 +560,7 @@ fn peer_readiness_error(error: PeerReadinessError) -> PeerRuntimeError {
             "peer readiness route set exceeds the bounded deployment limit".to_owned()
         }
         PeerReadinessError::UnknownRoute => "peer readiness route is not required".to_owned(),
+        PeerReadinessError::OwnerUnavailable => "peer readiness owner is unavailable".to_owned(),
     })
 }
 
@@ -638,6 +641,90 @@ impl fmt::Display for PeerOpenDiagnosticStage {
     }
 }
 
+/// The stage a [`PeerOpenDiagnostic`] stores itself.  The transport reports
+/// its own checkout, lock and dispatch stages through its progress cell, so
+/// the stored stage only says that the attempt is inside the transport.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RuntimeOpenStage {
+    Validation,
+    PoolConnect,
+    /// Inside the transport's stream open; its progress cell has the stage.
+    Transport,
+    EnvelopeSend,
+    Complete,
+    Head,
+    Body,
+    Lease,
+    Owner,
+}
+
+impl RuntimeOpenStage {
+    /// Every stored stage, for the conversion tests.
+    #[cfg(test)]
+    const ALL: [Self; 9] = [
+        Self::Validation,
+        Self::PoolConnect,
+        Self::Transport,
+        Self::EnvelopeSend,
+        Self::Complete,
+        Self::Head,
+        Self::Body,
+        Self::Lease,
+        Self::Owner,
+    ];
+
+    /// The stored stage for a reported stage.  The two stages only the
+    /// transport reaches (`SenderLock`, `H3Dispatch`) are never stored by
+    /// this runtime; reported from outside they read back as `Validation`,
+    /// as they always have.
+    const fn of(stage: PeerOpenDiagnosticStage) -> Self {
+        match stage {
+            PeerOpenDiagnosticStage::Validation
+            | PeerOpenDiagnosticStage::SenderLock
+            | PeerOpenDiagnosticStage::H3Dispatch => Self::Validation,
+            PeerOpenDiagnosticStage::PoolConnect => Self::PoolConnect,
+            PeerOpenDiagnosticStage::StreamPermitCheckout => Self::Transport,
+            PeerOpenDiagnosticStage::EnvelopeSend => Self::EnvelopeSend,
+            PeerOpenDiagnosticStage::Complete => Self::Complete,
+            PeerOpenDiagnosticStage::Head => Self::Head,
+            PeerOpenDiagnosticStage::Body => Self::Body,
+            PeerOpenDiagnosticStage::Lease => Self::Lease,
+            PeerOpenDiagnosticStage::Owner => Self::Owner,
+        }
+    }
+
+    /// The one encoding into the atomic byte.
+    const fn encode(self) -> u8 {
+        match self {
+            Self::Validation => 0,
+            Self::PoolConnect => 1,
+            Self::Transport => 2,
+            Self::EnvelopeSend => 3,
+            Self::Complete => 4,
+            Self::Head => 5,
+            Self::Body => 6,
+            Self::Lease => 7,
+            Self::Owner => 8,
+        }
+    }
+
+    /// The inverse of [`Self::encode`]; a byte no stage encodes to cannot be
+    /// stored and reads as the first stage.
+    const fn decode(value: u8) -> Self {
+        match value {
+            1 => Self::PoolConnect,
+            2 => Self::Transport,
+            3 => Self::EnvelopeSend,
+            4 => Self::Complete,
+            5 => Self::Head,
+            6 => Self::Body,
+            7 => Self::Lease,
+            8 => Self::Owner,
+            _ => Self::Validation,
+        }
+    }
+}
+
 /// A per-attempt, read-only observer for bounded peer-open diagnostics.
 ///
 /// The observer is not shared between attempts and has no effect on
@@ -653,7 +740,7 @@ impl PeerOpenDiagnostic {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            runtime_stage: AtomicU8::new(PeerOpenDiagnosticStage::Validation as u8),
+            runtime_stage: AtomicU8::new(RuntimeOpenStage::Validation.encode()),
             transport: PeerOpenProgress::new(),
         }
     }
@@ -661,9 +748,10 @@ impl PeerOpenDiagnostic {
     /// Return the last stage reached by this attempt.
     #[must_use]
     pub fn stage(&self) -> PeerOpenDiagnosticStage {
-        match self.runtime_stage.load(Ordering::Acquire) {
-            1 => PeerOpenDiagnosticStage::PoolConnect,
-            2 => match self.transport.stage() {
+        match RuntimeOpenStage::decode(self.runtime_stage.load(Ordering::Acquire)) {
+            RuntimeOpenStage::Validation => PeerOpenDiagnosticStage::Validation,
+            RuntimeOpenStage::PoolConnect => PeerOpenDiagnosticStage::PoolConnect,
+            RuntimeOpenStage::Transport => match self.transport.stage() {
                 PeerTransportOpenStage::StreamPermitCheckout => {
                     PeerOpenDiagnosticStage::StreamPermitCheckout
                 }
@@ -671,13 +759,12 @@ impl PeerOpenDiagnostic {
                 PeerTransportOpenStage::H3Dispatch => PeerOpenDiagnosticStage::H3Dispatch,
                 PeerTransportOpenStage::Complete => PeerOpenDiagnosticStage::EnvelopeSend,
             },
-            5 => PeerOpenDiagnosticStage::EnvelopeSend,
-            6 => PeerOpenDiagnosticStage::Complete,
-            7 => PeerOpenDiagnosticStage::Head,
-            8 => PeerOpenDiagnosticStage::Body,
-            9 => PeerOpenDiagnosticStage::Lease,
-            10 => PeerOpenDiagnosticStage::Owner,
-            _ => PeerOpenDiagnosticStage::Validation,
+            RuntimeOpenStage::EnvelopeSend => PeerOpenDiagnosticStage::EnvelopeSend,
+            RuntimeOpenStage::Complete => PeerOpenDiagnosticStage::Complete,
+            RuntimeOpenStage::Head => PeerOpenDiagnosticStage::Head,
+            RuntimeOpenStage::Body => PeerOpenDiagnosticStage::Body,
+            RuntimeOpenStage::Lease => PeerOpenDiagnosticStage::Lease,
+            RuntimeOpenStage::Owner => PeerOpenDiagnosticStage::Owner,
         }
     }
 
@@ -691,7 +778,8 @@ impl PeerOpenDiagnostic {
     }
 
     fn set_runtime_stage(&self, stage: PeerOpenDiagnosticStage) {
-        self.runtime_stage.store(stage as u8, Ordering::Release);
+        self.runtime_stage
+            .store(RuntimeOpenStage::of(stage).encode(), Ordering::Release);
     }
 
     fn transport_progress(&self) -> &PeerOpenProgress {
@@ -717,7 +805,59 @@ pub struct PeerRuntime {
     /// Cluster-level record budgets are shared by all request streams on one
     /// direct destination.  The transport applies an independent connection
     /// budget to the encoded HTTP/3 body.
-    budgets: Arc<Mutex<HashMap<PeerDestination, ConnectionBudget>>>,
+    budgets: Arc<DestinationBudgets>,
+}
+
+/// Commands queued for the destination-budget task.  The queue is bounded;
+/// an open waits its turn while it is full, as it waits for the answer.
+const DESTINATION_BUDGET_COMMANDS: usize = 64;
+
+struct BudgetCheckout {
+    destination: PeerDestination,
+    reply: oneshot::Sender<ConnectionBudget>,
+}
+
+/// The bounded table of per-destination record budgets.  One task owns the
+/// table, so each checkout (evict when full, then find or create) is applied
+/// whole; clones of the runtime share the task.
+struct DestinationBudgets {
+    owner: OwnerTask<BudgetCheckout>,
+}
+
+impl DestinationBudgets {
+    const fn new() -> Self {
+        Self {
+            owner: OwnerTask::new(),
+        }
+    }
+
+    async fn run(mut checkouts: mpsc::Receiver<BudgetCheckout>) {
+        let mut budgets: HashMap<PeerDestination, ConnectionBudget> = HashMap::new();
+        while let Some(BudgetCheckout { destination, reply }) = checkouts.recv().await {
+            if budgets.len() >= tunnel_transport::DEFAULT_PEER_DESTINATIONS
+                && !budgets.contains_key(&destination)
+                && let Some(evicted) = budgets.keys().next().cloned()
+            {
+                budgets.remove(&evicted);
+            }
+            let budget = budgets.entry(destination).or_default().clone();
+            let _ = reply.send(budget);
+        }
+    }
+
+    /// The shared budget of one destination.  A table whose task is gone
+    /// (the runtime is shutting down) refuses the open.
+    async fn checkout(
+        &self,
+        destination: PeerDestination,
+    ) -> Result<ConnectionBudget, PeerRuntimeError> {
+        self.owner
+            .request(DESTINATION_BUDGET_COMMANDS, Self::run, |reply| {
+                BudgetCheckout { destination, reply }
+            })
+            .await
+            .ok_or(PeerRuntimeError::Closed)
+    }
 }
 
 fn frame_consumer_unary_body(body: &[u8]) -> Result<Vec<u8>, PeerRuntimeError> {
@@ -741,77 +881,106 @@ fn frame_consumer_unary_body(body: &[u8]) -> Result<Vec<u8>, PeerRuntimeError> {
     Ok(framed)
 }
 
+/// How much of the one framed response record has arrived.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum ConsumerUnaryPhase {
+    /// No byte yet.
+    #[default]
+    Empty,
+    /// Some bytes, but not yet the whole length prefix.
+    Prefix,
+    /// The declared length is known and the record is still short of it.
+    Partial { expected_total: usize },
+    /// Exactly the declared record has arrived; nothing may follow.
+    Complete { expected_total: usize },
+}
+
+impl ConsumerUnaryPhase {
+    fn multiple_records() -> PeerRuntimeError {
+        PeerRuntimeError::Frame(PeerFrameError::MultipleRecords { count: 2 })
+    }
+
+    /// Whether another chunk may be appended at all.
+    fn accepts_chunk(self) -> Result<(), PeerRuntimeError> {
+        match self {
+            Self::Empty | Self::Prefix | Self::Partial { .. } => Ok(()),
+            Self::Complete { .. } => Err(Self::multiple_records()),
+        }
+    }
+
+    /// The only transition: the phase after `encoded` grew to its current
+    /// content.  The declared length is read once, when the prefix
+    /// completes.
+    fn after_chunk(self, encoded: &[u8]) -> Result<Self, PeerRuntimeError> {
+        let expected_total = match self {
+            Self::Complete { .. } => return Err(Self::multiple_records()),
+            Self::Partial { expected_total } => expected_total,
+            Self::Empty | Self::Prefix => {
+                let Some(prefix) = encoded.first_chunk::<CONSUMER_RECORD_PREFIX_LEN>() else {
+                    return Ok(if encoded.is_empty() {
+                        Self::Empty
+                    } else {
+                        Self::Prefix
+                    });
+                };
+                let declared = u32::from_be_bytes(*prefix) as usize;
+                if declared > MAX_CONSUMER_RESPONSE_BODY {
+                    return Err(PeerRuntimeError::Frame(PeerFrameError::BodyTooLarge {
+                        kind: PeerRecordKind::ConsumerChunk,
+                        length: declared,
+                        maximum: MAX_CONSUMER_RESPONSE_BODY,
+                    }));
+                }
+                CONSUMER_RECORD_PREFIX_LEN + declared
+            }
+        };
+        match encoded.len().cmp(&expected_total) {
+            std::cmp::Ordering::Greater => Err(Self::multiple_records()),
+            std::cmp::Ordering::Equal => Ok(Self::Complete { expected_total }),
+            std::cmp::Ordering::Less => Ok(Self::Partial { expected_total }),
+        }
+    }
+}
+
 #[derive(Default)]
 struct ConsumerUnaryResponse {
     encoded: Vec<u8>,
-    expected_total: Option<usize>,
-    saw_chunk: bool,
-    complete: bool,
+    phase: ConsumerUnaryPhase,
 }
 
 impl ConsumerUnaryResponse {
     fn push(&mut self, chunk: &[u8]) -> Result<(), PeerRuntimeError> {
-        if self.complete {
-            return Err(PeerRuntimeError::Frame(PeerFrameError::MultipleRecords {
-                count: 2,
-            }));
-        }
+        self.phase.accepts_chunk()?;
         let next_len = self
             .encoded
             .len()
             .checked_add(chunk.len())
             .ok_or(PeerRuntimeError::Closed)?;
         if next_len > MAX_CONSUMER_RESPONSE_RECORD {
-            return Err(PeerRuntimeError::Frame(PeerFrameError::MultipleRecords {
-                count: 2,
-            }));
+            return Err(ConsumerUnaryPhase::multiple_records());
         }
-        self.saw_chunk = true;
         self.encoded.extend_from_slice(chunk);
-        if self.expected_total.is_none() && self.encoded.len() >= CONSUMER_RECORD_PREFIX_LEN {
-            let declared = u32::from_be_bytes([
-                self.encoded[0],
-                self.encoded[1],
-                self.encoded[2],
-                self.encoded[3],
-            ]) as usize;
-            if declared > MAX_CONSUMER_RESPONSE_BODY {
-                return Err(PeerRuntimeError::Frame(PeerFrameError::BodyTooLarge {
-                    kind: PeerRecordKind::ConsumerChunk,
-                    length: declared,
-                    maximum: MAX_CONSUMER_RESPONSE_BODY,
-                }));
-            }
-            self.expected_total = Some(CONSUMER_RECORD_PREFIX_LEN + declared);
-        }
-        if let Some(expected_total) = self.expected_total {
-            if self.encoded.len() > expected_total {
-                return Err(PeerRuntimeError::Frame(PeerFrameError::MultipleRecords {
-                    count: 2,
-                }));
-            }
-            self.complete = self.encoded.len() == expected_total;
-        }
+        self.phase = self.phase.after_chunk(&self.encoded)?;
         Ok(())
     }
 
     fn finish(self) -> Result<Vec<u8>, PeerRuntimeError> {
-        if !self.saw_chunk || self.encoded.is_empty() {
-            return Err(PeerRuntimeError::Frame(PeerFrameError::NoRecord));
-        }
-        let Some(expected_total) = self.expected_total else {
-            return Err(PeerRuntimeError::Frame(PeerFrameError::Truncated {
+        match self.phase {
+            ConsumerUnaryPhase::Empty => Err(PeerRuntimeError::Frame(PeerFrameError::NoRecord)),
+            ConsumerUnaryPhase::Prefix => Err(PeerRuntimeError::Frame(PeerFrameError::Truncated {
                 expected: CONSUMER_RECORD_PREFIX_LEN,
                 received: self.encoded.len(),
-            }));
-        };
-        if self.encoded.len() < expected_total {
-            return Err(PeerRuntimeError::Frame(PeerFrameError::Truncated {
-                expected: expected_total,
-                received: self.encoded.len(),
-            }));
+            })),
+            ConsumerUnaryPhase::Partial { expected_total } => {
+                Err(PeerRuntimeError::Frame(PeerFrameError::Truncated {
+                    expected: expected_total,
+                    received: self.encoded.len(),
+                }))
+            }
+            ConsumerUnaryPhase::Complete { expected_total } => {
+                Ok(self.encoded[CONSUMER_RECORD_PREFIX_LEN..expected_total].to_vec())
+            }
         }
-        Ok(self.encoded[CONSUMER_RECORD_PREFIX_LEN..expected_total].to_vec())
     }
 }
 
@@ -949,7 +1118,7 @@ impl PeerRuntime {
             bindings,
             source: PeerIdentity::new(source_node_id, source_boot_id),
             readiness,
-            budgets: Arc::new(Mutex::new(HashMap::new())),
+            budgets: Arc::new(DestinationBudgets::new()),
         }
     }
 
@@ -1082,9 +1251,9 @@ impl PeerRuntime {
     }
 
     /// Publish a bounded observation of available peer transport capacity.
-    pub fn set_peer_capacity(&self, available: usize) {
+    pub async fn set_peer_capacity(&self, available: usize) {
         if let Some(readiness) = &self.readiness {
-            readiness.set_available_capacity(available);
+            readiness.set_available_capacity(available).await;
         }
     }
 
@@ -1098,9 +1267,9 @@ impl PeerRuntime {
     /// an authenticated peer's bounded reachability probe still be answered
     /// while this relay is unready. Discarding it instead couples each
     /// relay's readiness to the other's, which cannot converge.
-    pub fn withdraw_peer_readiness(&self) {
+    pub async fn withdraw_peer_readiness(&self) {
         if let Some(readiness) = &self.readiness {
-            readiness.reset_route_probes();
+            readiness.reset_route_probes().await;
         }
     }
 
@@ -1108,10 +1277,12 @@ impl PeerRuntime {
     /// current signed peer key material could be published at all. Without
     /// approved pins there is no trust evidence to admit any peer, so probe
     /// admission must fail closed as well.
-    pub fn withdraw_peer_trust(&self) {
+    pub async fn withdraw_peer_trust(&self) {
         if let Some(readiness) = &self.readiness {
-            readiness.clear_available_capacity();
-            let _ = readiness.replace_required_routes(std::iter::empty::<PeerRouteTarget>());
+            readiness.clear_available_capacity().await;
+            let _ = readiness
+                .replace_required_routes(std::iter::empty::<PeerRouteTarget>())
+                .await;
         }
     }
 
@@ -1130,6 +1301,7 @@ impl PeerRuntime {
         };
         let revision = readiness
             .replace_required_routes_with_revision(targets.clone())
+            .await
             .map_err(peer_readiness_error)?;
 
         let mut probes = stream::iter(targets.into_iter().map(|target| async move {
@@ -1148,6 +1320,7 @@ impl PeerRuntime {
                     // keeps the proof instead of dropping readiness (M8-C30).
                     let _published = readiness
                         .record_probe_proven_at(revision, &target, &observed_spki)
+                        .await
                         .map_err(peer_readiness_error)?;
                     // A successful health stream proves one slot for this
                     // route only; stale results are deliberately ignored.
@@ -1169,6 +1342,7 @@ impl PeerRuntime {
                     // failure from readiness reconciliation.
                     let _published = readiness
                         .record_probe_at(revision, &target, probe_state)
+                        .await
                         .map_err(peer_readiness_error)?;
                     first_error.get_or_insert(error);
                 }
@@ -1322,7 +1496,7 @@ impl PeerRuntime {
     pub async fn shutdown(&self) -> Result<(), PeerRuntimeError> {
         if let Some(readiness) = &self.readiness {
             readiness.set_listener_state(PeerListenerState::Draining);
-            readiness.clear_available_capacity();
+            readiness.clear_available_capacity().await;
         }
         self.client.shutdown().await.map_err(Into::into)
     }
@@ -1496,7 +1670,7 @@ impl PeerRuntime {
                 if let Some(readiness) = &self.readiness
                     && !matches!(error, PeerTransportError::PinsUnavailable)
                 {
-                    readiness.mark_route_unreachable(&readiness_target);
+                    readiness.mark_route_unreachable(&readiness_target).await;
                 }
                 return Err(error.into());
             }
@@ -1512,7 +1686,7 @@ impl PeerRuntime {
         if !identity.role().is_peer() || identity.role_id() != binding.node_id() {
             let _ = connection.shutdown().await;
             if let Some(readiness) = &self.readiness {
-                readiness.mark_route_unreachable(&readiness_target);
+                readiness.mark_route_unreachable(&readiness_target).await;
             }
             return Err(PeerRuntimeError::PeerIdentityMismatch);
         }
@@ -1542,7 +1716,7 @@ impl PeerRuntime {
         {
             let _ = connection.shutdown().await;
             if let Some(readiness) = &self.readiness {
-                readiness.mark_route_unreachable(&readiness_target);
+                readiness.mark_route_unreachable(&readiness_target).await;
             }
             return Err(PeerRuntimeError::PeerIdentityMismatch);
         }
@@ -1600,7 +1774,7 @@ impl PeerRuntime {
             Ok(stream) => stream,
             Err(error) => {
                 if let Some(readiness) = &self.readiness {
-                    readiness.mark_route_unreachable(&readiness_target);
+                    readiness.mark_route_unreachable(&readiness_target).await;
                 }
                 return Err(error);
             }
@@ -1608,19 +1782,7 @@ impl PeerRuntime {
         if let Some(diagnostic) = diagnostic {
             diagnostic.set_runtime_stage(PeerOpenDiagnosticStage::EnvelopeSend);
         }
-        let budget = {
-            let mut budgets = self.budgets.lock().await;
-            if budgets.len() >= tunnel_transport::DEFAULT_PEER_DESTINATIONS
-                && !budgets.contains_key(&destination)
-                && let Some(evicted) = budgets.keys().next().cloned()
-            {
-                budgets.remove(&evicted);
-            }
-            budgets
-                .entry(destination)
-                .or_insert_with(ConnectionBudget::new)
-                .clone()
-        };
+        let budget = self.budgets.checkout(destination).await?;
         // A stream that raced the peer's GOAWAY may still be refused after it
         // was opened; the hook withdraws this route's readiness on that typed
         // outcome exactly as an open-time failure does above.
@@ -1841,14 +2003,14 @@ struct RouteUnreachableHook {
 }
 
 impl RouteUnreachableHook {
-    fn observe(&self, error: &PeerRuntimeError) {
+    async fn observe(&self, error: &PeerRuntimeError) {
         if let Some((readiness, target)) = self.readiness.as_ref()
             && matches!(
                 error,
                 PeerRuntimeError::Transport(PeerTransportError::GoAway)
             )
         {
-            readiness.mark_route_unreachable(target);
+            readiness.mark_route_unreachable(target).await;
         }
     }
 
@@ -1858,9 +2020,9 @@ impl RouteUnreachableHook {
     }
 }
 
-fn observe_route_error(hook: Option<&Arc<RouteUnreachableHook>>, error: &PeerRuntimeError) {
+async fn observe_route_error(hook: Option<&Arc<RouteUnreachableHook>>, error: &PeerRuntimeError) {
     if let Some(hook) = hook {
-        hook.observe(error);
+        hook.observe(error).await;
     }
 }
 
@@ -1902,7 +2064,7 @@ impl PeerExchange {
         if let Err(error) =
             send_record(&mut send, &budget, record, admission_context.as_ref()).await
         {
-            observe_route_error(route_hook.as_ref(), &error);
+            observe_route_error(route_hook.as_ref(), &error).await;
             return Err(error);
         }
         Ok(Self {
@@ -1938,7 +2100,7 @@ impl PeerExchange {
                 recv,
                 decoder: PeerRecordDecoder::new(budget.clone()),
                 pending: VecDeque::new(),
-                response_seen: false,
+                response: ResponsePhase::AwaitingHead,
                 budget,
                 admission_cancellation,
                 admission_context,
@@ -1979,7 +2141,7 @@ impl PeerExchangeSend {
         )
         .await;
         if let Err(error) = &result {
-            observe_route_error(self.route_hook.as_ref(), error);
+            observe_route_error(self.route_hook.as_ref(), error).await;
         }
         result
     }
@@ -1988,7 +2150,7 @@ impl PeerExchangeSend {
     pub async fn finish(&mut self) -> Result<(), PeerRuntimeError> {
         let result = finish_client_send(&mut self.send, self.admission_context.as_ref()).await;
         if let Err(error) = &result {
-            observe_route_error(self.route_hook.as_ref(), error);
+            observe_route_error(self.route_hook.as_ref(), error).await;
         }
         result
     }
@@ -1999,12 +2161,32 @@ impl PeerExchangeSend {
     }
 }
 
+/// Where the response half of an exchange is: records are read only after
+/// the owner's response head was accepted.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ResponsePhase {
+    /// The owner's response head has not been accepted.
+    AwaitingHead,
+    /// A successful head was accepted; body records follow.
+    Body,
+}
+
+impl ResponsePhase {
+    /// The only transition: a successful response head was accepted.  A
+    /// refused head leaves the phase where it was.
+    const fn head_accepted(self) -> Self {
+        match self {
+            Self::AwaitingHead | Self::Body => Self::Body,
+        }
+    }
+}
+
 /// Response half of a live peer exchange.
 pub struct PeerExchangeRecv {
     recv: PeerClientRecv,
     decoder: PeerRecordDecoder,
     pending: VecDeque<PeerRecord>,
-    response_seen: bool,
+    response: ResponsePhase,
     budget: StreamBudget,
     admission_cancellation: Option<CancellationToken>,
     admission_context: Option<PeerAdmissionCancellation>,
@@ -2018,7 +2200,7 @@ impl PeerExchangeRecv {
             match recv_client_response(&mut self.recv, self.admission_context.as_ref()).await {
                 Ok(response) => response,
                 Err(error) => {
-                    observe_route_error(self.route_hook.as_ref(), &error);
+                    observe_route_error(self.route_hook.as_ref(), &error).await;
                     return Err(error);
                 }
             };
@@ -2042,7 +2224,7 @@ impl PeerExchangeRecv {
             }
             return Err(PeerRuntimeError::RemoteStatus(response.status()));
         }
-        self.response_seen = true;
+        self.response = self.response.head_accepted();
         Ok(response)
     }
 
@@ -2082,8 +2264,11 @@ impl PeerExchangeRecv {
                 self.admission_context.as_ref(),
             ));
         }
-        if !self.response_seen {
-            self.accept_response().await?;
+        match self.response {
+            ResponsePhase::AwaitingHead => {
+                self.accept_response().await?;
+            }
+            ResponsePhase::Body => {}
         }
         loop {
             if let Some(record) = self.pending.pop_front() {
@@ -2105,7 +2290,7 @@ impl PeerExchangeRecv {
                 {
                     Ok(chunk) => chunk,
                     Err(error) => {
-                        observe_route_error(self.route_hook.as_ref(), &error);
+                        observe_route_error(self.route_hook.as_ref(), &error).await;
                         return Err(error);
                     }
                 };
@@ -3055,6 +3240,109 @@ mod tests {
             response.push(chunk).expect("bounded response chunk");
         }
         assert_eq!(response.finish().expect("complete response"), body);
+    }
+
+    #[test]
+    fn runtime_open_stage_conversion_is_total_and_round_trips() {
+        for stage in RuntimeOpenStage::ALL {
+            assert_eq!(RuntimeOpenStage::decode(stage.encode()), stage);
+        }
+        let mut codes: Vec<u8> = RuntimeOpenStage::ALL.map(RuntimeOpenStage::encode).to_vec();
+        codes.sort_unstable();
+        codes.dedup();
+        assert_eq!(codes.len(), RuntimeOpenStage::ALL.len());
+        assert_eq!(
+            RuntimeOpenStage::decode(u8::MAX),
+            RuntimeOpenStage::Validation
+        );
+        // Every reported stage reads back as itself, except the stages only
+        // the transport reaches.
+        for stage in PeerOpenDiagnosticStage::ALL {
+            let diagnostic = PeerOpenDiagnostic::new();
+            diagnostic.mark(stage);
+            let expected = match stage {
+                PeerOpenDiagnosticStage::SenderLock | PeerOpenDiagnosticStage::H3Dispatch => {
+                    PeerOpenDiagnosticStage::Validation
+                }
+                stage => stage,
+            };
+            assert_eq!(diagnostic.stage(), expected, "{stage}");
+        }
+    }
+
+    #[test]
+    fn consumer_unary_phase_transition_table() {
+        use ConsumerUnaryPhase::{Complete, Empty, Partial, Prefix};
+        let record = [0, 0, 0, 2, 7, 8];
+        // Empty and Prefix: stay short of the prefix, or read the length.
+        for phase in [Empty, Prefix] {
+            assert_eq!(phase.after_chunk(&[]).expect("empty"), Empty);
+            assert_eq!(phase.after_chunk(&record[..3]).expect("prefix"), Prefix);
+            assert_eq!(
+                phase.after_chunk(&record[..4]).expect("length"),
+                Partial { expected_total: 6 }
+            );
+            assert_eq!(
+                phase.after_chunk(&record).expect("whole"),
+                Complete { expected_total: 6 }
+            );
+            assert_eq!(
+                phase.after_chunk(&[0, 0, 0, 0]).expect("empty body"),
+                Complete { expected_total: 4 }
+            );
+            assert!(matches!(
+                phase.after_chunk(&[0, 0, 0, 1, 7, 8]),
+                Err(PeerRuntimeError::Frame(PeerFrameError::MultipleRecords {
+                    count: 2
+                }))
+            ));
+            assert!(matches!(
+                phase.after_chunk(&u32::MAX.to_be_bytes()),
+                Err(PeerRuntimeError::Frame(PeerFrameError::BodyTooLarge { .. }))
+            ));
+            assert!(phase.accepts_chunk().is_ok());
+        }
+        // Partial: the declared length is not read again.
+        let partial = Partial { expected_total: 6 };
+        assert!(partial.accepts_chunk().is_ok());
+        assert_eq!(partial.after_chunk(&record[..5]).expect("short"), partial);
+        assert_eq!(
+            partial.after_chunk(&record).expect("exact"),
+            Complete { expected_total: 6 }
+        );
+        assert!(matches!(
+            partial.after_chunk(&[0, 0, 0, 2, 7, 8, 9]),
+            Err(PeerRuntimeError::Frame(PeerFrameError::MultipleRecords {
+                count: 2
+            }))
+        ));
+        // Complete: nothing may follow, not even an empty chunk.
+        let complete = Complete { expected_total: 6 };
+        assert!(complete.accepts_chunk().is_err());
+        assert!(complete.after_chunk(&record).is_err());
+        let mut response = ConsumerUnaryResponse::default();
+        response.push(&record).expect("record");
+        assert!(matches!(
+            response.push(&[]),
+            Err(PeerRuntimeError::Frame(PeerFrameError::MultipleRecords {
+                count: 2
+            }))
+        ));
+        let mut empty_chunk = ConsumerUnaryResponse::default();
+        empty_chunk.push(&[]).expect("empty chunk");
+        assert!(matches!(
+            empty_chunk.finish(),
+            Err(PeerRuntimeError::Frame(PeerFrameError::NoRecord))
+        ));
+    }
+
+    #[test]
+    fn response_phase_only_moves_to_body_on_an_accepted_head() {
+        assert_eq!(
+            ResponsePhase::AwaitingHead.head_accepted(),
+            ResponsePhase::Body
+        );
+        assert_eq!(ResponsePhase::Body.head_accepted(), ResponsePhase::Body);
     }
 
     #[test]

@@ -261,7 +261,10 @@ fn facade(
 /// Take the lease and one capture, and hand back the grant and the capture
 /// identity a later click must refer to.
 async fn capture_then_lease(facade: &SessionFacade) -> (tunnel_cua::lease::LeaseGrant, u64) {
-    let grant = facade.acquire_input_lease().expect("the lease was free");
+    let grant = facade
+        .acquire_input_lease()
+        .await
+        .expect("the lease was free");
     let dispatch = facade
         .handle(&body("capture", json!({"display": 0})), LIMIT)
         .await;
@@ -401,7 +404,7 @@ async fn a_restart_mid_operation_is_unknown_and_the_click_does_not_land_twice() 
         &desktop,
     );
     let (lease, capture) = capture_then_lease(&session).await;
-    assert_eq!(state.holder(&desktop), Some(SessionId::new(1)));
+    assert_eq!(state.holder(&desktop).await, Some(SessionId::new(1)));
 
     // A click, dispatched for real, against a backend that is about to be
     // taken away underneath it. The deadline is long, so nothing here can
@@ -463,11 +466,11 @@ async fn a_restart_mid_operation_is_unknown_and_the_click_does_not_land_twice() 
     assert_eq!(invalidation.leases_released, vec![desktop.clone()]);
     assert_eq!(invalidation.captures_forgotten, 1);
     assert_eq!(
-        state.holder(&desktop),
+        state.holder(&desktop).await,
         None,
         "the restart dropped the lease from the registry, not merely reported it"
     );
-    assert_eq!(state.capture_count(), 0);
+    assert_eq!(state.capture_count().await, 0);
     assert!(supervisor.generation() > first_generation);
 
     // ---- the control: a caller that retries anyway does not double-click --
@@ -523,7 +526,7 @@ async fn a_restart_mid_operation_is_unknown_and_the_click_does_not_land_twice() 
 
     // The old lease grant is not merely unusable, it is unknown to the
     // registry: releasing it fails rather than silently succeeding.
-    assert!(session.release_input_lease(&lease).is_err());
+    assert!(session.release_input_lease(&lease).await.is_err());
 
     supervisor.stop(state.as_ref()).await;
 }
@@ -637,6 +640,7 @@ async fn a_capture_identity_from_before_a_restart_is_unknown_afterwards() {
     let session = facade(&state, dispatcher_for(new_endpoint).await, &desktop);
     session
         .acquire_input_lease()
+        .await
         .expect("free after the restart");
 
     let refused = session

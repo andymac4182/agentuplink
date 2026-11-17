@@ -14,6 +14,7 @@
 use core::fmt;
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::rotation_attempt::{AttemptProgress, RecoverySocket, Retirement};
 use crate::rotation_control::{
     DrainProof, DrainSet, FenceSnapshot, RotationAttemptIdentity, StreamRoster,
 };
@@ -429,28 +430,38 @@ pub enum PrepareResult {
     Coalesced,
 }
 
+/// How the most recent attempt's old carrier was retired.  A fresh scheduled
+/// attempt starts `Ordinary`.  A missing connector attestation is recorded
+/// only together with the deadline-forced closure it completes on, so
+/// "missing but not forced" has no representation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RetirementRecord {
+    Ordinary,
+    DeadlineForced,
+    DeadlineForcedConnectorMissing,
+}
+
+impl RetirementRecord {
+    /// Record a deadline-forced closure.  It never clears a recorded missing
+    /// connector attestation.
+    const fn deadline_forced(self) -> Self {
+        match self {
+            Self::Ordinary | Self::DeadlineForced => Self::DeadlineForced,
+            Self::DeadlineForcedConnectorMissing => Self::DeadlineForcedConnectorMissing,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct AttemptState {
     identity: RotationAttemptIdentity,
     started_at_ms: RotationTime,
     handshake_deadline_ms: RotationTime,
     overlap_deadline_ms: RotationTime,
-    /// True only for an attempt allocated by a validated RECOVERY_BEGIN.
-    is_recovery_attempt: bool,
-    /// True while this recovery attempt's candidate is physically reserved.
-    recovery_socket_reserved: bool,
-    /// A recovery attempt may reserve its candidate at most once.  A later
-    /// retry creates a new attempt identity instead of reusing this carrier.
-    recovery_socket_ever_reserved: bool,
-    candidate_ready: bool,
-    roster: Option<StreamRoster>,
-    frozen: [Option<FenceSnapshot>; 2],
-    drained: [Option<DrainProof>; 2],
-    commit_sent: bool,
-    commit_accepted: bool,
-    retire_sent: bool,
-    old_socket_closed: [bool; 2],
-    candidate_socket_closed: [bool; 2],
+    /// Attempt kind and sub-phase progress.  Its fields are private to
+    /// [`crate::rotation_attempt`], whose transition methods are the only
+    /// writers.
+    progress: AttemptProgress,
     recovery_reason: Option<RecoveryReason>,
 }
 
@@ -460,7 +471,13 @@ impl AttemptState {
         started_at_ms: RotationTime,
         config: RotationConfig,
     ) -> Result<Self, RotationError> {
-        Self::new_with_deadline(identity, started_at_ms, config, None)
+        Self::new_with_deadline(
+            identity,
+            started_at_ms,
+            config,
+            None,
+            AttemptProgress::scheduled(),
+        )
     }
 
     fn new_with_deadline(
@@ -468,6 +485,7 @@ impl AttemptState {
         started_at_ms: RotationTime,
         config: RotationConfig,
         deadline_cap_ms: Option<RotationTime>,
+        progress: AttemptProgress,
     ) -> Result<Self, RotationError> {
         let handshake_deadline_ms = started_at_ms
             .checked_add(config.handshake_timeout_ms)
@@ -495,27 +513,9 @@ impl AttemptState {
             started_at_ms,
             handshake_deadline_ms,
             overlap_deadline_ms,
-            is_recovery_attempt: false,
-            recovery_socket_reserved: false,
-            recovery_socket_ever_reserved: false,
-            candidate_ready: false,
-            roster: None,
-            frozen: [None, None],
-            drained: [None, None],
-            commit_sent: false,
-            commit_accepted: false,
-            retire_sent: false,
-            old_socket_closed: [false, false],
-            candidate_socket_closed: [false, false],
+            progress,
             recovery_reason: None,
         })
-    }
-
-    fn direction_index(direction: Direction) -> usize {
-        match direction {
-            Direction::RelayToConnector => 0,
-            Direction::ConnectorToRelay => 1,
-        }
     }
 }
 
@@ -542,8 +542,8 @@ pub struct RotationState {
     recovery_episode_deadline: Option<RotationTime>,
     /// Number of candidate attempts consumed in the current recovery episode.
     recovery_attempts: u8,
-    deadline_forced_retirement: bool,
-    connector_retirement_missing: bool,
+    /// How the most recent attempt's old carrier was retired.
+    retirement_record: RetirementRecord,
     last_time_ms: Option<RotationTime>,
     /// Typed reason when the machine closed itself; `None` after a
     /// runtime-initiated close.
@@ -588,8 +588,7 @@ impl RotationState {
             used_connection_ids: BTreeSet::from([active_connection_id.clone()]),
             recovery_episode_deadline: None,
             recovery_attempts: 0,
-            deadline_forced_retirement: false,
-            connector_retirement_missing: false,
+            retirement_record: RetirementRecord::Ordinary,
             last_time_ms: None,
             terminal_reason: None,
         })
@@ -653,13 +652,13 @@ impl RotationState {
                 Some(attempt.identity.clone()),
                 Some(attempt.started_at_ms),
                 Some(attempt.overlap_deadline_ms),
-                attempt.candidate_ready,
-                [attempt.frozen[0].is_some(), attempt.frozen[1].is_some()],
-                [attempt.drained[0].is_some(), attempt.drained[1].is_some()],
-                attempt.commit_sent,
-                attempt.commit_accepted,
-                attempt.old_socket_closed,
-                attempt.candidate_socket_closed,
+                attempt.progress.candidate_ready(),
+                attempt.progress.writers_frozen(),
+                attempt.progress.drain_proofs(),
+                attempt.progress.commit_sent(),
+                attempt.progress.commit_accepted(),
+                attempt.progress.old_socket().flags(),
+                attempt.progress.candidate_socket().flags(),
                 attempt.recovery_reason,
             )
         } else {
@@ -692,8 +691,9 @@ impl RotationState {
             old_socket_closed,
             candidate_socket_closed,
             recovery_reason,
-            deadline_forced_retirement: self.deadline_forced_retirement,
-            connector_retirement_missing: self.connector_retirement_missing,
+            deadline_forced_retirement: self.retirement_record != RetirementRecord::Ordinary,
+            connector_retirement_missing: self.retirement_record
+                == RetirementRecord::DeadlineForcedConnectorMissing,
             socket_count: self.socket_count(),
             connection_history_used: self.used_connection_ids.len(),
             terminal_reason: self.terminal_reason,
@@ -795,7 +795,13 @@ impl RotationState {
         }
         let new_connection_id = identity.new_connection_id.clone();
         let attempt = if let Some(cap) = deadline_cap_ms {
-            AttemptState::new_with_deadline(identity, now_ms, self.config, Some(cap))?
+            AttemptState::new_with_deadline(
+                identity,
+                now_ms,
+                self.config,
+                Some(cap),
+                AttemptProgress::scheduled(),
+            )?
         } else {
             AttemptState::new(identity, now_ms, self.config)?
         };
@@ -808,8 +814,7 @@ impl RotationState {
         // fresh scheduled attempt starts clean so its own COMPLETE is not
         // misreported as forced; the earlier forced closure stays recorded in
         // the runtime's bounded deadline-event history.
-        self.deadline_forced_retirement = false;
-        self.connector_retirement_missing = false;
+        self.retirement_record = RetirementRecord::Ordinary;
         self.attempt = Some(attempt);
         self.phase = RotationPhase::Preparing;
         self.assert_socket_bound();
@@ -854,8 +859,10 @@ impl RotationState {
             });
         }
         let attempt = self.attempt.as_mut().expect("phase checked above");
-        attempt.candidate_ready = true;
-        Ok(())
+        attempt
+            .progress
+            .mark_candidate_ready()
+            .map_err(|_| RotationError::CandidateNotReady)
     }
 
     /// Freeze admission and install the immutable stream roster.  The roster
@@ -883,12 +890,15 @@ impl RotationState {
         }
         let maximum = self.config.max_roster_entries;
         let attempt = self.attempt.as_mut().expect("phase checked above");
-        if !attempt.candidate_ready {
+        if !attempt.progress.candidate_ready() {
             return Err(RotationError::CandidateNotReady);
         }
         validate_roster(&roster, maximum)?;
         validate_identifier("snapshot_id", &roster.snapshot_id)?;
-        attempt.roster = Some(roster);
+        attempt
+            .progress
+            .quiesce(roster)
+            .map_err(|_| RotationError::CandidateNotReady)?;
         self.phase = RotationPhase::Quiescing;
         Ok(())
     }
@@ -908,7 +918,7 @@ impl RotationState {
         self.check_deadline(now_ms)?;
         validate_fence_snapshot(&fences, direction, self.config.max_roster_entries)?;
         let attempt = self.attempt.as_mut().expect("phase checked above");
-        let Some(roster) = attempt.roster.as_ref() else {
+        let Some(roster) = attempt.progress.fencing_roster() else {
             return Err(RotationError::MissingRoster);
         };
         if fences.snapshot_id != roster.snapshot_id {
@@ -924,21 +934,22 @@ impl RotationState {
         if !fence_roster_matches(&fences, roster) {
             return Err(RotationError::RosterMismatch);
         }
-        let index = AttemptState::direction_index(direction);
-        if attempt.frozen[index].is_some() {
-            let old = attempt.frozen[index].as_ref().expect("checked above");
+        if let Some(old) = attempt.progress.frozen_fence(direction) {
             if old == &fences {
                 return Ok(());
             }
             return Err(RotationError::ConflictingFrozenFence { direction });
         }
-        if let Some(other) = attempt.frozen[1 - index].as_ref()
+        if let Some(other) = attempt.progress.frozen_fence(opposite(direction))
             && !same_fence_roster(other, &fences)
         {
             return Err(RotationError::RosterMismatch);
         }
-        attempt.frozen[index] = Some(fences);
-        if attempt.frozen[0].is_some() && attempt.frozen[1].is_some() {
+        let both_frozen = attempt
+            .progress
+            .freeze(direction, fences)
+            .map_err(|_| RotationError::ConflictingFrozenFence { direction })?;
+        if both_frozen {
             self.phase = RotationPhase::Draining;
         }
         Ok(())
@@ -958,7 +969,7 @@ impl RotationState {
         self.check_deadline(now_ms)?;
         let maximum = self.config.max_roster_entries;
         let attempt = self.attempt.as_mut().expect("phase checked above");
-        let Some(roster) = attempt.roster.as_ref() else {
+        let Some(roster) = attempt.progress.fencing_roster() else {
             return Err(RotationError::MissingRoster);
         };
         if proof.snapshot_id != roster.snapshot_id {
@@ -967,8 +978,7 @@ impl RotationState {
         validate_identifier("snapshot_id", &proof.snapshot_id)?;
         validate_identifier("fence_digest", &proof.fence_digest)?;
         let direction = proof.direction;
-        let index = AttemptState::direction_index(direction);
-        let Some(fences) = attempt.frozen[index].as_ref() else {
+        let Some(fences) = attempt.progress.frozen_fence(direction) else {
             return Err(RotationError::MissingFrozenFence { direction });
         };
         if proof.fence_digest != digest_for_snapshot(fences)? {
@@ -981,14 +991,21 @@ impl RotationState {
             });
         }
         validate_ack_cursors(fences, &proof)?;
-        if let Some(old) = attempt.drained[index].as_ref() {
+        if let Some(old) = attempt
+            .progress
+            .side_fence(direction)
+            .and_then(|side| side.proof())
+        {
             if old == &proof {
                 return Ok(());
             }
             return Err(RotationError::ConflictingDrainProof { direction });
         }
-        attempt.drained[index] = Some(proof);
-        if attempt.drained[0].is_some() && attempt.drained[1].is_some() {
+        let both_drained = attempt
+            .progress
+            .drain(proof)
+            .map_err(|_| RotationError::MissingFrozenFence { direction })?;
+        if both_drained {
             self.phase = RotationPhase::Committing;
         }
         Ok(())
@@ -1000,22 +1017,13 @@ impl RotationState {
     pub fn drain_set(&self, identity: &RotationAttemptIdentity) -> Result<DrainSet, RotationError> {
         self.ensure_attempt(identity, RotationPhase::Committing)?;
         let attempt = self.attempt.as_ref().expect("phase checked above");
-        let relay_to_connector =
-            attempt.drained[0]
-                .clone()
-                .ok_or(RotationError::MissingFrozenFence {
-                    direction: Direction::RelayToConnector,
-                })?;
-        let connector_to_relay =
-            attempt.drained[1]
-                .clone()
-                .ok_or(RotationError::MissingFrozenFence {
-                    direction: Direction::ConnectorToRelay,
-                })?;
-        Ok(DrainSet {
-            relay_to_connector,
-            connector_to_relay,
-        })
+        attempt
+            .progress
+            .drain_set()
+            .cloned()
+            .ok_or(RotationError::MissingFrozenFence {
+                direction: Direction::RelayToConnector,
+            })
     }
 
     /// Send the owner commit decision.  This is deliberately separate from
@@ -1029,14 +1037,10 @@ impl RotationState {
         self.ensure_attempt(identity, RotationPhase::Committing)?;
         self.check_deadline(now_ms)?;
         let attempt = self.attempt.as_mut().expect("phase checked above");
-        if attempt.drained[0].is_none() || attempt.drained[1].is_none() {
-            return Err(RotationError::DrainIncomplete);
-        }
-        if attempt.commit_sent {
-            return Ok(());
-        }
-        attempt.commit_sent = true;
-        Ok(())
+        attempt
+            .progress
+            .send_commit()
+            .map_err(|_| RotationError::DrainIncomplete)
     }
 
     /// Acknowledge candidate activation.  Once this succeeds, abort is
@@ -1051,10 +1055,10 @@ impl RotationState {
         self.ensure_attempt(identity, RotationPhase::Committing)?;
         self.check_deadline(now_ms)?;
         let attempt = self.attempt.as_mut().expect("phase checked above");
-        if !attempt.commit_sent {
-            return Err(RotationError::CommitNotSent);
-        }
-        attempt.commit_accepted = true;
+        attempt
+            .progress
+            .accept_commit()
+            .map_err(|_| RotationError::CommitNotSent)?;
         self.phase = RotationPhase::Retiring;
         Ok(())
     }
@@ -1069,11 +1073,10 @@ impl RotationState {
         self.ensure_attempt(identity, RotationPhase::Retiring)?;
         self.check_deadline(now_ms)?;
         let attempt = self.attempt.as_mut().expect("phase checked above");
-        if !attempt.commit_accepted {
-            return Err(RotationError::CommitNotAccepted);
-        }
-        attempt.retire_sent = true;
-        Ok(())
+        attempt
+            .progress
+            .send_retire()
+            .map_err(|_| RotationError::CommitNotAccepted)
     }
 
     /// Record one side's close evidence for the old carrier.  Active
@@ -1094,7 +1097,7 @@ impl RotationState {
             (
                 attempt.identity.old_connection_id.clone(),
                 attempt.overlap_deadline_ms,
-                attempt.retire_sent,
+                matches!(attempt.progress.retirement(), Some(Retirement::Sent { .. })),
             )
         };
         if !retire_sent {
@@ -1109,10 +1112,15 @@ impl RotationState {
         }
         let complete = {
             let attempt = self.attempt.as_mut().expect("phase checked above");
-            attempt.old_socket_closed[side_index(side)] = true;
-            attempt.old_socket_closed[0] && attempt.old_socket_closed[1]
+            attempt
+                .progress
+                .close_old_socket(side)
+                .map_err(|_| RotationError::RetireNotSent)?
+                .is_closed()
         };
-        self.deadline_forced_retirement |= now_ms >= overlap_deadline_ms;
+        if now_ms >= overlap_deadline_ms {
+            self.retirement_record = self.retirement_record.deadline_forced();
+        }
         if complete {
             self.allocated_connections.remove(&old_connection_id);
             // Closure evidence at or after the absolute overlap deadline is a
@@ -1202,8 +1210,11 @@ impl RotationState {
             (
                 attempt.identity.old_connection_id.clone(),
                 attempt.overlap_deadline_ms,
-                attempt.retire_sent,
-                attempt.old_socket_closed[side_index(RotationSide::Connector)],
+                matches!(attempt.progress.retirement(), Some(Retirement::Sent { .. })),
+                attempt
+                    .progress
+                    .old_socket()
+                    .is_closed_by(RotationSide::Connector),
             )
         };
         if !retire_sent {
@@ -1223,14 +1234,16 @@ impl RotationState {
         }
         let (new_generation, new_connection_id) = {
             let attempt = self.attempt.as_mut().expect("phase checked above");
-            attempt.old_socket_closed[side_index(RotationSide::Owner)] = true;
+            attempt
+                .progress
+                .close_old_socket(RotationSide::Owner)
+                .map_err(|_| RotationError::RetireNotSent)?;
             (
                 attempt.identity.new_generation,
                 attempt.identity.new_connection_id.clone(),
             )
         };
-        self.deadline_forced_retirement = true;
-        self.connector_retirement_missing = true;
+        self.retirement_record = RetirementRecord::DeadlineForcedConnectorMissing;
         self.allocated_connections.remove(&old_connection_id);
         self.active_generation = new_generation;
         self.active_connection_id = new_connection_id;
@@ -1264,7 +1277,7 @@ impl RotationState {
         self.ensure_attempt(identity, self.phase)?;
         self.check_deadline(now_ms)?;
         let attempt = self.attempt.as_mut().expect("phase checked above");
-        if attempt.commit_sent || attempt.commit_accepted {
+        if attempt.progress.commit_sent() || attempt.progress.commit_accepted() {
             return Err(RotationError::CommitCannotRollback);
         }
         attempt.recovery_reason = Some(reason);
@@ -1294,8 +1307,8 @@ impl RotationState {
             (
                 attempt.identity.new_connection_id.clone(),
                 attempt.overlap_deadline_ms,
-                attempt.is_recovery_attempt,
-                attempt.recovery_socket_reserved,
+                attempt.progress.is_recovery(),
+                attempt.progress.recovery_socket() == Some(RecoverySocket::Reserved),
             )
         };
         validate_identifier("connection_id", &evidence.connection_id)?;
@@ -1311,8 +1324,7 @@ impl RotationState {
         }
         let complete = {
             let attempt = self.attempt.as_mut().expect("phase checked above");
-            attempt.candidate_socket_closed[side_index(side)] = true;
-            attempt.candidate_socket_closed[0] && attempt.candidate_socket_closed[1]
+            attempt.progress.close_candidate_socket(side).is_closed()
         };
         if complete {
             let removed = self.allocated_connections.remove(&new_connection_id);
@@ -1320,8 +1332,13 @@ impl RotationState {
                 if !removed {
                     return Err(RotationError::ConnectionNotAllocated);
                 }
+                // `recovery_socket_reserved` was checked above, so the
+                // reservation is `Reserved` and this release cannot refuse.
                 if let Some(attempt) = self.attempt.as_mut() {
-                    attempt.recovery_socket_reserved = false;
+                    attempt
+                        .progress
+                        .release_recovery_socket()
+                        .map_err(|_| RotationError::RecoverySocketNotReserved)?;
                 }
             }
             if !was_recovering {
@@ -1424,8 +1441,7 @@ impl RotationState {
         // loss starts a fresh episode, so its QUIESCE snapshot must not be
         // mistaken for an episode roster this attempt has to match.
         if let Some(attempt) = self.attempt.as_ref()
-            && attempt.is_recovery_attempt
-            && let Some(previous_roster) = attempt.roster.as_ref()
+            && let Some(previous_roster) = attempt.progress.recovery_roster()
             && previous_roster != &roster
         {
             return Err(RotationError::RecoveryRosterMismatch);
@@ -1450,10 +1466,9 @@ impl RotationState {
             now_ms,
             self.config,
             Some(recovery_deadline),
+            AttemptProgress::recovery(roster),
         )?;
         let mut attempt = attempt;
-        attempt.is_recovery_attempt = true;
-        attempt.roster = Some(roster);
         attempt.recovery_reason = Some(reason);
         let recovery_attempts = self.recovery_attempts.checked_add(1).ok_or(
             RotationError::RecoveryAttemptLimitExceeded {
@@ -1503,13 +1518,13 @@ impl RotationState {
         let Some(attempt) = self.attempt.as_ref() else {
             return Err(RotationError::MissingAttempt);
         };
-        if !attempt.is_recovery_attempt {
+        let Some(recovery_socket) = attempt.progress.recovery_socket() else {
             return Err(RotationError::RecoveryBeginRequired);
-        }
+        };
         if self.recovery_episode_deadline.is_none() {
             return Err(RotationError::RecoveryBeginRequired);
         }
-        if attempt.recovery_socket_ever_reserved {
+        if recovery_socket != RecoverySocket::NeverReserved {
             return Err(RotationError::RecoverySocketAlreadyReserved);
         }
         let connection_id = attempt.identity.new_connection_id.clone();
@@ -1517,9 +1532,10 @@ impl RotationState {
             return Err(RotationError::ConnectionReuse);
         }
         let attempt = self.attempt.as_mut().ok_or(RotationError::MissingAttempt)?;
-        attempt.recovery_socket_reserved = true;
-        attempt.recovery_socket_ever_reserved = true;
-        Ok(())
+        attempt
+            .progress
+            .reserve_recovery_socket()
+            .map_err(|_| RotationError::RecoverySocketAlreadyReserved)
     }
 
     /// Release one failed/retired recovery transport after explicit close
@@ -1571,10 +1587,15 @@ impl RotationState {
             return Err(RotationError::ConnectionNotAllocated);
         }
         if let Some(attempt) = self.attempt.as_mut()
-            && attempt.is_recovery_attempt
             && connection_id == attempt.identity.new_connection_id
+            && attempt.progress.recovery_socket() == Some(RecoverySocket::Reserved)
         {
-            attempt.recovery_socket_reserved = false;
+            // A reservation that was never made or is already released has
+            // nothing to release; only `Reserved` moves to `Released`.
+            attempt
+                .progress
+                .release_recovery_socket()
+                .map_err(|_| RotationError::RecoverySocketNotReserved)?;
         }
         Ok(())
     }
@@ -1607,13 +1628,13 @@ impl RotationState {
         let Some(attempt) = self.attempt.as_ref() else {
             return Err(RotationError::MissingAttempt);
         };
-        if !attempt.is_recovery_attempt {
+        let Some(recovery_socket) = attempt.progress.recovery_socket() else {
             return Err(RotationError::RecoveryBeginRequired);
-        }
+        };
         if self.recovery_episode_deadline.is_none() {
             return Err(RotationError::RecoveryBeginRequired);
         }
-        if !attempt.recovery_socket_reserved {
+        if recovery_socket != RecoverySocket::Reserved {
             return Err(RotationError::RecoverySocketNotReserved);
         }
         if self.allocated_connections.len() != 1
@@ -1623,13 +1644,13 @@ impl RotationState {
         {
             return Err(RotationError::RecoveryResourcesNotReleased);
         }
-        if attempt.candidate_socket_closed.iter().any(|closed| *closed) {
+        if attempt.progress.candidate_socket().any_closed() {
             // A one-sided close record means the candidate is already in
             // teardown.  It may remain allocated until the second local side
             // releases it, but it can never become the active carrier.
             return Err(RotationError::RecoveryResourcesNotReleased);
         }
-        let Some(roster) = attempt.roster.as_ref() else {
+        let Some(roster) = attempt.progress.recovery_roster() else {
             return Err(RotationError::MissingRoster);
         };
         let expected_stream_ids = roster.stream_ids.clone();
@@ -1723,7 +1744,7 @@ impl RotationState {
             // abort or drain".  Record the forced retirement and leave the
             // phase so the runtime can release the old carrier; the budget is
             // not extended and the old generation is never promoted again.
-            self.deadline_forced_retirement = true;
+            self.retirement_record = self.retirement_record.deadline_forced();
             return self.phase;
         }
         self.enter_recovery_in_place(RecoveryReason::Deadline);
@@ -1752,7 +1773,7 @@ impl RotationState {
 
     fn recovery_anchor(&self) -> (u64, String) {
         if let Some(attempt) = self.attempt.as_ref() {
-            if attempt.commit_accepted {
+            if attempt.progress.commit_accepted() {
                 return (
                     attempt.identity.new_generation,
                     attempt.identity.new_connection_id.clone(),
@@ -1929,10 +1950,10 @@ fn direction_index(direction: Direction) -> usize {
     }
 }
 
-fn side_index(side: RotationSide) -> usize {
-    match side {
-        RotationSide::Owner => 0,
-        RotationSide::Connector => 1,
+fn opposite(direction: Direction) -> Direction {
+    match direction {
+        Direction::RelayToConnector => Direction::ConnectorToRelay,
+        Direction::ConnectorToRelay => Direction::RelayToConnector,
     }
 }
 
@@ -2463,14 +2484,22 @@ mod tests {
             )
             .expect("connector frozen");
         let d0 = digest_for_snapshot(
-            machine.attempt.as_ref().expect("attempt").frozen[0]
+            machine
+                .attempt
                 .as_ref()
+                .expect("attempt")
+                .progress
+                .frozen_fence(Direction::RelayToConnector)
                 .expect("relay fence"),
         )
         .expect("relay digest");
         let d1 = digest_for_snapshot(
-            machine.attempt.as_ref().expect("attempt").frozen[1]
+            machine
+                .attempt
                 .as_ref()
+                .expect("attempt")
+                .progress
+                .frozen_fence(Direction::ConnectorToRelay)
                 .expect("connector fence"),
         )
         .expect("connector digest");
@@ -2512,14 +2541,22 @@ mod tests {
             .expect("connector frozen");
         assert_eq!(machine.phase(), RotationPhase::Draining);
         let d0 = digest_for_snapshot(
-            machine.attempt.as_ref().expect("attempt").frozen[0]
+            machine
+                .attempt
                 .as_ref()
+                .expect("attempt")
+                .progress
+                .frozen_fence(Direction::RelayToConnector)
                 .expect("relay fence"),
         )
         .expect("relay digest");
         let d1 = digest_for_snapshot(
-            machine.attempt.as_ref().expect("attempt").frozen[1]
+            machine
+                .attempt
                 .as_ref()
+                .expect("attempt")
+                .progress
+                .frozen_fence(Direction::ConnectorToRelay)
                 .expect("connector fence"),
         )
         .expect("connector digest");
@@ -2698,8 +2735,12 @@ mod tests {
             .frozen(&identity, connector, Direction::ConnectorToRelay, 4)
             .expect("connector frozen");
         let digest = digest_for_snapshot(
-            machine.attempt.as_ref().expect("attempt").frozen[0]
+            machine
+                .attempt
                 .as_ref()
+                .expect("attempt")
+                .progress
+                .frozen_fence(Direction::RelayToConnector)
                 .expect("relay fence"),
         )
         .expect("digest");
@@ -2747,14 +2788,22 @@ mod tests {
             )
             .expect("connector frozen");
         let d0 = digest_for_snapshot(
-            machine.attempt.as_ref().expect("attempt").frozen[0]
+            machine
+                .attempt
                 .as_ref()
+                .expect("attempt")
+                .progress
+                .frozen_fence(Direction::RelayToConnector)
                 .expect("relay fence"),
         )
         .expect("relay digest");
         let d1 = digest_for_snapshot(
-            machine.attempt.as_ref().expect("attempt").frozen[1]
+            machine
+                .attempt
                 .as_ref()
+                .expect("attempt")
+                .progress
+                .frozen_fence(Direction::ConnectorToRelay)
                 .expect("connector fence"),
         )
         .expect("connector digest");
@@ -3923,5 +3972,17 @@ mod tests {
         assert_eq!(machine.phase(), RotationPhase::Closed);
         assert_eq!(machine.terminal_reason(), None);
         assert_eq!(machine.status().connection_history_used, 1);
+    }
+
+    #[test]
+    fn retirement_record_transition_table() {
+        use RetirementRecord::{DeadlineForced, DeadlineForcedConnectorMissing, Ordinary};
+        assert_eq!(Ordinary.deadline_forced(), DeadlineForced);
+        assert_eq!(DeadlineForced.deadline_forced(), DeadlineForced);
+        // A forced closure never clears a recorded missing attestation.
+        assert_eq!(
+            DeadlineForcedConnectorMissing.deadline_forced(),
+            DeadlineForcedConnectorMissing
+        );
     }
 }

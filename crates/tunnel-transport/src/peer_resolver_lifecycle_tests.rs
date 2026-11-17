@@ -216,7 +216,7 @@ async fn planned_resolver_case(case: ResolverCase, prove_drain: bool) -> TestRes
             let planned = PlannedDrainSignal::new();
             if matches!(case, ResolverCase::PreCancelled) {
                 planned.close_admission();
-                planned.token.cancel();
+                planned.begin_drain(Instant::now() + BOUND);
             }
             let mut resolving = Box::pin(handle_incoming_stream(
                 target,
@@ -243,7 +243,7 @@ async fn planned_resolver_case(case: ResolverCase, prove_drain: bool) -> TestRes
                 })
                 .await?;
                 planned.close_admission();
-                planned.token.cancel();
+                planned.begin_drain(Instant::now() + BOUND);
             }
             resolving.await?;
         }
@@ -569,5 +569,166 @@ async fn m6c246_released_capacity_control_serves_target_and_sibling() -> TestRes
         observation.client_cleanup.is_none() && observation.server_cleanup.is_none(),
         "released capacity cleanup failed: {observation:?}"
     );
+    Ok(())
+}
+
+/// Accept the fixture's one connection and hold it until the client closes
+/// it; report the application close reason the client sent.
+async fn closed_by_client(server: quinn::Endpoint) -> TestResult<Vec<u8>> {
+    let incoming = timeout(BOUND, server.accept())
+        .await?
+        .ok_or("no connection")?;
+    let connection = timeout(BOUND, incoming).await??;
+    let _h3_connection = h3::server::builder()
+        .build::<_, Bytes>(h3_quinn::Connection::new(connection.clone()))
+        .await?;
+    match timeout(BOUND, connection.closed()).await? {
+        quinn::ConnectionError::ApplicationClosed(close) => Ok(close.reason.to_vec()),
+        other => Err(format!("the client did not close the connection: {other}").into()),
+    }
+}
+
+// A dial that finishes after `PeerClient::shutdown` took the pooled
+// connections it joins must not be pooled behind it: nothing would close it,
+// join its tasks or return its connection permit until the last clone of the
+// client was dropped.  The fixture holds the dial turn itself so the dial
+// completes strictly before shutdown and is handed back strictly after it.
+#[tokio::test]
+async fn dial_finished_after_shutdown_is_closed_joined_and_not_pooled() -> TestResult {
+    let Endpoints {
+        server,
+        client,
+        destination,
+        pins: _,
+    } = endpoints(&limits())?;
+    let server_task = tokio::spawn(closed_by_client(server));
+
+    let (reply, checkout) = oneshot::channel();
+    client
+        .pool()
+        .send(PoolCommand::Checkout {
+            destination: destination.clone(),
+            pins: client.pin_provider.snapshot(),
+            local_identity: None,
+            reply,
+        })
+        .await
+        .map_err(|_| "the pool task is gone")?;
+    let Checkout::Dial {
+        previous: None,
+        local_generation,
+        turn,
+    } = timeout(BOUND, checkout).await???
+    else {
+        return Err("the first checkout did not get the dial turn".into());
+    };
+    let dialed = client
+        .dial(
+            destination.clone(),
+            local_generation,
+            Instant::now() + BOUND,
+        )
+        .await?;
+    let max_connections = limits().max_connections;
+    assert_eq!(client.connections.available_permits(), max_connections - 1);
+    assert!(dialed.connection.close_reason().is_none());
+
+    // Shutdown begins and completes with the dial still out: it has nothing
+    // to join and forgets nothing.
+    timeout(BOUND, client.shutdown()).await??;
+    assert!(dialed.connection.close_reason().is_none());
+
+    let quic = dialed.connection.clone();
+    let retained = Arc::downgrade(&dialed);
+    let result = timeout(BOUND, client.finish_dial(turn, dialed)).await?;
+    assert!(
+        matches!(result, Err(PeerTransportError::Cancelled)),
+        "a dial finished after shutdown was returned as usable"
+    );
+    assert!(quic.close_reason().is_some(), "the connection stayed open");
+    assert!(
+        retained.upgrade().is_none(),
+        "the shut-down pool kept the connection"
+    );
+    assert_eq!(
+        client.connections.available_permits(),
+        max_connections,
+        "the connection permit was not released"
+    );
+    assert!(client.pool_stats().await.pooled_connections.is_empty());
+    assert!(client.pool_stats_for(&destination).await.is_none());
+    assert!(matches!(
+        client.connect(destination).await,
+        Err(PeerTransportError::Cancelled)
+    ));
+    // The close the server saw is the shutdown close, not a side effect of
+    // the cancelled driver going away.
+    assert_eq!(join_server_value(server_task).await?, b"shutdown");
+    Ok(())
+}
+
+async fn join_server_value<T>(mut task: tokio::task::JoinHandle<TestResult<T>>) -> TestResult<T> {
+    match timeout(BOUND, &mut task).await {
+        Ok(result) => result?,
+        Err(_) => {
+            task.abort();
+            let _ = task.await;
+            Err("server fixture exceeded its bound".into())
+        }
+    }
+}
+
+/// How many HTTP/3 GREASE frames (`vendor/h3`: a reserved frame type, length
+/// 6, payload `grease`) a raw request stream carried.
+fn grease_frames(stream: &[u8]) -> usize {
+    stream
+        .windows(7)
+        .filter(|window| *window == b"\x06grease")
+        .count()
+}
+
+// Every open dispatches on its own clone of the connection's HTTP/3 sender,
+// and a clone of the sender as built carries the connection's GREASE frame
+// again.  The wire must still show that frame once per connection, on the
+// first request stream, as it did when all opens shared one sender.
+#[tokio::test]
+async fn grease_frame_is_sent_once_per_connection_not_once_per_request() -> TestResult {
+    const REQUESTS: usize = 3;
+    let Endpoints {
+        server,
+        client,
+        destination,
+        pins: _,
+    } = endpoints(&limits())?;
+    let server_task = tokio::spawn(async move {
+        let incoming = timeout(BOUND, server.accept())
+            .await?
+            .ok_or("no connection")?;
+        let connection = timeout(BOUND, incoming).await??;
+        let mut held = Vec::new();
+        let mut counts = Vec::new();
+        for _ in 0..REQUESTS {
+            let (send, mut recv) = timeout(BOUND, connection.accept_bi()).await??;
+            let bytes = timeout(BOUND, recv.read_to_end(64 * 1024)).await??;
+            counts.push(grease_frames(&bytes));
+            held.push(send);
+        }
+        Ok(counts)
+    });
+
+    let connection = client.connect(destination).await?;
+    let mut streams = Vec::new();
+    for index in 0..REQUESTS {
+        let mut stream = connection
+            .open(request(&format!("request-{index}")))
+            .await?;
+        stream.finish().await?;
+        streams.push(stream);
+    }
+    let counts = join_server_value(server_task).await?;
+    assert_eq!(counts, [1, 0, 0], "GREASE frames per request stream");
+    drop(streams);
+    drop(connection);
+    timeout(BOUND, client.shutdown()).await??;
     Ok(())
 }

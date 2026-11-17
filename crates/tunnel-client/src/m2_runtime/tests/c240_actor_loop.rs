@@ -1,7 +1,7 @@
 //! C240 scope A: ordinary protocol input through the real session loop.
 //! The owner and grants are synthetic. This is not a public-route close oracle.
 use super::*;
-use std::sync::{Mutex, Weak};
+use std::sync::Weak;
 
 const LIMIT: usize = 256 * 1024;
 const BULK: usize = 192 * 1024;
@@ -68,13 +68,15 @@ struct Evidence {
 
 #[derive(Default)]
 struct Probe {
-    evidence: Mutex<Evidence>,
+    /// Published by the one task that runs inside the probe's scope (the
+    /// session actor); the test samples the latest value.
+    evidence: watch::Sender<Evidence>,
     changed: Notify,
 }
 
 fn note(update: impl FnOnce(&mut Evidence)) {
     let _ = PROBE.try_with(|probe| {
-        update(&mut probe.evidence.lock().expect("C240 passive probe lock"));
+        probe.evidence.send_modify(update);
         probe.changed.notify_waiters();
     });
 }
@@ -95,9 +97,9 @@ pub(in crate::m2_runtime) fn observe(actor: &M2Actor, rejected: Option<usize>) {
                     challenge: stream.auth.challenge_id.clone(),
                     digest: stream.auth.permission_digest.clone(),
                     revision: stream.auth.grant_revision,
-                    confirmed: stream.auth.confirmed,
-                    invalidated: stream.auth.invalidated,
-                    refresh: stream.auth.refresh_in_flight,
+                    confirmed: stream.auth.confirmed(),
+                    invalidated: stream.auth.invalidated(),
+                    refresh: stream.auth.refresh_in_flight(),
                     auth: stream.auth.deadline,
                     operation: stream.auth.operation_deadline,
                     inbound: stream
@@ -110,7 +112,7 @@ pub(in crate::m2_runtime) fn observe(actor: &M2Actor, rejected: Option<usize>) {
                         .snapshot(),
                 })
                 .collect(),
-            frozen: actor.writes_frozen,
+            frozen: actor.admission.writes_frozen(),
             local_fence: actor.local_fence.clone(),
             peer_fence: actor.peer_fence.clone(),
             pending_terminals: actor
@@ -163,12 +165,7 @@ impl Probe {
     async fn wait(&self, predicate: impl Fn(&Observation) -> bool) -> Proof<Observation> {
         loop {
             let changed = self.changed.notified();
-            if let Some(snapshot) = self
-                .evidence
-                .lock()
-                .map_err(|_| "probe poisoned")?
-                .last
-                .clone()
+            if let Some(snapshot) = self.evidence.borrow().last.clone()
                 && predicate(&snapshot)
             {
                 return Ok(snapshot);
@@ -187,7 +184,8 @@ enum Wire {
 
 #[derive(Default)]
 struct Transcript {
-    messages: Mutex<Vec<Wire>>,
+    /// Published by the peer task alone; the test samples the latest value.
+    messages: watch::Sender<Vec<Wire>>,
     changed: Notify,
 }
 
@@ -242,11 +240,8 @@ impl Peer {
                             }
                             Message::Frame(_) => return Err("unexpected raw WebSocket frame".to_owned()),
                         };
-                        {
-                            let mut log = observed.messages.lock().map_err(|_| "transcript poisoned")?;
-                            require!(log.len() < 128, "fixture transcript capacity exceeded");
-                            log.push(wire);
-                        }
+                        require!(observed.messages.borrow().len() < 128, "fixture transcript capacity exceeded");
+                        observed.messages.send_modify(|log| log.push(wire));
                         observed.changed.notify_waiters();
                     }
                 }
@@ -280,12 +275,7 @@ impl Peer {
     }
 
     fn messages(&self) -> Proof<Vec<Wire>> {
-        Ok(self
-            .transcript
-            .messages
-            .lock()
-            .map_err(|_| "transcript poisoned")?
-            .clone())
+        Ok(self.transcript.messages.borrow().clone())
     }
 
     async fn wait<T>(&self, select: impl Fn(&[Wire]) -> Option<T>) -> Proof<T> {
@@ -341,8 +331,8 @@ impl Peer {
 struct Candidate {
     cancel: CancellationToken,
     task: Option<JoinHandle<Result<(), tunnel_transport::TransportError>>>,
-    socket: Option<oneshot::Receiver<axum::extract::ws::WebSocket>>,
-    handed_off: Option<oneshot::Receiver<()>>,
+    socket: Option<mpsc::Receiver<axum::extract::ws::WebSocket>>,
+    handed_off: Option<mpsc::Receiver<()>>,
     upgrades: Arc<std::sync::atomic::AtomicUsize>,
     peer: Option<Peer>,
 }
@@ -421,16 +411,20 @@ impl Candidate {
             "wss://{}/v1/device/control",
             listener.local_addr().map_err(|e| e.to_string())?
         );
-        let (socket_tx, socket) = oneshot::channel();
-        let (done_tx, handed_off) = oneshot::channel();
-        let transfer = Arc::new(Mutex::new(Some((socket_tx, done_tx))));
+        // One candidate only: the first authorised upgrade claims the
+        // transfer, and each channel carries exactly that one value.
+        let (socket_tx, socket) = mpsc::channel(1);
+        let (done_tx, handed_off) = mpsc::channel(1);
+        let claimed = Arc::new(AtomicBool::new(false));
         let upgrades = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let count = upgrades.clone();
         let router = axum::Router::new().route(
             "/v1/device/data",
             axum::routing::get(
                 move |headers: http::HeaderMap, ws: axum::extract::ws::WebSocketUpgrade| {
-                    let transfer = transfer.clone();
+                    let claimed = claimed.clone();
+                    let socket_tx = socket_tx.clone();
+                    let done_tx = done_tx.clone();
                     let count = count.clone();
                     async move {
                         use axum::response::IntoResponse;
@@ -445,16 +439,14 @@ impl Candidate {
                         {
                             return http::StatusCode::FORBIDDEN.into_response();
                         }
-                        let Some((socket_tx, done_tx)) =
-                            transfer.lock().expect("candidate transfer").take()
-                        else {
+                        if claimed.swap(true, Ordering::SeqCst) {
                             return http::StatusCode::CONFLICT.into_response();
-                        };
+                        }
                         ws.protocols([crate::DATA_SUBPROTOCOL])
                             .on_upgrade(move |socket| async move {
                                 count.fetch_add(1, Ordering::SeqCst);
-                                let _ = socket_tx.send(socket);
-                                let _ = done_tx.send(());
+                                let _ = socket_tx.try_send(socket);
+                                let _ = done_tx.try_send(());
                                 // No detached handler, retained socket or work after transfer.
                             })
                             .into_response()
@@ -482,13 +474,15 @@ impl Candidate {
             .socket
             .take()
             .ok_or("candidate received twice")?
+            .recv()
             .await
-            .map_err(|_| "candidate upgrade failed")?;
+            .ok_or("candidate upgrade failed")?;
         self.handed_off
             .take()
             .ok_or("candidate handoff received twice")?
+            .recv()
             .await
-            .map_err(|_| "candidate callback did not finish")?;
+            .ok_or("candidate callback did not finish")?;
         use axum::extract::ws::Message as AxumMessage;
         // Adapt only the framework's WebSocket value types; the TLS and
         // WebSocket handshakes above are the actual production dial path.
@@ -994,12 +988,7 @@ impl Fixture {
             }
         }
         require!(
-            self.probe
-                .evidence
-                .lock()
-                .map_err(|_| "probe poisoned")?
-                .dispatches
-                .is_empty(),
+            self.probe.evidence.borrow().dispatches.is_empty(),
             "buffered input reached application dispatch"
         );
         Ok(())
@@ -1039,7 +1028,7 @@ impl Fixture {
     }
 
     fn check_ownership(&self) -> Proof {
-        let evidence = self.probe.evidence.lock().map_err(|_| "probe poisoned")?;
+        let evidence = self.probe.evidence.borrow();
         require!(
             matches!(&*self.readiness.borrow(), Readiness::Closed { .. }),
             "session did not publish Closed"
@@ -1165,11 +1154,7 @@ async fn quota_case(frozen: bool, cross: bool) -> Proof {
         if let Some(crossing) = crossing {
             fixture.data.frame(&crossing).await?;
             fixture.natural_completion().await?;
-            let evidence = fixture
-                .probe
-                .evidence
-                .lock()
-                .map_err(|_| "probe poisoned")?;
+            let evidence = fixture.probe.evidence.borrow();
             require!(
                 quota_predicate(fixture.natural.as_ref(), &evidence),
                 "natural QueueLimit predicate did not hold"
@@ -1214,11 +1199,7 @@ async fn quota_case(frozen: bool, cross: bool) -> Proof {
                     .is_some_and(|actor| !actor.is_finished()),
                 "in-capacity control ended the session"
             );
-            let evidence = fixture
-                .probe
-                .evidence
-                .lock()
-                .map_err(|_| "probe poisoned")?;
+            let evidence = fixture.probe.evidence.borrow();
             require!(
                 !quota_predicate(None, &evidence) && evidence.rejection.is_none(),
                 "quota oracle accepted an omitted crossing"
@@ -1277,7 +1258,7 @@ async fn authorization_case(frozen: bool, invalidate: bool) -> Proof {
         if invalidate {
             require!(frames[0].kind == FrameKind::Reset && frames[0].reset_reason().map_err(|e| e.to_string())? == Some(M2_RESET_AUTH_EXPIRED), "explicit invalidation was not exact RESET4001");
         } else { require!(frames[0].kind == FrameKind::Data && frames[0].payload == payload, "confirmation did not execute the accepted record exactly once"); }
-        let evidence = fixture.probe.evidence.lock().map_err(|_| "probe poisoned")?;
+        let evidence = fixture.probe.evidence.borrow();
         require!(!quota_predicate(None, &evidence) && evidence.rejection.is_none(), "quota oracle accepted authorization control");
         require!(evidence.dispatches == if invalidate { vec![] } else { vec![1] }, "application dispatch count changed");
         Ok(())
@@ -1318,11 +1299,7 @@ async fn authorization_case(frozen: bool, invalidate: bool) -> Proof {
         {
             require!(peer.messages()?.iter().all(|wire| !matches!(wire, Wire::Frame(frame) if matches!(frame.kind, FrameKind::Data | FrameKind::Fin | FrameKind::Reset))), "application output crossed candidate before commit");
         }
-        let evidence = fixture
-            .probe
-            .evidence
-            .lock()
-            .map_err(|_| "probe poisoned")?;
+        let evidence = fixture.probe.evidence.borrow();
         require!(
             evidence.dispatches == if invalidate { vec![] } else { vec![1] },
             "late application dispatch during teardown"

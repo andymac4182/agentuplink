@@ -89,7 +89,6 @@ async fn admitted_six_seconds_ago() -> Admitted {
     {
         let session = actor.sessions.get_mut(&key.scope()).expect("session");
         session.profile = super::RuntimeProfile::M2;
-        session.data_tx = Some(data_tx.clone());
         session.active_carrier = Some(DataCarrier {
             context: CarrierContext::new(key.session_id.clone(), key.epoch, 1, "m6c180".to_owned()),
             tx: data_tx,

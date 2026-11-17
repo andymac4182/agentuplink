@@ -1,4 +1,4 @@
-//! One supervisor task per ACP transport connection.
+//! One supervisor per ACP transport connection.
 //!
 //! It owns the child, the clock and the bounded channels. Every **decision**
 //! is `tunnel_acp::lifecycle`'s, which owns none of those: the supervisor
@@ -6,32 +6,51 @@
 //! way `tunnel-http-forward`'s `RecordDeadline` is driven. That is the only
 //! clock in this path, and it is deliberately on this side of the boundary.
 //!
+//! **One owner of the connection state.** The lifecycle, the callback table,
+//! the waiters and the request-id counter change together, so they are plain
+//! fields of one task ([`Owner`]) and nothing else can reach them. Everything
+//! else — the public [`Supervisor`] methods, the stdout reader, the deadline
+//! ticker — sends that task a [`Command`] over a bounded queue and, where it
+//! needs the result, awaits a `oneshot` reply. Each command is applied whole
+//! before the next is looked at, which is the atomicity the fields need.
+//!
+//! The owner never awaits anything but its own queue: it performs no child
+//! I/O and never sends on a host-facing channel. That is why it is a task of
+//! its own rather than the stdout reader: the reader has to wait on bounded
+//! host-facing queues, and a state owner parked there would make `prompt` wait
+//! for the host to drain its events.
+//!
 //! **A separate reader.** The task that reads the child's stdout is not the
 //! task that is waiting for a prompt's `stopReason`, so an agent callback is
 //! handled while a prompt is pending. A prompt hands the caller a
-//! [`PromptTicket`] instead of blocking, and no lock is held across any child
-//! I/O: the shared state is a `std::sync::Mutex` taken only for short,
-//! await-free critical sections.
+//! [`PromptTicket`] instead of blocking.
 //!
 //! **What is not here.** HTTP, SSE, sessions over the wire, the tunnel, a
 //! relay and any real ACP client. Chunks 3 to 5.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tunnel_acp::lifecycle::{
-    AcpConnection, CallbackTable, ChildLifecycle, Direction, IdScope, LifecycleEvent,
-    LifecycleRejection, LifecycleRule, MAX_PENDING_PER_DIRECTION, MAX_SESSIONS_PER_CONNECTION,
-    Outcome, PendingKind, PermissionOutcome, RequestId,
+    AcpConnection, CallbackTable, ChildLifecycle, Direction, ExpiredPermission, IdScope,
+    LifecycleEvent, LifecycleRejection, LifecycleRule, MAX_PENDING_PER_DIRECTION,
+    MAX_SESSIONS_PER_CONNECTION, Outcome, PendingKind, PermissionOutcome, RequestId,
 };
 use tunnel_acp::message::{AcpRule, MessageKind, read_turn_completion};
 use tunnel_acp::terminal::AcpTerminal;
 
 use crate::child::{ChildConfig, ChildCounters, ChildEnd, ChildEvent, ChildHandle, SpawnError};
+
+/// Commands queued towards the state owner.
+///
+/// The owner only ever waits on this queue, so it drains as fast as commands
+/// arrive; when the queue is full a sender waits its turn, which is the
+/// backpressure. Nothing is dropped and nothing is unbounded.
+const COMMAND_QUEUE: usize = 64;
 
 /// The identifiers a JSON-RPC id is scoped by, minus the direction.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -287,9 +306,117 @@ pub struct Diagnostics {
     pub permission_expirations: u64,
 }
 
-type Waiters = HashMap<(IdScope, RequestId), oneshot::Sender<Result<Value, SupervisorError>>>;
+type Reply = oneshot::Receiver<Result<Value, SupervisorError>>;
+type Waiters = HashMap<RequestId, oneshot::Sender<Result<Value, SupervisorError>>>;
 
-struct Shared {
+/// What must hold before a host request is registered and written.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Gate {
+    /// `initialize`: admitted before the connection is ready.
+    Open,
+    /// `session/new`: admission open and a session slot free.
+    NewSession,
+    /// `session/prompt`: the session's one prompt slot is taken first, and
+    /// given back if the request is then refused.
+    Prompt,
+}
+
+/// A host request the owner registered: its id, its line, and where its
+/// response will arrive.
+struct Dispatched {
+    id: RequestId,
+    body: Vec<u8>,
+    reply: Reply,
+}
+
+/// Everything that can be asked of the state owner. One command is one
+/// indivisible change.
+enum Command {
+    /// Allocate the next request id, register it and hand back its line.
+    Dispatch {
+        method: &'static str,
+        params: Value,
+        kind: PendingKind,
+        session: Option<String>,
+        gate: Gate,
+        reply: oneshot::Sender<Result<Dispatched, SupervisorError>>,
+    },
+    /// The line of a dispatched request could not be written.
+    SendFailed {
+        id: RequestId,
+    },
+    /// Drive the child lifecycle's own transition table.
+    Advance {
+        event: LifecycleEvent,
+        reply: oneshot::Sender<Result<(), LifecycleRejection>>,
+    },
+    OpenSession {
+        session: String,
+        reply: oneshot::Sender<Result<(), LifecycleRejection>>,
+    },
+    SubscriberReady {
+        session: String,
+        reply: oneshot::Sender<Result<(), LifecycleRejection>>,
+    },
+    AnswerPermission {
+        id: RequestId,
+        outcome: PermissionOutcome,
+        reply: oneshot::Sender<Result<(), LifecycleRejection>>,
+    },
+    /// Cancel one session's outstanding permissions, or every open session's.
+    CancelPermissions {
+        session: Option<String>,
+        reply: oneshot::Sender<Vec<RequestId>>,
+    },
+    HasSession {
+        session: String,
+        reply: oneshot::Sender<bool>,
+    },
+    OpenSessions {
+        reply: oneshot::Sender<Vec<String>>,
+    },
+    /// Stop admission and cancel every outstanding permission.
+    Drain {
+        reply: oneshot::Sender<()>,
+    },
+    /// The agent asked the host for permission.
+    RegisterPermission {
+        id: RequestId,
+        session: String,
+        offered: Vec<String>,
+        reply: oneshot::Sender<Result<(), LifecycleRejection>>,
+    },
+    /// The agent answered a host request. `result` is `None` for an error.
+    Response {
+        id: RequestId,
+        result: Option<Value>,
+        reply: oneshot::Sender<()>,
+    },
+    /// The child's message stream ended.
+    ChildEnded {
+        end: ChildEnd,
+        reply: oneshot::Sender<()>,
+    },
+    /// The deadline ticker read the clock.
+    Observe {
+        reply: oneshot::Sender<Vec<ExpiredPermission>>,
+    },
+}
+
+/// What the owner publishes after every command: the values the synchronous
+/// accessors read.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Published {
+    lifecycle: ChildLifecycle,
+    session_count: usize,
+    pending_host_to_agent: usize,
+    pending_agent_to_host: usize,
+    resolutions: u64,
+    permission_expirations: u64,
+}
+
+/// The single owner of one connection's state.
+struct Owner {
     connection: AcpConnection,
     callbacks: CallbackTable,
     waiters: Waiters,
@@ -298,20 +425,329 @@ struct Shared {
     /// Session identifiers this connection has opened, so a drain can cancel
     /// each one's outstanding permissions.
     open_sessions: Vec<String>,
+    host_scope: IdScope,
+    agent_scope: IdScope,
+    started: Instant,
+    permission_timeout_ms: u64,
+    published: watch::Sender<Published>,
+}
+
+impl Owner {
+    async fn run(mut self, mut commands: mpsc::Receiver<Command>) {
+        // Ends when every sender is gone: the `Supervisor`, the reader and the
+        // ticker. Waiters still held then are dropped, which a ticket reads
+        // as `ChildGone`.
+        while let Some(command) = commands.recv().await {
+            self.handle(command);
+        }
+    }
+
+    fn now(&self) -> u64 {
+        u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    fn snapshot(&self) -> Published {
+        Published {
+            lifecycle: self.connection.lifecycle(),
+            session_count: self.connection.session_count(),
+            pending_host_to_agent: self.callbacks.pending_in(&self.host_scope),
+            pending_agent_to_host: self.callbacks.pending_in(&self.agent_scope),
+            resolutions: self.callbacks.resolutions(),
+            permission_expirations: self.callbacks.expirations(),
+        }
+    }
+
+    /// Publish the state as it now is. Called after a command is applied and
+    /// **before** its reply or any waiter is released, so whoever is woken by
+    /// a change reads a snapshot that already contains it.
+    fn publish(&self) {
+        let next = self.snapshot();
+        self.published.send_if_modified(|current| {
+            if *current == next {
+                false
+            } else {
+                *current = next;
+                true
+            }
+        });
+    }
+
+    fn handle(&mut self, command: Command) {
+        match command {
+            Command::Dispatch {
+                method,
+                params,
+                kind,
+                session,
+                gate,
+                reply,
+            } => {
+                let dispatched = self.dispatch(method, params, kind, session.as_deref(), gate);
+                self.publish();
+                if let Err(Ok(dispatched)) = reply.send(dispatched) {
+                    // The caller went away before it could write the line, so
+                    // the request was never sent and nobody is waiting.
+                    self.forget(&dispatched.id, kind, session.as_deref());
+                    self.publish();
+                }
+            }
+            Command::SendFailed { id } => {
+                let waiter = self.waiters.remove(&id);
+                if let Some(waiter) = waiter {
+                    let _ = waiter.send(Err(SupervisorError::ChildGone));
+                }
+            }
+            Command::Advance { event, reply } => {
+                let advanced = self.connection.advance(event).map(|_| ());
+                self.publish();
+                let _ = reply.send(advanced);
+            }
+            Command::OpenSession { session, reply } => {
+                let now = self.now();
+                let opened = self.connection.open_session(&session, now);
+                if opened.is_ok() {
+                    self.open_sessions.push(session);
+                }
+                self.publish();
+                let _ = reply.send(opened);
+            }
+            Command::SubscriberReady { session, reply } => {
+                let ready = self.connection.subscriber_ready(&session);
+                self.publish();
+                let _ = reply.send(ready);
+            }
+            Command::AnswerPermission { id, outcome, reply } => {
+                let now = self.now();
+                let resolved = self
+                    .callbacks
+                    .resolve(&self.agent_scope, &id, Outcome::Permission(outcome), now)
+                    .map(|_| ());
+                self.publish();
+                let _ = reply.send(resolved);
+            }
+            Command::CancelPermissions { session, reply } => {
+                let now = self.now();
+                let sessions = session.map_or_else(|| self.open_sessions.clone(), |one| vec![one]);
+                let mut cancelled = Vec::new();
+                for session in sessions {
+                    cancelled.extend(
+                        self.callbacks
+                            .cancel_session_permissions(&session, now)
+                            .into_iter()
+                            .map(|(_, id)| id),
+                    );
+                }
+                self.publish();
+                let _ = reply.send(cancelled);
+            }
+            Command::HasSession { session, reply } => {
+                let _ = reply.send(self.open_sessions.contains(&session));
+            }
+            Command::OpenSessions { reply } => {
+                let _ = reply.send(self.open_sessions.clone());
+            }
+            Command::Drain { reply } => {
+                let now = self.now();
+                let _ = self.connection.advance(LifecycleEvent::DrainRequested);
+                // Every outstanding permission is cancelled, never approved.
+                for session in self.open_sessions.clone() {
+                    self.callbacks.cancel_session_permissions(&session, now);
+                }
+                self.publish();
+                let _ = reply.send(());
+            }
+            Command::RegisterPermission {
+                id,
+                session,
+                offered,
+                reply,
+            } => {
+                let now = self.now();
+                // The options the agent offered are recorded with the
+                // callback, so the host's answer can be checked against them
+                // (`docs/acp.md`: "Validate the response against ... the
+                // offered option").
+                let registered = self.callbacks.register_permission(
+                    &self.agent_scope,
+                    id,
+                    Some(&session),
+                    now,
+                    self.permission_timeout_ms,
+                    offered,
+                );
+                self.publish();
+                let _ = reply.send(registered);
+            }
+            Command::Response { id, result, reply } => {
+                self.response(id, result);
+                let _ = reply.send(());
+            }
+            Command::ChildEnded { end, reply } => {
+                let event = match end {
+                    ChildEnd::Closed => LifecycleEvent::Reaped,
+                    ChildEnd::OversizedLine | ChildEnd::InvalidLine(_) | ChildEnd::ReadFailed => {
+                        LifecycleEvent::Failed
+                    }
+                };
+                let _ = self.connection.advance(event);
+                let waiters: Vec<_> = self.waiters.drain().map(|(_, sender)| sender).collect();
+                self.publish();
+                // Every request still outstanding learns that its outcome is
+                // unknown. None is answered as if it had completed, and none
+                // is sent again.
+                for waiter in waiters {
+                    let _ = waiter.send(Err(SupervisorError::ChildGone));
+                }
+                let _ = reply.send(());
+            }
+            Command::Observe { reply } => {
+                let now = self.now();
+                let expired = self.callbacks.observe(now);
+                self.publish();
+                let _ = reply.send(expired);
+            }
+        }
+    }
+
+    /// Register a host request and compose its line.
+    fn dispatch(
+        &mut self,
+        method: &str,
+        params: Value,
+        kind: PendingKind,
+        session: Option<&str>,
+        gate: Gate,
+    ) -> Result<Dispatched, SupervisorError> {
+        match gate {
+            Gate::Open => {}
+            // The bound is checked before dispatch, so a ninth session is
+            // never asked for.
+            Gate::NewSession => {
+                if !self.connection.lifecycle().admits() {
+                    return Err(LifecycleRejection::new(
+                        LifecycleRule::ConnectionNotReady,
+                        "the connection is not admitting new sessions",
+                    )
+                    .into());
+                }
+                if self.connection.session_count() >= self.session_limit {
+                    return Err(LifecycleRejection::new(
+                        LifecycleRule::SessionLimit,
+                        "too many sessions on this connection",
+                    )
+                    .into());
+                }
+            }
+            Gate::Prompt => {
+                self.connection.begin_prompt(session.unwrap_or_default())?;
+            }
+        }
+        let registered = self.register(method, params, kind, session, gate != Gate::Open);
+        if registered.is_err() && gate == Gate::Prompt {
+            // The turn never started; put the session back.
+            let _ = self.connection.end_prompt(session.unwrap_or_default());
+        }
+        registered
+    }
+
+    fn register(
+        &mut self,
+        method: &str,
+        params: Value,
+        kind: PendingKind,
+        session: Option<&str>,
+        require_ready: bool,
+    ) -> Result<Dispatched, SupervisorError> {
+        if require_ready && !self.connection.lifecycle().admits() {
+            return Err(LifecycleRejection::new(
+                LifecycleRule::ConnectionNotReady,
+                "the connection is not admitting requests",
+            )
+            .into());
+        }
+        let now = self.now();
+        self.next_id += 1;
+        let id = RequestId::Number(i64::try_from(self.next_id).unwrap_or(i64::MAX));
+        self.callbacks
+            .register(&self.host_scope, id.clone(), kind, session, now, 0)?;
+        let (sender, reply) = oneshot::channel();
+        self.waiters.insert(id.clone(), sender);
+        let body = serde_json::to_vec(&json!({
+            "jsonrpc": "2.0",
+            "id": id_value(&id),
+            "method": method,
+            "params": params,
+        }))
+        .unwrap_or_default();
+        Ok(Dispatched { id, body, reply })
+    }
+
+    /// Undo a registration whose line was never written.
+    fn forget(&mut self, id: &RequestId, kind: PendingKind, session: Option<&str>) {
+        let now = self.now();
+        self.waiters.remove(id);
+        let _ = self.callbacks.resolve(
+            &self.host_scope,
+            id,
+            Outcome::Failed("not_sent".to_owned()),
+            now,
+        );
+        if kind == PendingKind::Prompt
+            && let Some(session) = session
+        {
+            let _ = self.connection.end_prompt(session);
+        }
+    }
+
+    fn response(&mut self, id: RequestId, result: Option<Value>) {
+        let now = self.now();
+        let outcome = result.as_ref().map_or_else(
+            || Outcome::Failed("agent_error".to_owned()),
+            |_| Outcome::Completed("ok".to_owned()),
+        );
+        let Ok(resolution) = self.callbacks.resolve(&self.host_scope, &id, outcome, now) else {
+            // A duplicate, a late, or an unsolicited response. It cannot
+            // repeat a decision, so it is dropped.
+            return;
+        };
+        if resolution.kind == PendingKind::Prompt
+            && let Some(session) = resolution.session.as_deref()
+        {
+            let _ = self.connection.end_prompt(session);
+        }
+        // The entry leaves the table and the waiter leaves the map in this one
+        // step, so a response reaches its waiter exactly once.
+        let waiter = self.waiters.remove(&id);
+        self.publish();
+        if let Some(waiter) = waiter {
+            let _ = waiter.send(match result {
+                Some(value) => Ok(value),
+                None => Err(SupervisorError::Protocol(AcpRule::NotJsonRpcMessage)),
+            });
+        }
+    }
 }
 
 /// One supervised ACP child and its connection state.
+///
+/// The state itself lives in the owner task; this is a handle to it. Methods
+/// that change it are `async` and return once the owner has applied the
+/// change. [`Supervisor::lifecycle`], [`Supervisor::pending`],
+/// [`Supervisor::session_count`] and [`Supervisor::diagnostics`] stay
+/// synchronous by reading the owner's **last published snapshot**; the owner
+/// publishes before it releases any reply, waiter or agent event, so a caller
+/// that has awaited a method, a ticket or an [`AgentEvent`] reads a snapshot
+/// that already includes it.
 pub struct Supervisor {
-    shared: Arc<Mutex<Shared>>,
+    commands: mpsc::Sender<Command>,
+    published: watch::Receiver<Published>,
     child: Arc<ChildHandle>,
     counters: Arc<ChildCounters>,
-    scope: ConnectionScope,
     started: Instant,
-    permission_timeout_ms: u64,
 }
 
 impl Supervisor {
-    /// Spawn the child and start the reader and deadline tasks.
+    /// Spawn the child and start the owner, reader and deadline tasks.
     ///
     /// # Errors
     /// [`SpawnError`] when the process cannot be started.
@@ -340,45 +776,60 @@ impl Supervisor {
         let counters = Arc::new(ChildCounters::default());
         let (child, events) = crate::child::spawn(&config.child, &counters)?;
         let child = Arc::new(child);
-        let shared = Arc::new(Mutex::new(Shared {
-            connection: AcpConnection::new(config.session_limit),
-            callbacks: CallbackTable::new(config.pending_limit),
+        let started = Instant::now();
+        let connection = AcpConnection::new(config.session_limit);
+        let callbacks = CallbackTable::new(config.pending_limit);
+        let (published, snapshots) = watch::channel(Published {
+            lifecycle: connection.lifecycle(),
+            session_count: 0,
+            pending_host_to_agent: 0,
+            pending_agent_to_host: 0,
+            resolutions: callbacks.resolutions(),
+            permission_expirations: callbacks.expirations(),
+        });
+        let owner = Owner {
+            connection,
+            callbacks,
             waiters: HashMap::new(),
             next_id: 0,
             session_limit: config.session_limit,
             open_sessions: Vec::new(),
-        }));
-        let (to_host, from_agent) = mpsc::channel(crate::child::STDOUT_QUEUE);
-        let supervisor = Self {
-            shared: Arc::clone(&shared),
-            child: Arc::clone(&child),
-            counters: Arc::clone(&counters),
-            scope: config.scope.clone(),
-            started: Instant::now(),
+            host_scope: config.scope.id_scope(Direction::HostToAgent),
+            agent_scope: config.scope.id_scope(Direction::AgentToHost),
+            started,
             permission_timeout_ms: u64::try_from(config.permission_timeout.as_millis())
                 .unwrap_or(u64::MAX),
+            published,
         };
+        let (commands, queue) = mpsc::channel(COMMAND_QUEUE);
+        // The owner holds no child handle, so it never delays the synchronous
+        // cleanup in `ChildHandle::drop`.
+        tokio::spawn(owner.run(queue));
+        let (to_host, from_agent) = mpsc::channel(crate::child::STDOUT_QUEUE);
         tokio::spawn(read_agent(
             events,
             ReaderContext {
-                shared: Arc::clone(&shared),
+                commands: commands.clone(),
                 child: Arc::clone(&child),
                 to_host: to_host.clone(),
-                scope: config.scope.clone(),
-                started: supervisor.started,
-                permission_timeout_ms: supervisor.permission_timeout_ms,
                 counters: Arc::clone(&counters),
                 forward,
             },
         ));
         tokio::spawn(observe_deadlines(
-            Arc::clone(&shared),
+            commands.clone(),
             Arc::clone(&child),
             to_host,
             config.deadline_tick,
-            supervisor.started,
             Arc::clone(&counters),
         ));
+        let supervisor = Self {
+            commands,
+            published: snapshots,
+            child,
+            counters,
+            started,
+        };
         Ok((supervisor, from_agent))
     }
 
@@ -390,9 +841,10 @@ impl Supervisor {
         u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX)
     }
 
+    /// The child lifecycle in the owner's last published snapshot.
     #[must_use]
     pub fn lifecycle(&self) -> ChildLifecycle {
-        self.with(|shared| shared.connection.lifecycle())
+        self.published.borrow().lifecycle
     }
 
     /// The child's process id, which is its process-group id.
@@ -426,14 +878,15 @@ impl Supervisor {
     /// [`SupervisorError::ChildGone`], or the lifecycle's refusal of a second
     /// `initialize`.
     pub async fn initialize_with(&self, params: Value) -> Result<Value, SupervisorError> {
-        let (_, reply) = self.dispatch("initialize", params, PendingKind::Call, None, false)?;
+        let (_, reply) = self
+            .dispatch("initialize", params, PendingKind::Call, None, Gate::Open)
+            .await?;
         let value = reply.await.map_err(|_| SupervisorError::ChildGone)??;
-        self.try_with(|shared| {
-            shared
-                .connection
-                .advance(LifecycleEvent::Initialized)
-                .map(|_| ())
-        })?;
+        self.lifecycle_command(|reply| Command::Advance {
+            event: LifecycleEvent::Initialized,
+            reply,
+        })
+        .await?;
         Ok(value)
     }
 
@@ -452,36 +905,27 @@ impl Supervisor {
     /// # Errors
     /// As [`Supervisor::new_session`].
     pub async fn new_session_with(&self, params: Value) -> Result<String, SupervisorError> {
-        // The bound is checked before dispatch, so a ninth session is never
-        // asked for.
-        self.try_with(|shared| {
-            if !shared.connection.lifecycle().admits() {
-                return Err(LifecycleRejection::new(
-                    LifecycleRule::ConnectionNotReady,
-                    "the connection is not admitting new sessions",
-                ));
-            }
-            if shared.connection.session_count() >= shared.session_limit {
-                return Err(LifecycleRejection::new(
-                    LifecycleRule::SessionLimit,
-                    "too many sessions on this connection",
-                ));
-            }
-            Ok(())
-        })?;
-        let (_, reply) = self.dispatch("session/new", params, PendingKind::Call, None, true)?;
+        let (_, reply) = self
+            .dispatch(
+                "session/new",
+                params,
+                PendingKind::Call,
+                None,
+                Gate::NewSession,
+            )
+            .await?;
         let value = reply.await.map_err(|_| SupervisorError::ChildGone)??;
         let session = value
             .get("sessionId")
             .and_then(Value::as_str)
             .ok_or(SupervisorError::Protocol(AcpRule::NotJsonRpcMessage))?
             .to_owned();
-        let now = self.now_ms();
-        self.try_with(|shared| {
-            shared.connection.open_session(&session, now)?;
-            shared.open_sessions.push(session.clone());
-            Ok(())
-        })?;
+        let opened = session.clone();
+        self.lifecycle_command(|reply| Command::OpenSession {
+            session: opened,
+            reply,
+        })
+        .await?;
         Ok(session)
     }
 
@@ -489,24 +933,28 @@ impl Supervisor {
     ///
     /// # Errors
     /// [`LifecycleRule::UnknownSession`] or [`LifecycleRule::SessionNotReady`].
-    pub fn subscriber_ready(&self, session: &str) -> Result<(), SupervisorError> {
-        self.try_with(|shared| shared.connection.subscriber_ready(session))
+    pub async fn subscriber_ready(&self, session: &str) -> Result<(), SupervisorError> {
+        let session = session.to_owned();
+        self.lifecycle_command(|reply| Command::SubscriberReady { session, reply })
+            .await
     }
 
     /// Start the session's one active prompt.
     ///
-    /// Returns immediately with a [`PromptTicket`]; the reader keeps handling
-    /// agent callbacks while it is outstanding.
+    /// Returns a [`PromptTicket`] as soon as the owner has registered the
+    /// turn — it does not wait for the agent — and the reader keeps handling
+    /// agent callbacks while the ticket is outstanding.
     ///
     /// # Errors
     /// [`LifecycleRule::PromptAlreadyActive`] for a second concurrent prompt,
     /// [`LifecycleRule::SessionNotReady`] before the subscriber arrives, and
     /// [`LifecycleRule::ConnectionNotReady`] once admission has stopped.
-    pub fn prompt(&self, session: &str, text: &str) -> Result<PromptTicket, SupervisorError> {
+    pub async fn prompt(&self, session: &str, text: &str) -> Result<PromptTicket, SupervisorError> {
         self.prompt_with(
             session,
             json!({"sessionId": session, "prompt": [{"type": "text", "text": text}]}),
         )
+        .await
     }
 
     /// Start the session's one active prompt from the caller's own params.
@@ -515,33 +963,31 @@ impl Supervisor {
     /// a v1 prompt is a list of content blocks, and a bridge that rebuilt it
     /// from the first text block would silently drop the rest.
     ///
+    /// Taking the session's prompt slot, registering the request and — when
+    /// the request is refused — giving the slot back are one owner command,
+    /// so no other caller can observe the session between those steps.
+    ///
     /// # Errors
     /// As [`Supervisor::prompt`].
-    pub fn prompt_with(
+    pub async fn prompt_with(
         &self,
         session: &str,
         params: Value,
     ) -> Result<PromptTicket, SupervisorError> {
-        self.try_with(|shared| shared.connection.begin_prompt(session))?;
-        let reply = self.dispatch(
-            "session/prompt",
-            params,
-            PendingKind::Prompt,
-            Some(session),
-            true,
-        );
-        match reply {
-            Ok((id, reply)) => Ok(PromptTicket {
-                session: session.to_owned(),
-                id,
-                reply,
-            }),
-            Err(error) => {
-                // The turn never started; put the session back.
-                let _ = self.try_with(|shared| shared.connection.end_prompt(session));
-                Err(error)
-            }
-        }
+        let (id, reply) = self
+            .dispatch(
+                "session/prompt",
+                params,
+                PendingKind::Prompt,
+                Some(session),
+                Gate::Prompt,
+            )
+            .await?;
+        Ok(PromptTicket {
+            session: session.to_owned(),
+            id,
+            reply,
+        })
     }
 
     /// Answer an outstanding permission request.
@@ -555,15 +1001,10 @@ impl Supervisor {
         id: &RequestId,
         outcome: PermissionOutcome,
     ) -> Result<(), SupervisorError> {
-        let scope = self.scope.id_scope(Direction::AgentToHost);
-        let now = self.now_ms();
-        self.try_with(|shared| {
-            shared
-                .callbacks
-                .resolve(&scope, id, Outcome::Permission(outcome.clone()), now)
-                .map(|_| ())
-        })?;
         let body = permission_response(id, &outcome);
+        let id = id.clone();
+        self.lifecycle_command(|reply| Command::AnswerPermission { id, outcome, reply })
+            .await?;
         self.child
             .send(&body)
             .await
@@ -584,10 +1025,8 @@ impl Supervisor {
         session: &str,
         params: Value,
     ) -> Result<(), SupervisorError> {
-        let now = self.now_ms();
-        let cancelled =
-            self.with(|shared| shared.callbacks.cancel_session_permissions(session, now));
-        for (_, id) in cancelled {
+        let cancelled = self.cancel_permissions(Some(session.to_owned())).await;
+        for id in cancelled {
             // Tell the agent on the wire, exactly as the deadline path does.
             let _ = self
                 .child
@@ -606,16 +1045,19 @@ impl Supervisor {
             .map_err(|_| SupervisorError::ChildGone)
     }
 
-    /// Whether this connection opened `session`.
-    #[must_use]
-    pub fn has_session(&self, session: &str) -> bool {
-        self.with(|shared| shared.open_sessions.iter().any(|open| open == session))
+    /// Whether this connection opened `session`, asked of the owner.
+    pub async fn has_session(&self, session: &str) -> bool {
+        let session = session.to_owned();
+        self.ask(|reply| Command::HasSession { session, reply })
+            .await
+            .unwrap_or(false)
     }
 
-    /// Every session this connection has open.
-    #[must_use]
-    pub fn open_sessions(&self) -> Vec<String> {
-        self.with(|shared| shared.open_sessions.clone())
+    /// Every session this connection has open, asked of the owner.
+    pub async fn open_sessions(&self) -> Vec<String> {
+        self.ask(|reply| Command::OpenSessions { reply })
+            .await
+            .unwrap_or_default()
     }
 
     /// Resolve every outstanding permission on every open session as
@@ -633,16 +1075,8 @@ impl Supervisor {
     /// way, which is the point: `docs/acp.md` says timeout and disconnect never
     /// mean permission.
     pub async fn cancel_all_permissions(&self) -> usize {
-        let now = self.now_ms();
-        let cancelled = self.with(|shared| {
-            let sessions: Vec<String> = shared.open_sessions.clone();
-            let mut all = Vec::new();
-            for session in sessions {
-                all.extend(shared.callbacks.cancel_session_permissions(&session, now));
-            }
-            all
-        });
-        for (_, id) in &cancelled {
+        let cancelled = self.cancel_permissions(None).await;
+        for id in &cancelled {
             // The agent learns on the wire, exactly as the deadline path and
             // `session/cancel` do.  A supervisor's belief about what it
             // resolved is not evidence that the agent was told.
@@ -664,22 +1098,17 @@ impl Supervisor {
     /// *who ended the child* — the supervisor, deliberately — and not *how the
     /// process died.
     pub async fn drain(&self) {
-        let now = self.now_ms();
-        self.with(|shared| {
-            let _ = shared.connection.advance(LifecycleEvent::DrainRequested);
-            // Every outstanding permission is cancelled, never approved.
-            let sessions: Vec<String> = shared.open_sessions.clone();
-            for session in sessions {
-                shared.callbacks.cancel_session_permissions(&session, now);
-            }
-        });
+        let _ = self.ask(|reply| Command::Drain { reply }).await;
         self.child.kill();
         self.child.wait_exited().await;
-        self.with(|shared| {
-            // Draining then reaped is what reaches `Stopped`; the transition
-            // table decides, not this line.
-            let _ = shared.connection.advance(LifecycleEvent::Reaped);
-        });
+        // Draining then reaped is what reaches `Stopped`; the transition
+        // table decides, not this line.
+        let _ = self
+            .ask(|reply| Command::Advance {
+                event: LifecycleEvent::Reaped,
+                reply,
+            })
+            .await;
     }
 
     /// End the child's life without awaiting anything.
@@ -697,17 +1126,13 @@ impl Supervisor {
         self.child.wait_exited().await;
     }
 
+    /// Payload-free counters. The lifecycle, resolution and expiry values are
+    /// the owner's last published snapshot; the rest are the child's atomics.
     #[must_use]
     pub fn diagnostics(&self) -> Diagnostics {
-        let (resolutions, permission_expirations, terminal) = self.with(|shared| {
-            (
-                shared.callbacks.resolutions(),
-                shared.callbacks.expirations(),
-                shared.connection.lifecycle().is_terminal(),
-            )
-        });
+        let published = *self.published.borrow();
         Diagnostics {
-            lifecycle_is_terminal: terminal,
+            lifecycle_is_terminal: published.lifecycle.is_terminal(),
             spawned: self.counters.spawned.load(Ordering::Relaxed),
             killed: self.counters.killed.load(Ordering::Relaxed),
             exited: self.counters.exited.load(Ordering::Relaxed),
@@ -722,83 +1147,84 @@ impl Supervisor {
             background_tasks: self.counters.background_tasks.load(Ordering::Relaxed),
             deadman_armed: self.counters.deadman_armed.load(Ordering::Relaxed),
             deadman_stood_down: self.counters.deadman_stood_down.load(Ordering::Relaxed),
-            resolutions,
-            permission_expirations,
+            resolutions: published.resolutions,
+            permission_expirations: published.permission_expirations,
         }
     }
 
-    /// Outstanding requests in one direction, for the bound tests.
+    /// Outstanding requests in one direction, for the bound tests, in the
+    /// owner's last published snapshot.
     #[must_use]
     pub fn pending(&self, direction: Direction) -> usize {
-        let scope = self.scope.id_scope(direction);
-        self.with(|shared| shared.callbacks.pending_in(&scope))
+        let published = self.published.borrow();
+        match direction {
+            Direction::HostToAgent => published.pending_host_to_agent,
+            Direction::AgentToHost => published.pending_agent_to_host,
+        }
     }
 
+    /// Open sessions in the owner's last published snapshot.
     #[must_use]
     pub fn session_count(&self) -> usize {
-        self.with(|shared| shared.connection.session_count())
+        self.published.borrow().session_count
     }
 
-    fn with<R>(&self, apply: impl FnOnce(&mut Shared) -> R) -> R {
-        let mut guard = self.shared.lock().unwrap_or_else(PoisonError::into_inner);
-        apply(&mut guard)
+    /// Send one command and await its reply. `None` when the owner is gone,
+    /// which only a runtime being torn down can cause.
+    async fn ask<R>(&self, command: impl FnOnce(oneshot::Sender<R>) -> Command) -> Option<R> {
+        ask_owner(&self.commands, command).await
     }
 
-    fn try_with<R>(
+    async fn lifecycle_command(
         &self,
-        apply: impl FnOnce(&mut Shared) -> Result<R, LifecycleRejection>,
-    ) -> Result<R, SupervisorError> {
-        self.with(apply).map_err(SupervisorError::from)
+        command: impl FnOnce(oneshot::Sender<Result<(), LifecycleRejection>>) -> Command,
+    ) -> Result<(), SupervisorError> {
+        self.ask(command)
+            .await
+            .ok_or(SupervisorError::ChildGone)?
+            .map_err(SupervisorError::from)
     }
 
-    /// Register a host request and write its line. The critical section holds
-    /// no await.
-    fn dispatch(
+    async fn cancel_permissions(&self, session: Option<String>) -> Vec<RequestId> {
+        self.ask(|reply| Command::CancelPermissions { session, reply })
+            .await
+            .unwrap_or_default()
+    }
+
+    /// Have the owner register a host request, then write its line.
+    ///
+    /// The id is allocated by the owner, in the order commands reach it. The
+    /// line is written by a task of its own so that a full stdin queue cannot
+    /// hold the caller.
+    async fn dispatch(
         &self,
-        method: &str,
+        method: &'static str,
         params: Value,
         kind: PendingKind,
         session: Option<&str>,
-        require_ready: bool,
-    ) -> Result<(RequestId, oneshot::Receiver<Result<Value, SupervisorError>>), SupervisorError>
-    {
-        let scope = self.scope.id_scope(Direction::HostToAgent);
-        let now = self.now_ms();
-        let (sender, receiver) = oneshot::channel();
-        let (id, body) = self.try_with(|shared| {
-            if require_ready && !shared.connection.lifecycle().admits() {
-                return Err(LifecycleRejection::new(
-                    LifecycleRule::ConnectionNotReady,
-                    "the connection is not admitting requests",
-                ));
-            }
-            shared.next_id += 1;
-            let id = RequestId::Number(i64::try_from(shared.next_id).unwrap_or(i64::MAX));
-            shared
-                .callbacks
-                .register(&scope, id.clone(), kind, session, now, 0)?;
-            shared.waiters.insert((scope.clone(), id.clone()), sender);
-            let body = serde_json::to_vec(&json!({
-                "jsonrpc": "2.0",
-                "id": id_value(&id),
-                "method": method,
-                "params": params,
-            }))
-            .unwrap_or_default();
-            Ok((id, body))
-        })?;
+        gate: Gate,
+    ) -> Result<(RequestId, Reply), SupervisorError> {
+        let session = session.map(ToOwned::to_owned);
+        let Dispatched { id, body, reply } = self
+            .ask(|reply| Command::Dispatch {
+                method,
+                params,
+                kind,
+                session,
+                gate,
+                reply,
+            })
+            .await
+            .ok_or(SupervisorError::ChildGone)??;
         let child = Arc::clone(&self.child);
-        let shared = Arc::clone(&self.shared);
-        let key = (scope, id.clone());
+        let commands = self.commands.clone();
+        let failed = id.clone();
         tokio::spawn(async move {
             if child.send(&body).await.is_err() {
-                let mut guard = shared.lock().unwrap_or_else(PoisonError::into_inner);
-                if let Some(waiter) = guard.waiters.remove(&key) {
-                    let _ = waiter.send(Err(SupervisorError::ChildGone));
-                }
+                let _ = commands.send(Command::SendFailed { id: failed }).await;
             }
         });
-        Ok((id, receiver))
+        Ok((id, reply))
     }
 }
 
@@ -892,38 +1318,44 @@ fn permission_response(id: &RequestId, outcome: &PermissionOutcome) -> Vec<u8> {
     .unwrap_or_default()
 }
 
-/// The separate reader: it keeps handling agent callbacks while a prompt is
-/// pending, because it is not the task awaiting the prompt.
-/// Everything the reader task needs. A struct rather than eight arguments,
-/// which is also what `clippy::too_many_arguments` asks for.
+/// Everything the reader task needs. A struct rather than five arguments.
 struct ReaderContext {
-    shared: Arc<Mutex<Shared>>,
+    commands: mpsc::Sender<Command>,
     child: Arc<ChildHandle>,
     to_host: mpsc::Sender<AgentEvent>,
-    scope: ConnectionScope,
-    started: Instant,
-    permission_timeout_ms: u64,
     counters: Arc<ChildCounters>,
     /// The transport sink, when a bridge asked for one.
     forward: Option<mpsc::Sender<OutboundMessage>>,
 }
 
+/// Send the owner one command and await its reply. `None` when the owner is
+/// gone.
+async fn ask_owner<R>(
+    commands: &mpsc::Sender<Command>,
+    command: impl FnOnce(oneshot::Sender<R>) -> Command,
+) -> Option<R> {
+    let (reply, answer) = oneshot::channel();
+    commands.send(command(reply)).await.ok()?;
+    answer.await.ok()
+}
+
+/// The separate reader: it keeps handling agent callbacks while a prompt is
+/// pending, because it is not the task awaiting the prompt.
+///
+/// It owns no connection state. Each message becomes one owner command, and
+/// the reader waits for the owner to have applied it before it tells the host
+/// or reads the next line, so the owner sees the agent's messages in the order
+/// the agent wrote them.
 async fn read_agent(mut events: mpsc::Receiver<ChildEvent>, context: ReaderContext) {
     let ReaderContext {
-        shared,
+        commands,
         child,
         to_host,
-        scope,
-        started,
-        permission_timeout_ms,
         counters,
         forward,
     } = context;
     let _alive = TaskGuard::new(&counters);
-    let host_scope = scope.id_scope(Direction::HostToAgent);
-    let agent_scope = scope.id_scope(Direction::AgentToHost);
     while let Some(event) = events.recv().await {
-        let now = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         match event {
             ChildEvent::Message(message) => {
                 let message = message.message;
@@ -954,20 +1386,17 @@ async fn read_agent(mut events: mpsc::Receiver<ChildEvent>, context: ReaderConte
                             continue;
                         };
                         let session = message.session_id().unwrap_or_default().to_owned();
-                        let registered = {
-                            let mut guard = shared.lock().unwrap_or_else(PoisonError::into_inner);
-                            // The options the agent offered are recorded with
-                            // the callback, so the host's answer can be
-                            // checked against them (`docs/acp.md`: "Validate
-                            // the response against ... the offered option").
-                            guard.callbacks.register_permission(
-                                &agent_scope,
-                                id.clone(),
-                                Some(&session),
-                                now,
-                                permission_timeout_ms,
-                                offered_options(&message.value),
-                            )
+                        let offered = offered_options(&message.value);
+                        let Some(registered) =
+                            ask_owner(&commands, |reply| Command::RegisterPermission {
+                                id: id.clone(),
+                                session: session.clone(),
+                                offered,
+                                reply,
+                            })
+                            .await
+                        else {
+                            return;
                         };
                         let event = match registered {
                             Ok(()) => {
@@ -1013,47 +1442,19 @@ async fn read_agent(mut events: mpsc::Receiver<ChildEvent>, context: ReaderConte
                             continue;
                         };
                         let result = message.value.get("result").cloned();
-                        let outcome = result.as_ref().map_or_else(
-                            || Outcome::Failed("agent_error".to_owned()),
-                            |_| Outcome::Completed("ok".to_owned()),
-                        );
-                        let mut guard = shared.lock().unwrap_or_else(PoisonError::into_inner);
-                        let Ok(resolution) =
-                            guard.callbacks.resolve(&host_scope, &id, outcome, now)
-                        else {
-                            // A duplicate, a late, or an unsolicited response.
-                            // It cannot repeat a decision, so it is dropped.
-                            continue;
-                        };
-                        if resolution.kind == PendingKind::Prompt
-                            && let Some(session) = resolution.session.as_deref()
+                        if ask_owner(&commands, |reply| Command::Response { id, result, reply })
+                            .await
+                            .is_none()
                         {
-                            let _ = guard.connection.end_prompt(session);
-                        }
-                        if let Some(waiter) = guard.waiters.remove(&(host_scope.clone(), id)) {
-                            let _ = waiter.send(match result {
-                                Some(value) => Ok(value),
-                                None => Err(SupervisorError::Protocol(AcpRule::NotJsonRpcMessage)),
-                            });
+                            return;
                         }
                     }
                 }
             }
             ChildEvent::Ended(end) => {
-                let waiters: Vec<_> = {
-                    let mut guard = shared.lock().unwrap_or_else(PoisonError::into_inner);
-                    let event = match end {
-                        ChildEnd::Closed => LifecycleEvent::Reaped,
-                        ChildEnd::OversizedLine
-                        | ChildEnd::InvalidLine(_)
-                        | ChildEnd::ReadFailed => LifecycleEvent::Failed,
-                    };
-                    let _ = guard.connection.advance(event);
-                    guard.waiters.drain().map(|(_, sender)| sender).collect()
-                };
-                for waiter in waiters {
-                    let _ = waiter.send(Err(SupervisorError::ChildGone));
-                }
+                // The owner fails every outstanding waiter before the host is
+                // told the stream ended.
+                let _ = ask_owner(&commands, |reply| Command::ChildEnded { end, reply }).await;
                 let _ = to_host.send(AgentEvent::Ended(end)).await;
                 return;
             }
@@ -1061,15 +1462,14 @@ async fn read_agent(mut events: mpsc::Receiver<ChildEvent>, context: ReaderConte
     }
 }
 
-/// Read the clock, hand the reading to the pure table, and act on what it
-/// decided. A permission that ran out of time is **cancelled**; there is no
-/// path here that approves one.
+/// Wake on the tick, have the owner read the clock and hand the reading to
+/// the pure table, and act on what it decided. A permission that ran out of
+/// time is **cancelled**; there is no path here that approves one.
 async fn observe_deadlines(
-    shared: Arc<Mutex<Shared>>,
+    commands: mpsc::Sender<Command>,
     child: Arc<ChildHandle>,
     to_host: mpsc::Sender<AgentEvent>,
     tick: Duration,
-    started: Instant,
     counters: Arc<ChildCounters>,
 ) {
     let _alive = TaskGuard::new(&counters);
@@ -1087,10 +1487,8 @@ async fn observe_deadlines(
             () = child.wait_exited() => return,
             _ = ticker.tick() => {}
         }
-        let now = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-        let expired = {
-            let mut guard = shared.lock().unwrap_or_else(PoisonError::into_inner);
-            guard.callbacks.observe(now)
+        let Some(expired) = ask_owner(&commands, |reply| Command::Observe { reply }).await else {
+            return;
         };
         for permission in expired {
             // Tell the agent, on the wire, that its request was cancelled.
@@ -1111,5 +1509,162 @@ async fn observe_deadlines(
                 return;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scope() -> ConnectionScope {
+        ConnectionScope {
+            tenant: "tenant-a".to_owned(),
+            principal: "principal-a".to_owned(),
+            device: "device-a".to_owned(),
+            service: "agent".to_owned(),
+            connection: "connection-1".to_owned(),
+        }
+    }
+
+    /// An owner with no child behind it: `handle` is synchronous, so a test
+    /// can place a command exactly between two others.
+    fn owner() -> (Owner, watch::Receiver<Published>) {
+        let connection = AcpConnection::new(MAX_SESSIONS_PER_CONNECTION);
+        let callbacks = CallbackTable::new(MAX_PENDING_PER_DIRECTION);
+        let (published, snapshots) = watch::channel(Published {
+            lifecycle: connection.lifecycle(),
+            session_count: 0,
+            pending_host_to_agent: 0,
+            pending_agent_to_host: 0,
+            resolutions: 0,
+            permission_expirations: 0,
+        });
+        let owner = Owner {
+            connection,
+            callbacks,
+            waiters: HashMap::new(),
+            next_id: 0,
+            session_limit: MAX_SESSIONS_PER_CONNECTION,
+            open_sessions: Vec::new(),
+            host_scope: scope().id_scope(Direction::HostToAgent),
+            agent_scope: scope().id_scope(Direction::AgentToHost),
+            started: Instant::now(),
+            permission_timeout_ms: 60_000,
+            published,
+        };
+        (owner, snapshots)
+    }
+
+    fn ready_session(owner: &mut Owner, session: &str) {
+        let (reply, mut answer) = oneshot::channel();
+        owner.handle(Command::Advance {
+            event: LifecycleEvent::Initialized,
+            reply,
+        });
+        answer.try_recv().expect("replied").expect("initialized");
+        let (reply, mut answer) = oneshot::channel();
+        owner.handle(Command::OpenSession {
+            session: session.to_owned(),
+            reply,
+        });
+        answer.try_recv().expect("replied").expect("opened");
+        let (reply, mut answer) = oneshot::channel();
+        owner.handle(Command::SubscriberReady {
+            session: session.to_owned(),
+            reply,
+        });
+        answer.try_recv().expect("replied").expect("subscriber");
+    }
+
+    fn prompt(
+        owner: &mut Owner,
+        session: &str,
+    ) -> oneshot::Receiver<Result<Dispatched, SupervisorError>> {
+        let (reply, answer) = oneshot::channel();
+        owner.handle(Command::Dispatch {
+            method: "session/prompt",
+            params: json!({"sessionId": session}),
+            kind: PendingKind::Prompt,
+            session: Some(session.to_owned()),
+            gate: Gate::Prompt,
+            reply,
+        });
+        answer
+    }
+
+    fn respond(owner: &mut Owner, id: i64) {
+        let (reply, _answer) = oneshot::channel();
+        owner.handle(Command::Response {
+            id: RequestId::Number(id),
+            result: Some(json!({"stopReason": "end_turn"})),
+            reply,
+        });
+    }
+
+    /// A caller that drops `prompt()` after its command was queued has a
+    /// closed reply channel by the time the owner registers the request. The
+    /// registration must be undone in that same command: the line was never
+    /// written, so nothing may stay outstanding for it.
+    #[test]
+    fn a_prompt_whose_caller_went_away_is_undone_and_its_late_response_is_ignored() {
+        let (mut owner, snapshots) = owner();
+        ready_session(&mut owner, "s1");
+
+        // The caller is gone before the owner applies the command.
+        let (reply, answer) = oneshot::channel();
+        drop(answer);
+        owner.handle(Command::Dispatch {
+            method: "session/prompt",
+            params: json!({"sessionId": "s1"}),
+            kind: PendingKind::Prompt,
+            session: Some("s1".to_owned()),
+            gate: Gate::Prompt,
+            reply,
+        });
+
+        // The id was allocated, and then everything about it was undone.
+        assert_eq!(owner.next_id, 1);
+        assert!(owner.waiters.is_empty(), "no waiter is left behind");
+        assert_eq!(owner.callbacks.pending_in(&owner.host_scope), 0);
+        assert_eq!(owner.callbacks.resolutions(), 1);
+        let published = *snapshots.borrow();
+        assert_eq!(published.pending_host_to_agent, 0);
+        assert_eq!(published.resolutions, 1, "exactly one resolution");
+
+        // The prompt slot is free: the next prompt is admitted, under a new id.
+        let mut second = prompt(&mut owner, "s1");
+        let Dispatched {
+            id,
+            reply: mut ticket,
+            ..
+        } = second
+            .try_recv()
+            .expect("replied")
+            .expect("the slot was given back");
+        assert_eq!(id, RequestId::Number(2));
+        assert_eq!(owner.waiters.len(), 1);
+
+        // A late response for the forgotten id resolves nothing and reaches
+        // nobody — in particular not the request that came after it.
+        respond(&mut owner, 1);
+        assert!(ticket.try_recv().is_err(), "the later request is untouched");
+        assert_eq!(owner.callbacks.resolutions(), 1);
+        assert_eq!(owner.callbacks.pending_in(&owner.host_scope), 1);
+        assert_eq!(owner.waiters.len(), 1);
+        // The slot is still held by the second prompt, not freed by the stray.
+        let refused = prompt(&mut owner, "s1")
+            .try_recv()
+            .expect("replied")
+            .err()
+            .expect("the second prompt still holds the slot");
+        assert_eq!(refused.rule(), Some(LifecycleRule::PromptAlreadyActive));
+
+        // Its own response is delivered to it, once.
+        respond(&mut owner, 2);
+        let value = ticket.try_recv().expect("delivered").expect("a result");
+        assert_eq!(value["stopReason"], "end_turn");
+        assert!(owner.waiters.is_empty());
+        assert_eq!(owner.callbacks.pending_in(&owner.host_scope), 0);
+        assert_eq!(snapshots.borrow().resolutions, 2);
     }
 }

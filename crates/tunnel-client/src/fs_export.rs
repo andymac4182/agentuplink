@@ -164,6 +164,15 @@ pub struct StreamAuthority {
     revision: AtomicU64,
     /// Every capability bit, as gate 1 packs them.
     grant: AtomicU64,
+    /// The provider-visible projection of the stream's `AuthLifecycle`, which
+    /// the connector actor owns: `true` (fresh) from admission and after each
+    /// accepted confirmation, `false` (stale) once the actor invalidates the
+    /// authorization by a CANCEL, an expiry or a revocation.  The actor is
+    /// the only writer and calls [`Self::confirm`] and [`Self::invalidate`]
+    /// only next to the lifecycle transition they publish; the lifecycle
+    /// refuses a confirmation after an invalidation, so in the actor stale is
+    /// final (this type alone does not enforce that).  It is a separate atomic because the provider reads it from another task
+    /// and must never wait on the actor.
     fresh: AtomicBool,
 }
 
@@ -372,9 +381,9 @@ async fn serve_unix(
     // that sends refusable frames and takes no replies cannot grow this
     // buffer without bound.
     'stream: loop {
-        let reading = !out.terminal && out.bytes < PENDING_CAP;
-        let can_step = out.records.is_empty() && !out.terminal && provider.has_work();
-        let idle_wait = out.records.is_empty() && !out.terminal && !provider.has_work();
+        let reading = !out.closing() && out.bytes < PENDING_CAP;
+        let can_step = out.records.is_empty() && !out.closing() && provider.has_work();
+        let idle_wait = out.records.is_empty() && !out.closing() && !provider.has_work();
         let stall_at = out.progress_at + stall_limit;
         let idle_at = last_activity + idle;
         let chunk = out.next_chunk(&outbound);
@@ -543,18 +552,57 @@ struct Outgoing {
     bytes: usize,
     /// When the carrier last granted credit, or when a reply started waiting.
     progress_at: tokio::time::Instant,
-    /// A close record is queued: nothing is read or performed after it.
-    terminal: bool,
+    /// Whether a close record is queued: nothing is read or performed after
+    /// it.
+    phase: OutPhase,
+}
+
+/// What one queued record is.  A close record never reports an effect.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OutKind {
+    /// A provider reply. `effect`: it reports an effect the provider is
+    /// holding as undelivered.
+    Reply { effect: bool },
+    /// A close record: the session ends once it is out.
+    Close,
+}
+
+/// The outgoing queue's phase: `Open --Close--> CloseQueued`.
+///
+/// `Open` stays `Open` for every reply. `CloseQueued` is final and accepts
+/// nothing more, because the session ends as soon as the close record is out
+/// and a record queued behind it could never be sent.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OutPhase {
+    Open,
+    CloseQueued,
+}
+
+/// A record was offered to a queue that already holds its close record.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CloseAlreadyQueued;
+
+#[cfg(unix)]
+impl OutPhase {
+    /// The only writer of the phase: the effect of queueing one record.
+    fn transition(&mut self, queued: OutKind) -> Result<(), CloseAlreadyQueued> {
+        *self = match (*self, queued) {
+            (Self::Open, OutKind::Reply { .. }) => Self::Open,
+            (Self::Open, OutKind::Close) => Self::CloseQueued,
+            (Self::CloseQueued, _) => return Err(CloseAlreadyQueued),
+        };
+        Ok(())
+    }
 }
 
 #[cfg(unix)]
 struct OutRecord {
     bytes: Bytes,
     sent: usize,
-    /// The reply reports an effect the provider is holding as undelivered.
-    effect: bool,
-    /// A close record: the session ends once it is out.
-    close: bool,
+    kind: OutKind,
 }
 
 #[cfg(unix)]
@@ -571,19 +619,29 @@ impl Default for Outgoing {
             records: std::collections::VecDeque::new(),
             bytes: 0,
             progress_at: tokio::time::Instant::now(),
-            terminal: false,
+            phase: OutPhase::Open,
         }
     }
 }
 
 #[cfg(unix)]
 impl Outgoing {
+    /// A close record is queued.
+    fn closing(&self) -> bool {
+        self.phase == OutPhase::CloseQueued
+    }
+
     fn enqueue(&mut self, record: OutRecord) {
+        // Nothing is produced after a close record (the loop neither reads
+        // nor steps the provider once one is queued), and a record behind it
+        // could never be sent.
+        if self.phase.transition(record.kind).is_err() {
+            return;
+        }
         if self.records.is_empty() {
             self.progress_at = tokio::time::Instant::now();
         }
         self.bytes += record.bytes.len();
-        self.terminal |= record.close;
         self.records.push_back(record);
     }
 
@@ -607,8 +665,9 @@ impl Outgoing {
                     self.enqueue(OutRecord {
                         bytes: Bytes::from(record),
                         sent: 0,
-                        effect: provider.reply_carries_effect(),
-                        close: false,
+                        kind: OutKind::Reply {
+                            effect: provider.reply_carries_effect(),
+                        },
                     });
                 }
                 Outbound::Close(code) => {
@@ -621,7 +680,7 @@ impl Outgoing {
     }
 
     fn push_close(&mut self, report: &mut FsExchangeReport, code: SessionErrorCode) {
-        if self.terminal {
+        if self.closing() {
             return;
         }
         report.closed_with = Some(code);
@@ -630,8 +689,7 @@ impl Outgoing {
         self.enqueue(OutRecord {
             bytes: Bytes::from(record),
             sent: 0,
-            effect: false,
-            close: true,
+            kind: OutKind::Close,
         });
     }
 
@@ -663,12 +721,9 @@ impl Outgoing {
             return Advanced::Partial;
         }
         let done = self.records.pop_front().expect("front exists");
-        if done.close {
-            Advanced::Terminal
-        } else {
-            Advanced::Record {
-                effect: done.effect,
-            }
+        match done.kind {
+            OutKind::Close => Advanced::Terminal,
+            OutKind::Reply { effect } => Advanced::Record { effect },
         }
     }
 
@@ -1146,6 +1201,55 @@ mod tests {
         drop(consumer);
         let report = task.await.expect("session task");
         assert_eq!(report.stats.dropped_after_flush, 1, "{report:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_outgoing_phase_transition_table_is_exact() {
+        use super::{CloseAlreadyQueued, OutKind, OutPhase};
+        let kinds = [
+            OutKind::Reply { effect: false },
+            OutKind::Reply { effect: true },
+            OutKind::Close,
+        ];
+        for kind in kinds {
+            let mut phase = OutPhase::Open;
+            assert_eq!(phase.transition(kind), Ok(()));
+            let expected = if kind == OutKind::Close {
+                OutPhase::CloseQueued
+            } else {
+                OutPhase::Open
+            };
+            assert_eq!(phase, expected, "{kind:?}");
+            // Nothing is queued behind a close record.
+            let mut phase = OutPhase::CloseQueued;
+            assert_eq!(phase.transition(kind), Err(CloseAlreadyQueued), "{kind:?}");
+            assert_eq!(phase, OutPhase::CloseQueued);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_record_offered_after_the_close_record_is_not_queued() {
+        use super::{Advanced, OutKind, OutRecord, Outgoing};
+        let record = |kind| OutRecord {
+            bytes: super::Bytes::from_static(b"abcd"),
+            sent: 0,
+            kind,
+        };
+        let mut out = Outgoing::default();
+        out.enqueue(record(OutKind::Reply { effect: true }));
+        assert!(!out.closing());
+        out.enqueue(record(OutKind::Close));
+        assert!(out.closing());
+        out.enqueue(record(OutKind::Reply { effect: false }));
+        out.enqueue(record(OutKind::Close));
+        assert_eq!((out.records.len(), out.bytes), (2, 8));
+        assert!(matches!(out.advance(2), Advanced::Partial));
+        assert!(matches!(out.advance(2), Advanced::Record { effect: true }));
+        assert!(matches!(out.advance(4), Advanced::Terminal));
+        assert!(out.closing(), "the phase is final");
+        assert_eq!((out.records.len(), out.bytes), (0, 0));
     }
 
     #[test]

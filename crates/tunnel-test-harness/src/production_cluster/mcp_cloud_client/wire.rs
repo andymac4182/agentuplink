@@ -26,7 +26,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
@@ -41,11 +41,12 @@ use rmcp::transport::streamable_http_client::{
 use rmcp::{ClientHandler, RoleClient};
 use rustls::pki_types::{CertificateDer, ServerName};
 use sse_stream::Sse;
-use tokio::sync::Notify;
+use tokio::sync::{Notify, watch};
 use tokio::time::{sleep, timeout};
 use tokio_rustls::TlsConnector;
 use tokio_util::sync::CancellationToken;
 
+use crate::production_cluster::append_log::AppendLog;
 use crate::{HarnessError, Result};
 
 /// The smallest retry hint the relay sends with a retryable refusal
@@ -92,10 +93,14 @@ pub(in crate::production_cluster) struct FreezeWatch {
     seen_frozen: AtomicBool,
     /// Milliseconds since the watch started, at the last frozen sample.
     last_frozen_ms: AtomicU64,
-    started: Mutex<Option<Instant>>,
+    /// The origin `last_frozen_ms` is measured from, set by the first sample
+    /// and kept across resets: only differences from it are ever used, and
+    /// `seen_frozen` says whether `last_frozen_ms` means anything.
+    started: OnceLock<Instant>,
     /// The connector's last observed rotation phase and completed rotation
-    /// count, for a refusal that did not coincide with a freeze.
-    phase: Mutex<String>,
+    /// count, for a refusal that did not coincide with a freeze.  Published
+    /// whole by the status sampler, and emptied by a reset between sessions.
+    phase: watch::Sender<String>,
     rotations_completed: AtomicU64,
 }
 
@@ -104,38 +109,22 @@ impl FreezeWatch {
     /// never attributes a refusal on a new session to an old session's
     /// freeze.
     pub(in crate::production_cluster) fn reset(&self) {
-        *self
-            .started
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         self.frozen.store(false, Ordering::SeqCst);
         self.seen_frozen.store(false, Ordering::SeqCst);
         self.last_frozen_ms.store(0, Ordering::SeqCst);
         self.rotations_completed.store(0, Ordering::SeqCst);
-        self.phase
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clear();
+        self.phase.send_replace(String::new());
     }
 
     /// Record one connector status sample: its rotation phase and completed
     /// rotation count.
     pub fn record(&self, phase: &str, rotations_completed: u64) {
         let frozen = FROZEN_PHASES.contains(&phase);
-        let mut started = self
-            .started
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let started = *started.get_or_insert_with(Instant::now);
+        let started = *self.started.get_or_init(Instant::now);
         self.frozen.store(frozen, Ordering::SeqCst);
         self.rotations_completed
             .store(rotations_completed, Ordering::SeqCst);
-        phase.clone_into(
-            &mut self
-                .phase
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-        );
+        self.phase.send_replace(phase.to_owned());
         if frozen {
             self.seen_frozen.store(true, Ordering::SeqCst);
             self.last_frozen_ms.store(
@@ -149,22 +138,12 @@ impl FreezeWatch {
     /// the moment it was observed.  The owner freezes before the connector
     /// sees `ROTATE_QUIESCE`, so a refusal can land in that head gap.
     pub(in crate::production_cluster) fn unexplained(&self) -> String {
-        let phase = self
-            .phase
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
-        let since_frozen = {
-            let started = self
-                .started
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            started.map(|started| {
-                u64::try_from(started.elapsed().as_millis())
-                    .unwrap_or(u64::MAX)
-                    .saturating_sub(self.last_frozen_ms.load(Ordering::SeqCst))
-            })
-        };
+        let phase = self.phase.borrow().clone();
+        let since_frozen = self.started.get().map(|started| {
+            u64::try_from(started.elapsed().as_millis())
+                .unwrap_or(u64::MAX)
+                .saturating_sub(self.last_frozen_ms.load(Ordering::SeqCst))
+        });
         let since_frozen = if self.seen_frozen.load(Ordering::SeqCst) {
             since_frozen
         } else {
@@ -181,14 +160,7 @@ impl FreezeWatch {
         if self.frozen.load(Ordering::SeqCst) {
             return true;
         }
-        let started = {
-            let started = self
-                .started
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            *started
-        };
-        let Some(started) = started else {
+        let Some(started) = self.started.get() else {
             return false;
         };
         if !self.seen_frozen.load(Ordering::SeqCst) {
@@ -452,20 +424,72 @@ impl WireCounts {
     }
 }
 
-#[derive(Default)]
-struct LedgerInner {
-    counts: WireCounts,
-    digest: sha2::Sha256,
-    /// JSON-RPC request ID → call key.  IDs never leave this process.
-    outstanding: HashMap<String, String>,
+/// One thing the ledger was told.  The counts are these events folded in the
+/// order they were recorded, so every figure a snapshot reports comes from
+/// the same prefix of the client's traffic.
+enum WireEvent {
+    /// A POSTed message, by call key.
+    Post { key: String },
+    /// A POST response carrying `Mcp-Session-Id`.
+    SessionHeader,
+    /// A POST answered 404 for an attached legacy session.
+    SessionExpired,
+    /// A POST that failed at the transport, with its truncated summary.
+    PostFailure { summary: String },
+    /// A POST the relay refused as `not_dispatched`, and whether it was
+    /// sent again.
+    NotDispatchedRefusal { resent: bool },
+    /// A legacy session DELETE.
+    Delete,
+    /// A GET without a session.
+    ResumeAttempt,
+    /// A standalone GET refused with 503.  `unexplained` is `None` when the
+    /// refusal coincided with a freeze and was sent again, and otherwise the
+    /// connector state it was observed in.
+    StandaloneRefusal { unexplained: Option<String> },
+    /// A standalone GET stream opened.
+    StandaloneOpened,
+    /// A standalone GET attempt refused for any reason.
+    StandaloneRefused,
+    /// A progress notification.  The message is held only to be digested.
+    Progress { value: u64, message: Option<String> },
+    /// A `notifications/message` log without an ID.
+    Log { seq: Option<u64>, standalone: bool },
+    /// A JSON-RPC result or error, by the call it answers.
+    Answer { key: String, error: bool },
+    /// A POST stream read on after its final response, by that call.
+    Drained { key: String },
+    /// Drains aborted at teardown.
+    DrainsAborted { count: u64 },
+}
+
+/// A POSTed JSON-RPC request awaiting its answer.  IDs never leave this
+/// process.
+struct PostedRequest {
+    id: String,
+    key: String,
+    /// Claimed by the one answer that is attributed to this request.
+    answered: AtomicBool,
+}
+
+/// A post-response drain still reading (M3-23).
+struct DrainTask {
+    abort: tokio::task::AbortHandle,
+    /// Cancelled when the drain task ends, however it ends.
+    done: CancellationToken,
+    /// Claimed by the teardown that waits for this drain.
+    joined: AtomicBool,
 }
 
 /// The shared ledger of one client.
 #[derive(Default)]
 pub struct WireLedger {
-    inner: Mutex<LedgerInner>,
-    /// Post-response drains still reading (M3-23), joined at teardown.
-    drains: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    events: AppendLog<WireEvent>,
+    /// Every POSTed request with an ID.  The request an ID names is the
+    /// latest one posted with it.
+    requests: AppendLog<PostedRequest>,
+    /// Post-response drains (M3-23), joined at teardown.
+    drains: AppendLog<DrainTask>,
 }
 
 impl std::fmt::Debug for WireLedger {
@@ -489,59 +513,133 @@ fn call_key(value: &serde_json::Value) -> Option<String> {
 }
 
 impl WireLedger {
-    fn with<T>(&self, update: impl FnOnce(&mut LedgerInner) -> T) -> T {
-        let mut inner = self
-            .inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        update(&mut inner)
+    fn record(&self, event: WireEvent) {
+        self.events.push(event);
     }
 
     /// Join every post-response drain this client started, and abort any
     /// still running at `bound` -- counted, so a drain that never reached its
     /// stream's end is visible in the evidence rather than left running.
     pub async fn finish_drains(&self, bound: Duration) {
-        let drains = std::mem::take(
-            &mut *self
-                .drains
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-        );
         let deadline = tokio::time::Instant::now() + bound;
         let mut aborted = 0;
-        for mut drain in drains {
-            if tokio::time::timeout_at(deadline, &mut drain).await.is_err() {
-                drain.abort();
+        for drain in self.drains.iter() {
+            if drain.joined.swap(true, Ordering::AcqRel) {
+                continue;
+            }
+            if tokio::time::timeout_at(deadline, drain.done.cancelled())
+                .await
+                .is_err()
+            {
+                drain.abort.abort();
                 aborted += 1;
             }
         }
         if aborted > 0 {
-            self.with(|inner| inner.counts.post_stream_drains_aborted += aborted);
+            self.record(WireEvent::DrainsAborted { count: aborted });
         }
     }
 
     pub fn counts(&self) -> WireCounts {
         use sha2::Digest;
-        self.with(|inner| {
-            let mut counts = inner.counts.clone();
-            counts.progress_digest = hex_digest(&inner.digest.clone().finalize());
-            counts
-        })
+        let mut counts = WireCounts::default();
+        let mut digest = sha2::Sha256::default();
+        for event in self.events.iter() {
+            match event {
+                WireEvent::Post { key } => *counts.posts.entry(key.clone()).or_default() += 1,
+                WireEvent::SessionHeader => counts.session_headers += 1,
+                WireEvent::SessionExpired => counts.session_expired += 1,
+                WireEvent::PostFailure { summary } => {
+                    counts.post_failures += 1;
+                    counts.first_failure.get_or_insert_with(|| summary.clone());
+                }
+                WireEvent::NotDispatchedRefusal { resent } => {
+                    counts.not_dispatched_refusals += 1;
+                    if *resent {
+                        counts.not_dispatched_retries += 1;
+                    }
+                }
+                WireEvent::Delete => counts.deletes += 1,
+                WireEvent::ResumeAttempt => counts.resume_attempts += 1,
+                WireEvent::StandaloneRefusal { unexplained } => {
+                    counts.standalone_not_dispatched_refusals += 1;
+                    match unexplained {
+                        None => counts.standalone_retries += 1,
+                        Some(cause) => {
+                            counts
+                                .unexplained_refusal
+                                .get_or_insert_with(|| cause.clone());
+                        }
+                    }
+                }
+                WireEvent::StandaloneOpened => counts.standalone_opened += 1,
+                WireEvent::StandaloneRefused => counts.standalone_refused += 1,
+                WireEvent::Progress { value, message } => {
+                    counts.progress_values.push(*value);
+                    if let Some(message) = message {
+                        digest.update(message.as_bytes());
+                        digest.update(b"\n");
+                    }
+                }
+                WireEvent::Log { seq, standalone } => {
+                    if let Some(seq) = seq {
+                        counts.log_seqs.push(*seq);
+                    }
+                    if *standalone {
+                        counts.logs_on_standalone_streams += 1;
+                    } else {
+                        counts.logs_on_request_streams += 1;
+                    }
+                }
+                WireEvent::Answer { key, error } => {
+                    let by_call = if *error {
+                        &mut counts.errors
+                    } else {
+                        &mut counts.results
+                    };
+                    *by_call.entry(key.clone()).or_default() += 1;
+                }
+                WireEvent::Drained { key } => {
+                    counts.post_streams_drained_after_response += 1;
+                    *counts.drained_by_call.entry(key.clone()).or_default() += 1;
+                }
+                WireEvent::DrainsAborted { count } => {
+                    counts.post_stream_drains_aborted += count;
+                }
+            }
+        }
+        counts.progress_digest = hex_digest(&digest.finalize());
+        counts
     }
 
     fn note_post(&self, message: &ClientJsonRpcMessage) {
         let Ok(value) = serde_json::to_value(message) else {
             return;
         };
-        self.with(|inner| {
-            let key = call_key(&value).unwrap_or_else(|| "response".to_owned());
-            *inner.counts.posts.entry(key.clone()).or_default() += 1;
-            if let Some(id) = value.get("id")
-                && value.get("method").is_some()
-            {
-                inner.outstanding.insert(id.to_string(), key);
-            }
-        });
+        let key = call_key(&value).unwrap_or_else(|| "response".to_owned());
+        // The request is registered before it is counted and long before it
+        // is sent, so its answer always finds it.
+        if let Some(id) = value.get("id")
+            && value.get("method").is_some()
+        {
+            self.requests.push(PostedRequest {
+                id: id.to_string(),
+                key: key.clone(),
+                answered: AtomicBool::new(false),
+            });
+        }
+        self.record(WireEvent::Post { key });
+    }
+
+    /// The call an answer with this ID is attributed to: the latest request
+    /// posted with it, once; `unknown` for any other answer.
+    fn claim_request(&self, id: &str) -> String {
+        self.requests
+            .iter()
+            .filter(|request| request.id == id)
+            .last()
+            .filter(|request| !request.answered.swap(true, Ordering::AcqRel))
+            .map_or_else(|| "unknown".to_owned(), |request| request.key.clone())
     }
 
     /// Count one message; for a JSON-RPC result or error, return the call it
@@ -550,48 +648,51 @@ impl WireLedger {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(data) else {
             return None;
         };
-        self.with(|inner| {
-            if let Some(method) = value.get("method").and_then(serde_json::Value::as_str) {
-                if method == "notifications/progress" {
-                    use sha2::Digest;
-                    let params = &value["params"];
-                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-                    inner
-                        .counts
-                        .progress_values
-                        .push(params["progress"].as_f64().unwrap_or(-1.0) as u64);
-                    if let Some(message) = params["message"].as_str() {
-                        inner.digest.update(message.as_bytes());
-                        inner.digest.update(b"\n");
-                    }
-                }
-                if value.get("id").is_none() && method == "notifications/message" {
-                    if let Some(seq) = value["params"]["data"]["seq"].as_u64() {
-                        inner.counts.log_seqs.push(seq);
-                    }
-                    if standalone {
-                        inner.counts.logs_on_standalone_streams += 1;
-                    } else {
-                        inner.counts.logs_on_request_streams += 1;
-                    }
-                }
-                return None;
+        if let Some(method) = value.get("method").and_then(serde_json::Value::as_str) {
+            if method == "notifications/progress" {
+                let params = &value["params"];
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let progress = params["progress"].as_f64().unwrap_or(-1.0) as u64;
+                self.record(WireEvent::Progress {
+                    value: progress,
+                    message: params["message"].as_str().map(str::to_owned),
+                });
             }
-            let id = value.get("id")?;
-            let key = inner
-                .outstanding
-                .remove(&id.to_string())
-                .unwrap_or_else(|| "unknown".to_owned());
-            if value.get("error").is_some() {
-                *inner.counts.errors.entry(key.clone()).or_default() += 1;
-                Some(key)
-            } else if value.get("result").is_some() {
-                *inner.counts.results.entry(key.clone()).or_default() += 1;
-                Some(key)
-            } else {
-                None
+            if value.get("id").is_none() && method == "notifications/message" {
+                self.record(WireEvent::Log {
+                    seq: value["params"]["data"]["seq"].as_u64(),
+                    standalone,
+                });
             }
-        })
+            return None;
+        }
+        let id = value.get("id")?;
+        let key = self.claim_request(&id.to_string());
+        if value.get("error").is_some() {
+            self.record(WireEvent::Answer {
+                key: key.clone(),
+                error: true,
+            });
+            Some(key)
+        } else if value.get("result").is_some() {
+            self.record(WireEvent::Answer {
+                key: key.clone(),
+                error: false,
+            });
+            Some(key)
+        } else {
+            None
+        }
+    }
+
+    /// [`Self::observe`] for one stream item.
+    fn observe_item(
+        &self,
+        item: &std::result::Result<Sse, SseError>,
+        standalone: bool,
+    ) -> Option<String> {
+        let data = item.as_ref().ok()?.data.as_ref()?;
+        self.observe(data, standalone)
     }
 
     fn wrap(
@@ -599,31 +700,19 @@ impl WireLedger {
         stream: BoxStream<'static, std::result::Result<Sse, SseError>>,
         standalone: bool,
     ) -> BoxStream<'static, std::result::Result<Sse, SseError>> {
-        let ledger = Arc::clone(self);
-        let observed = Arc::clone(self);
-        let responded = Arc::new(Mutex::new(None));
-        let saw_response = Arc::clone(&responded);
-        let inspected = stream
-            .inspect(move |item| {
-                if let Ok(event) = item
-                    && let Some(data) = &event.data
-                    && let Some(key) = observed.observe(data, standalone)
-                    && !standalone
-                {
-                    *saw_response
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(key);
-                }
-            })
-            .boxed();
         if standalone {
-            return inspected;
+            let observed = Arc::clone(self);
+            return stream
+                .inspect(move |item| {
+                    observed.observe_item(item, true);
+                })
+                .boxed();
         }
         DrainAfterResponse {
-            inner: Some(inspected),
+            inner: Some(stream),
             ended: false,
-            responded,
-            ledger,
+            responded: None,
+            ledger: Arc::clone(self),
         }
         .boxed()
     }
@@ -657,7 +746,9 @@ struct DrainAfterResponse {
     inner: Option<BoxStream<'static, std::result::Result<Sse, SseError>>>,
     ended: bool,
     /// The call whose final response this stream carried, once it has.
-    responded: Arc<Mutex<Option<String>>>,
+    /// Whoever polls this stream is the only one to see its items, so it
+    /// observes them itself.
+    responded: Option<String>,
     ledger: Arc<WireLedger>,
 }
 
@@ -672,8 +763,14 @@ impl futures_util::Stream for DrainAfterResponse {
             return std::task::Poll::Ready(None);
         };
         let polled = inner.poll_next_unpin(cx);
-        if matches!(polled, std::task::Poll::Ready(None)) {
-            self.ended = true;
+        match &polled {
+            std::task::Poll::Ready(None) => self.ended = true,
+            std::task::Poll::Ready(Some(item)) => {
+                if let Some(key) = self.ledger.observe_item(item, false) {
+                    self.responded = Some(key);
+                }
+            }
+            std::task::Poll::Pending => {}
         }
         polled
     }
@@ -681,12 +778,8 @@ impl futures_util::Stream for DrainAfterResponse {
 
 impl Drop for DrainAfterResponse {
     fn drop(&mut self) {
-        let responded = self
-            .responded
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
-        let Some(key) = responded.filter(|_| !self.ended) else {
+        let ended = self.ended;
+        let Some(key) = self.responded.take().filter(|_| !ended) else {
             return;
         };
         let (Some(mut inner), Ok(runtime)) =
@@ -694,23 +787,28 @@ impl Drop for DrainAfterResponse {
         else {
             return;
         };
-        self.ledger.with(|inner| {
-            inner.counts.post_streams_drained_after_response += 1;
-            *inner.counts.drained_by_call.entry(key).or_default() += 1;
-        });
+        self.ledger.record(WireEvent::Drained { key });
+        let ledger = Arc::clone(&self.ledger);
+        let done = CancellationToken::new();
+        let finished = done.clone().drop_guard();
         let drain = runtime.spawn(async move {
+            // Dropped, and so signalled, when this task ends: at the
+            // stream's end, at the bound, or when teardown aborts it.
+            let _finished = finished;
             let _ = timeout(POST_RESPONSE_DRAIN, async {
-                while inner.next().await.is_some() {}
+                while let Some(item) = inner.next().await {
+                    ledger.observe_item(&item, false);
+                }
             })
             .await;
         });
         // Held by the ledger so the case's teardown joins it, or aborts it at
         // a bound, instead of leaving it running into the next case.
-        self.ledger
-            .drains
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(drain);
+        self.ledger.drains.push(DrainTask {
+            abort: drain.abort_handle(),
+            done,
+            joined: AtomicBool::new(false),
+        });
     }
 }
 
@@ -748,7 +846,7 @@ impl CountingHttpClient {
         match result {
             Ok(StreamableHttpPostResponse::Json(message, session)) => {
                 if session.is_some() {
-                    self.ledger.with(|inner| inner.counts.session_headers += 1);
+                    self.ledger.record(WireEvent::SessionHeader);
                 }
                 if let Ok(text) = serde_json::to_string(&message) {
                     self.ledger.observe(&text, false);
@@ -757,7 +855,7 @@ impl CountingHttpClient {
             }
             Ok(StreamableHttpPostResponse::Sse(stream, session)) => {
                 if session.is_some() {
-                    self.ledger.with(|inner| inner.counts.session_headers += 1);
+                    self.ledger.record(WireEvent::SessionHeader);
                 }
                 Ok(StreamableHttpPostResponse::Sse(
                     self.ledger.wrap(stream, false),
@@ -766,15 +864,12 @@ impl CountingHttpClient {
             }
             Ok(other) => Ok(other),
             Err(StreamableHttpError::SessionExpired) => {
-                self.ledger.with(|inner| inner.counts.session_expired += 1);
+                self.ledger.record(WireEvent::SessionExpired);
                 Err(StreamableHttpError::SessionExpired)
             }
             Err(error) => {
                 let summary = error.to_string().chars().take(200).collect::<String>();
-                self.ledger.with(|inner| {
-                    inner.counts.post_failures += 1;
-                    inner.counts.first_failure.get_or_insert(summary);
-                });
+                self.ledger.record(WireEvent::PostFailure { summary });
                 Err(error)
             }
         }
@@ -834,12 +929,8 @@ impl StreamableHttpClient for CountingHttpClient {
                 && let Some(delay) = not_dispatched_retry_after(error)
             {
                 let resend = retries < NOT_DISPATCHED_RETRIES;
-                self.ledger.with(|inner| {
-                    inner.counts.not_dispatched_refusals += 1;
-                    if resend {
-                        inner.counts.not_dispatched_retries += 1;
-                    }
-                });
+                self.ledger
+                    .record(WireEvent::NotDispatchedRefusal { resent: resend });
                 if resend {
                     retries += 1;
                     sleep(delay).await;
@@ -857,7 +948,7 @@ impl StreamableHttpClient for CountingHttpClient {
         auth_header: Option<String>,
         custom_headers: HashMap<HeaderName, HeaderValue>,
     ) -> std::result::Result<(), StreamableHttpError<Self::Error>> {
-        self.ledger.with(|inner| inner.counts.deletes += 1);
+        self.ledger.record(WireEvent::Delete);
         self.inner
             .delete_session(uri, session_id, auth_header, custom_headers)
             .await
@@ -899,7 +990,7 @@ impl StreamableHttpClient for CountingHttpClient {
     > {
         let standalone = session_id.is_some();
         if !standalone {
-            self.ledger.with(|inner| inner.counts.resume_attempts += 1);
+            self.ledger.record(WireEvent::ResumeAttempt);
         }
         let mut retries = 0;
         let result = loop {
@@ -926,14 +1017,8 @@ impl StreamableHttpClient for CountingHttpClient {
             if refused {
                 let coincides = self.freeze.coincides();
                 let cause = (!coincides).then(|| self.freeze.unexplained());
-                self.ledger.with(|inner| {
-                    inner.counts.standalone_not_dispatched_refusals += 1;
-                    if coincides {
-                        inner.counts.standalone_retries += 1;
-                    } else if let Some(cause) = cause {
-                        inner.counts.unexplained_refusal.get_or_insert(cause);
-                    }
-                });
+                self.ledger
+                    .record(WireEvent::StandaloneRefusal { unexplained: cause });
                 if coincides && retries < NOT_DISPATCHED_RETRIES {
                     retries += 1;
                     sleep(Duration::from_millis(MIN_RETRY_HINT_MS)).await;
@@ -945,15 +1030,13 @@ impl StreamableHttpClient for CountingHttpClient {
         match result {
             Ok(stream) => {
                 if standalone {
-                    self.ledger
-                        .with(|inner| inner.counts.standalone_opened += 1);
+                    self.ledger.record(WireEvent::StandaloneOpened);
                 }
                 Ok(self.ledger.wrap(stream, standalone))
             }
             Err(error) => {
                 if standalone {
-                    self.ledger
-                        .with(|inner| inner.counts.standalone_refused += 1);
+                    self.ledger.record(WireEvent::StandaloneRefused);
                 }
                 Err(error)
             }
@@ -966,8 +1049,8 @@ impl StreamableHttpClient for CountingHttpClient {
 
 #[derive(Default)]
 struct HandlerState {
-    progress: Mutex<Vec<(f64, Option<String>)>>,
-    logs: Mutex<Vec<serde_json::Value>>,
+    progress: AppendLog<(f64, Option<String>)>,
+    logs: AppendLog<serde_json::Value>,
     changed: Notify,
 }
 
@@ -993,19 +1076,11 @@ impl GateClient {
     }
 
     pub fn progress(&self) -> Vec<(f64, Option<String>)> {
-        self.state
-            .progress
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
+        self.state.progress.snapshot()
     }
 
     pub fn logs(&self) -> Vec<serde_json::Value> {
-        self.state
-            .logs
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
+        self.state.logs.snapshot()
     }
 
     /// Wait, bounded, until `ready` holds for the recorded notifications.
@@ -1040,11 +1115,7 @@ impl ClientHandler for GateClient {
         params: ProgressNotificationParam,
         _context: NotificationContext<RoleClient>,
     ) {
-        self.state
-            .progress
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push((params.progress, params.message));
+        self.state.progress.push((params.progress, params.message));
         self.state.changed.notify_waiters();
     }
 
@@ -1054,11 +1125,7 @@ impl ClientHandler for GateClient {
         params: rmcp::model::LoggingMessageNotificationParam,
         _context: NotificationContext<RoleClient>,
     ) {
-        self.state
-            .logs
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(params.data);
+        self.state.logs.push(params.data);
         self.state.changed.notify_waiters();
     }
 }

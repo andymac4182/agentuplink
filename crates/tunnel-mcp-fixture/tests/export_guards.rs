@@ -8,7 +8,6 @@ mod common;
 
 use std::collections::HashMap;
 use std::convert::Infallible;
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -372,22 +371,22 @@ async fn legacy_sessions_require_ids_and_end_on_delete() {
     assert_eq!(export.diagnostics().children_running, 0);
 }
 
-type Recorded = Arc<Mutex<Vec<HashMap<String, String>>>>;
+/// The headers of every request a hostile backend received, in arrival order.
+type Recorded = tokio::sync::mpsc::UnboundedReceiver<HashMap<String, String>>;
 
 /// A hostile fixed backend answering every request with `response`.
 async fn hostile_backend(response: fn() -> Response<Full<Bytes>>) -> (String, Recorded) {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let address = listener.local_addr().expect("address");
-    let recorded: Recorded = Arc::default();
-    let seen = Arc::clone(&recorded);
+    let (seen, recorded) = tokio::sync::mpsc::unbounded_channel();
     tokio::spawn(async move {
         while let Ok((stream, _)) = listener.accept().await {
-            let seen = Arc::clone(&seen);
+            let seen = seen.clone();
             tokio::spawn(async move {
                 let service = hyper::service::service_fn(move |request: Request<Incoming>| {
-                    let seen = Arc::clone(&seen);
+                    let seen = seen.clone();
                     async move {
-                        seen.lock().expect("lock").push(
+                        let _ = seen.send(
                             request
                                 .headers()
                                 .iter()
@@ -466,7 +465,7 @@ async fn fixed_http_backends_cannot_redirect_challenge_encode_or_leak_headers() 
         ),
     ];
     for (index, (respond, expected)) in cases.into_iter().enumerate() {
-        let (url, recorded) = hostile_backend(respond).await;
+        let (url, mut recorded) = hostile_backend(respond).await;
         let export = http_export(CURRENT, &url, Some(&token));
         let response = within(exchange(&export, post(&as_refs(&headers), body.clone()))).await;
         assert_eq!(response.status(), expected, "case {index}");
@@ -490,7 +489,8 @@ async fn fixed_http_backends_cannot_redirect_challenge_encode_or_leak_headers() 
             !text.contains("private") && !text.contains("169.254"),
             "case {index}: {text}"
         );
-        let seen = recorded.lock().expect("lock").clone();
+        let seen: Vec<HashMap<String, String>> =
+            core::iter::from_fn(|| recorded.try_recv().ok()).collect();
         assert_eq!(
             seen.len(),
             1,

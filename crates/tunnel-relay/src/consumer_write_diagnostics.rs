@@ -4,17 +4,18 @@
 //! window at exact public response-write callsites.  No socket error, payload,
 //! URL, path, token, or caller-provided text is stored.
 
-use std::{
-    collections::VecDeque,
-    future::Future,
-    sync::{Arc, Mutex},
-};
+use std::{future::Future, sync::Arc};
 
 use serde::Serialize;
 use tokio::time::{Instant, timeout_at};
 use uuid::Uuid;
 
-use crate::runtime::StreamTerminalCause;
+use crate::{
+    peer_transport_diagnostics::cells::{
+        Arena, Entry, Ledger, Order, Place, WordReader, WordWriter, code_of, variant,
+    },
+    runtime::StreamTerminalCause,
+};
 
 /// The outcome of one bounded public response write.
 ///
@@ -101,6 +102,10 @@ pub enum ConsumerIngressKind {
     Forwarded,
 }
 
+impl ConsumerIngressKind {
+    const ALL: [Self; 2] = [Self::Local, Self::Forwarded];
+}
+
 /// Safe correlation scope for one public consumer response write.
 ///
 /// Device and service UUIDs are authorization-scope identifiers already used
@@ -143,53 +148,101 @@ pub struct ConsumerWriteDiagnosticSnapshot {
     pub timeout_count: u64,
     /// At most this module's fixed recent-event bound is retained.
     pub recent_timeouts: Vec<ConsumerWriteTimeoutSnapshot>,
+    /// True only when this snapshot could not be taken because too many
+    /// reads of these diagnostics were in progress at once.  Every other
+    /// field is then a placeholder and not an observation: the counts are
+    /// unknown, not zero.  Absent from the serialized snapshot otherwise.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub unavailable: bool,
 }
 
 const MAX_RECENT_TIMEOUTS: usize = 8;
 
-#[derive(Default)]
+/// The cap on this diagnostic's storage: 2^14 blocks of 88 bytes, 1.4 MB.
+/// A handful of events is retained; the rest is head-room.
+const BLOCKS: usize = 1 << 14;
+
+/// The ledger holding the timeout count and the recent events it counted.
 struct ConsumerWriteDiagnosticState {
-    timeout_count: u64,
-    recent_timeouts: VecDeque<ConsumerWriteTimeoutSnapshot>,
+    arena: Arena,
+    ledger: Ledger,
+}
+
+impl Default for ConsumerWriteDiagnosticState {
+    fn default() -> Self {
+        Self {
+            arena: Arena::new(BLOCKS),
+            ledger: Ledger::new(1, &[MAX_RECENT_TIMEOUTS]),
+        }
+    }
+}
+
+fn decode_timeout(sequence: u64, mut record: WordReader) -> Option<ConsumerWriteTimeoutSnapshot> {
+    Some(ConsumerWriteTimeoutSnapshot {
+        sequence,
+        scope: ConsumerWriteScope {
+            device_id: record.uuid()?,
+            service_id: record.uuid()?,
+            ingress: variant(&ConsumerIngressKind::ALL, record.u64()?)?,
+        },
+    })
 }
 
 /// Cloneable, bounded state for response-write timeout diagnostics.
 #[derive(Clone, Default)]
 pub(crate) struct ConsumerWriteDiagnostics {
-    state: Arc<Mutex<ConsumerWriteDiagnosticState>>,
+    state: Arc<ConsumerWriteDiagnosticState>,
 }
 
 impl ConsumerWriteDiagnostics {
     /// Record a timeout without retaining any transport error or message
-    /// content.  The count and event window are updated under one lock so a
-    /// snapshot cannot pair a count with a different scope.
+    /// content.  The count and the event window change in one atomic step
+    /// and the event's occurrence number is the count that step reaches, so
+    /// a snapshot cannot pair a count with a different scope or show a
+    /// count whose event is not yet in the window.
     pub(crate) fn record_timeout(&self, scope: ConsumerWriteScope) -> ConsumerWriteTimeoutSnapshot {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.timeout_count = state.timeout_count.saturating_add(1);
-        let event = ConsumerWriteTimeoutSnapshot {
-            sequence: state.timeout_count,
+        let state = &*self.state;
+        let mut event = WordWriter::new();
+        event.uuid(scope.device_id);
+        event.uuid(scope.service_id);
+        event.u64(code_of(&ConsumerIngressKind::ALL, &scope.ingress));
+        let committed = state.ledger.commit(
+            &state.arena,
+            None,
+            &[0],
+            vec![Entry {
+                place: Place::Push(0),
+                order: Order::Count(0),
+                record: event,
+            }],
+        );
+        ConsumerWriteTimeoutSnapshot {
+            // Zero only if the record was dropped for want of storage,
+            // which the HTTP forward snapshot counts.
+            sequence: committed
+                .and_then(|committed| committed.counts.first().copied())
+                .unwrap_or(0),
             scope,
-        };
-        if state.recent_timeouts.len() == MAX_RECENT_TIMEOUTS {
-            let _ = state.recent_timeouts.pop_front();
         }
-        state.recent_timeouts.push_back(event);
-        event
     }
 
     /// Return the bounded redacted view used by a relay's typed snapshot.
     #[must_use]
     pub(crate) fn snapshot(&self) -> ConsumerWriteDiagnosticSnapshot {
-        let state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(view) = self.state.ledger.read(&self.state.arena) else {
+            return ConsumerWriteDiagnosticSnapshot {
+                unavailable: true,
+                ..ConsumerWriteDiagnosticSnapshot::default()
+            };
+        };
         ConsumerWriteDiagnosticSnapshot {
-            timeout_count: state.timeout_count,
-            recent_timeouts: state.recent_timeouts.iter().copied().collect(),
+            timeout_count: view.count(0),
+            recent_timeouts: view
+                .retained
+                .into_iter()
+                .filter_map(|retained| decode_timeout(retained.order, retained.record))
+                .collect(),
+            unavailable: false,
         }
     }
 }
@@ -202,7 +255,45 @@ mod tests {
     };
     use tokio::time::{Duration, Instant, sleep};
 
-    use super::{ConsumerWriteOutcome, send_until_or_expired};
+    use uuid::Uuid;
+
+    use super::{
+        ConsumerIngressKind, ConsumerWriteDiagnostics, ConsumerWriteOutcome, ConsumerWriteScope,
+        MAX_RECENT_TIMEOUTS, send_until_or_expired,
+    };
+
+    #[test]
+    fn timeouts_are_counted_and_the_recent_window_stays_bounded() {
+        let diagnostics = ConsumerWriteDiagnostics::default();
+        let total = MAX_RECENT_TIMEOUTS as u64 + 3;
+        for index in 1..=total {
+            let ingress = if index % 2 == 0 {
+                ConsumerIngressKind::Forwarded
+            } else {
+                ConsumerIngressKind::Local
+            };
+            let scope = ConsumerWriteScope::new(
+                Uuid::from_u128(u128::from(index)),
+                Uuid::from_u128(u128::from(index) << 64),
+                ingress,
+            );
+            let event = diagnostics.record_timeout(scope);
+            assert_eq!(event.sequence, index);
+            assert_eq!(event.scope, scope);
+        }
+        let snapshot = diagnostics.snapshot();
+        assert_eq!(snapshot.timeout_count, total);
+        assert_eq!(snapshot.recent_timeouts.len(), MAX_RECENT_TIMEOUTS);
+        for (offset, event) in snapshot.recent_timeouts.iter().enumerate() {
+            let sequence = 4 + offset as u64;
+            assert_eq!(event.sequence, sequence);
+            assert_eq!(event.scope.device_id, Uuid::from_u128(u128::from(sequence)));
+            assert_eq!(
+                event.scope.service_id,
+                Uuid::from_u128(u128::from(sequence) << 64)
+            );
+        }
+    }
 
     #[tokio::test]
     async fn expired_write_does_not_poll_send_future() {

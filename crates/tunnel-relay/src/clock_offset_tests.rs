@@ -1,18 +1,18 @@
 //! Task row M7-C175: clock-offset health with injected clocks.
 
 use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicBool, AtomicUsize, Ordering},
+    Arc,
+    atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering},
 };
 
 use super::*;
 
 /// A local clock fixed at an instant the test sets.
-struct FixedLocal(Mutex<DateTime<Utc>>);
+struct FixedLocal(DateTime<Utc>);
 
 impl LocalClock for FixedLocal {
     fn now(&self) -> DateTime<Utc> {
-        *self.0.lock().expect("local clock")
+        self.0
     }
 }
 
@@ -21,7 +21,7 @@ impl LocalClock for FixedLocal {
 struct FakeAuthority {
     local: Arc<FixedLocal>,
     /// Authority minus local.
-    lead: Mutex<TimeDelta>,
+    lead_ms: AtomicI64,
     fail: AtomicBool,
     hang: AtomicBool,
     absent: AtomicBool,
@@ -42,17 +42,19 @@ impl AuthorityClock for FakeAuthority {
         if self.absent.load(Ordering::Acquire) {
             return Ok(None);
         }
-        Ok(Some(self.local.now() + *self.lead.lock().expect("lead")))
+        Ok(Some(
+            self.local.now() + TimeDelta::milliseconds(self.lead_ms.load(Ordering::Acquire)),
+        ))
     }
 }
 
 fn clocks() -> (Arc<FixedLocal>, FakeAuthority) {
-    let local = Arc::new(FixedLocal(Mutex::new(
+    let local = Arc::new(FixedLocal(
         DateTime::from_timestamp(1_800_000_000, 0).expect("instant"),
-    )));
+    ));
     let authority = FakeAuthority {
         local: Arc::clone(&local),
-        lead: Mutex::new(TimeDelta::zero()),
+        lead_ms: AtomicI64::new(0),
         fail: AtomicBool::new(false),
         hang: AtomicBool::new(false),
         absent: AtomicBool::new(false),
@@ -67,7 +69,7 @@ async fn step(state: &ClockOffsetHealth, authority: &FakeAuthority, local: &Fixe
 }
 
 fn set_lead(authority: &FakeAuthority, milliseconds: i64) {
-    *authority.lead.lock().expect("lead") = TimeDelta::milliseconds(milliseconds);
+    authority.lead_ms.store(milliseconds, Ordering::Release);
 }
 
 #[test]
@@ -187,9 +189,7 @@ async fn a_slow_round_trip_is_discarded() {
             Ok(Some(self.at))
         }
     }
-    let local = FixedLocal(Mutex::new(
-        DateTime::from_timestamp(1_800_000_000, 0).expect("instant"),
-    ));
+    let local = FixedLocal(DateTime::from_timestamp(1_800_000_000, 0).expect("instant"));
     let far = local.now() - TimeDelta::seconds(9);
     let slow = Slow {
         delay: MAX_SAMPLE_ROUND_TRIP + Duration::from_millis(1),
@@ -218,13 +218,14 @@ async fn a_slow_round_trip_is_discarded() {
 #[tokio::test]
 async fn the_estimate_uses_the_midpoint_of_the_read() {
     /// A local clock that advances 400 ms per reading.
-    struct Advancing(Mutex<DateTime<Utc>>);
+    struct Advancing {
+        start: DateTime<Utc>,
+        readings: AtomicI64,
+    }
     impl LocalClock for Advancing {
         fn now(&self) -> DateTime<Utc> {
-            let mut now = self.0.lock().expect("clock");
-            let current = *now;
-            *now = current + TimeDelta::milliseconds(400);
-            current
+            let reading = self.readings.fetch_add(1, Ordering::AcqRel);
+            self.start + TimeDelta::milliseconds(400 * reading)
         }
     }
     struct At(DateTime<Utc>);
@@ -234,7 +235,10 @@ async fn the_estimate_uses_the_midpoint_of_the_read() {
         }
     }
     let start = DateTime::from_timestamp(1_800_000_000, 0).expect("instant");
-    let local = Advancing(Mutex::new(start));
+    let local = Advancing {
+        start,
+        readings: AtomicI64::new(0),
+    };
     // The read spans [start, start + 400 ms]; the midpoint is start + 200 ms.
     let measurement = measure(&At(start), &local, Duration::from_secs(1)).await;
     assert_eq!(
@@ -324,4 +328,73 @@ async fn readyz_is_not_ready_beyond_the_skew_bound() {
         readyz_status(&app).await,
         (200, r#"{"status":"ready"}"#.to_owned())
     );
+}
+
+#[test]
+fn the_phase_transition_table_is_total_and_has_hysteresis() {
+    use ClockOffsetPhase::{Measured, Unmeasured};
+    use OffsetVerdict::{Beyond, Warn, Within};
+    let measured = |verdict, streak| Measured { verdict, streak };
+    assert_eq!(Unmeasured.verdict(), Within);
+    // The first sample measures; one sample beyond the bound does not flip.
+    assert_eq!(Unmeasured.on_sample(Within), (measured(Within, 0), None));
+    assert_eq!(
+        Unmeasured.on_sample(Warn),
+        (measured(Warn, 0), Some((Within, Warn)))
+    );
+    assert_eq!(Unmeasured.on_sample(Beyond), (measured(Within, 1), None));
+    // On the ready side: Within and Warn move at once, Beyond needs a streak.
+    for ready in [Within, Warn] {
+        for sample in [Within, Warn] {
+            for streak in 0..CONSECUTIVE_SAMPLES_TO_FLIP {
+                assert_eq!(
+                    measured(ready, streak).on_sample(sample),
+                    (
+                        measured(sample, 0),
+                        (ready != sample).then_some((ready, sample))
+                    )
+                );
+            }
+        }
+        assert_eq!(
+            measured(ready, 0).on_sample(Beyond),
+            (measured(ready, 1), None)
+        );
+        assert_eq!(
+            measured(ready, CONSECUTIVE_SAMPLES_TO_FLIP - 1).on_sample(Beyond),
+            (measured(Beyond, 0), Some((ready, Beyond)))
+        );
+    }
+    // On the not-ready side: a Beyond sample resets, the way back needs a streak.
+    for streak in 0..CONSECUTIVE_SAMPLES_TO_FLIP {
+        assert_eq!(
+            measured(Beyond, streak).on_sample(Beyond),
+            (measured(Beyond, 0), None)
+        );
+    }
+    for sample in [Within, Warn] {
+        assert_eq!(
+            measured(Beyond, 0).on_sample(sample),
+            (measured(Beyond, 1), None)
+        );
+        assert_eq!(
+            measured(Beyond, CONSECUTIVE_SAMPLES_TO_FLIP - 1).on_sample(sample),
+            (measured(sample, 0), Some((Beyond, sample)))
+        );
+    }
+    // No transition returns to Unmeasured, and the encoding is one-to-one.
+    let mut phases = vec![Unmeasured];
+    for verdict in [Within, Warn, Beyond] {
+        for streak in 0..CONSECUTIVE_SAMPLES_TO_FLIP {
+            phases.push(measured(verdict, streak));
+        }
+    }
+    for phase in &phases {
+        assert_eq!(ClockOffsetPhase::decode(phase.encode()), *phase);
+        for sample in [Within, Warn, Beyond] {
+            assert_ne!(phase.on_sample(sample).0, Unmeasured);
+        }
+    }
+    // A byte no phase encodes to is not ready.
+    assert_eq!(ClockOffsetPhase::decode(u8::MAX).verdict(), Beyond);
 }

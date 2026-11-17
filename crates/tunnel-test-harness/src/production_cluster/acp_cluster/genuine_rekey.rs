@@ -69,7 +69,7 @@ impl Gate<'_> {
             .map_err(|error| HarnessError::Pki(error.to_string()))?;
         let ledger = Arc::new(InvalidationLedger::default());
         for relay in &self.cluster.relays {
-            install_reason_recorder(relay, &ledger);
+            install_reason_recorder(relay, &ledger).await;
         }
 
         // The owner's own readiness, sampled for the whole case by a watcher
@@ -104,7 +104,7 @@ impl Gate<'_> {
                 .stage_pem(
                     self.successor_chain_pem().as_bytes(),
                     successor.private_key_pem.as_bytes(),
-                )
+                ).await
                 .map_err(|error| HarnessError::Process(format!("staging the successor: {error}")))?;
             let before = rekey.tick().await;
             evidence.genuine_staged_not_served = staged == new_spki
