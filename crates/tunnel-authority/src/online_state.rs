@@ -504,6 +504,8 @@ enum Command {
     Operate(Job),
     /// Read the engine without admission, budgets or the fatal latch.
     #[cfg(test)]
+    // The tests that use this run only on Linux and macOS.
+    #[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
     Inspect(Box<dyn FnOnce(&Engine) + Send>),
 }
 
@@ -520,6 +522,8 @@ pub struct Coordinator {
     pub fatal: Arc<AtomicBool>,
     /// Whether the actor's blocking operation is still running.
     #[cfg(test)]
+    // The tests that use this run only on Linux and macOS.
+    #[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
     operating: Arc<AtomicBool>,
 }
 
@@ -614,6 +618,8 @@ impl Coordinator {
     }
 
     #[cfg(test)]
+    // The tests that use this run only on Linux and macOS.
+    #[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
     async fn inspect<T: Send + 'static>(
         &self,
         read: impl FnOnce(&Engine) -> T + Send + 'static,
@@ -629,6 +635,8 @@ impl Coordinator {
     }
 
     #[cfg(test)]
+    // The tests that use this run only on Linux and macOS.
+    #[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
     fn operating(&self) -> bool {
         self.operating.load(Ordering::SeqCst)
     }
