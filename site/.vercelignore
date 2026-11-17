@@ -2,5 +2,6 @@
 README.md
 verify.cjs
 build-docs.cjs
+build-architecture.cjs
 provenance.json
 test-releases.cjs
