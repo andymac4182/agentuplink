@@ -156,12 +156,22 @@ fn level_change(bytes: usize, change: fn(u64) -> LevelChange) -> LevelChange {
 
 /// Replace the pair held in `word` only with a better-attested one, in a
 /// single compare-and-swap of the packed word.
+///
+/// "Better" is a total order: the larger smaller-level wins, and between two
+/// pairs whose smaller levels are equal the larger packed word wins.  A hop
+/// keeps two latches, its own and its published cell's, and concurrent
+/// movers can offer the same candidates to them in different orders; with a
+/// first-come tie the two latches could settle on different, equally good
+/// pairs.  Under a total order each latch holds the maximum of what it was
+/// offered whatever the order, so the published copy equals the hop's.
 fn latch_pair(word: &AtomicU64, candidate: HopBytePair) {
     if candidate.smaller() == 0 {
         return;
     }
+    let packed = pack_pair(candidate);
+    let rank = |word: u64| (unpack_pair(word).smaller(), word);
     let _ = word.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |held| {
-        (candidate.smaller() > unpack_pair(held).smaller()).then(|| pack_pair(candidate))
+        (rank(packed) > rank(held)).then_some(packed)
     });
 }
 
@@ -1509,6 +1519,39 @@ mod tests {
         }
         assert_eq!(verify(&diagnostics.snapshot()), WRITERS * PER_WRITER);
         assert_eq!(diagnostics.snapshot().label_overflow, 0);
+    }
+
+    /// Two latches offered the same equally good pairs in opposite orders
+    /// settle on the same one: ties are broken by a total order, not by
+    /// arrival (the hosted macOS failure of the test below, task row
+    /// M6-C297).
+    #[test]
+    fn equally_good_pairs_latch_the_same_whatever_the_order() {
+        let first = HopBytePair {
+            send_bytes: 26_290,
+            receive_bytes: 39_424,
+        };
+        let second = HopBytePair {
+            send_bytes: 26_290,
+            receive_bytes: 39_124,
+        };
+        assert_eq!(first.smaller(), second.smaller());
+        let (one, other) = (AtomicU64::new(0), AtomicU64::new(0));
+        latch_pair(&one, first);
+        latch_pair(&one, second);
+        latch_pair(&other, second);
+        latch_pair(&other, first);
+        assert_eq!(
+            unpack_pair(one.load(Ordering::SeqCst)),
+            unpack_pair(other.load(Ordering::SeqCst))
+        );
+        // A strictly better pair still replaces either.
+        let better = HopBytePair {
+            send_bytes: 26_291,
+            receive_bytes: 26_291,
+        };
+        latch_pair(&one, better);
+        assert_eq!(unpack_pair(one.load(Ordering::SeqCst)), better);
     }
 
     /// Each level moved by two tasks at once, as a hop's are (a charge and a
