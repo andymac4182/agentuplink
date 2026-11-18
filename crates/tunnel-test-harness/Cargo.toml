@@ -32,7 +32,7 @@ jsonwebtoken = { version = "10.3.0", features = ["aws_lc_rs"] }
 rcgen = "0.13"
 # The M3-03 gate's cloud-side client is the pinned official Rust MCP SDK
 # (docs/mcp.md, "Pinned in code").
-rmcp = { version = "=3.4.0", default-features = false, features = [
+rmcp = { version = "=3.11.0", default-features = false, features = [
     "client",
     "transport-streamable-http-client-unix-socket",
 ] }

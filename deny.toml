@@ -61,6 +61,12 @@ ignore = [
     # credential loaders in tunnel-transport, tunnel-client and tunnel-relay,
     # so it is its own tracked row rather than a lockfile edit.
     { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile is unmaintained with no advisory against its code; migration to rustls-pki-types PemObject is docs/tasks.md M6-C100" },
+    # Unmaintained, not a vulnerability, and no safe upgrade exists.  chrono
+    # is not a direct choice that a lockfile edit can undo: it is used by the
+    # workspace's own timestamp handling and arrives again through `schemars`
+    # (the pinned official ACP crates, `serde_with`) and `rmcp`.  Accepted by
+    # the owner on 2026-11-18; replacing it is its own tracked row.
+    { id = "RUSTSEC-2026-0543", reason = "chrono is unmaintained with no safe upgrade and no advisory against its code; accepted by the owner 2026-11-18, replacement tracked in docs/tasks.md M6-C293" },
 ]
 
 [licenses]

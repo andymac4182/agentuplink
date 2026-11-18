@@ -1,5 +1,5 @@
 #![cfg(unix)]
-//! The official rmcp client (3.4.0) against the stdio export through the
+//! The official rmcp client (3.11.0) against the stdio export through the
 //! in-process http-forward/1 bridge, for both pinned profiles.
 
 mod common;
